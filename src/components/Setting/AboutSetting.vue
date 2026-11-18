@@ -36,7 +36,7 @@
         <span class="row-icon"><SvgIcon name="Cloud" :size="22" /></span>
         <span class="row-copy">
           <span class="row-title">更新访问源</span>
-          <span class="row-value">GitHub 直连或使用 ghproxy 加速下载</span>
+          <span class="row-value">GitHub 直连或使用 ghproxy Cloudflare 节点加速下载</span>
         </span>
         <n-select
           v-model:value="settingStore.updateSource"

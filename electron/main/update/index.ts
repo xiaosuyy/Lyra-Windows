@@ -1,7 +1,7 @@
 import { app, type BrowserWindow } from "electron";
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -46,7 +46,13 @@ const GITHUB_HEADERS = {
   "X-GitHub-Api-Version": "2022-11-28",
   "User-Agent": "LyraDesktop",
 };
-const GH_PROXY_PREFIX = "https://gh-proxy.com/";
+// 加速节点：Cloudflare (v4/v6) 优先，故障时依次回退
+const GH_PROXY_PREFIXES = [
+  "https://v6.gh-proxy.org/",
+  "https://v4.gh-proxy.org/",
+  "https://gh-proxy.org/",
+  "https://ghfast.top/",
+];
 const GITHUB_DOWNLOAD_HOSTS = new Set(["github.com", "objects.githubusercontent.com"]);
 const MAX_CHANGELOG_CHARS = 8000;
 const SEMVER_RE = /(?<![\d.])(\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)(?![\d.])/;
@@ -166,18 +172,66 @@ const readInstalledAt = async (): Promise<number> => {
   return installedAt;
 };
 
-const routeDownloadUrl = (url: string, source: UpdateSource): string => {
-  if (source !== "ghproxy") return url;
+const buildDownloadUrls = (url: string, source: UpdateSource): string[] => {
+  if (source !== "ghproxy") return [url];
   try {
     const parsed = new URL(url);
-    if (parsed.protocol !== "https:" || !GITHUB_DOWNLOAD_HOSTS.has(parsed.hostname)) return url;
-    return `${GH_PROXY_PREFIX}${url}`;
+    if (parsed.protocol !== "https:" || !GITHUB_DOWNLOAD_HOSTS.has(parsed.hostname)) return [url];
+    return GH_PROXY_PREFIXES.map((prefix) => `${prefix}${url}`);
   } catch {
-    return url;
+    return [url];
   }
 };
 
 const getUpdateDir = () => join(app.getPath("userData"), "updates");
+
+/** 分段并行下载，单连接被节点限速时可明显提速 */
+const DOWNLOAD_CONCURRENCY = 4;
+const SEGMENTED_MIN_BYTES = 16 * 1024 * 1024;
+
+const downloadSegment = async (
+  url: string,
+  start: number,
+  end: number,
+  filePath: string,
+  signal: AbortSignal,
+  onChunk: (length: number) => void,
+): Promise<void> => {
+  const response = await fetch(url, {
+    headers: { "User-Agent": "LyraDesktop", Range: `bytes=${start}-${end}` },
+    redirect: "follow",
+    signal,
+  });
+  if (response.status !== 206 || !response.body) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`分段下载失败：HTTP ${response.status}`);
+  }
+  const expected = end - start + 1;
+  let received = 0;
+  const body = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+  body.on("data", (chunk: Buffer) => {
+    received += chunk.length;
+    onChunk(chunk.length);
+  });
+  await pipeline(body, createWriteStream(filePath));
+  if (received !== expected) throw new Error("分段下载不完整");
+};
+
+const mergeSegments = async (parts: string[], target: string): Promise<void> => {
+  const output = createWriteStream(target);
+  try {
+    for (const part of parts) {
+      await new Promise<void>((resolve, reject) => {
+        const input = createReadStream(part);
+        input.on("error", reject);
+        input.on("end", resolve);
+        input.pipe(output, { end: false });
+      });
+    }
+  } finally {
+    await new Promise<void>((resolve) => output.end(resolve));
+  }
+};
 
 export const checkUpdate = async (
   win: BrowserWindow,
@@ -258,36 +312,99 @@ export const startDownloadUpdate = async (
       await rm(join(updateDir, file), { force: true }).catch(() => undefined);
     }
 
-    const url = routeDownloadUrl(update.downloadUrl, source);
-    updateLog.info(`开始下载更新：${url}`);
-    const response = await fetch(url, {
-      headers: { "User-Agent": "LyraDesktop" },
-      redirect: "follow",
-    });
-    if (!response.ok || !response.body) throw new Error(`下载失败：HTTP ${response.status}`);
-
-    const total = Number(response.headers.get("content-length") || 0) || update.sizeBytes;
+    const candidates = buildDownloadUrls(update.downloadUrl, source);
+    const total = update.sizeBytes;
+    let progressTotal = total;
     let received = 0;
     let lastReportAt = 0;
-    const body = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
-    body.on("data", (chunk: Buffer) => {
-      received += chunk.length;
+    const onChunk = (length: number) => {
+      received += length;
       const now = Date.now();
       if (now - lastReportAt >= 200) {
         lastReportAt = now;
         win.webContents.send("download-progress", {
-          percent: total > 0 ? Math.min(100, (received / total) * 100) : 0,
+          percent: progressTotal > 0 ? Math.min(100, (received / progressTotal) * 100) : 0,
         });
       }
-    });
-    await pipeline(body, createWriteStream(partFile));
+    };
+
+    let lastError: unknown = null;
+    let completed = false;
+
+    if (total >= SEGMENTED_MIN_BYTES) {
+      const count = Math.min(DOWNLOAD_CONCURRENCY, Math.ceil(total / (8 * 1024 * 1024)));
+      const segmentSize = Math.ceil(total / count);
+      for (const url of candidates) {
+        const parts = Array.from({ length: count }, (_, index) => `${partFile}.${index}`);
+        const controller = new AbortController();
+        const tasks = parts.map((part, index) => {
+          const start = index * segmentSize;
+          const end = Math.min(total - 1, start + segmentSize - 1);
+          return downloadSegment(url, start, end, part, controller.signal, onChunk);
+        });
+        updateLog.info(`开始分段下载更新（${count} 线程）：${url}`);
+        try {
+          await Promise.all(tasks);
+          await mergeSegments(parts, partFile);
+          const { size } = await stat(partFile);
+          if (size !== total) throw new Error(`更新包大小不一致：${size}/${total}`);
+          await Promise.all(parts.map((part) => rm(part, { force: true }).catch(() => undefined)));
+          completed = true;
+          break;
+        } catch (error) {
+          lastError = error;
+          controller.abort();
+          await Promise.allSettled(tasks);
+          await Promise.all(parts.map((part) => rm(part, { force: true }).catch(() => undefined)));
+          await rm(partFile, { force: true }).catch(() => undefined);
+          received = 0;
+        }
+      }
+    }
+
+    // 分段不被支持时退回单连接下载
+    if (!completed) {
+      let response: Awaited<ReturnType<typeof fetch>> | null = null;
+      for (const url of candidates) {
+        updateLog.info(`开始下载更新：${url}`);
+        try {
+          const res = await fetch(url, {
+            headers: { "User-Agent": "LyraDesktop" },
+            redirect: "follow",
+          });
+          // 节点异常时可能返回错误页，大小不符直接切换下一个节点
+          const length = Number(res.headers.get("content-length") || 0);
+          if (!res.ok || !res.body || (length > 0 && total > 0 && length !== total)) {
+            await res.body?.cancel().catch(() => undefined);
+            lastError = new Error(`下载失败：HTTP ${res.status}`);
+            continue;
+          }
+          response = res;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!response?.body) {
+        throw lastError instanceof Error ? lastError : new Error("下载更新失败");
+      }
+
+      progressTotal = Number(response.headers.get("content-length") || 0) || total;
+      received = 0;
+      const body = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+      body.on("data", (chunk: Buffer) => onChunk(chunk.length));
+      await pipeline(body, createWriteStream(partFile));
+    }
+
     await rename(partFile, target);
 
     downloadedFile = target;
     updateLog.info(`更新下载完成：${target}`);
     win.webContents.send("update-downloaded", { path: target });
   } catch (error) {
-    await rm(partFile, { force: true }).catch(() => undefined);
+    for (const file of await readdir(updateDir).catch(() => [])) {
+      await rm(join(updateDir, file), { force: true }).catch(() => undefined);
+    }
     const message = error instanceof Error ? error.message : "下载更新失败";
     updateLog.error(`下载更新失败：${message}`);
     win.webContents.send("update-error", message);
