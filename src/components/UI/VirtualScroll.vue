@@ -31,7 +31,6 @@
               left: 0,
               right: 0,
               transform: `translateY(${getItemTop(actualStartIndex + index)}px)`,
-              transition: 'transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1)',
             }"
           >
             <slot :item="item" :index="actualStartIndex + index" />
@@ -168,10 +167,11 @@ const calculateVisibleRange = (currentScrollTop: number) => {
   let endIndex = 0;
 
   if (props.itemFixed) {
-    // 定高模式
-    startIndex = Math.floor(currentScrollTop / props.itemHeight);
+    // 定高模式；scrollTop 可能残留自更长的旧列表，必须夹紧到有效范围
+    const maxIndex = Math.max(0, props.items.length - 1);
+    startIndex = Math.min(Math.max(0, Math.floor(currentScrollTop / props.itemHeight)), maxIndex);
     const visibleCount = Math.ceil(vHeight / props.itemHeight);
-    endIndex = startIndex + visibleCount;
+    endIndex = Math.min(startIndex + visibleCount, maxIndex);
   } else {
     // 动态高度模式 - 使用二分查找优化
     const tops = itemTops.value;
@@ -410,6 +410,12 @@ watch(
   () => props.items.length,
   () => {
     initializeHeights();
+    // 列表变短后把残留的超界滚动位置拉回有效范围，否则会出现空白
+    const maxTop = Math.max(0, totalHeight.value - viewportHeight.value);
+    if (scrollTop.value > maxTop) {
+      scrollTop.value = maxTop;
+      scrollToPosition(maxTop);
+    }
     calculateVisibleRange(scrollTop.value);
   },
 );
@@ -463,5 +469,9 @@ onUnmounted(() => {
 }
 .virtual-item {
   contain: layout paint;
+}
+/* 拖拽排序时才做位移动画，普通滚动不能加过渡，否则行会互相压叠 */
+.virtual-scroll-wrapper.is-dragging-global .virtual-item {
+  transition: transform 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 </style>

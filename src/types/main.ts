@@ -110,6 +110,8 @@ export type SongType = {
   createTime?: number;
   /** 更新时间 */
   updateTime?: number;
+  /** 最近播放时间（毫秒，跨设备同步最近播放顺序） */
+  playedAt?: number;
   /** 播放量 */
   playCount?: number;
   /**

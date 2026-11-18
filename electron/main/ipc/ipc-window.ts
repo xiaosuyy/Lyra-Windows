@@ -22,6 +22,33 @@ const initWindowsIpc = (): void => {
   // store
   const store = useStore();
 
+  // 应用背景透明度（30% - 100%）
+  const applyBackgroundOpacity = (win: BrowserWindow) => {
+    if (win.isDestroyed()) return;
+    const { backgroundTransparent, backgroundOpacity } = store.get("window");
+    const percent = Math.min(100, Math.max(30, Math.round(Number(backgroundOpacity) || 90)));
+    win.setOpacity(backgroundTransparent ? percent / 100 : 1);
+  };
+
+  // 设置背景透明度
+  ipcMain.handle(
+    "set-background-opacity",
+    (event, payload: { enabled: boolean; value: number }) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (!win) return false;
+      const enabled = Boolean(payload?.enabled);
+      const value = Math.min(100, Math.max(30, Math.round(Number(payload?.value) || 90)));
+      const windowConfig = store.get("window") || {};
+      store.set("window", {
+        ...windowConfig,
+        backgroundTransparent: enabled,
+        backgroundOpacity: value,
+      });
+      win.setOpacity(enabled ? value / 100 : 1);
+      return true;
+    },
+  );
+
   // 当前窗口状态
   ipcMain.on("win-state", (event) => {
     const mainWin = mainWindow.getWin();
@@ -39,6 +66,8 @@ const initWindowsIpc = (): void => {
     if (!mainWin) return;
     // 应用缩放
     if (zoomFactor) mainWin.webContents.setZoomFactor(zoomFactor);
+    // 应用背景透明度
+    applyBackgroundOpacity(mainWin);
     mainWin?.show();
     mainWin?.focus();
     if (!isFirstLaunch) {

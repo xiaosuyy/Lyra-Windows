@@ -56,11 +56,12 @@
 </template>
 
 <script setup lang="ts">
-import { useDataStore } from "@/stores";
+import { useDataStore, useLibraryStore } from "@/stores";
 import { usePlayerController } from "@/core/player/PlayerController";
 
 const player = usePlayerController();
 const dataStore = useDataStore();
+const libraryStore = useLibraryStore();
 
 // 清空最近播放
 const cleanHistory = () => {
@@ -70,6 +71,11 @@ const cleanHistory = () => {
     positiveText: "确认",
     negativeText: "取消",
     onPositiveClick: async () => {
+      // 记录删除时间，其他设备的旧记录不会把列表恢复
+      const ids = (dataStore.historyList || [])
+        .map((song) => Number(song.id))
+        .filter((id) => id > 0);
+      libraryStore.markHistoryCleared(ids);
       await dataStore.clearHistory();
       window.$message.success("最近播放列表已清空");
     },

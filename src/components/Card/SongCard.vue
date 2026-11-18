@@ -39,7 +39,7 @@
                   v-for="ar in song.artists"
                   :key="ar.id"
                   class="ar"
-                  @click="openJumpArtist(song.artists, ar.id)"
+                  @click="openJumpArtist(song.artists, ar.id, song.origin, ar.name)"
                 >
                   {{ settingStore.hideBracketedContent ? removeBrackets(ar.name) : ar.name }}
                 </n-text>
@@ -47,7 +47,11 @@
               <div v-else-if="song.type === 'radio'" class="artists">
                 <n-text class="ar"> 电台节目 </n-text>
               </div>
-              <div v-else class="artists" @click="openJumpArtist(song.artists)">
+              <div
+                v-else
+                class="artists"
+                @click="openJumpArtist(song.artists, undefined, song.origin)"
+              >
                 <n-text class="ar">
                   {{
                     settingStore.hideBracketedContent

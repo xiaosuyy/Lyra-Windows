@@ -26,12 +26,13 @@ export interface QQPlaylistPayload {
 /** 将字符串稳定映射为数字 ID（QQ 歌曲没有可用的数字 ID 时使用） */
 const hashId = hashStringToId;
 
+// QQ 音乐没有网易云歌手 ID，留 0 让跳转时按名称解析
 const splitArtists = (value: string): MetaData[] =>
   value
     .split(/\s*[/、&,，]\s*/)
     .map((name) => name.trim())
     .filter(Boolean)
-    .map((name) => ({ id: hashId(name), name }));
+    .map((name) => ({ id: 0, name }));
 
 /**
  * QQ 歌曲转换为应用歌曲结构

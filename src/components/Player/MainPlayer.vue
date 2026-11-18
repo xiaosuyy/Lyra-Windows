@@ -109,7 +109,14 @@
                       v-for="(item, index) in musicStore.playSong.artists"
                       :key="index"
                       class="ar-item"
-                      @click="openJumpArtist(musicStore.playSong.artists, item.id)"
+                      @click="
+                        openJumpArtist(
+                          musicStore.playSong.artists,
+                          item.id,
+                          musicStore.playSong.origin,
+                          item.name,
+                        )
+                      "
                     >
                       {{
                         settingStore.hideBracketedContent ? removeBrackets(item.name) : item.name
@@ -119,7 +126,13 @@
                   <n-text
                     v-else
                     class="ar-item"
-                    @click="openJumpArtist(musicStore.playSong.artists)"
+                    @click="
+                      openJumpArtist(
+                        musicStore.playSong.artists,
+                        undefined,
+                        musicStore.playSong.origin,
+                      )
+                    "
                   >
                     {{
                       settingStore.hideBracketedContent

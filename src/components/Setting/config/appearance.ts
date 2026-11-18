@@ -33,10 +33,32 @@ export const useAppearanceSettings = (): SettingConfig => {
     window.$message.warning("设置已保存，重启软件后生效");
   };
 
+  // --- Window Background Opacity ---
+  const windowTransparent = ref(false);
+  const windowOpacity = ref(90);
+
+  const applyWindowOpacity = (enabled: boolean, value: number) => {
+    if (!isElectron) return;
+    window.electron.ipcRenderer.invoke("set-background-opacity", { enabled, value });
+  };
+
+  const handleWindowTransparentChange = (val: boolean) => {
+    windowTransparent.value = val;
+    // 关闭时恢复不透明，再次开启沿用上次数值
+    applyWindowOpacity(val, val ? windowOpacity.value : 100);
+  };
+
+  const handleWindowOpacityChange = (val: number) => {
+    windowOpacity.value = val;
+    if (windowTransparent.value) applyWindowOpacity(true, val);
+  };
+
   const onActivate = async () => {
     if (isElectron) {
       const windowConfig = await window.api.store.get("window");
       useBorderless.value = windowConfig?.useBorderless ?? true;
+      windowTransparent.value = windowConfig?.backgroundTransparent ?? false;
+      windowOpacity.value = windowConfig?.backgroundOpacity ?? 90;
     }
   };
 
@@ -97,6 +119,34 @@ export const useAppearanceSettings = (): SettingConfig => {
                 value: computed({
                   get: () => settingStore.frostedGlassBlur,
                   set: (v) => (settingStore.frostedGlassBlur = v),
+                }),
+              },
+            ],
+          },
+          {
+            key: "backgroundTransparent",
+            label: "背景透明度",
+            type: "switch",
+            show: isElectron,
+            description: "开启后降低窗口不透明度，可以直接看见电脑桌面",
+            value: computed({
+              get: () => windowTransparent.value,
+              set: handleWindowTransparentChange,
+            }),
+            children: [
+              {
+                key: "backgroundOpacity",
+                label: "透明度",
+                type: "slider",
+                description: "数值越小，桌面透出越明显",
+                min: 30,
+                max: 100,
+                step: 1,
+                marks: { 90: "默认" },
+                formatTooltip: (v) => `${v}%`,
+                value: computed({
+                  get: () => windowOpacity.value,
+                  set: handleWindowOpacityChange,
                 }),
               },
             ],

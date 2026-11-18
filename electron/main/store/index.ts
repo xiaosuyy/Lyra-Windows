@@ -26,6 +26,10 @@ export interface StoreType {
     useBorderless?: boolean;
     /** 缩放系数 (0.5 - 2.0) */
     zoomFactor?: number;
+    /** 是否启用背景透明 */
+    backgroundTransparent?: boolean;
+    /** 背景不透明度（百分比 30-100） */
+    backgroundOpacity?: number;
   };
   /** 歌词 */
   lyric: {

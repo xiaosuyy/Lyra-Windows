@@ -151,7 +151,7 @@ import type { ArtistType } from "@/types/main";
 import { coverLoaded, renderIcon, copyData, getShareUrl } from "@/utils/helper";
 import { renderToolbar } from "@/utils/meta";
 import { openDescModal, openBatchList } from "@/utils/modal";
-import { artistDetail } from "@/api/artist";
+import { artistDetail, searchArtist } from "@/api/artist";
 import { formatArtistsList, removeBrackets } from "@/utils/format";
 import { useDataStore, useSettingStore } from "@/stores";
 import { toLikeArtist } from "@/utils/auth";
@@ -230,16 +230,41 @@ const toggleFollowArtist = () => {
 };
 
 // 获取歌手详情
-const getArtistDetail = async (id: number) => {
+// 从非网易云歌曲跳转时可能拿到无效 ID，按名称重新解析一次
+const resolveArtistId = async (name: string): Promise<number> => {
+  try {
+    const result = await searchArtist(name);
+    const list = Array.isArray(result?.data?.list) ? result.data.list : [];
+    const hit = list.find((ar: { artistName?: string }) => ar?.artistName === name) || list[0];
+    return Number(hit?.artistId) || 0;
+  } catch (error) {
+    console.warn(`搜索歌手 ${name} 失败`, error);
+    return 0;
+  }
+};
+
+const detailFallbackIds = new Set<number>();
+const getArtistDetail = async (id: number, allowFallback = true) => {
   try {
     if (!id) return;
     listScrolling.value = false;
     artistDetailData.value = null;
     const result = await artistDetail(id);
-    artistDetailData.value = formatArtistsList(result.data.artist)[0];
+    const detail = formatArtistsList(result?.data?.artist)[0];
+    if (!detail) throw new Error("歌手数据为空");
+    artistDetailData.value = detail;
     // 附加身份
     artistDetailData.value.identify = result.data.identify?.imageDesc;
   } catch (error) {
+    const name = String(route.query.name || "").trim();
+    if (allowFallback && name && !detailFallbackIds.has(id)) {
+      detailFallbackIds.add(id);
+      const resolved = await resolveArtistId(name);
+      if (resolved && resolved !== id) {
+        await router.replace({ name: route.name as string, query: { id: resolved, name } });
+        return;
+      }
+    }
     console.error("Erorr getting artist detail:", error);
     window.$message.error("获取歌手详情失败");
   }

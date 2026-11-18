@@ -89,8 +89,12 @@ interface MobileSyncData {
   playlists?: MobileSyncPlaylist[];
   favoritePlaylists?: MobileSyncFavoritePlaylist[];
   recentPlays?: MobileSyncRecentPlay[];
-  recentPlayDeletions?: { songId?: number }[];
-  playlistSongDeletions?: { playlistId?: number; songId?: number }[];
+  recentPlayDeletions?: { songId?: number; deletedAt?: number }[];
+  playlistSongDeletions?: {
+    playlistId?: number;
+    songId?: number;
+    deletedAt?: number;
+  }[];
   profileDisplayName?: string;
   profileAvatarBase64?: string;
   profileUpdatedAt?: number;
@@ -113,6 +117,8 @@ interface FavoriteTombstone {
   id: number;
   source: string;
   playlistId: string | null;
+  /** 手机端删除时间，用于判断重新收藏是否比删除更新 */
+  at: number;
 }
 
 /** 在线歌单身份，用于阻止账号歌单列表刷新后重新导入已删歌单 */
@@ -133,6 +139,8 @@ interface PendingDelete {
 interface NormalizedSync {
   likedSongs: SongType[];
   likedIds: number[];
+  /** 远端收藏歌曲的加入时间，用于判断是否晚于本机取消喜欢 */
+  likedAddedAt: Map<number, number>;
   history: SongType[];
   created: LibraryPlaylist[];
   favorites: LibraryPlaylist[];
@@ -142,10 +150,10 @@ interface NormalizedSync {
     mvs: CoverType[];
     djs: CoverType[];
   };
-  deletedPlaylistIds: number[];
+  deletedPlaylists: { id: number; at: number }[];
   deletedFavorites: FavoriteTombstone[];
-  removedFromPlaylist: { playlistId: number; songIds: number[] }[];
-  deletedHistoryIds: number[];
+  removedFromPlaylist: { playlistId: number; songId: number; deletedAt: number }[];
+  deletedHistory: { songId: number; deletedAt: number }[];
   profile: SyncedProfile;
   extras: Record<string, unknown>;
 }
@@ -154,6 +162,29 @@ interface NormalizedSync {
 const FAVORITES_PLAYLIST_ID = -1001;
 /** 手机端系统歌单（我喜欢的音乐 / 本地文件），不进入桌面歌单列表 */
 const SYSTEM_PLAYLIST_IDS = new Set([-1001, -1002]);
+/** 系统歌单固定名称：部分旧版本会用其他 ID 导出，同样不能作为普通歌单导入 */
+const SYSTEM_PLAYLIST_NAMES = new Set([
+  "我喜欢的音乐",
+  "my favorite music",
+  "本地歌曲",
+  "local files",
+]);
+
+/** 「我喜欢的音乐」名称，和本地歌曲等系统歌单区分开 */
+const FAVORITES_PLAYLIST_NAMES = new Set(["我喜欢的音乐", "my favorite music"]);
+
+const isSystemPlaylistName = (name?: string | null): boolean =>
+  SYSTEM_PLAYLIST_NAMES.has((name || "").trim().toLowerCase());
+
+const isFavoritesPlaylistName = (name?: string | null): boolean =>
+  FAVORITES_PLAYLIST_NAMES.has((name || "").trim().toLowerCase());
+
+/**
+ * 本地文件 / 流媒体仅当前设备可播放
+ * 手机端上传时同样会剔除这类歌曲
+ */
+const isTransferableSong = (song: SongType): boolean =>
+  Boolean(song) && !song.path && song.type !== "streaming";
 
 const libraryDB = localforage.createInstance({
   name: "lyra-library",
@@ -270,9 +301,10 @@ const mapSongs = (songs?: MobileSyncSong[]): SongType[] =>
  */
 const parseMobileSync = (data: MobileSyncData): NormalizedSync => {
   const likedSongs: SongType[] = [];
+  const likedAddedAt = new Map<number, number>();
   const created: LibraryPlaylist[] = [];
   const favorites: LibraryPlaylist[] = [];
-  const deletedPlaylistIds: number[] = [];
+  const deletedPlaylists: { id: number; at: number }[] = [];
   const deletedFavorites: FavoriteTombstone[] = [];
   const favoriteMeta: NormalizedSync["favoriteMeta"] = {
     albums: [],
@@ -285,15 +317,23 @@ const parseMobileSync = (data: MobileSyncData): NormalizedSync => {
     const id = Number(item?.id) || 0;
     if (!id) continue;
     if (item.isDeleted) {
-      deletedPlaylistIds.push(id);
+      // 系统歌单（负数 ID）不会作为普通歌单删除
+      if (id > 0) deletedPlaylists.push({ id, at: Number(item.modifiedAt) || Date.now() });
       continue;
     }
     const songs = mapSongs(item.songs);
-    if (id === FAVORITES_PLAYLIST_ID) {
+    // 「我喜欢的音乐」无论用哪个 ID 导出，都只合并进收藏而不是当作歌单
+    if (id === FAVORITES_PLAYLIST_ID || isFavoritesPlaylistName(item.name)) {
       likedSongs.push(...songs);
+      for (const song of item.songs || []) {
+        const songId = Number(song?.id) || 0;
+        if (!songId) continue;
+        const addedAt = Number(song?.addedAt) || 0;
+        if (addedAt > (likedAddedAt.get(songId) || 0)) likedAddedAt.set(songId, addedAt);
+      }
       continue;
     }
-    if (SYSTEM_PLAYLIST_IDS.has(id)) continue;
+    if (id < 0 || SYSTEM_PLAYLIST_IDS.has(id) || isSystemPlaylistName(item.name)) continue;
     const updatedAt = Number(item.modifiedAt) || Number(item.createdAt) || Date.now();
     created.push({
       id,
@@ -314,6 +354,7 @@ const parseMobileSync = (data: MobileSyncData): NormalizedSync => {
           id,
           source: String(item.source ?? "netease"),
           playlistId: item.playlistId ?? null,
+          at: Number(item.modifiedAt) || Number(item.addedTime) || Date.now(),
         });
       }
       continue;
@@ -332,6 +373,8 @@ const parseMobileSync = (data: MobileSyncData): NormalizedSync => {
       continue;
     }
     if (source !== "netease" && source !== "tencent") continue;
+    // 账号自带的「我喜欢的音乐」不是收藏歌单，避免重复出现在歌单列表
+    if (isSystemPlaylistName(item.name)) continue;
     const updatedAt = Number(item.modifiedAt) || Number(item.addedTime) || Date.now();
     favorites.push({
       id: remoteId,
@@ -349,19 +392,32 @@ const parseMobileSync = (data: MobileSyncData): NormalizedSync => {
   const history = (data.recentPlays || [])
     .slice()
     .sort((a, b) => (Number(b.playedAt) || 0) - (Number(a.playedAt) || 0))
-    .map((item) => mobileSongToSong(item.song))
+    .map((item): SongType | null => {
+      const song = mobileSongToSong(item.song);
+      return song ? { ...song, playedAt: Number(item.playedAt) || 0 } : null;
+    })
     .filter((song): song is SongType => Boolean(song));
-  const deletedHistoryIds = (data.recentPlayDeletions || [])
-    .map((item) => Number(item.songId) || 0)
-    .filter(Boolean);
+  const deletedHistory = (data.recentPlayDeletions || [])
+    .map((item) => ({
+      songId: Number(item.songId) || 0,
+      deletedAt: Number(item.deletedAt) || 0,
+    }))
+    .filter((item) => item.songId > 0);
 
-  const removedFromPlaylist = new Map<number, Set<number>>();
+  const removedFromPlaylist: {
+    playlistId: number;
+    songId: number;
+    deletedAt: number;
+  }[] = [];
   for (const item of data.playlistSongDeletions || []) {
     const playlistId = Number(item.playlistId) || 0;
     const songId = Number(item.songId) || 0;
     if (!playlistId || !songId) continue;
-    if (!removedFromPlaylist.has(playlistId)) removedFromPlaylist.set(playlistId, new Set());
-    removedFromPlaylist.get(playlistId)?.add(songId);
+    removedFromPlaylist.push({
+      playlistId,
+      songId,
+      deletedAt: Number(item.deletedAt) || 0,
+    });
   }
 
   const extras: Record<string, unknown> = {};
@@ -381,17 +437,15 @@ const parseMobileSync = (data: MobileSyncData): NormalizedSync => {
   return {
     likedSongs: uniqueSongs(likedSongs),
     likedIds: uniqueSongs(likedSongs).map((song) => song.id),
+    likedAddedAt,
     history: uniqueSongs(history),
     created,
     favorites,
     favoriteMeta,
-    deletedPlaylistIds,
+    deletedPlaylists,
     deletedFavorites,
-    removedFromPlaylist: Array.from(removedFromPlaylist, ([playlistId, ids]) => ({
-      playlistId,
-      songIds: [...ids],
-    })),
-    deletedHistoryIds,
+    removedFromPlaylist,
+    deletedHistory,
     profile: {
       displayName: String(data.profileDisplayName || "").trim(),
       avatarBase64: String(data.profileAvatarBase64 || "").trim(),
@@ -430,6 +484,7 @@ const parseLegacySync = (data: LegacySyncPayload): NormalizedSync => {
   return {
     likedSongs: data.likedSongs || [],
     likedIds: data.likedIds || [],
+    likedAddedAt: new Map(),
     history: data.history || [],
     created,
     favorites,
@@ -439,10 +494,10 @@ const parseLegacySync = (data: LegacySyncPayload): NormalizedSync => {
       mvs: data.favorites?.mvs || [],
       djs: data.favorites?.djs || [],
     },
-    deletedPlaylistIds: [],
+    deletedPlaylists: [],
     deletedFavorites: [],
     removedFromPlaylist: [],
-    deletedHistoryIds: [],
+    deletedHistory: [],
     profile: {},
     extras: {},
   };
@@ -462,6 +517,25 @@ const parseSyncContent = (raw: string): NormalizedSync | null => {
   }
 };
 
+/** 用户在本机重新加入歌单的歌曲，用于覆盖手机端旧的删除记录 */
+interface ReaddedSong {
+  playlistId: number;
+  songId: number;
+  at: number;
+}
+
+/** 本机歌曲删除墓碑：即使另一台设备上传了旧列表，也不会把歌带回来 */
+interface SongDeletion {
+  playlistId: number;
+  songId: number;
+  deletedAt: number;
+}
+
+interface HistoryDeletion {
+  songId: number;
+  deletedAt: number;
+}
+
 /**
  * 本地音乐库：收藏 / 歌单 / 最近播放离线可用，并通过 WebDAV 同步
  */
@@ -469,10 +543,18 @@ export const useLibraryStore = defineStore("library", () => {
   const playlists = ref<LibraryPlaylist[]>([]);
   /** 已删除歌单的墓碑，长期保留：手机端同样持久化删除记录 */
   const pendingDeletes = ref<PendingDelete[]>([]);
+  const readdedSongs = ref<ReaddedSong[]>([]);
+  /** 本机删除的歌单内歌曲 / 收藏歌曲，需要上传删除记录并从远端旧快照中过滤 */
+  const songDeletions = ref<SongDeletion[]>([]);
+  const historyDeletions = ref<HistoryDeletion[]>([]);
   const initialized = ref(false);
   const syncing = ref(false);
   const lastSyncAt = ref(0);
   const syncError = ref("");
+
+  const MAX_READDED_SONGS = 1000;
+  const MAX_SONG_DELETIONS = 5000;
+  const MAX_HISTORY_DELETIONS = 500;
 
   const normalizeSource = (source?: string): "netease" | "tencent" =>
     source === "tencent" ? "tencent" : "netease";
@@ -503,6 +585,79 @@ export const useLibraryStore = defineStore("library", () => {
   const save = async () => {
     await libraryDB.setItem("playlists", cloneDeep(toRaw(playlists.value)));
     await libraryDB.setItem("pending-deletes", cloneDeep(toRaw(pendingDeletes.value)));
+    await libraryDB.setItem("readded-songs", cloneDeep(toRaw(readdedSongs.value)));
+    await libraryDB.setItem("song-deletions", cloneDeep(toRaw(songDeletions.value)));
+    await libraryDB.setItem("history-deletions", cloneDeep(toRaw(historyDeletions.value)));
+  };
+
+  /** 记录本机删除的歌曲，其他设备下次同步时据此移除 */
+  const markSongsRemoved = (playlistId: number, songIds: number[]) => {
+    if (!playlistId || songIds.length === 0) return;
+    const now = Date.now();
+    const keys = new Set(songIds.map((songId) => `${playlistId}:${songId}`));
+    songDeletions.value = songDeletions.value.filter(
+      (item) => !keys.has(`${item.playlistId}:${item.songId}`),
+    );
+    songIds.forEach((songId) => songDeletions.value.push({ playlistId, songId, deletedAt: now }));
+    if (songDeletions.value.length > MAX_SONG_DELETIONS) {
+      songDeletions.value = songDeletions.value.slice(-MAX_SONG_DELETIONS);
+    }
+    scheduleSync();
+  };
+
+  /** 重新加入歌曲后撤销删除记录 */
+  const clearSongRemovals = (playlistId: number, songIds: number[]) => {
+    if (!playlistId || songIds.length === 0) return;
+    const keys = new Set(songIds.map((songId) => `${playlistId}:${songId}`));
+    songDeletions.value = songDeletions.value.filter(
+      (item) => !keys.has(`${item.playlistId}:${item.songId}`),
+    );
+  };
+
+  /** 我喜欢的音乐：取消喜欢 / 重新喜欢 */
+  const markFavoritesRemoved = (songIds: number[]) =>
+    markSongsRemoved(FAVORITES_PLAYLIST_ID, songIds);
+  const clearFavoriteRemoval = (songId: number) =>
+    clearSongRemovals(FAVORITES_PLAYLIST_ID, [songId]);
+  /** 该歌曲是否已被取消喜欢（在线账号刷新时不要把它带回列表） */
+  const isFavoriteRemoved = (songId: number): boolean =>
+    songDeletions.value.some(
+      (item) => item.playlistId === FAVORITES_PLAYLIST_ID && item.songId === Number(songId),
+    );
+
+  /** 清空最近播放时记录删除，避免远端旧记录把列表带回来 */
+  const markHistoryCleared = (songIds: number[]) => {
+    if (songIds.length === 0) return;
+    const now = Date.now();
+    const ids = new Set(songIds);
+    historyDeletions.value = historyDeletions.value.filter((item) => !ids.has(item.songId));
+    songIds.forEach((songId) => historyDeletions.value.push({ songId, deletedAt: now }));
+    if (historyDeletions.value.length > MAX_HISTORY_DELETIONS) {
+      historyDeletions.value = historyDeletions.value.slice(-MAX_HISTORY_DELETIONS);
+    }
+    scheduleSync();
+  };
+
+  /** 记录本机刚加入歌单的歌曲，并清掉同一首歌旧的重新加入记录 */
+  const markSongsReadded = (playlistId: number, songIds: number[]) => {
+    if (songIds.length === 0) return;
+    const now = Date.now();
+    const keys = new Set(songIds.map((songId) => `${playlistId}:${songId}`));
+    readdedSongs.value = readdedSongs.value.filter(
+      (item) => !keys.has(`${item.playlistId}:${item.songId}`),
+    );
+    songIds.forEach((songId) => readdedSongs.value.push({ playlistId, songId, at: now }));
+    if (readdedSongs.value.length > MAX_READDED_SONGS) {
+      readdedSongs.value = readdedSongs.value.slice(-MAX_READDED_SONGS);
+    }
+  };
+
+  /** 歌曲再次被删除 / 歌单被删除时，旧的重新加入记录不再生效 */
+  const clearReaddedSongs = (playlistId: number, songIds?: number[]) => {
+    const ids = songIds ? new Set(songIds) : null;
+    readdedSongs.value = readdedSongs.value.filter(
+      (item) => item.playlistId !== playlistId || (ids !== null && !ids.has(item.songId)),
+    );
   };
 
   const findPlaylist = (id: number | string | undefined | null) => {
@@ -555,6 +710,7 @@ export const useLibraryStore = defineStore("library", () => {
     if (index === -1) return false;
     const target = playlists.value[index];
     playlists.value.splice(index, 1);
+    clearReaddedSongs(id);
     if (!pendingDeletes.value.some((item) => item.id === id)) {
       const source = normalizeSource(target.remoteSource);
       pendingDeletes.value.push({
@@ -566,6 +722,7 @@ export const useLibraryStore = defineStore("library", () => {
                 id: target.remoteId,
                 source,
                 playlistId: String(target.remoteId),
+                at: Date.now(),
               }
             : undefined,
         // 在线歌单删除后仍留在账号列表里，记录身份避免下次刷新再导入
@@ -585,6 +742,14 @@ export const useLibraryStore = defineStore("library", () => {
     if (fresh.length === 0) return 0;
     playlist.songs.unshift(...cloneDeep(fresh));
     if (!playlist.cover && playlist.songs[0]?.cover) playlist.cover = playlist.songs[0].cover;
+    markSongsReadded(
+      id,
+      fresh.map((song) => song.id),
+    );
+    clearSongRemovals(
+      id,
+      fresh.map((song) => song.id),
+    );
     touch(playlist);
     await save();
     return fresh.length;
@@ -595,6 +760,8 @@ export const useLibraryStore = defineStore("library", () => {
     if (!playlist) return false;
     const ids = new Set(songIds);
     playlist.songs = playlist.songs.filter((song) => !ids.has(song.id));
+    clearReaddedSongs(id, songIds);
+    markSongsRemoved(id, songIds);
     touch(playlist);
     await save();
     return true;
@@ -623,7 +790,7 @@ export const useLibraryStore = defineStore("library", () => {
     for (const item of list) {
       const remoteId = Number(item.id);
       if (!remoteId) continue;
-      if (String(item.name).includes("我喜欢的音乐")) continue;
+      if (String(item.name).includes("我喜欢的音乐") || isSystemPlaylistName(item.name)) continue;
       // 本地已删除的歌单不再从账号列表重新导入
       if (isRemotePlaylistDeleted("netease", remoteId)) continue;
       const kind = item.userId === userId ? "created" : "liked";
@@ -808,11 +975,15 @@ export const useLibraryStore = defineStore("library", () => {
     const mobilePlaylists: MobileSyncPlaylist[] = [];
     const mobileFavorites: MobileSyncFavoritePlaylist[] = [];
     const favoriteKeys = new Set<string>();
+    // 本机重新加入的歌曲需要比手机端删除记录更新，手机端才会保留
+    const readdedAtByKey = new Map(
+      readdedSongs.value.map((item) => [`${item.playlistId}:${item.songId}`, item.at]),
+    );
 
     // 我喜欢的音乐 -> 手机端系统歌单 -1001
     // 本地 / 流媒体歌曲仅当前设备可见，不同步为在线喜欢列表
     const likedSongs = uniqueSongs(cloneDeep(toRaw(dataStore.likeSongsList.data || []))).filter(
-      (song) => !song.path && song.type !== "streaming",
+      isTransferableSong,
     );
     if (likedSongs.length > 0) {
       mobilePlaylists.push({
@@ -829,11 +1000,17 @@ export const useLibraryStore = defineStore("library", () => {
 
     for (const item of playlists.value) {
       if (pendingDeletes.value.some((entry) => entry.id === item.id)) continue;
+      // 系统歌单只以固定 ID 同步，避免被其他设备当成普通歌单
+      if (item.id < 0 || isSystemPlaylistName(item.name)) continue;
+      // 本地文件 / 流媒体歌曲无法在手机端播放，不写入同步文件
+      const syncableSongs = item.songs.filter(isTransferableSong);
       if (item.kind === "created") {
         mobilePlaylists.push({
           id: item.id,
           name: item.name,
-          songs: item.songs.map(songToMobile),
+          songs: syncableSongs.map((song) =>
+            songToMobile(song, readdedAtByKey.get(`${item.id}:${toNumericSongId(song)}`) ?? 0),
+          ),
           createdAt: item.createTime || now,
           modifiedAt: item.updateTime || now,
           isDeleted: false,
@@ -848,9 +1025,9 @@ export const useLibraryStore = defineStore("library", () => {
         id,
         name: item.name,
         coverUrl: item.cover || null,
-        trackCount: item.songs.length,
+        trackCount: syncableSongs.length,
         source,
-        songs: item.songs.map(songToMobile),
+        songs: syncableSongs.map(songToMobile),
         addedTime: item.createTime || now,
         modifiedAt: item.updateTime || now,
         isDeleted: false,
@@ -900,6 +1077,7 @@ export const useLibraryStore = defineStore("library", () => {
           source: item.favorite.source,
           songs: [],
           addedTime: item.at,
+          // 使用删除发生的时间，其他设备更晚的重新收藏 / 修改才能覆盖删除
           modifiedAt: item.at,
           isDeleted: true,
           sortOrder: item.at,
@@ -914,6 +1092,7 @@ export const useLibraryStore = defineStore("library", () => {
         name: "",
         songs: [],
         createdAt: item.at,
+        // 使用删除发生的时间，其他设备更晚的重新创建才能覆盖删除
         modifiedAt: item.at,
         isDeleted: true,
         songOrderVersion: 1,
@@ -929,15 +1108,18 @@ export const useLibraryStore = defineStore("library", () => {
     const recentPlays: MobileSyncRecentPlay[] = dedupeSongsByIdentity(
       cloneDeep(toRaw(dataStore.historyList || [])),
     )
-      .filter((song) => !deletedHistoryIds.has(toNumericSongId(song)))
+      .filter((song) => isTransferableSong(song) && !deletedHistoryIds.has(toNumericSongId(song)))
       .slice(0, 500)
       .map((song, index) => {
         // 手机端 songId 为 Long，必须与内嵌歌曲使用同一个数字 ID
         const mobileSong = songToMobile(song);
+        // 保留真实播放时间，其他设备才能按时间排序；旧数据用上次同步时间兜底
+        const playedAt =
+          Number(song.playedAt) || (lastSyncAt.value > 0 ? lastSyncAt.value : now) - index * 1000;
         return {
           songId: mobileSong.id,
           song: mobileSong,
-          playedAt: now - index * 1000,
+          playedAt,
           deviceId,
         };
       });
@@ -951,8 +1133,59 @@ export const useLibraryStore = defineStore("library", () => {
       profile.profileUpdatedAt = accountStore.profileUpdatedAt;
     }
 
+    // 重新喜欢的歌曲要清掉旧的取消喜欢记录，避免手机端再次删除
+    const favoriteSongIds = new Set(likedSongs.map((song) => toNumericSongId(song)));
+    // 上传列表里仍存在的歌曲，对应删除记录已解决（本机重新加入 / 并发合并保留）
+    const uploadedSongKeys = new Set<string>();
+    for (const playlist of mobilePlaylists) {
+      if (playlist.isDeleted || playlist.id < 0) continue;
+      (playlist.songs || []).forEach((song) => uploadedSongKeys.add(`${playlist.id}:${song.id}`));
+    }
+    const rawOrderDeletions = Array.isArray(extras.playlistSongDeletions)
+      ? (extras.playlistSongDeletions as Record<string, unknown>[])
+      : [];
+    // 合并本机删除记录：同一首歌只保留较新的删除时间，避免旧墓碑压掉重新加入
+    const orderDeletionMap = new Map<string, Record<string, unknown>>();
+    for (const item of [...rawOrderDeletions, ...songDeletions.value]) {
+      const playlistId = Number(item?.playlistId);
+      const songId = Number(item?.songId);
+      if (!playlistId || !songId) continue;
+      const key = `${playlistId}:${songId}`;
+      const prev = orderDeletionMap.get(key);
+      if (!prev || (Number(item?.deletedAt) || 0) > (Number(prev?.deletedAt) || 0)) {
+        orderDeletionMap.set(key, item as Record<string, unknown>);
+      }
+    }
+    const playlistSongDeletions = [...orderDeletionMap.values()].filter((item) => {
+      const playlistId = Number(item.playlistId);
+      const songId = Number(item.songId);
+      if (!playlistId || !songId) return false;
+      if (playlistId === FAVORITES_PLAYLIST_ID) return !favoriteSongIds.has(songId);
+      return !uploadedSongKeys.has(`${playlistId}:${songId}`);
+    });
+
+    // 本机重新播放过的歌曲，对应的历史删除记录已经解决
+    const uploadedHistoryIds = new Set(recentPlays.map((item) => Number(item.songId)));
+    const rawHistoryDeletions = Array.isArray(extras.recentPlayDeletions)
+      ? (extras.recentPlayDeletions as Record<string, unknown>[])
+      : [];
+    const historyDeletionMap = new Map<number, Record<string, unknown>>();
+    for (const item of [...rawHistoryDeletions, ...historyDeletions.value]) {
+      const songId = Number(item?.songId);
+      if (!songId) continue;
+      const prev = historyDeletionMap.get(songId);
+      if (!prev || (Number(item?.deletedAt) || 0) > (Number(prev?.deletedAt) || 0)) {
+        historyDeletionMap.set(songId, item as Record<string, unknown>);
+      }
+    }
+    const recentPlayDeletions = [...historyDeletionMap.values()].filter(
+      (item) => !uploadedHistoryIds.has(Number(item.songId)),
+    );
+
     return {
       ...extras,
+      playlistSongDeletions,
+      recentPlayDeletions,
       ...profile,
       version: "2.0",
       deviceId,
@@ -975,52 +1208,148 @@ export const useLibraryStore = defineStore("library", () => {
     const remoteSongs = sync.likedSongs.map(normalizeSongDuration);
     const mergedSongs =
       remoteSongs.length > 0 ? uniqueSongs([...remoteSongs, ...localSongs]) : localSongs;
+    // 手机端取消喜欢会为系统歌单 -1001 写入删除记录，桌面端必须同步移除
+    const remoteFavoriteIds = new Set(remoteSongs.map((song) => Number(song.id)));
+    const localFavoriteTombstones = new Map<number, number>();
+    for (const item of songDeletions.value) {
+      if (item.playlistId !== FAVORITES_PLAYLIST_ID) continue;
+      if (item.deletedAt > (localFavoriteTombstones.get(item.songId) || 0)) {
+        localFavoriteTombstones.set(item.songId, item.deletedAt);
+      }
+    }
+    // 远端重新喜欢（加入时间更新）时撤销本机删除记录
+    if (localFavoriteTombstones.size > 0) {
+      songDeletions.value = songDeletions.value.filter((item) => {
+        if (item.playlistId !== FAVORITES_PLAYLIST_ID) return true;
+        return (sync.likedAddedAt.get(item.songId) || 0) <= item.deletedAt;
+      });
+    }
+    const favoriteRemovals = new Set(
+      [
+        ...sync.removedFromPlaylist
+          .filter((item) => item.playlistId === FAVORITES_PLAYLIST_ID)
+          .map((item) => item.songId),
+        ...[...localFavoriteTombstones].map(([songId]) => songId),
+      ]
+        // 远端列表仍保留说明已重新喜欢，以最新状态为准
+        .filter((id) => id > 0 && !remoteFavoriteIds.has(id)),
+    );
+    const localFavoriteIds = new Set([
+      ...localSongs.map((song) => Number(song.id)),
+      ...(dataStore.userLikeData.songs || []).map(Number),
+    ]);
+    const appliedFavoriteRemovals = new Set(
+      [...favoriteRemovals].filter((id) => localFavoriteIds.has(id)),
+    );
+    const keptSongs = mergedSongs.filter((song) => !favoriteRemovals.has(Number(song.id)));
     const mergedIds = Array.from(
       new Set([
         ...(dataStore.userLikeData.songs || []),
         ...sync.likedIds,
-        ...mergedSongs.map((song) => song.id),
+        ...keptSongs.map((song) => song.id),
       ]),
-    );
-    if (mergedIds.length > 0) {
+    ).filter((id) => !favoriteRemovals.has(Number(id)));
+    if (mergedIds.length > 0 || appliedFavoriteRemovals.size > 0) {
       await dataStore.setUserLikeData("songs", mergedIds);
     }
-    if (mergedSongs.length > 0) {
-      await dataStore.setLikeSongsList(dataStore.likeSongsList.detail, mergedSongs);
+    // 删除后为空也要落盘，否则本地缓存会把已取消的喜欢又带回来
+    if (keptSongs.length > 0 || appliedFavoriteRemovals.size > 0) {
+      await dataStore.setLikeSongsList(dataStore.likeSongsList.detail, keptSongs);
     }
 
-    // 最近播放
-    const deletedHistoryIds = new Set(sync.deletedHistoryIds);
-    const mergedHistory = dedupeSongsByIdentity([
-      ...(dataStore.historyList || []).map(normalizeSongDuration),
-      ...sync.history.map(normalizeSongDuration),
-    ])
-      .filter((song) => !deletedHistoryIds.has(song.id))
+    // 最近播放：按真实播放时间排序，删除记录带时间，重新播放过的歌曲不会被误删
+    const historyDeletionMap = new Map<number, number>();
+    for (const item of [...sync.deletedHistory, ...historyDeletions.value]) {
+      const prev = historyDeletionMap.get(item.songId) || 0;
+      if (item.deletedAt > prev) historyDeletionMap.set(item.songId, item.deletedAt);
+    }
+    const isHistoryDeleted = (song: SongType): boolean => {
+      const deletedAt = historyDeletionMap.get(Number(song.id));
+      if (deletedAt === undefined) return false;
+      return (Number(song.playedAt) || 0) <= deletedAt;
+    };
+    const mergedHistory = dedupeSongsByIdentity(
+      [
+        ...(dataStore.historyList || []).map(normalizeSongDuration),
+        ...sync.history.map(normalizeSongDuration),
+      ].sort((a, b) => (Number(b.playedAt) || 0) - (Number(a.playedAt) || 0)),
+    )
+      .filter((song) => !isHistoryDeleted(song))
       .slice(0, 500);
-    if (mergedHistory.length > 0) await dataStore.setHistoryList(mergedHistory);
+    const historyRemovalsApplied = (dataStore.historyList || []).some(isHistoryDeleted);
+    if (mergedHistory.length > 0 || historyRemovalsApplied) {
+      await dataStore.setHistoryList(mergedHistory);
+    }
 
-    // 远端删除的歌单 / 歌单内删除的歌曲
-    const pendingIds = new Set(pendingDeletes.value.map((item) => item.id));
-    if (sync.deletedPlaylistIds.length > 0) {
-      const ids = new Set(sync.deletedPlaylistIds);
-      playlists.value = playlists.value.filter((item) => !ids.has(item.id));
-      // 保留删除墓碑，让下次上传仍然携带
-      for (const id of ids) {
-        if (!pendingIds.has(id)) {
-          pendingIds.add(id);
-          pendingDeletes.value.push({ id, at: Date.now() });
-        }
+    // 远端删除的歌单：记录删除时间，本机更新的改动优先
+    if (sync.deletedPlaylists.length > 0) {
+      const deletedAtById = new Map(sync.deletedPlaylists.map((item) => [item.id, item.at]));
+      const removed = playlists.value.filter((item) => deletedAtById.has(item.id));
+      playlists.value = playlists.value.filter((item) => {
+        if (!deletedAtById.has(item.id)) return true;
+        return (item.updateTime || 0) > (deletedAtById.get(item.id) || 0);
+      });
+      for (const [id, deletedAt] of deletedAtById) {
+        if (pendingDeletes.value.some((item) => item.id === id)) continue;
+        const target = removed.find((item) => item.id === id);
+        // 本机在删除之后又改过该歌单，保留本地内容
+        if (target && (target.updateTime || 0) > deletedAt) continue;
+        const source = normalizeSource(target?.remoteSource);
+        pendingDeletes.value.push({
+          id,
+          at: deletedAt || Date.now(),
+          favorite:
+            target?.kind === "liked" && target.remoteId
+              ? {
+                  id: target.remoteId,
+                  source,
+                  playlistId: String(target.remoteId),
+                  at: deletedAt || Date.now(),
+                }
+              : undefined,
+          // 记录在线歌单身份，账号列表刷新时不再重新导入
+          remote: target?.remoteId ? { source, remoteId: target.remoteId } : undefined,
+        });
       }
     }
-    for (const { playlistId, songIds } of sync.removedFromPlaylist) {
-      const target = playlists.value.find((entry) => entry.id === playlistId);
-      if (!target) continue;
-      const ids = new Set(songIds);
-      target.songs = target.songs.filter((song) => !ids.has(song.id));
-    }
     if (sync.deletedFavorites.length > 0) {
+      // 收藏的专辑 / 歌手被其他设备取消收藏时同步移除（仍存在的以最新收藏为准）
+      const activeAlbumIds = new Set(sync.favoriteMeta.albums.map((item) => Number(item?.id)));
+      const removedAlbumIds = new Set(
+        sync.deletedFavorites
+          .filter((item) => item.source === "neteaseAlbum" && !activeAlbumIds.has(item.id))
+          .map((item) => item.id),
+      );
+      if (removedAlbumIds.size > 0) {
+        const albums = dataStore.userLikeData.albums || [];
+        const remaining = albums.filter((item) => !removedAlbumIds.has(Number(item?.id)));
+        if (remaining.length !== albums.length) {
+          await dataStore.setUserLikeData("albums", remaining);
+        }
+      }
+      const activeArtistIds = new Set(sync.favoriteMeta.artists.map((item) => Number(item?.id)));
+      const removedArtistIds = new Set(
+        sync.deletedFavorites
+          .filter((item) => item.source === "neteaseArtist" && !activeArtistIds.has(item.id))
+          .map((item) => item.id),
+      );
+      if (removedArtistIds.size > 0) {
+        const artists = dataStore.userLikeData.artists || [];
+        const remaining = artists.filter((item) => !removedArtistIds.has(Number(item?.id)));
+        if (remaining.length !== artists.length) {
+          await dataStore.setUserLikeData("artists", remaining);
+        }
+      }
       for (const item of sync.deletedFavorites) {
         const source = item.source;
+        const local = playlists.value.find(
+          (entry) =>
+            entry.kind === "liked" &&
+            entry.remoteId === item.id &&
+            (entry.remoteSource ?? "netease") === source,
+        );
+        // 本机在删除之后重新收藏过，保留本地收藏
+        if (local && (local.updateTime || 0) > (item.at || 0)) continue;
         playlists.value = playlists.value.filter(
           (entry) =>
             !(
@@ -1036,7 +1365,7 @@ export const useLibraryStore = defineStore("library", () => {
         ) {
           pendingDeletes.value.push({
             id: item.id,
-            at: Date.now(),
+            at: item.at || Date.now(),
             favorite: item,
             // 专辑 / 歌手收藏与歌单 ID 不在同一命名空间，只记录歌单来源
             remote:
@@ -1048,16 +1377,35 @@ export const useLibraryStore = defineStore("library", () => {
       }
     }
 
-    // 歌单合并
+    // 歌单合并：与手机端一致，远端独有改动时采用远端，双方都改过时取并集
+    const syncTime = lastSyncAt.value;
     for (const remote of [...sync.created, ...sync.favorites]) {
-      if (pendingIds.has(remote.id)) continue;
-      // 收藏歌单的远端 ID 与本地 ID 可能不同，需按来源 + 远端 ID 再判断一次
-      if (
-        remote.kind === "liked" &&
-        remote.remoteId &&
-        isRemotePlaylistDeleted(remote.remoteSource ?? "netease", remote.remoteId)
-      ) {
-        continue;
+      // 系统歌单不进普通歌单列表（旧版本可能用其他 ID 导出）
+      if (remote.id < 0 || isSystemPlaylistName(remote.name)) continue;
+      const source = normalizeSource(remote.remoteSource ?? "netease");
+      // 本机删除后，其他设备又重新收藏 / 改动得更晚：撤销本机删除记录
+      const pending =
+        remote.kind === "liked" && remote.remoteId
+          ? (pendingDeletes.value
+              .filter(
+                (item) => item.favorite?.id === remote.remoteId && item.favorite?.source === source,
+              )
+              .sort((a, b) => (b.at || 0) - (a.at || 0))[0] ??
+            pendingDeletes.value.find((item) => !item.favorite && item.id === remote.id))
+          : pendingDeletes.value.find((item) => item.id === remote.id);
+      if (pending) {
+        if ((remote.updateTime || 0) <= (pending.at || 0)) continue;
+        pendingDeletes.value = pendingDeletes.value.filter(
+          (item) =>
+            item !== pending &&
+            !(!item.favorite && item.id === remote.id) &&
+            !(
+              remote.kind === "liked" &&
+              remote.remoteId &&
+              item.favorite?.id === remote.remoteId &&
+              item.favorite?.source === source
+            ),
+        );
       }
       let local = playlists.value.find((item) => item.id === remote.id);
       if (!local && remote.kind === "liked" && remote.remoteId) {
@@ -1069,16 +1417,52 @@ export const useLibraryStore = defineStore("library", () => {
         playlists.value.push(remote);
         continue;
       }
-      if ((remote.updateTime || 0) > (local.updateTime || 0)) {
-        const id = local.id;
+      const localChanged = (local.updateTime || 0) > syncTime;
+      const remoteChanged = (remote.updateTime || 0) > syncTime;
+      const localOnlySongs = local.songs.filter((song) => !isTransferableSong(song));
+      let songs: SongType[];
+      if (remoteChanged && !localChanged) {
         // 远端快照可能没有歌曲（如从未缓存的在线歌单），不要因此清空本地内容
-        const songs = remote.songs.length > 0 ? remote.songs : local.songs;
-        const cover = remote.cover || local.cover;
-        Object.assign(local, remote, { id, songs, cover });
+        songs =
+          remote.songs.length > 0 ? uniqueSongs([...remote.songs, ...localOnlySongs]) : local.songs;
+      } else if (localChanged && !remoteChanged) {
+        // 本机改动较新，保留本地顺序，等上传后由其他设备合并
+        songs = local.songs;
       } else {
-        local.songs = uniqueSongs([...local.songs, ...remote.songs]);
-        if (!local.cover && remote.cover) local.cover = remote.cover;
+        songs = uniqueSongs([...remote.songs, ...local.songs]);
       }
+      const useRemoteMeta = remoteChanged && !localChanged;
+      const id = local.id;
+      const cover = remote.cover || local.cover;
+      const updateTime = Math.max(local.updateTime || 0, remote.updateTime || 0);
+      const name = useRemoteMeta ? remote.name : local.name;
+      const description = useRemoteMeta ? remote.description : local.description;
+      Object.assign(local, remote, { id, name, description, cover, songs, updateTime });
+    }
+
+    // 歌单内删除的歌曲要在歌单合并之后处理，新导入的歌单同样生效
+    const readdedAtByKey = new Map(
+      readdedSongs.value.map((item) => [`${item.playlistId}:${item.songId}`, item.at]),
+    );
+    // 本机删除记录优先于远端旧快照，避免并发合并把歌带回来
+    const playlistDeletionMap = new Map<
+      string,
+      { playlistId: number; songId: number; deletedAt: number }
+    >();
+    for (const item of [...sync.removedFromPlaylist, ...songDeletions.value]) {
+      if (item.playlistId === FAVORITES_PLAYLIST_ID) continue;
+      const key = `${item.playlistId}:${item.songId}`;
+      const prev = playlistDeletionMap.get(key);
+      if (!prev || item.deletedAt > prev.deletedAt) {
+        playlistDeletionMap.set(key, item);
+      }
+    }
+    for (const { playlistId, songId, deletedAt } of playlistDeletionMap.values()) {
+      const target = playlists.value.find((entry) => entry.id === playlistId);
+      if (!target) continue;
+      // 本机在这条删除之后重新加入过，保留歌曲
+      if ((readdedAtByKey.get(`${playlistId}:${songId}`) || 0) > deletedAt) continue;
+      target.songs = target.songs.filter((song) => Number(song.id) !== songId);
     }
     await save();
 
@@ -1230,9 +1614,20 @@ export const useLibraryStore = defineStore("library", () => {
     if (initialized.value) return;
     try {
       const stored = await libraryDB.getItem<LibraryPlaylist[]>("playlists");
-      if (Array.isArray(stored)) playlists.value = stored;
+      if (Array.isArray(stored)) {
+        // 清理旧版本误导入的系统歌单（我喜欢的音乐 / 本地歌曲），它们不属于歌单列表
+        const cleaned = stored.filter((item) => item.id >= 0);
+        playlists.value = cleaned;
+        if (cleaned.length !== stored.length) await save();
+      }
       const pending = await libraryDB.getItem<PendingDelete[]>("pending-deletes");
       if (Array.isArray(pending)) pendingDeletes.value = pending;
+      const readded = await libraryDB.getItem<ReaddedSong[]>("readded-songs");
+      if (Array.isArray(readded)) readdedSongs.value = readded;
+      const removedSongs = await libraryDB.getItem<SongDeletion[]>("song-deletions");
+      if (Array.isArray(removedSongs)) songDeletions.value = removedSongs;
+      const removedHistory = await libraryDB.getItem<HistoryDeletion[]>("history-deletions");
+      if (Array.isArray(removedHistory)) historyDeletions.value = removedHistory;
       lastSyncAt.value = Number(await libraryDB.getItem("last-sync-at")) || 0;
     } catch (error) {
       console.error("读取本地音乐库失败", error);
@@ -1268,6 +1663,11 @@ export const useLibraryStore = defineStore("library", () => {
     deletePlaylist,
     addSongs,
     removeSongs,
+    markSongsRemoved,
+    markFavoritesRemoved,
+    clearFavoriteRemoval,
+    isFavoriteRemoved,
+    markHistoryCleared,
     reorderSongs,
     importRemotePlaylists,
     hydrateRemotePlaylist,

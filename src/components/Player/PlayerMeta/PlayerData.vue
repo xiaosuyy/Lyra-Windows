@@ -52,13 +52,13 @@
             v-for="ar in musicStore.playSong.artists"
             :key="ar.id"
             class="ar"
-            @click="jumpPage({ name: 'artist', query: { id: ar.id } })"
+            @click="jumpArtist(ar.id, ar.name)"
           >
             {{ settingStore.hideBracketedContent ? removeBrackets(ar.name) : ar.name }}
           </span>
         </div>
         <div v-else class="ar-list">
-          <span class="ar">{{
+          <span class="ar" @click="jumpArtist()">{{
             settingStore.hideBracketedContent
               ? removeBrackets(musicStore.playSong.artists)
               : musicStore.playSong.artists || "未知艺术家"
@@ -83,10 +83,10 @@
 </template>
 
 <script setup lang="ts">
-import type { RouteLocationRaw } from "vue-router";
 import { useMusicStore, useStatusStore, useSettingStore } from "@/stores";
 import { debounce } from "lodash-es";
 import { removeBrackets } from "@/utils/format";
+import { openJumpArtist } from "@/utils/modal";
 import { radioProgramDetail } from "@/api/radio";
 const props = defineProps<{
   /** 数据居中 */
@@ -107,18 +107,11 @@ const leftMargin = computed(() => {
   return settingStore.useAMLyrics ? `${offset + 40}px` : `${offset + 10}px`;
 });
 
-const jumpPage = debounce(
-  (go: RouteLocationRaw) => {
-    if (!go) return;
-    statusStore.showFullPlayer = false;
-    router.push(go);
-  },
-  300,
-  {
-    leading: true,
-    trailing: false,
-  },
-);
+// 跳转歌手：非网易云歌曲的歌手 ID 无效，交给通用逻辑按名称解析
+const jumpArtist = (id?: number, name?: string) => {
+  statusStore.showFullPlayer = false;
+  openJumpArtist(musicStore.playSong.artists, id, musicStore.playSong.origin, name);
+};
 
 // 暂不支持查看主播主页
 const showCreatorTip = () => window.$message.info("暂不支持查看主播主页");

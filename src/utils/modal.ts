@@ -6,6 +6,7 @@ import { useSettingStore } from "@/stores";
 import router from "@/router";
 import type { StreamingServerConfig as StreamingServerConfigType } from "@/types/streaming";
 import type { FavoritesActionMode } from "./favorites";
+import { searchArtist } from "@/api/artist";
 
 // 单例弹窗管理：跟踪已打开的弹窗类型
 const openedModals = new Set<string>();
@@ -193,27 +194,58 @@ export const openFavoritesPicker = async (mode: FavoritesActionMode) => {
 };
 
 /**
+ * 按歌名解析网易云歌手 ID
+ */
+const resolveArtistByName = async (name?: string): Promise<number> => {
+  const keyword = (name || "").trim();
+  if (!keyword) return 0;
+  try {
+    const result = await searchArtist(keyword);
+    const list = Array.isArray(result?.data?.list) ? result.data.list : [];
+    const hit = list.find((ar: { artistName?: string }) => ar?.artistName === keyword) || list[0];
+    return Number(hit?.artistId) || 0;
+  } catch (error) {
+    console.warn(`搜索歌手 ${keyword} 失败`, error);
+    return 0;
+  }
+};
+
+/**
  * 跳转到歌手
  * @param data 歌手信息
  * @param id 歌手 id
+ * @param origin 歌曲来源，非网易云歌曲的歌手 ID 不可直接查询
+ * @param name 点击的歌手名，没有可用 ID 时按名称解析
  * @returns
- */ export const openJumpArtist = async (data: SongType["artists"], id?: number) => {
-  // 若 data 为数组且只有一个元素，则直接跳转
-  if (isArray(data) && data.length <= 2 && id) {
-    router.push({ name: "artist", query: { id } });
+ */ export const openJumpArtist = async (
+  data: SongType["artists"],
+  id?: number,
+  origin?: SongType["origin"],
+  name?: string,
+) => {
+  // QQ / 本地 / 流媒体 / 同步歌曲的歌手 ID 不是网易云 ID
+  const artistId = origin && origin !== "netease" ? 0 : Number(id) || 0;
+  if (artistId) {
+    const label =
+      name || (isArray(data) ? data.find((item) => Number(item.id) === artistId)?.name : "") || "";
+    router.push({ name: "artist", query: { id: artistId, ...(label ? { name: label } : {}) } });
     return;
   }
-  const { default: JumpArtist } = await import("@/components/Modal/JumpArtist.vue");
-  const modal = window.$modal.create({
-    preset: "card",
-    transformOrigin: "center",
-    autoFocus: false,
-    style: { width: "600px" },
-    title: "跳转到歌手",
-    content: () => {
-      return h(JumpArtist, { artist: data, onClose: () => modal.destroy() });
-    },
-  });
+  // 没有可用 ID 时按名称解析后直接跳转
+  const target = name || (isArray(data) ? data[0]?.name || "" : String(data || "")) || "";
+  let resolved = await resolveArtistByName(target);
+  if (!resolved) {
+    const first = String(target)
+      .split(/\s*[/、,;&]\s*/)
+      .map((item) => item.trim())
+      .find(Boolean);
+    if (first && first !== target) resolved = await resolveArtistByName(first);
+  }
+  if (!resolved) {
+    window.$message.warning("未找到该歌手的在线信息");
+    return;
+  }
+  router.push({ name: "artist", query: { id: resolved, name: target } });
 };
 
 // 编辑歌曲信息

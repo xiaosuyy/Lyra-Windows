@@ -286,8 +286,9 @@ export const useDataStore = defineStore("data", {
         if (!Array.isArray(historyList)) historyList = [];
         // 过滤同一首歌（跨渠道）的旧记录，把新的放到第一位
         const identityKey = getSongIdentityKey(song);
+        const playedSong = { ...song, playedAt: Date.now() };
         const updatedList = [
-          song,
+          playedSong,
           ...historyList.filter((item) => getSongIdentityKey(item) !== identityKey),
         ];
         // 最多 500 首

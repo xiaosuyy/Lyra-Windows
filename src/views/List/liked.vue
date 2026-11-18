@@ -82,16 +82,57 @@ const { searchValue, searchData, displayData, clearSearch, performSearch } =
 const { listScrolling, handleListScroll, resetScroll } = useListScroll();
 const { playAllSongs: playAllSongsAction } = useListActions();
 
-// 歌单 ID
-const playlistId = computed<number>(() => Number(dataStore.userLikeData.playlists?.[0]?.id) || 0);
+// 歌单 ID：优先按名称定位「我喜欢的音乐」，避免账号歌单顺序变化后拿错歌单
+const playlistId = computed<number>(() => {
+  const list = dataStore.userLikeData.playlists || [];
+  const liked = list.find((item) => String(item?.name || "").includes("我喜欢的音乐"));
+  return Number(liked?.id ?? list[0]?.id) || 0;
+});
 
 // 是否可拖拽排序（默认排序 + 非搜索模式）
 const canDragSort = computed(() => {
   return !searchValue.value && statusStore.listSortField === "default";
 });
 
-// 当前正在请求的歌单 ID，用于防止竞态条件
-const currentRequestId = ref<number>(0);
+// 请求令牌：只允许最后一次刷新写入列表和缓存
+let requestToken = 0;
+
+/**
+ * 收藏合并：保持本地现有顺序，账号里新增的收藏补到最前面，绝不丢歌
+ */
+const mergeWithCachedFavorites = (incoming: SongType[]): SongType[] => {
+  // 账号接口偶尔会重复返回同一首歌，先按 ID 去重再合并
+  const incomingById = new Map(incoming.map((song) => [Number(song.id), song]));
+  const uniqueIncoming = [...incomingById.values()];
+  const cachedById = new Map(
+    (dataStore.likeSongsList.data || []).map((song) => [Number(song.id), song]),
+  );
+  const cached = [...cachedById.values()];
+  if (uniqueIncoming.length === 0) {
+    return cached.filter((song) => !libraryStore.isFavoriteRemoved(Number(song.id)));
+  }
+  const cachedIds = new Set(cachedById.keys());
+  const fresh = uniqueIncoming.filter((song) => !cachedIds.has(Number(song.id)));
+  // 已有歌曲用最新详情覆盖，但位置不动
+  const refreshed = cached.map((song) => incomingById.get(Number(song.id)) ?? song);
+  // 已取消喜欢的歌曲即使账号接口还没刷新，也不要再显示
+  return [...fresh, ...refreshed].filter(
+    (song) => !libraryStore.isFavoriteRemoved(Number(song.id)),
+  );
+};
+
+/** 收藏 ID 与列表保持并集，离线收藏也能正常显示已喜欢状态 */
+const syncFavoriteIds = async (songs: SongType[]) => {
+  const ids = new Set((dataStore.userLikeData.songs || []).map(Number));
+  const before = ids.size;
+  songs.forEach((song) => {
+    const id = Number(song.id);
+    if (id && !libraryStore.isFavoriteRemoved(id)) ids.add(id);
+  });
+  if (ids.size > before) {
+    await dataStore.setUserLikeData("songs", [...ids]);
+  }
+};
 
 // 列表高度
 const songListHeight = computed(() => getSongListHeight(listScrolling.value));
@@ -198,8 +239,7 @@ const moreOptions = computed<DropdownOption[]>(() => [
  */
 const loadPlaylistData = async (id: number, forceRefresh: boolean = false) => {
   if (!id) return;
-  // 设置当前请求 ID，防止竞态条件
-  currentRequestId.value = id;
+  const token = ++requestToken;
   setLoading(true);
   clearSearch();
   if (!forceRefresh) {
@@ -211,34 +251,42 @@ const loadPlaylistData = async (id: number, forceRefresh: boolean = false) => {
   }
   try {
     const detail = await playlistDetail(id);
-    if (currentRequestId.value !== id) return;
+    if (token !== requestToken) return;
     // 更新歌单详情
     setDetailData(formatCoverList(detail.playlist)[0]);
     // 获取全部 ID 顺序
     const serverIds: number[] = detail.privileges?.map((p: any) => p.id) || [];
     const trackCount = detail.playlist?.trackCount || 0;
 
+    let complete = false;
     // 如果 privileges 数量少于 trackCount，说明数据不完整，需要全量获取
     if (serverIds.length < trackCount && trackCount > 0) {
       console.log(`🔄 Liked songs incomplete (${serverIds.length}/${trackCount}), fetching all...`);
-      await fetchAllSongs(id, trackCount);
-    } else {
-      if (serverIds.length === 0) {
-        setLoading(false);
-        return;
-      }
+      complete = await fetchAllSongs(id, trackCount, token);
+    } else if (serverIds.length > 0) {
       // 同步歌曲列表
-      await syncSongList(serverIds, id);
+      complete = await syncSongList(serverIds, id, token);
+    } else {
+      // 服务器收藏为空：保留本地缓存，不覆盖
+      complete = true;
     }
+    if (token !== requestToken) return;
 
-    // 更新缓存
-    if (currentRequestId.value === id && detailData.value) {
-      dataStore.setLikeSongsList(detailData.value, listData.value);
+    if (complete && detailData.value) {
+      const merged = mergeWithCachedFavorites(listData.value);
+      setListData(merged);
+      // 合并后的列表才不会丢歌，再写入缓存
+      await dataStore.setLikeSongsList(detailData.value, merged);
+      await syncFavoriteIds(merged);
+    } else {
+      // 拉取失败或不完整：回退本地缓存，避免把列表清空 / 截断后同步出去
+      loadLikedCache();
     }
   } catch (error) {
     console.error("Failed to load playlist data:", error);
+    if (token === requestToken) loadLikedCache();
   } finally {
-    if (currentRequestId.value === id) {
+    if (token === requestToken) {
       setLoading(false);
     }
   }
@@ -248,35 +296,36 @@ const loadPlaylistData = async (id: number, forceRefresh: boolean = false) => {
  * 全量获取歌曲列表
  * 当 privileges 数据不完整时调用
  */
-const fetchAllSongs = async (id: number, total: number) => {
+const fetchAllSongs = async (id: number, total: number, token: number): Promise<boolean> => {
   const limit = 500;
   let offset = 0;
   const allSongs: SongType[] = [];
 
   while (offset < total) {
-    if (currentRequestId.value !== id) return;
+    if (token !== requestToken) return false;
     try {
       const result = await playlistAllSongs(id, limit, offset);
-      if (currentRequestId.value !== id) return;
+      if (token !== requestToken) return false;
       const songs = formatSongsList(result.songs);
       allSongs.push(...songs);
       // 实时更新列表展示
       if (offset === 0) {
-        setListData(songs);
+        setListData(mergeWithCachedFavorites(allSongs));
       } else {
         appendListData(songs);
       }
       offset += limit;
     } catch (error) {
       console.error("Failed to fetch all songs:", error);
-      break;
+      return false;
     }
   }
 
-  if (currentRequestId.value !== id) return;
-  // 确保最终列表完整性
-  setListData(allSongs);
+  if (token !== requestToken) return false;
+  if (allSongs.length === 0) return false;
+  setListData(mergeWithCachedFavorites(allSongs));
   console.log(`✅ Fetched all ${allSongs.length} liked songs`);
+  return allSongs.length >= total;
 };
 
 /**
@@ -287,7 +336,11 @@ const loadLikedCache = () => {
     setDetailData(dataStore.likeSongsList.detail);
   }
   if (dataStore.likeSongsList.data.length) {
-    setListData(dataStore.likeSongsList.data);
+    setListData(
+      dataStore.likeSongsList.data.filter(
+        (song) => !libraryStore.isFavoriteRemoved(Number(song.id)),
+      ),
+    );
   }
 };
 
@@ -297,18 +350,19 @@ const loadLikedCache = () => {
  * @param serverIds 服务器返回的 ID 列表（官方顺序）
  * @param requestId 当前请求 ID
  */
-const syncSongList = async (serverIds: number[], requestId: number) => {
+const syncSongList = async (serverIds: number[], id: number, token: number): Promise<boolean> => {
   // 当前缓存的歌曲 Map
   const cachedMap = new Map(listData.value.map((s) => [s.id, s]));
   // 找出缺失的 ID
   const missingIds = serverIds.filter((id) => !cachedMap.has(id));
   // 获取缺失的歌曲详情
+  let failed = false;
   if (missingIds.length > 0) {
     console.log(`🔄 Syncing liked songs: found ${missingIds.length} missing songs`);
     const limit = 500;
     let offset = 0;
     while (offset < missingIds.length) {
-      if (currentRequestId.value !== requestId) return;
+      if (token !== requestToken) return false;
       const chunk = missingIds.slice(offset, offset + limit);
       try {
         const result = await songDetail(chunk);
@@ -316,31 +370,42 @@ const syncSongList = async (serverIds: number[], requestId: number) => {
         songs.forEach((song) => cachedMap.set(song.id, song));
       } catch (error) {
         console.error("Failed to fetch song details:", error);
+        failed = true;
       }
       offset += limit;
     }
   }
+  if (token !== requestToken) return false;
+  // 有歌曲详情没取到时不写入缓存，避免把服务器上已有的歌从收藏里抹掉
+  if (failed) return false;
   // 重建列表
-  const newList = serverIds.map((id) => cachedMap.get(id)).filter((s): s is SongType => !!s);
-  if (currentRequestId.value !== requestId) return;
-  setListData(newList);
-  // 更新详情
-  const detail = await playlistDetail(playlistId.value);
-  if (currentRequestId.value === requestId) {
-    setDetailData(formatCoverList(detail.playlist)[0]);
+  const newList = serverIds
+    .map((songId) => cachedMap.get(songId))
+    .filter((s): s is SongType => !!s);
+  if (newList.length === 0 && serverIds.length > 0) return false;
+  setListData(mergeWithCachedFavorites(newList));
+  // 更新详情（失败不影响歌曲列表）
+  try {
+    const detail = await playlistDetail(id);
+    if (token === requestToken) {
+      setDetailData(formatCoverList(detail.playlist)[0]);
+    }
+  } catch (error) {
+    console.warn("刷新我喜欢的音乐详情失败", error);
   }
   console.log("✅ 我喜欢的音乐已同步到服务器顺序");
+  return true;
 };
 
 /**
  * 检查缓存是否需要更新
- * 通过比较 userLikeData.songs 的数量与缓存数量来判断
+ * 只有账号里出现缓存中没有的收藏时才拉取；缓存里的离线收藏不算缺失
  */
 const checkNeedsUpdate = (): boolean => {
-  const likedCount = dataStore.userLikeData.songs.length;
-  const cachedCount = dataStore.likeSongsList.data.length;
-  if (likedCount !== cachedCount) {
-    console.log(`🔄 我喜欢的音乐缓存需要更新: count changed (${cachedCount} -> ${likedCount})`);
+  const cachedIds = new Set(dataStore.likeSongsList.data.map((song) => Number(song.id)));
+  const missing = (dataStore.userLikeData.songs || []).filter((id) => !cachedIds.has(Number(id)));
+  if (missing.length > 0) {
+    console.log(`🔄 我喜欢的音乐缓存需要更新: 缺少 ${missing.length} 首`);
     return true;
   }
   console.log("✅ 我喜欢的音乐缓存已更新");
@@ -369,6 +434,8 @@ const removeSong = async (ids: number[]) => {
   await dataStore.setUserLikeData("songs", likedIds);
   const snapshots = dataStore.likeSongsList.data.filter((song) => !removeIds.has(song.id));
   await dataStore.setLikeSongsList(detailData.value ?? dataStore.likeSongsList.detail, snapshots);
+  // 写入删除记录，其他设备的旧列表不会把歌曲带回来
+  libraryStore.markFavoritesRemoved(ids);
   libraryStore.scheduleSync();
   // 已登录时同步到网易云
   if (isLogin() === 1) {
@@ -449,9 +516,8 @@ onMounted(async () => {
   }
 
   // 获取我喜欢的音乐歌单 ID
-  const likedPlaylistId = dataStore.userLikeData.playlists?.[0]?.id;
-  if (likedPlaylistId) {
-    loadPlaylistData(Number(likedPlaylistId));
+  if (playlistId.value) {
+    loadPlaylistData(playlistId.value);
   } else {
     // 如果没有找到我喜欢的音乐歌单，尝试从缓存获取
     const data: any = await dataStore.getUserLikePlaylist();

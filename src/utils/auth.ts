@@ -382,6 +382,9 @@ export const toLikeSong: DebouncedFunc<(song: SongType, like: boolean) => Promis
       if (like) snapshots.unshift(song);
       await dataStore.setLikeSongsList(dataStore.likeSongsList.detail, snapshots);
       window.$message.success(like ? "已添加到我喜欢的音乐" : "已取消喜欢");
+      // 记录 / 撤销删除记录，其他设备同步时不会把歌曲带回来
+      if (like) libraryStore.clearFavoriteRemoval(id);
+      else libraryStore.markFavoritesRemoved([id]);
       libraryStore.scheduleSync();
       // 网易云账号在线时同步到云端
       if (isLogin() === 1 && !song.qqMid && !isOfflineSong) {
