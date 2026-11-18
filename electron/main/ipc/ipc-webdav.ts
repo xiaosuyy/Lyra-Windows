@@ -1,6 +1,7 @@
 import { ipcMain, safeStorage } from "electron";
 import { useStore } from "../store";
 import { decodeSyncContent } from "../webdav/sync-codec";
+import { webdavLog } from "../logger";
 
 /** WebDAV 公开配置（不含密码） */
 export interface WebDavPublicConfig {
@@ -85,6 +86,57 @@ const readCredentials = (): WebDavLoginPayload | null => {
 const syncUrl = (payload: WebDavLoginPayload): string =>
   `${buildDirectoryUrl(payload.serverUrl, payload.basePath)}Lyra-sync.json`;
 
+/** 上次读取到的同步文件校验值，用于条件请求，仅在当前会话内有效 */
+let syncValidators: { etag?: string; lastModified?: string } = {};
+
+const resetSyncValidators = (): void => {
+  syncValidators = {};
+};
+
+const SYNC_HEAD_TIMEOUT = 20000;
+const SYNC_DOWNLOAD_TIMEOUT = 90000;
+const SEGMENT_MIN_BYTES = 64 * 1024;
+const SEGMENT_CONCURRENCY = 8;
+
+const authHeader = (payload: WebDavLoginPayload): string =>
+  `Basic ${Buffer.from(`${payload.username}:${payload.password}`).toString("base64")}`;
+
+/**
+ * 分段并行拉取：单连接被限速时多连接可显著提速
+ */
+const downloadSegments = async (
+  url: string,
+  auth: string,
+  etag: string,
+  total: number,
+): Promise<Buffer> => {
+  const count = Math.min(SEGMENT_CONCURRENCY, Math.ceil(total / (32 * 1024)));
+  const size = Math.ceil(total / count);
+  const parts = await Promise.all(
+    Array.from({ length: count }, async (_, index) => {
+      const start = index * size;
+      const end = Math.min(total - 1, start + size - 1);
+      const response = await fetch(url, {
+        headers: {
+          Authorization: auth,
+          Range: `bytes=${start}-${end}`,
+          // 文件在下载过程中被其他设备改写时放弃，避免拼出损坏内容
+          "If-Match": etag,
+        },
+        signal: AbortSignal.timeout(SYNC_DOWNLOAD_TIMEOUT),
+      });
+      if (response.status !== 206) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error(`分段下载失败：HTTP ${response.status}`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length !== end - start + 1) throw new Error("分段下载不完整");
+      return buffer;
+    }),
+  );
+  return Buffer.concat(parts);
+};
+
 /** 确保远端初始目录存在 */
 const ensureDirectory = async (payload: WebDavLoginPayload): Promise<void> => {
   const segments = normalizeBasePath(payload.basePath)
@@ -150,6 +202,7 @@ const initWebDavIpc = (): void => {
       encrypted = true;
     }
     store.set("webdav", { serverUrl, username, basePath, password: storedPassword, encrypted });
+    resetSyncValidators();
 
     return {
       success: true,
@@ -160,6 +213,7 @@ const initWebDavIpc = (): void => {
   // 退出登录
   ipcMain.handle("webdav-logout", () => {
     store.delete("webdav");
+    resetSyncValidators();
     return true;
   });
 
@@ -170,15 +224,17 @@ const initWebDavIpc = (): void => {
     if (typeof content !== "string" || !content) {
       return { success: false, error: "同步内容为空" };
     }
-    const auth = Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64");
+    const auth = authHeader(credentials);
+    const url = syncUrl(credentials);
     const upload = async (): Promise<Response> =>
-      fetch(syncUrl(credentials), {
+      fetch(url, {
         method: "PUT",
         headers: {
-          Authorization: `Basic ${auth}`,
+          Authorization: auth,
           "Content-Type": "application/json; charset=utf-8",
         },
         body: content,
+        signal: AbortSignal.timeout(SYNC_DOWNLOAD_TIMEOUT),
       });
     try {
       let response = await upload();
@@ -192,6 +248,28 @@ const initWebDavIpc = (): void => {
       if (!response.ok) {
         return { success: false, error: `服务器返回 HTTP ${response.status}` };
       }
+      // 记录新版本校验值，下次同步可走 304 快路径
+      const etag = response.headers.get("etag") || "";
+      const lastModified = response.headers.get("last-modified") || "";
+      if (etag || lastModified) {
+        syncValidators = { etag, lastModified };
+      } else {
+        try {
+          const head = await fetch(url, {
+            method: "HEAD",
+            headers: { Authorization: auth },
+            signal: AbortSignal.timeout(SYNC_HEAD_TIMEOUT),
+          });
+          if (head.ok) {
+            syncValidators = {
+              etag: head.headers.get("etag") || "",
+              lastModified: head.headers.get("last-modified") || "",
+            };
+          }
+        } catch {
+          resetSyncValidators();
+        }
+      }
       return { success: true };
     } catch (error) {
       return { success: false, error: `上传失败：${(error as Error).message}` };
@@ -199,25 +277,92 @@ const initWebDavIpc = (): void => {
   });
 
   // 下载同步数据
-  ipcMain.handle("webdav-sync-download", async () => {
+  ipcMain.handle("webdav-sync-download", async (_event, forceFull?: boolean) => {
     const credentials = readCredentials();
     if (!credentials) return { success: false, error: "尚未配置 WebDAV 账号" };
-    const auth = Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64");
+    const auth = authHeader(credentials);
+    const url = syncUrl(credentials);
+    const startedAt = Date.now();
+    const conditional: Record<string, string> = { Authorization: auth };
+    if (!forceFull) {
+      if (syncValidators.etag) conditional["If-None-Match"] = syncValidators.etag;
+      else if (syncValidators.lastModified) {
+        conditional["If-Modified-Since"] = syncValidators.lastModified;
+      }
+    }
+
     try {
-      const response = await fetch(syncUrl(credentials), {
-        headers: { Authorization: `Basic ${auth}` },
-      });
-      if (response.status === 404) return { success: true, notFound: true };
-      if (response.status === 401 || response.status === 403) {
+      // 先发条件 HEAD：未变化时一两秒返回 304，避免整包下载
+      let head: Response | null = null;
+      try {
+        head = await fetch(url, {
+          method: "HEAD",
+          headers: conditional,
+          signal: AbortSignal.timeout(SYNC_HEAD_TIMEOUT),
+        });
+      } catch {
+        head = null;
+      }
+      if (head?.status === 304) {
+        webdavLog.info(`同步文件未变化，跳过下载（${Date.now() - startedAt}ms）`);
+        return { success: true, notModified: true };
+      }
+      if (head?.status === 404) return { success: true, notFound: true };
+      if (head && (head.status === 401 || head.status === 403)) {
         return { success: false, error: "WebDAV 用户名或密码错误" };
       }
-      if (!response.ok) {
-        return { success: false, error: `服务器返回 HTTP ${response.status}` };
+
+      const total = Number(head?.headers.get("content-length") || 0);
+      const etag = head?.headers.get("etag") || "";
+      const lastModified = head?.headers.get("last-modified") || "";
+      const acceptsRanges = (head?.headers.get("accept-ranges") || "")
+        .toLowerCase()
+        .includes("bytes");
+
+      let buffer: Buffer | null = null;
+      let method = "single";
+      if (head?.ok && etag && acceptsRanges && total >= SEGMENT_MIN_BYTES) {
+        try {
+          buffer = await downloadSegments(url, auth, etag, total);
+          method = "segments";
+        } catch {
+          // 分段不被支持或下载中被改写，回退到单连接整包下载
+          buffer = null;
+        }
       }
-      const buffer = Buffer.from(await response.arrayBuffer());
+      if (!buffer) {
+        const response = await fetch(url, {
+          headers: conditional,
+          signal: AbortSignal.timeout(SYNC_DOWNLOAD_TIMEOUT),
+        });
+        if (response.status === 304) {
+          return { success: true, notModified: true };
+        }
+        if (response.status === 404) return { success: true, notFound: true };
+        if (response.status === 401 || response.status === 403) {
+          return { success: false, error: "WebDAV 用户名或密码错误" };
+        }
+        if (!response.ok) {
+          return { success: false, error: `服务器返回 HTTP ${response.status}` };
+        }
+        buffer = Buffer.from(await response.arrayBuffer());
+        if (total > 0 && buffer.length !== total) {
+          return { success: false, error: "同步文件下载不完整" };
+        }
+        syncValidators = {
+          etag: response.headers.get("etag") || etag,
+          lastModified: response.headers.get("last-modified") || lastModified,
+        };
+      } else {
+        syncValidators = { etag, lastModified };
+      }
       const data = decodeSyncContent(buffer);
+      webdavLog.info(
+        `同步数据下载完成：${buffer.length} 字节，用时 ${Date.now() - startedAt}ms（${method}）`,
+      );
       return { success: true, data };
     } catch (error) {
+      webdavLog.error(`同步数据下载失败：${(error as Error).message}`);
       return { success: false, error: `下载失败：${(error as Error).message}` };
     }
   });

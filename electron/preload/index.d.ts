@@ -33,10 +33,12 @@ declare global {
         }>;
         logout(): Promise<boolean>;
         syncUpload(content: string): Promise<{ success: boolean; error?: string }>;
-        syncDownload(): Promise<{
+        syncDownload(forceFull?: boolean): Promise<{
           success: boolean;
           data?: string;
           notFound?: boolean;
+          /** 远端文件自上次读取后未变化 */
+          notModified?: boolean;
           error?: string;
         }>;
       };

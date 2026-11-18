@@ -28,7 +28,8 @@ if (process.contextIsolated) {
         }) => ipcRenderer.invoke("webdav-login", payload),
         logout: () => ipcRenderer.invoke("webdav-logout"),
         syncUpload: (content: string) => ipcRenderer.invoke("webdav-sync-upload", content),
-        syncDownload: () => ipcRenderer.invoke("webdav-sync-download"),
+        syncDownload: (forceFull?: boolean) =>
+          ipcRenderer.invoke("webdav-sync-download", Boolean(forceFull)),
       },
       qqmusic: {
         login: () => ipcRenderer.invoke("qqmusic-login"),

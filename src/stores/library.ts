@@ -551,6 +551,35 @@ export const useLibraryStore = defineStore("library", () => {
   const syncing = ref(false);
   const lastSyncAt = ref(0);
   const syncError = ref("");
+  /** 上次拉取的远端附加字段（如手机端删除记录），未变化时直接复用 */
+  let sessionExtras: Record<string, unknown> | null = null;
+  /** 正在应用远端数据时不标记本机改动 */
+  let applyingRemote = false;
+  /** 本机数据变更计数与待上传标记，用于判断是否还需要上传 */
+  let changeSeq = 0;
+  let pendingLocalChanges = false;
+  const markLocalChange = () => {
+    if (applyingRemote) return;
+    changeSeq += 1;
+    pendingLocalChanges = true;
+  };
+
+  // 播放记录、喜欢列表变化同样会改变同步内容
+  watch(
+    () => useDataStore().historyList,
+    () => markLocalChange(),
+    { flush: "sync" },
+  );
+  watch(
+    () => useDataStore().likeSongsList,
+    () => markLocalChange(),
+    { flush: "sync" },
+  );
+  watch(
+    () => useDataStore().userLikeData,
+    () => markLocalChange(),
+    { deep: true, flush: "sync" },
+  );
 
   const MAX_READDED_SONGS = 1000;
   const MAX_SONG_DELETIONS = 5000;
@@ -583,6 +612,7 @@ export const useLibraryStore = defineStore("library", () => {
   const likedPlaylists = computed(() => playlists.value.filter((p) => p.kind === "liked"));
 
   const save = async () => {
+    markLocalChange();
     await libraryDB.setItem("playlists", cloneDeep(toRaw(playlists.value)));
     await libraryDB.setItem("pending-deletes", cloneDeep(toRaw(pendingDeletes.value)));
     await libraryDB.setItem("readded-songs", cloneDeep(toRaw(readdedSongs.value)));
@@ -1512,23 +1542,54 @@ export const useLibraryStore = defineStore("library", () => {
     if (syncing.value) return { success: false, error: "正在同步中" };
     syncing.value = true;
     syncError.value = "";
+    const seqAtStart = changeSeq;
+    const hadLocalChanges = pendingLocalChanges;
     try {
-      const downloaded = await window.api.webdav.syncDownload();
+      // 没有远端附加字段缓存时（如刚启动）必须整包拉取
+      const downloaded = await window.api.webdav.syncDownload(!sessionExtras);
       let extras: Record<string, unknown> = {};
       if (downloaded.success && downloaded.data) {
         const sync = parseSyncContent(downloaded.data);
         if (!sync) throw new Error("同步文件格式无法识别");
-        await applySync(sync);
+        applyingRemote = true;
+        try {
+          await applySync(sync);
+        } finally {
+          applyingRemote = false;
+        }
         extras = sync.extras;
+        sessionExtras = extras;
+        // 合并结果必须回传，上传失败时下次同步继续重试
+        pendingLocalChanges = true;
+      } else if (downloaded.notModified) {
+        // 远端未变化，沿用上次解析出的附加字段
+        extras = sessionExtras ?? {};
+      } else if (downloaded.notFound) {
+        sessionExtras = null;
+        pendingLocalChanges = true;
       } else if (!downloaded.success) {
         throw new Error(downloaded.error || "拉取同步数据失败");
+      }
+      // 远端和本机都没有变化时无需重复上传，避免其他设备反复下载
+      if (downloaded.notModified && !hadLocalChanges) {
+        lastSyncAt.value = Date.now();
+        await libraryDB.setItem("last-sync-at", lastSyncAt.value);
+        if (!silent) window.$message.success("已同步到 WebDAV");
+        return { success: true };
       }
       const uploaded = await window.api.webdav.syncUpload(
         JSON.stringify(await buildSyncData(extras)),
       );
       if (!uploaded.success) throw new Error(uploaded.error || "上传同步数据失败");
       // 删除墓碑不清空：其他设备可能还保留旧快照，墓碑需要持续下发直到它们完成合并
-      await save();
+      applyingRemote = true;
+      try {
+        await save();
+      } finally {
+        applyingRemote = false;
+      }
+      // 同步期间没有新的本机改动才算干净，否则留待下次上传
+      if (changeSeq === seqAtStart) pendingLocalChanges = false;
       lastSyncAt.value = Date.now();
       await libraryDB.setItem("last-sync-at", lastSyncAt.value);
       if (!silent) window.$message.success("已同步到 WebDAV");
@@ -1544,6 +1605,7 @@ export const useLibraryStore = defineStore("library", () => {
   };
 
   const scheduleSync = debounce(() => {
+    markLocalChange();
     const settingStore = useSettingStore();
     const accountStore = useAccountStore();
     if (!isElectron || !settingStore.webdavAutoSync || !accountStore.configured) return;
