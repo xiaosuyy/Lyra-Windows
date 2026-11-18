@@ -1,11 +1,11 @@
 import type { CoverType, UpdateInfoType, SettingType, SongType } from "@/types/main";
 import { CURRENT_AGREEMENT_VERSION } from "@/constants/agreement";
 import { NScrollbar } from "naive-ui";
-import { isLogin } from "./auth";
 import { isArray, isFunction } from "lodash-es";
 import { useSettingStore } from "@/stores";
 import router from "@/router";
 import type { StreamingServerConfig as StreamingServerConfigType } from "@/types/streaming";
+import type { FavoritesActionMode } from "./favorites";
 
 // 单例弹窗管理：跟踪已打开的弹窗类型
 const openedModals = new Set<string>();
@@ -172,6 +172,26 @@ export const openWebDavLogin = async (onSuccess?: () => void) => {
   });
 };
 
+// 收藏导入 / 同步平台选择
+export const openFavoritesPicker = async (mode: FavoritesActionMode) => {
+  const { default: FavoritesChannelPicker } =
+    await import("@/components/Modal/FavoritesChannelPicker.vue");
+  const modal = window.$modal.create({
+    preset: "card",
+    transformOrigin: "center",
+    autoFocus: false,
+    maskClosable: false,
+    style: { width: "420px" },
+    title: mode === "import" ? "从哪个平台导入？" : "同步到哪个平台？",
+    content: () => {
+      return h(FavoritesChannelPicker, {
+        mode,
+        onClose: () => modal.destroy(),
+      });
+    },
+  });
+};
+
 /**
  * 跳转到歌手
  * @param data 歌手信息
@@ -212,10 +232,12 @@ export const openSongInfoEditor = async (song: SongType) => {
   });
 };
 
-// 添加到歌单
+// 添加到歌单（未登录也可添加到离线歌单）
 export const openPlaylistAdd = async (data: SongType[], isLocal: boolean) => {
-  if (!data.length) return window.$message.warning("请正确选择歌曲");
-  if (!isLogin() && !isLocal) return openUserLogin();
+  if (!data.length) {
+    window.$message.warning("请正确选择歌曲");
+    return;
+  }
   const { default: PlaylistAdd } = await import("@/components/Modal/PlaylistAdd.vue");
   const modal = window.$modal.create({
     preset: "card",

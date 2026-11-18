@@ -53,7 +53,7 @@ import { isObject } from "lodash-es";
 import { isLogin } from "@/utils/auth";
 import { useDataStore, useLibraryStore, useStatusStore } from "@/stores";
 import { likeSong } from "@/api/song";
-import { openBatchList, openUpdatePlaylist } from "@/utils/modal";
+import { openBatchList, openFavoritesPicker, openUpdatePlaylist } from "@/utils/modal";
 import { updateUserLikePlaylist } from "@/utils/auth";
 import { useListDetail } from "@/composables/List/useListDetail";
 import { useListSearch } from "@/composables/List/useListSearch";
@@ -152,6 +152,22 @@ const moreOptions = computed<DropdownOption[]>(() => [
       onClick: () => openBatchList(displayData.value, false, playlistId.value),
     },
     icon: renderIcon("Batch"),
+  },
+  {
+    label: "导入收藏",
+    key: "import",
+    props: {
+      onClick: () => openFavoritesPicker("import"),
+    },
+    icon: renderIcon("Download"),
+  },
+  {
+    label: "同步收藏",
+    key: "sync",
+    props: {
+      onClick: () => openFavoritesPicker("sync"),
+    },
+    icon: renderIcon("Update"),
   },
   {
     label: "复制分享链接",
@@ -396,6 +412,12 @@ const handleReorder = async (fromIndex: number, toIndex: number) => {
     loadPlaylistData(playlistId.value, true);
   }
 };
+
+// 启动加载或 WebDAV 同步写入缓存后刷新视图
+watch([() => dataStore.likeSongsList.detail, () => dataStore.likeSongsList.data], () => {
+  if (loading.value) return;
+  loadLikedCache();
+});
 
 onActivated(async () => {
   if (!isActivated.value) {

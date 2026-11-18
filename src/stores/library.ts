@@ -205,10 +205,24 @@ const artistsToText = (artists: MetaData[] | string): string => {
     .join("/");
 };
 
-/** 超过 12 小时视为旧版同步把毫秒当成秒二次放大 */
+/**
+ * 同步时长统一为毫秒
+ * 手机端旧数据可能把秒写进 durationMs，桌面旧数据也可能被二次放大
+ */
 const normalizeSyncDuration = (value: number): number => {
   if (!Number.isFinite(value) || value <= 0) return 0;
-  return value > 12 * 60 * 60 * 1000 ? Math.round(value / 1000) : Math.round(value);
+  // 超过 12 小时视为毫秒被当成秒二次放大
+  if (value > 12 * 60 * 60 * 1000) return Math.round(value / 1000);
+  // 小于 1 秒视为旧版手机端写入的秒数
+  if (value < 1000) return Math.round(value * 1000);
+  return Math.round(value);
+};
+
+/** 修正曲库中已有的错误时长，本地文件时长可信 */
+const normalizeSongDuration = (song: SongType): SongType => {
+  if (!song || song.path) return song;
+  const duration = normalizeSyncDuration(Number(song.duration) || 0);
+  return duration === song.duration ? song : { ...song, duration };
 };
 
 const mobileSongToSong = (song?: MobileSyncSong | null): SongType | null => {
@@ -232,7 +246,7 @@ const mobileSongToSong = (song?: MobileSyncSong | null): SongType | null => {
   };
 };
 
-const songToMobile = (song: SongType): MobileSyncSong => ({
+const songToMobile = (song: SongType, addedAt = 0): MobileSyncSong => ({
   id: toNumericSongId(song),
   name: song.name ?? "",
   artist: artistsToText(song.artists),
@@ -241,7 +255,7 @@ const songToMobile = (song: SongType): MobileSyncSong => ({
   durationMs: normalizeSyncDuration(Number(song.duration) || 0),
   coverUrl: song.cover || null,
   mediaUri: null,
-  addedAt: 0,
+  addedAt,
   channelId: song.origin === "tencent" ? "tencent" : "netease",
   audioId: song.qqMid || song.qqMediaMid || null,
 });
@@ -804,7 +818,8 @@ export const useLibraryStore = defineStore("library", () => {
       mobilePlaylists.push({
         id: FAVORITES_PLAYLIST_ID,
         name: "我喜欢的音乐",
-        songs: likedSongs.map(songToMobile),
+        // 手机端按 addedAt 倒序展示，这里按当前顺序递减写入，保证同步后顺序不变
+        songs: likedSongs.map((song, index) => songToMobile(song, now - index)),
         createdAt: now,
         modifiedAt: now,
         isDeleted: false,
@@ -955,9 +970,11 @@ export const useLibraryStore = defineStore("library", () => {
   const applySync = async (sync: NormalizedSync) => {
     const dataStore = useDataStore();
 
-    // 我喜欢的音乐
-    const localSongs = dataStore.likeSongsList.data || [];
-    const mergedSongs = uniqueSongs([...localSongs, ...sync.likedSongs]);
+    // 我喜欢的音乐：远端顺序即手机端展示顺序，本地独有的歌曲追加到末尾
+    const localSongs = (dataStore.likeSongsList.data || []).map(normalizeSongDuration);
+    const remoteSongs = sync.likedSongs.map(normalizeSongDuration);
+    const mergedSongs =
+      remoteSongs.length > 0 ? uniqueSongs([...remoteSongs, ...localSongs]) : localSongs;
     const mergedIds = Array.from(
       new Set([
         ...(dataStore.userLikeData.songs || []),
@@ -974,7 +991,10 @@ export const useLibraryStore = defineStore("library", () => {
 
     // 最近播放
     const deletedHistoryIds = new Set(sync.deletedHistoryIds);
-    const mergedHistory = dedupeSongsByIdentity([...(dataStore.historyList || []), ...sync.history])
+    const mergedHistory = dedupeSongsByIdentity([
+      ...(dataStore.historyList || []).map(normalizeSongDuration),
+      ...sync.history.map(normalizeSongDuration),
+    ])
       .filter((song) => !deletedHistoryIds.has(song.id))
       .slice(0, 500);
     if (mergedHistory.length > 0) await dataStore.setHistoryList(mergedHistory);
@@ -1178,6 +1198,31 @@ export const useLibraryStore = defineStore("library", () => {
     },
   );
 
+  /** 修复旧版同步写入的错误时长 */
+  const repairLegacyDurations = async () => {
+    const dataStore = useDataStore();
+    const liked = dataStore.likeSongsList.data || [];
+    const fixedLiked = liked.map(normalizeSongDuration);
+    if (fixedLiked.some((song, index) => song !== liked[index])) {
+      await dataStore.setLikeSongsList(dataStore.likeSongsList.detail, fixedLiked);
+    }
+    const history = dataStore.historyList || [];
+    const fixedHistory = history.map(normalizeSongDuration);
+    if (fixedHistory.some((song, index) => song !== history[index])) {
+      await dataStore.setHistoryList(fixedHistory);
+    }
+    let playlistsChanged = false;
+    playlists.value = playlists.value.map((playlist) => {
+      const songs = (playlist.songs || []).map(normalizeSongDuration);
+      if (songs.some((song, index) => song !== playlist.songs[index])) {
+        playlistsChanged = true;
+        return { ...playlist, songs };
+      }
+      return playlist;
+    });
+    if (playlistsChanged) await save();
+  };
+
   /**
    * 初始化本地库
    */
@@ -1192,6 +1237,7 @@ export const useLibraryStore = defineStore("library", () => {
     } catch (error) {
       console.error("读取本地音乐库失败", error);
     }
+    await repairLegacyDurations();
     initialized.value = true;
     const accountStore = useAccountStore();
     const settingStore = useSettingStore();
