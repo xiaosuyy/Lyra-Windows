@@ -1,0 +1,2001 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>糖釉过载</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #1a0320;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #candy-stage {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+  }
+  #lyric-live {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    color: transparent;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="candy-stage" aria-hidden="true"></canvas>
+<div id="lyric-live" aria-live="polite">糖釉过载</div>
+<script>
+/* The stage snapshot hook must exist unconditionally, at the very top of the script. */
+window.__stage = function () {
+  var snapshot = window.__stageState;
+  if (!snapshot) {
+    return {
+      lines: 0, idx: -1, t: 0, playing: true, frames: 0,
+      js: 0, err: "", text: "", gl: false, rm: false
+    };
+  }
+  return {
+    lines: typeof snapshot.lineCount === "number" ? snapshot.lineCount : 0,
+    idx: typeof snapshot.lineIndex === "number" ? snapshot.lineIndex : -1,
+    t: typeof snapshot.time === "number" ? snapshot.time : 0,
+    playing: snapshot.playing !== false,
+    frames: typeof snapshot.frames === "number" ? snapshot.frames : 0,
+    js: typeof snapshot.jsMs === "number" ? snapshot.jsMs : 0,
+    err: "",
+    text: typeof snapshot.currentText === "string" ? snapshot.currentText : "",
+    gl: false,
+    rm: snapshot.reducedMotion === true
+  };
+};
+
+(function () {
+  "use strict";
+
+  var stageState = {
+    lineCount: 0,
+    lineIndex: -1,
+    time: 0,
+    playing: true,
+    frames: 0,
+    jsMs: 0,
+    currentText: "",
+    reducedMotion: false,
+    accent: [255, 63, 164],
+    lines: [],
+    duration: 0,
+    beatLevel: 0,
+    liveLevel: 0.4,
+    bass: 0.4,
+    bpm: 0,
+    songTitle: "",
+    songArtist: "",
+    hasInit: false
+  };
+  window.__stageState = stageState;
+
+  /* ---------- ready: scheduled before every other boot task ---------- */
+  var readySent = false;
+  function reportReady() {
+    if (readySent) {
+      return;
+    }
+    readySent = true;
+    try {
+      window.parent.postMessage({ __c100: 1, type: "ready" }, "*");
+    } catch (error) {
+      console.error("[sugar-glaze] ready postMessage failed", error);
+    }
+  }
+  if (typeof window.requestAnimationFrame === "function") {
+    window.requestAnimationFrame(reportReady);
+  } else {
+    window.setTimeout(reportReady, 16);
+  }
+  window.setTimeout(reportReady, 900);
+
+  /* ---------- throttled diagnostics: never swallow silently ---------- */
+  var lastErrorAt = 0;
+  function noteError(scope, error) {
+    var stamp = Date.now();
+    if (stamp - lastErrorAt < 1000) {
+      return;
+    }
+    lastErrorAt = stamp;
+    console.error("[sugar-glaze] " + scope, error);
+  }
+
+  var canvas = document.getElementById("candy-stage");
+  var context = canvas ? canvas.getContext("2d") : null;
+  var liveRegion = document.getElementById("lyric-live");
+  var viewWidth = 1440;
+  var viewHeight = 900;
+  var pixelRatio = 1;
+  var lastFrameAt = 0;
+  var resizeTimer = 0;
+  var motionQuery = null;
+
+  if (typeof window.matchMedia === "function") {
+    motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    stageState.reducedMotion = !!(motionQuery && motionQuery.matches);
+    if (motionQuery && typeof motionQuery.addEventListener === "function") {
+      motionQuery.addEventListener("change", function (event) {
+        stageState.reducedMotion = !!(event && event.matches);
+      });
+    }
+  }
+
+  function clampNumber(value, low, high) {
+    if (!isFinite(value)) {
+      return low;
+    }
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+  }
+
+  function clampByte(value) {
+    if (!isFinite(value)) {
+      return 0;
+    }
+    var rounded = Math.round(value);
+    if (rounded < 0) return 0;
+    if (rounded > 255) return 255;
+    return rounded;
+  }
+
+  function toColorString(triple, alpha) {
+    var red = clampByte(triple && triple[0]);
+    var green = clampByte(triple && triple[1]);
+    var blue = clampByte(triple && triple[2]);
+    var opacity = clampNumber(typeof alpha === "number" ? alpha : 1, 0, 1);
+    return "rgba(" + red + "," + green + "," + blue + "," + Math.round(opacity * 1000) / 1000 + ")";
+  }
+
+  function parseAccent(rawAccent) {
+    if (!rawAccent || typeof rawAccent === "string" || typeof rawAccent.length !== "number" || rawAccent.length < 3) {
+      return [255, 63, 164];
+    }
+    var red = Number(rawAccent[0]);
+    var green = Number(rawAccent[1]);
+    var blue = Number(rawAccent[2]);
+    if (!isFinite(red) || !isFinite(green) || !isFinite(blue)) {
+      return [255, 63, 164];
+    }
+    if (red <= 0 && green <= 0 && blue <= 0) {
+      return [255, 63, 164];
+    }
+    return [clampByte(red), clampByte(green), clampByte(blue)];
+  }
+
+  function mixTriple(firstColor, secondColor, amount) {
+    var ratio = clampNumber(amount, 0, 1);
+    return [
+      clampByte(firstColor[0] + (secondColor[0] - firstColor[0]) * ratio),
+      clampByte(firstColor[1] + (secondColor[1] - firstColor[1]) * ratio),
+      clampByte(firstColor[2] + (secondColor[2] - firstColor[2]) * ratio)
+    ];
+  }
+
+  function lightenTriple(sourceColor, amount) {
+    return mixTriple(sourceColor, [255, 255, 255], amount);
+  }
+
+  function darkenTriple(sourceColor, amount) {
+    return mixTriple(sourceColor, [26, 2, 30], amount);
+  }
+
+  function safeAddStop(gradient, offset, color) {
+    if (!gradient || typeof gradient.addColorStop !== "function") {
+      return;
+    }
+    try {
+      gradient.addColorStop(clampNumber(offset, 0, 1), color);
+    } catch (error) {
+      noteError("addColorStop", error);
+    }
+  }
+
+  function createSink(width, height) {
+    var sinkCanvas = document.createElement("canvas");
+    var safeWidth = Math.max(1, Math.round(isFinite(width) ? width : 1));
+    var safeHeight = Math.max(1, Math.round(isFinite(height) ? height : 1));
+    if (safeWidth > 4096 || safeHeight > 4096) {
+      return null;
+    }
+    sinkCanvas.width = safeWidth;
+    sinkCanvas.height = safeHeight;
+    var sinkContext = sinkCanvas.getContext("2d");
+    if (!sinkContext) {
+      return null;
+    }
+    return {
+      canvas: sinkCanvas,
+      context: sinkContext,
+      width: sinkCanvas.width,
+      height: sinkCanvas.height
+    };
+  }
+
+  function canUseAsImage(source) {
+    if (!source) {
+      return false;
+    }
+    if (typeof HTMLCanvasElement !== "undefined" && !(source instanceof HTMLCanvasElement)) {
+      return false;
+    }
+    if (!(source.width > 0) || !(source.height > 0)) {
+      return false;
+    }
+    return typeof source.getContext === "function";
+  }
+
+  function hasPathApi(target) {
+    return !!target && typeof target.beginPath === "function" && typeof target.arc === "function";
+  }
+
+  function resolveViewportSize() {
+    var width = window.innerWidth;
+    var height = window.innerHeight;
+    if (!isFinite(width) || !isFinite(height) || width <= 0 || height <= 0) {
+      width = 1440;
+      height = 900;
+    }
+    return { width: width, height: height };
+  }
+
+  /* ---------- palette & reactive levels ---------- */
+  var accentColor = [255, 63, 164];
+  var beatPulse = 0;
+  var smoothedLevel = 0.4;
+  var motionScale = 1;
+  var backgroundCache = {
+    key: "",
+    sky: null,
+    blooms: [],
+    dotPattern: null,
+    vignette: null,
+    scrim: null
+  };
+
+  function accentKey() {
+    return accentColor[0] + "-" + accentColor[1] + "-" + accentColor[2];
+  }
+
+  function ensureBackground() {
+    var key = Math.round(viewWidth) + "x" + Math.round(viewHeight) + "|" + accentKey();
+    if (backgroundCache.key === key && backgroundCache.sky) {
+      return;
+    }
+    backgroundCache.key = key;
+    var sky = context.createLinearGradient(0, 0, viewWidth * 0.3, viewHeight);
+    safeAddStop(sky, 0, "#190229");
+    safeAddStop(sky, 0.2, "#4a0b7d");
+    safeAddStop(sky, 0.42, "#b418a8");
+    safeAddStop(sky, 0.62, "#ff3c9d");
+    safeAddStop(sky, 0.82, "#ff9a76");
+    safeAddStop(sky, 1, "#ffd977");
+    backgroundCache.sky = sky;
+
+    var bloomSpecs = [
+      { nx: 0.14, ny: 0.12, radius: 0.66, inner: "rgba(110,255,238,0.28)", outer: "rgba(110,255,238,0)" },
+      { nx: 0.9, ny: 0.08, radius: 0.58, inner: "rgba(255,241,140,0.26)", outer: "rgba(255,241,140,0)" },
+      { nx: 0.74, ny: 0.88, radius: 0.72, inner: "rgba(124,70,255,0.34)", outer: "rgba(124,70,255,0)" },
+      { nx: 0.04, ny: 0.84, radius: 0.54, inner: "rgba(255,74,196,0.34)", outer: "rgba(255,74,196,0)" }
+    ];
+    var unit = Math.max(viewWidth, viewHeight);
+    var blooms = [];
+    for (var bloomIndex = 0; bloomIndex < bloomSpecs.length; bloomIndex += 1) {
+      var spec = bloomSpecs[bloomIndex];
+      var centerX = spec.nx * viewWidth;
+      var centerY = spec.ny * viewHeight;
+      var radius = spec.radius * unit;
+      var gradient = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius);
+      safeAddStop(gradient, 0, spec.inner);
+      safeAddStop(gradient, 0.55, spec.outer);
+      safeAddStop(gradient, 1, spec.outer);
+      blooms.push({ nx: centerX - radius, ny: centerY - radius, size: radius * 2, gradient: gradient });
+    }
+    backgroundCache.blooms = blooms;
+
+    var vignette = context.createRadialGradient(
+      viewWidth * 0.5, viewHeight * 0.48, Math.min(viewWidth, viewHeight) * 0.22,
+      viewWidth * 0.5, viewHeight * 0.48, Math.max(viewWidth, viewHeight) * 0.78
+    );
+    safeAddStop(vignette, 0, "rgba(20,0,26,0)");
+    safeAddStop(vignette, 0.72, "rgba(20,0,26,0.16)");
+    safeAddStop(vignette, 1, "rgba(14,0,20,0.62)");
+    backgroundCache.vignette = vignette;
+
+    var scrim = context.createLinearGradient(0, viewHeight * 0.2, 0, viewHeight * 0.82);
+    safeAddStop(scrim, 0, "rgba(22,0,28,0)");
+    safeAddStop(scrim, 0.32, "rgba(22,0,28,0.3)");
+    safeAddStop(scrim, 0.5, "rgba(20,0,26,0.4)");
+    safeAddStop(scrim, 0.72, "rgba(22,0,28,0.26)");
+    safeAddStop(scrim, 1, "rgba(22,0,28,0)");
+    backgroundCache.scrim = scrim;
+
+    if (!backgroundCache.dotPattern) {
+      backgroundCache.dotPattern = buildDotPattern();
+    }
+  }
+
+  function buildDotPattern() {
+    var sink = createSink(34, 34);
+    if (!sink) {
+      return null;
+    }
+    var sinkContext = sink.context;
+    sinkContext.fillStyle = "rgba(255,255,255,0.15)";
+    if (hasPathApi(sinkContext)) {
+      sinkContext.beginPath();
+      sinkContext.arc(8, 8, 2.5, 0, Math.PI * 2);
+      sinkContext.fill();
+      sinkContext.beginPath();
+      sinkContext.arc(25, 25, 3.3, 0, Math.PI * 2);
+      sinkContext.fillStyle = "rgba(255,92,196,0.24)";
+      sinkContext.fill();
+    }
+    try {
+      return context.createPattern(sink.canvas, "repeat");
+    } catch (error) {
+      noteError("dotPattern", error);
+      return null;
+    }
+  }
+
+  function invalidateSunburst() {
+    sunburstSprite = null;
+    sunburstTried = false;
+  }
+
+  function ensureSunburstSprite() {
+    if (sunburstSprite && canUseAsImage(sunburstSprite.canvas)) {
+      return sunburstSprite;
+    }
+    if (sunburstTried) {
+      return null;
+    }
+    sunburstTried = true;
+    var spriteSize = 640;
+    var center = spriteSize / 2;
+    var rayCount = 22;
+    sunburstSprite = bakeSprite(spriteSize, spriteSize, function (paint) {
+      if (!hasPathApi(paint)) {
+        return;
+      }
+      paint.fillStyle = "rgba(255,255,255,0.06)";
+      for (var rayIndex = 0; rayIndex < rayCount; rayIndex += 1) {
+        var angle = (rayIndex / rayCount) * Math.PI * 2;
+        var halfWidth = (Math.PI / rayCount) * 0.6;
+        paint.beginPath();
+        paint.moveTo(center, center);
+        paint.arc(center, center, center, angle - halfWidth, angle + halfWidth);
+        paint.closePath();
+        paint.fill();
+      }
+    });
+    return sunburstSprite;
+  }
+
+  function drawSunburst(timeSec) {
+    var sprite = ensureSunburstSprite();
+    if (!sprite || !canUseAsImage(sprite.canvas)) {
+      return;
+    }
+    var cover = Math.max(viewWidth, viewHeight) * 2;
+    context.save();
+    context.translate(viewWidth * 0.5, viewHeight * 0.38);
+    context.rotate(timeSec * 0.05 * motionScale);
+    context.globalAlpha = 0.9;
+    context.drawImage(sprite.canvas, -cover / 2, -cover / 2, cover, cover);
+    context.restore();
+  }
+
+  function drawHalftone(timeSec) {
+    if (!backgroundCache.dotPattern) {
+      return;
+    }
+    var offsetX = (timeSec * 6 * motionScale) % 34;
+    var offsetY = (timeSec * 3.5 * motionScale) % 34;
+    context.save();
+    context.translate(-offsetX, -offsetY);
+    context.fillStyle = backgroundCache.dotPattern;
+    context.fillRect(0, 0, viewWidth + 68, viewHeight + 68);
+    context.restore();
+  }
+
+  function drawGlossSweep(timeSec) {
+    var span = clampNumber(viewWidth * 1.6, 900, 3600);
+    var travel = (timeSec * 46 * motionScale) % (span + viewWidth);
+    var left = travel - span;
+    var gradient = context.createLinearGradient(left, 0, left + span * 0.7, viewHeight);
+    safeAddStop(gradient, 0, "rgba(255,255,255,0)");
+    safeAddStop(gradient, 0.46, "rgba(255,255,255,0.09)");
+    safeAddStop(gradient, 0.54, "rgba(255,255,255,0.09)");
+    safeAddStop(gradient, 1, "rgba(255,255,255,0)");
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, viewWidth, viewHeight);
+  }
+
+  function drawBackground(timeSec) {
+    ensureBackground();
+    if (backgroundCache.sky) {
+      context.fillStyle = backgroundCache.sky;
+    } else {
+      context.fillStyle = "#2a0533";
+    }
+    context.fillRect(0, 0, viewWidth, viewHeight);
+
+    for (var bloomIndex = 0; bloomIndex < backgroundCache.blooms.length; bloomIndex += 1) {
+      var bloom = backgroundCache.blooms[bloomIndex];
+      if (!bloom) {
+        continue;
+      }
+      context.fillStyle = bloom.gradient;
+      context.fillRect(bloom.nx, bloom.ny, bloom.size, bloom.size);
+    }
+
+    drawSunburst(timeSec);
+    drawHalftone(timeSec);
+    drawGlossSweep(timeSec);
+  }
+
+  function drawScrim() {
+    if (backgroundCache.scrim) {
+      context.fillStyle = backgroundCache.scrim;
+      context.fillRect(0, 0, viewWidth, viewHeight);
+    }
+  }
+
+  function drawVignette() {
+    if (backgroundCache.vignette) {
+      context.fillStyle = backgroundCache.vignette;
+      context.fillRect(0, 0, viewWidth, viewHeight);
+    }
+  }
+
+  function applyViewportSize() {
+    var size = resolveViewportSize();
+    viewWidth = size.width;
+    viewHeight = size.height;
+    var ratio = window.devicePixelRatio || 1;
+    if (!isFinite(ratio) || ratio <= 0) {
+      ratio = 1;
+    }
+    pixelRatio = Math.min(ratio, 2);
+    if (!canvas) {
+      return;
+    }
+    canvas.width = Math.max(1, Math.round(viewWidth * pixelRatio));
+    canvas.height = Math.max(1, Math.round(viewHeight * pixelRatio));
+    canvas.style.width = viewWidth + "px";
+    canvas.style.height = viewHeight + "px";
+    if (context) {
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    }
+  }
+
+  function applyInit(payload) {
+    var lines = Array.isArray(payload.lines) ? payload.lines : [];
+    stageState.lineIndex = -1;
+    stageState.currentText = "";
+    stageState.playing = payload.playing !== false;
+    stageState.duration = typeof payload.duration === "number" && isFinite(payload.duration) ? payload.duration : 0;
+    stageState.hasInit = true;
+
+    var previousAccentKey = accentKey();
+    accentColor = parseAccent(payload.accent);
+    stageState.accent = accentColor;
+
+    var song = payload.song && typeof payload.song === "object" ? payload.song : {};
+    var titleText = "";
+    var artistText = "";
+    try {
+      titleText = typeof song.name === "string" ? song.name.replace(/\s+/g, " ").trim() : "";
+      if (Array.isArray(song.artists)) {
+        var artistParts = [];
+        for (var artistIndex = 0; artistIndex < Math.min(song.artists.length, 6); artistIndex += 1) {
+          var artist = song.artists[artistIndex];
+          if (artist != null && String(artist).trim()) {
+            artistParts.push(String(artist).trim());
+          }
+        }
+        artistText = artistParts.join(" / ");
+      } else if (song.artists != null) {
+        artistText = String(song.artists).trim();
+      }
+    } catch (error) {
+      noteError("init:song", error);
+      titleText = typeof song.name === "string" ? song.name : "";
+      artistText = "";
+    }
+    stageState.songTitle = titleText;
+    stageState.songArtist = artistText;
+
+    try {
+      normalizedLines = normalizeLines(lines);
+    } catch (error) {
+      noteError("init:lyrics", error);
+      normalizedLines = [];
+    }
+    stageState.lines = normalizedLines;
+    stageState.lineCount = normalizedLines.length;
+    layoutCache.key = "";
+    layoutCache.layout = null;
+    if (normalizedLines.length > 0) {
+      var initialIndex = findLineIndex(stageState.time);
+      stageState.lineIndex = initialIndex;
+      stageState.currentText = initialIndex >= 0 ? normalizedLines[initialIndex].text : "";
+    }
+
+    backgroundCache.key = "";
+    if (previousAccentKey !== accentKey()) {
+      resetPropCaches();
+    }
+    if (liveRegion) {
+      liveRegion.textContent = titleText ? titleText + " · " + (artistText || "糖釉过载") : "糖釉过载";
+    }
+  }
+
+  function applyTick(payload) {
+    if (typeof payload.time === "number" && isFinite(payload.time)) {
+      stageState.time = payload.time;
+    }
+    if (typeof payload.playing === "boolean") {
+      stageState.playing = payload.playing;
+    }
+    if (Array.isArray(normalizedLines) && normalizedLines.length > 0) {
+      var index = findLineIndex(stageState.time);
+      stageState.lineIndex = index;
+      stageState.currentText = index >= 0 ? normalizedLines[index].text : "";
+    } else {
+      stageState.lineIndex = -1;
+      stageState.currentText = "";
+    }
+  }
+
+  function applyBeat(payload) {
+    var level = typeof payload.level === "number" && isFinite(payload.level) ? payload.level : 0.6;
+    var clamped = clampNumber(level, 0, 1);
+    stageState.beatLevel = clamped;
+    beatPulse = Math.max(beatPulse, clamped);
+  }
+
+  function applyLive(payload) {
+    var level = typeof payload.level === "number" && isFinite(payload.level) ? payload.level : 0.5;
+    stageState.liveLevel = clampNumber(level, 0, 1);
+    if (typeof payload.bass === "number" && isFinite(payload.bass)) {
+      stageState.bass = clampNumber(payload.bass, 0, 1);
+    }
+    if (typeof payload.bpm === "number" && isFinite(payload.bpm) && payload.bpm > 0) {
+      stageState.bpm = clampNumber(payload.bpm, 40, 220);
+    }
+  }
+
+  /* ---------- lyric data ---------- */
+  var normalizedLines = [];
+  var advanceCache = new Map();
+  var layoutCache = { key: "", layout: null };
+  var measureSink = null;
+  var measureContext = null;
+  var EMPTY_STATE_TEXT = "纯音乐 · 没有歌词";
+  var EMPTY_STATE_HINT = "让糖浆自己流一会儿";
+
+  function ensureMeasureContext() {
+    if (measureContext) {
+      return measureContext;
+    }
+    measureSink = createSink(8, 8);
+    measureContext = measureSink ? measureSink.context : context;
+    return measureContext;
+  }
+
+  function resolveFontSpec(fontPx) {
+    var size = Math.round(clampNumber(fontPx, 8, 220) * 10) / 10;
+    return "900 " + size + "px \"PingFang SC\", \"Microsoft YaHei\", \"Noto Sans SC\", \"Source Han Sans SC\", system-ui, sans-serif";
+  }
+
+  function tokenizeText(rawText) {
+    var tokens = [];
+    if (typeof rawText !== "string" || !rawText) {
+      return tokens;
+    }
+    var characters = Array.from(rawText);
+    var limit = Math.min(characters.length, 600);
+    var latinPattern = /[A-Za-z0-9\u00C0-\u024F'’\-_.!?&+]/;
+    var gluePattern = /[\s，。、！？；：”’）】》…—~～·,.;:!?)\]]/;
+    var pending = "";
+    for (var index = 0; index < limit; index += 1) {
+      var character = characters[index];
+      if (/\s/.test(character)) {
+        if (pending) {
+          tokens.push({ text: pending + " ", weight: Math.max(1, Array.from(pending).length) });
+          pending = "";
+        } else if (tokens.length > 0) {
+          tokens[tokens.length - 1].text += " ";
+        } else {
+          tokens.push({ text: " ", weight: 1 });
+        }
+        continue;
+      }
+      if (latinPattern.test(character) || (pending && gluePattern.test(character))) {
+        pending += character;
+        continue;
+      }
+      if (pending) {
+        tokens.push({ text: pending, weight: Math.max(1, Array.from(pending).length) });
+        pending = "";
+      }
+      if (gluePattern.test(character)) {
+        if (tokens.length > 0) {
+          tokens[tokens.length - 1].text += character;
+          tokens[tokens.length - 1].weight = Math.max(1, Array.from(tokens[tokens.length - 1].text).length);
+        } else {
+          tokens.push({ text: character, weight: 1 });
+        }
+        continue;
+      }
+      tokens.push({ text: character, weight: 1 });
+    }
+    if (pending) {
+      tokens.push({ text: pending, weight: Math.max(1, Array.from(pending).length) });
+    }
+    return tokens;
+  }
+
+  function normalizeYrcChars(rawChars, lineStart) {
+    var tokens = [];
+    if (!Array.isArray(rawChars)) {
+      return tokens;
+    }
+    var limit = Math.min(rawChars.length, 600);
+    for (var index = 0; index < limit; index += 1) {
+      var entry = rawChars[index];
+      if (!entry) {
+        continue;
+      }
+      var charText = typeof entry.c === "string" ? entry.c : (entry.c == null ? "" : String(entry.c));
+      if (!charText) {
+        continue;
+      }
+      if (/^\s+$/.test(charText) && tokens.length > 0) {
+        tokens[tokens.length - 1].text += charText;
+        continue;
+      }
+      var startTime = typeof entry.t === "number" && isFinite(entry.t) ? entry.t : lineStart;
+      tokens.push({
+        text: charText,
+        start: startTime,
+        weight: Math.max(1, Array.from(charText).length)
+      });
+    }
+    return tokens;
+  }
+
+  function normalizeUniformChars(text, lineStart, lineDuration) {
+    var tokens = tokenizeText(text);
+    if (!tokens.length) {
+      return tokens;
+    }
+    var totalWeight = 0;
+    for (var index = 0; index < tokens.length; index += 1) {
+      totalWeight += tokens[index].weight;
+    }
+    if (totalWeight <= 0) {
+      totalWeight = tokens.length;
+    }
+    var span = lineDuration > 0 ? lineDuration : clampNumber(tokens.length * 0.26, 1.6, 7);
+    var cursor = lineStart;
+    for (var tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+      tokens[tokenIndex].start = cursor;
+      cursor += (tokens[tokenIndex].weight / totalWeight) * span;
+    }
+    return tokens;
+  }
+
+  function normalizeLines(rawLines) {
+    var result = [];
+    if (!Array.isArray(rawLines)) {
+      return result;
+    }
+    var limit = Math.min(rawLines.length, 3000);
+    for (var index = 0; index < limit; index += 1) {
+      var raw = rawLines[index];
+      if (!raw || typeof raw !== "object") {
+        continue;
+      }
+      var text = typeof raw.text === "string" ? raw.text : (raw.text == null ? "" : String(raw.text));
+      text = text.replace(/\s+/g, " ").trim();
+      var hasTime = typeof raw.t === "number" && isFinite(raw.t);
+      if (!text && !hasTime) {
+        continue;
+      }
+      var start = hasTime ? raw.t : 0;
+      var duration = typeof raw.dur === "number" && isFinite(raw.dur) && raw.dur > 0 ? Math.min(raw.dur, 60) : 0;
+      var tokens = normalizeYrcChars(raw.chars, start);
+      if (!tokens.length) {
+        tokens = normalizeUniformChars(text, start, duration);
+      }
+      result.push({
+        start: start,
+        duration: duration,
+        text: text,
+        tokens: tokens
+      });
+    }
+    result.sort(function (firstLine, secondLine) {
+      if (firstLine.start !== secondLine.start) {
+        return firstLine.start - secondLine.start;
+      }
+      return 0;
+    });
+    for (var lineIndex = 0; lineIndex < result.length; lineIndex += 1) {
+      var line = result[lineIndex];
+      if (line.duration > 0) {
+        continue;
+      }
+      var nextStart = lineIndex + 1 < result.length ? result[lineIndex + 1].start : line.start + 4;
+      line.duration = clampNumber(nextStart - line.start, 0.8, 12);
+    }
+    return result;
+  }
+
+  function findLineIndex(timeSec) {
+    var lines = normalizedLines;
+    if (!lines.length) {
+      return -1;
+    }
+    var found = -1;
+    for (var index = 0; index < lines.length; index += 1) {
+      if (lines[index].start <= timeSec + 0.02) {
+        found = index;
+      } else {
+        break;
+      }
+    }
+    return found;
+  }
+
+  function measureAdvance(text, fontPx) {
+    var key = Math.round(fontPx * 10) + "|" + text;
+    var cached = advanceCache.get(key);
+    if (typeof cached === "number" && isFinite(cached)) {
+      return cached;
+    }
+    var measure = ensureMeasureContext();
+    if (!measure) {
+      return fontPx * 0.62;
+    }
+    measure.font = resolveFontSpec(fontPx);
+    var width = measure.measureText(text).width;
+    if (!isFinite(width) || width <= 0) {
+      width = fontPx * 0.62;
+    }
+    var advance = width + fontPx * 0.035;
+    if (advanceCache.size > 1400) {
+      advanceCache.clear();
+    }
+    advanceCache.set(key, advance);
+    return advance;
+  }
+
+  function buildLayoutRows(tokens, fontPx, maxWidth) {
+    var rows = [];
+    var currentRow = { tokens: [], width: 0 };
+    var widest = 0;
+    for (var index = 0; index < tokens.length; index += 1) {
+      var token = tokens[index];
+      var advance = measureAdvance(token.text, fontPx);
+      if (currentRow.tokens.length > 0 && currentRow.width + advance > maxWidth) {
+        rows.push(currentRow);
+        currentRow = { tokens: [], width: 0 };
+      }
+      currentRow.tokens.push({ token: token, advance: advance, offsetX: currentRow.width });
+      currentRow.width += advance;
+    }
+    if (currentRow.tokens.length > 0) {
+      rows.push(currentRow);
+    }
+    for (var rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      if (rows[rowIndex].width > widest) {
+        widest = rows[rowIndex].width;
+      }
+    }
+    return { rows: rows, widest: widest };
+  }
+
+  function buildLineLayout(line, baseFontPx, maxWidth) {
+    if (!line || !line.tokens.length) {
+      return null;
+    }
+    var fontPx = baseFontPx;
+    var built = null;
+    for (var attempt = 0; attempt < 4; attempt += 1) {
+      built = buildLayoutRows(line.tokens, fontPx, maxWidth);
+      var fitsWidth = built.widest <= maxWidth + 0.5;
+      if (fitsWidth && built.rows.length <= 3) {
+        break;
+      }
+      fontPx = Math.max(16, fontPx * 0.84);
+    }
+    if (!built || !built.rows.length) {
+      return null;
+    }
+    if (built.widest > maxWidth + 0.5) {
+      var fitRatio = maxWidth / built.widest;
+      if (isFinite(fitRatio) && fitRatio > 0.1) {
+        fontPx = Math.max(8, fontPx * fitRatio);
+        built = buildLayoutRows(line.tokens, fontPx, maxWidth);
+      }
+    }
+    return {
+      fontPx: fontPx,
+      rows: built.rows,
+      widest: built.widest,
+      rowHeight: fontPx * 1.24,
+      blockHeight: built.rows.length * fontPx * 1.24
+    };
+  }
+
+  function getLineLayout(line, baseFontPx, maxWidth) {
+    var key = line.start + "|" + line.text + "|" + Math.round(baseFontPx) + "|" + Math.round(maxWidth) + "|" + Math.round(viewHeight) + "|" + Math.round(viewWidth);
+    if (layoutCache.key === key && layoutCache.layout) {
+      return layoutCache.layout;
+    }
+    var layout = buildLineLayout(line, baseFontPx, maxWidth);
+    layoutCache.key = key;
+    layoutCache.layout = layout;
+    return layout;
+  }
+
+  function roundedRectPath(target, left, top, width, height, radius) {
+    if (!hasPathApi(target) || typeof target.arcTo !== "function") {
+      return false;
+    }
+    var safeRadius = clampNumber(radius, 0, Math.min(width, height) / 2);
+    target.beginPath();
+    target.moveTo(left + safeRadius, top);
+    target.lineTo(left + width - safeRadius, top);
+    target.arcTo(left + width, top, left + width, top + safeRadius, safeRadius);
+    target.lineTo(left + width, top + height - safeRadius);
+    target.arcTo(left + width, top + height, left + width - safeRadius, top + height, safeRadius);
+    target.lineTo(left + safeRadius, top + height);
+    target.arcTo(left, top + height, left, top + height - safeRadius, safeRadius);
+    target.lineTo(left, top + safeRadius);
+    target.arcTo(left, top, left + safeRadius, top, safeRadius);
+    target.closePath();
+    return true;
+  }
+
+  function sparklePath(target, centerX, centerY, radius, innerRatio) {
+    if (!hasPathApi(target)) {
+      return false;
+    }
+    var points = 4;
+    target.beginPath();
+    for (var index = 0; index < points * 2; index += 1) {
+      var angle = (index / (points * 2)) * Math.PI * 2 - Math.PI / 2;
+      var radiusHere = index % 2 === 0 ? radius : radius * innerRatio;
+      var pointX = centerX + Math.cos(angle) * radiusHere;
+      var pointY = centerY + Math.sin(angle) * radiusHere;
+      if (index === 0) {
+        target.moveTo(pointX, pointY);
+      } else {
+        target.lineTo(pointX, pointY);
+      }
+    }
+    target.closePath();
+    return true;
+  }
+
+  function drawLyricToken(text, originX, centerY, lit, fontPx, outlineWidth, fillStyle) {
+    context.lineWidth = outlineWidth;
+    context.strokeStyle = lit ? "rgba(28,1,32,0.92)" : "rgba(34,4,40,0.42)";
+    context.strokeText(text, originX, centerY);
+    context.fillStyle = fillStyle;
+    context.fillText(text, originX, centerY);
+  }
+
+  function drawGhostLine(text, centerY, fontPx, alpha) {
+    if (!text) {
+      return;
+    }
+    var measure = ensureMeasureContext();
+    if (!measure) {
+      return;
+    }
+    var maxWidth = Math.min(viewWidth * 0.86, 1100);
+    measure.font = resolveFontSpec(fontPx);
+    var width = measure.measureText(text).width;
+    var scaledFont = fontPx;
+    if (isFinite(width) && width > maxWidth && width > 0) {
+      scaledFont = Math.max(11, fontPx * (maxWidth / width));
+    }
+    context.save();
+    context.globalAlpha = alpha;
+    context.font = resolveFontSpec(scaledFont);
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.lineJoin = "round";
+    context.lineWidth = Math.max(2, scaledFont * 0.14);
+    context.strokeStyle = "rgba(28,2,32,0.62)";
+    context.strokeText(text, viewWidth / 2, centerY);
+    context.fillStyle = "rgba(255,247,253,0.85)";
+    context.fillText(text, viewWidth / 2, centerY);
+    context.restore();
+  }
+
+  function drawCurrentLine(line, layout, centerY, audioTime) {
+    var fontPx = layout.fontPx;
+    var outlineWidth = Math.max(2, fontPx * 0.1);
+    var blockTop = centerY - layout.blockHeight / 2;
+    var glowRadius = Math.max(viewWidth, viewHeight) * 0.42;
+    var glow = context.createRadialGradient(viewWidth / 2, centerY, 0, viewWidth / 2, centerY, glowRadius);
+    safeAddStop(glow, 0, toColorString(lightenTriple(accentColor, 0.18), 0.14 + smoothedLevel * 0.14 + beatPulse * 0.22));
+    safeAddStop(glow, 1, "rgba(255,120,220,0)");
+    context.fillStyle = glow;
+    context.fillRect(viewWidth / 2 - glowRadius, centerY - glowRadius, glowRadius * 2, glowRadius * 2);
+
+    var litTop = lightenTriple(accentColor, 0.82);
+    var litMiddle = lightenTriple(accentColor, 0.58);
+    var litDeep = darkenTriple(accentColor, 0.24);
+    var depthColor = toColorString(darkenTriple(accentColor, 0.68), 0.9);
+    var dimFill = "rgba(255,246,252,0.54)";
+
+    context.save();
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    context.lineJoin = "round";
+    context.lineCap = "round";
+
+    for (var rowIndex = 0; rowIndex < layout.rows.length; rowIndex += 1) {
+      var row = layout.rows[rowIndex];
+      var rowCenterY = blockTop + rowIndex * layout.rowHeight + layout.rowHeight / 2;
+      var rowStartX = (viewWidth - row.width) / 2;
+      var tokenIndex = 0;
+      var token = null;
+      var elapsed = 0;
+      var pop = 0;
+
+      context.font = resolveFontSpec(fontPx);
+      for (tokenIndex = 0; tokenIndex < row.tokens.length; tokenIndex += 1) {
+        token = row.tokens[tokenIndex];
+        if (audioTime < token.token.start) {
+          continue;
+        }
+        context.fillStyle = depthColor;
+        context.fillText(token.token.text, rowStartX + token.offsetX, rowCenterY + fontPx * 0.085);
+      }
+
+      context.font = resolveFontSpec(fontPx);
+      var fillGradient = context.createLinearGradient(0, rowCenterY - fontPx * 0.62, 0, rowCenterY + fontPx * 0.62);
+      safeAddStop(fillGradient, 0, "#fffafd");
+      safeAddStop(fillGradient, 0.24, toColorString(litTop, 1));
+      safeAddStop(fillGradient, 0.58, toColorString(litMiddle, 1));
+      safeAddStop(fillGradient, 1, toColorString(litDeep, 1));
+
+      for (tokenIndex = 0; tokenIndex < row.tokens.length; tokenIndex += 1) {
+        token = row.tokens[tokenIndex];
+        elapsed = audioTime - token.token.start;
+        if (elapsed >= 0) {
+          context.font = resolveFontSpec(fontPx);
+          pop = 0.16 * Math.exp(-elapsed * 9) * motionScale;
+          if (pop > 0.005) {
+            context.save();
+            context.translate(rowStartX + token.offsetX + token.advance / 2, rowCenterY);
+            context.scale(1 + pop, 1 + pop);
+            context.translate(-(rowStartX + token.offsetX + token.advance / 2), -rowCenterY);
+            drawLyricToken(token.token.text, rowStartX + token.offsetX, rowCenterY, true, fontPx, outlineWidth, fillGradient);
+            context.restore();
+          } else {
+            drawLyricToken(token.token.text, rowStartX + token.offsetX, rowCenterY, true, fontPx, outlineWidth, fillGradient);
+          }
+        } else {
+          context.font = resolveFontSpec(fontPx);
+          drawLyricToken(token.token.text, rowStartX + token.offsetX, rowCenterY, false, fontPx, outlineWidth * 0.8, dimFill);
+        }
+      }
+
+      var bandTop = rowCenterY - fontPx * 0.6;
+      var bandHeight = fontPx * 0.5;
+      context.save();
+      if (hasPathApi(context)) {
+        context.beginPath();
+        context.rect(0, bandTop, viewWidth, bandHeight);
+        context.clip();
+        var glossGradient = context.createLinearGradient(0, bandTop, 0, bandTop + bandHeight);
+        safeAddStop(glossGradient, 0, "rgba(255,255,255,0.72)");
+        safeAddStop(glossGradient, 0.5, "rgba(255,255,255,0.3)");
+        safeAddStop(glossGradient, 1, "rgba(255,255,255,0)");
+        context.fillStyle = glossGradient;
+        context.font = resolveFontSpec(fontPx);
+        for (tokenIndex = 0; tokenIndex < row.tokens.length; tokenIndex += 1) {
+          token = row.tokens[tokenIndex];
+          if (audioTime < token.token.start) {
+            continue;
+          }
+          context.fillText(token.token.text, rowStartX + token.offsetX, rowCenterY);
+        }
+        context.restore();
+      } else {
+        context.restore();
+      }
+    }
+    context.restore();
+    return layout;
+  }
+
+  function drawEmptyState(audioTime) {
+    var centerX = viewWidth / 2;
+    var centerY = viewHeight * 0.5;
+    var plateWidth = Math.min(viewWidth * 0.8, 600);
+    var plateHeight = clampNumber(viewHeight * 0.17, 104, 178);
+    var bob = Math.sin(audioTime * 1.1) * 6 * motionScale;
+    var plateX = centerX - plateWidth / 2;
+    var plateY = centerY - plateHeight / 2 + bob;
+    var titleText = stageState.hasInit ? EMPTY_STATE_TEXT : "糖釉过载";
+    var hintText = stageState.hasInit ? EMPTY_STATE_HINT : "等待播放器接入";
+
+    context.save();
+    context.translate(centerX, plateY + plateHeight / 2);
+    context.rotate(-0.018);
+    context.translate(-centerX, -(plateY + plateHeight / 2));
+
+    if (roundedRectPath(context, plateX, plateY, plateWidth, plateHeight, plateHeight * 0.42)) {
+      context.shadowColor = "rgba(32,0,36,0.5)";
+      context.shadowBlur = Math.max(12, plateHeight * 0.28);
+      context.shadowOffsetY = plateHeight * 0.1;
+      var plateGradient = context.createLinearGradient(plateX, plateY, plateX, plateY + plateHeight);
+      safeAddStop(plateGradient, 0, toColorString(lightenTriple(accentColor, 0.72), 0.98));
+      safeAddStop(plateGradient, 0.55, toColorString(accentColor, 0.96));
+      safeAddStop(plateGradient, 1, toColorString(darkenTriple(accentColor, 0.32), 0.96));
+      context.fillStyle = plateGradient;
+      context.fill();
+      context.shadowColor = "transparent";
+      context.shadowBlur = 0;
+      context.shadowOffsetY = 0;
+      context.lineWidth = Math.max(2, plateHeight * 0.035);
+      context.strokeStyle = "rgba(30,2,34,0.85)";
+      context.stroke();
+
+      context.save();
+      context.beginPath();
+      context.rect(plateX, plateY, plateWidth, plateHeight * 0.42);
+      context.clip();
+      var sheen = context.createLinearGradient(0, plateY, 0, plateY + plateHeight * 0.42);
+      safeAddStop(sheen, 0, "rgba(255,255,255,0.62)");
+      safeAddStop(sheen, 1, "rgba(255,255,255,0)");
+      context.fillStyle = sheen;
+      context.fillRect(plateX, plateY, plateWidth, plateHeight * 0.42);
+      context.restore();
+    }
+
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.font = "900 " + Math.round(plateHeight * 0.24) + "px \"PingFang SC\", \"Microsoft YaHei\", sans-serif";
+    context.lineJoin = "round";
+    context.lineWidth = Math.max(2, plateHeight * 0.032);
+    context.strokeStyle = "rgba(30,2,34,0.72)";
+    context.strokeText(titleText, centerX, plateY + plateHeight * 0.42);
+    context.fillStyle = "#fffafd";
+    context.fillText(titleText, centerX, plateY + plateHeight * 0.42);
+    context.font = "600 " + Math.round(clampNumber(plateHeight * 0.135, 11, 22)) + "px \"PingFang SC\", \"Microsoft YaHei\", sans-serif";
+    context.fillStyle = "rgba(48,4,52,0.78)";
+    context.fillText(hintText, centerX, plateY + plateHeight * 0.72);
+    context.restore();
+  }
+
+  function drawSongChip() {
+    var label = stageState.songTitle;
+    if (!label) {
+      return;
+    }
+    if (stageState.songArtist) {
+      label = label + "  ·  " + stageState.songArtist;
+    }
+    if (label.length > 24) {
+      label = label.slice(0, 24) + "…";
+    }
+    var chipFont = Math.round(clampNumber(viewWidth * 0.0125, 11, 16));
+    var maxChipWidth = viewWidth * 0.66;
+    context.save();
+    context.font = "700 " + chipFont + "px \"PingFang SC\", \"Microsoft YaHei\", sans-serif";
+    var textWidth = context.measureText(label).width;
+    if (isFinite(textWidth) && textWidth > maxChipWidth - 54) {
+      chipFont = Math.max(9, chipFont * ((maxChipWidth - 54) / textWidth));
+      context.font = "700 " + chipFont + "px \"PingFang SC\", \"Microsoft YaHei\", sans-serif";
+      textWidth = context.measureText(label).width;
+    }
+    if (!isFinite(textWidth) || textWidth <= 0) {
+      textWidth = chipFont * 6;
+    }
+    var chipHeight = chipFont * 2.2;
+    var chipWidth = textWidth + chipHeight * 1.2;
+    var chipX = Math.max(14, viewWidth * 0.038);
+    var chipY = Math.max(14, viewHeight * 0.05);
+    context.translate(chipX, chipY);
+    context.rotate(-0.022);
+    if (roundedRectPath(context, 0, 0, chipWidth, chipHeight, chipHeight / 2)) {
+      context.shadowColor = "rgba(30,0,34,0.45)";
+      context.shadowBlur = chipHeight * 0.5;
+      context.shadowOffsetY = chipHeight * 0.14;
+      var chipGradient = context.createLinearGradient(0, 0, 0, chipHeight);
+      safeAddStop(chipGradient, 0, "rgba(60,10,80,0.92)");
+      safeAddStop(chipGradient, 1, "rgba(28,4,40,0.86)");
+      context.fillStyle = chipGradient;
+      context.fill();
+      context.shadowColor = "transparent";
+      context.shadowBlur = 0;
+      context.shadowOffsetY = 0;
+      context.lineWidth = Math.max(1, chipHeight * 0.04);
+      context.strokeStyle = "rgba(255,190,235,0.7)";
+      context.stroke();
+    }
+    if (sparklePath(context, chipHeight * 0.62, chipHeight * 0.5, chipHeight * 0.28, 0.34)) {
+      var starGradient = context.createLinearGradient(0, 0, chipHeight, chipHeight);
+      safeAddStop(starGradient, 0, toColorString(lightenTriple(accentColor, 0.8), 1));
+      safeAddStop(starGradient, 1, toColorString(accentColor, 1));
+      context.fillStyle = starGradient;
+      context.fill();
+    }
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    context.font = "700 " + chipFont + "px \"PingFang SC\", \"Microsoft YaHei\", sans-serif";
+    context.fillStyle = "rgba(255,248,253,0.96)";
+    context.fillText(label, chipHeight * 1.05, chipHeight * 0.54);
+    context.restore();
+  }
+
+  function drawLyrics(timeSec) {
+    var audioTime = stageState.time;
+    if (!normalizedLines.length) {
+      stageState.lineIndex = -1;
+      stageState.currentText = "";
+      drawEmptyState(timeSec);
+      drawSongChip();
+      return;
+    }
+    var index = findLineIndex(audioTime);
+    if (index !== stageState.lineIndex) {
+      stageState.lineIndex = index;
+      stageState.currentText = index >= 0 ? normalizedLines[index].text : "";
+      if (liveRegion) {
+        liveRegion.textContent = stageState.currentText || stageState.songTitle || "糖釉过载";
+      }
+    }
+    drawSongChip();
+    if (index < 0) {
+      return;
+    }
+    var line = normalizedLines[index];
+    var baseFontPx = clampNumber(Math.min(viewWidth * 0.082, viewHeight * 0.108), 22, 104);
+    var maxWidth = Math.min(viewWidth * 0.86, 1100);
+    var layout = getLineLayout(line, baseFontPx, maxWidth);
+    if (!layout) {
+      return;
+    }
+    var centerY = viewHeight * 0.5;
+    var gap = Math.max(16, layout.rowHeight * 0.52);
+    var ghostFont = clampNumber(layout.fontPx * 0.42, 14, 34);
+    var previousLine = index > 0 ? normalizedLines[index - 1] : null;
+    var nextLine = index + 1 < normalizedLines.length ? normalizedLines[index + 1] : null;
+    if (previousLine && previousLine.text) {
+      drawGhostLine(previousLine.text, Math.max(viewHeight * 0.11, centerY - layout.blockHeight / 2 - gap - ghostFont * 0.5), ghostFont, 0.5);
+    }
+    if (nextLine && nextLine.text) {
+      drawGhostLine(nextLine.text, Math.min(viewHeight * 0.93, centerY + layout.blockHeight / 2 + gap + ghostFont * 0.5), ghostFont, 0.36);
+    }
+    drawCurrentLine(line, layout, centerY, audioTime);
+  }
+
+  /* ---------- inflatable props ---------- */
+  var propList = [];
+  var bakeCursor = 0;
+  var glowSprites = { accent: null, cyan: null };
+  var sunburstSprite = null;
+  var sunburstTried = false;
+  var shadowSprite = null;
+  var slimeTone = null;
+
+  function currentTimeMs() {
+    if (typeof window.performance !== "undefined" && window.performance.now) {
+      return window.performance.now();
+    }
+    return Date.now();
+  }
+
+  function bakeSprite(cssWidth, cssHeight, painter) {
+    var sink = createSink(cssWidth * pixelRatio, cssHeight * pixelRatio);
+    if (!sink) {
+      return null;
+    }
+    sink.context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    try {
+      painter(sink.context, cssWidth, cssHeight);
+    } catch (error) {
+      noteError("bake", error);
+      return null;
+    }
+    return { canvas: sink.canvas, cssWidth: cssWidth, cssHeight: cssHeight };
+  }
+
+  function ellipsePath(target, centerX, centerY, radiusX, radiusY, rotation) {
+    if (!target || typeof target.beginPath !== "function") {
+      return false;
+    }
+    var safeX = Math.max(0.5, Math.abs(radiusX));
+    var safeY = Math.max(0.5, Math.abs(radiusY));
+    try {
+      target.beginPath();
+      if (typeof target.ellipse === "function") {
+        target.ellipse(centerX, centerY, safeX, safeY, rotation || 0, 0, Math.PI * 2);
+        return true;
+      }
+      target.save();
+      target.translate(centerX, centerY);
+      target.rotate(rotation || 0);
+      target.scale(1, safeY / safeX);
+      target.arc(0, 0, safeX, 0, Math.PI * 2);
+      target.restore();
+      return true;
+    } catch (error) {
+      noteError("ellipsePath", error);
+      return false;
+    }
+  }
+
+  function resetPropCaches() {
+    propList = [];
+    bakeCursor = 0;
+    glowSprites = { accent: null, cyan: null };
+    slimeTone = null;
+    invalidateSunburst();
+  }
+
+  function ensurePropList() {
+    if (propList.length > 0) {
+      return;
+    }
+    propList = [
+      { kind: "donut", nx: 0.11, ny: 0.16, size: 0.19, tilt: -0.2, phase: 0.3, beatScale: 0.05, sprite: null },
+      { kind: "can", nx: 0.885, ny: 0.72, size: 0.135, tilt: 0.26, phase: 1.7, beatScale: 0.06, sprite: null },
+      { kind: "heart", nx: 0.855, ny: 0.15, size: 0.1, tilt: 0.16, phase: 0.9, beatScale: 0.09, sprite: null },
+      { kind: "ball", nx: 0.945, ny: 0.33, size: 0.05, tilt: 0, phase: 2.4, beatScale: 0.12, sprite: null },
+      { kind: "ball", nx: 0.07, ny: 0.71, size: 0.045, tilt: 0, phase: 3.1, beatScale: 0.1, sprite: null },
+      { kind: "heart", nx: 0.17, ny: 0.87, size: 0.085, tilt: -0.22, phase: 1.2, beatScale: 0.08, sprite: null },
+      { kind: "spike", nx: 0.74, ny: 0.9, size: 0.055, tilt: 0.4, phase: 2, beatScale: 0.14, sprite: null }
+    ];
+    bakeCursor = 0;
+  }
+
+  function propRadius(prop) {
+    var unit = Math.min(viewWidth, viewHeight);
+    return clampNumber(prop.size * unit, 10, 520);
+  }
+
+  function ensurePropsBaked() {
+    var startAt = currentTimeMs();
+    for (var step = 0; step < 2; step += 1) {
+      if (bakeCursor >= propList.length) {
+        return;
+      }
+      var prop = propList[bakeCursor];
+      if (!prop.sprite) {
+        prop.sprite = bakePropSprite(prop);
+      }
+      bakeCursor += 1;
+      if (currentTimeMs() - startAt > 5) {
+        return;
+      }
+    }
+  }
+
+  function bakePropSprite(prop) {
+    var radius = propRadius(prop);
+    if (prop.kind === "donut") {
+      return bakeDonutSprite(radius);
+    }
+    if (prop.kind === "ball") {
+      return bakeBallSprite(radius, mixTriple(accentColor, [110, 245, 255], 0.55));
+    }
+    if (prop.kind === "heart") {
+      return bakeHeartSprite(radius, accentColor);
+    }
+    if (prop.kind === "can") {
+      return bakeCanSprite(radius);
+    }
+    if (prop.kind === "spike") {
+      return bakeSpikeSprite(radius, mixTriple(accentColor, [255, 233, 120], 0.5));
+    }
+    return null;
+  }
+
+  function bakeDonutSprite(radius) {
+    var size = radius * 2.45;
+    var center = size / 2;
+    var outer = radius;
+    var inner = radius * 0.44;
+    return bakeSprite(size, size, function (paint, width, height) {
+      if (!hasPathApi(paint)) {
+        return;
+      }
+      var body = paint.createRadialGradient(
+        center - radius * 0.36, center - radius * 0.42, inner * 0.45,
+        center, center, outer
+      );
+      safeAddStop(body, 0, toColorString(darkenTriple(accentColor, 0.5), 1));
+      safeAddStop(body, 0.3, toColorString(darkenTriple(accentColor, 0.12), 1));
+      safeAddStop(body, 0.58, toColorString(lightenTriple(accentColor, 0.5), 1));
+      safeAddStop(body, 0.84, toColorString(accentColor, 1));
+      safeAddStop(body, 1, toColorString(darkenTriple(accentColor, 0.62), 1));
+
+      paint.save();
+      paint.shadowColor = "rgba(26,0,32,0.5)";
+      paint.shadowBlur = radius * 0.3;
+      paint.shadowOffsetY = radius * 0.12;
+      paint.beginPath();
+      paint.arc(center, center, outer, 0, Math.PI * 2);
+      paint.arc(center, center, inner, 0, Math.PI * 2, true);
+      paint.fillStyle = body;
+      paint.fill();
+      paint.restore();
+
+      paint.save();
+      paint.beginPath();
+      paint.arc(center, center, outer, 0, Math.PI * 2);
+      paint.arc(center, center, inner, 0, Math.PI * 2, true);
+      paint.clip();
+
+      var stripeCount = 10;
+      paint.fillStyle = "rgba(255,255,255,0.45)";
+      for (var stripeIndex = 0; stripeIndex < stripeCount; stripeIndex += 2) {
+        var startAngle = (stripeIndex / stripeCount) * Math.PI * 2 + 0.4;
+        var endAngle = startAngle + (Math.PI * 2 / stripeCount) * 0.8;
+        paint.beginPath();
+        paint.moveTo(center, center);
+        paint.arc(center, center, outer * 1.2, startAngle, endAngle);
+        paint.closePath();
+        paint.fill();
+      }
+
+      var rim = paint.createRadialGradient(
+        center - radius * 0.34, center - radius * 0.4, radius * 0.05,
+        center - radius * 0.2, center - radius * 0.24, radius * 1.1
+      );
+      safeAddStop(rim, 0, "rgba(255,255,255,0.5)");
+      safeAddStop(rim, 0.5, "rgba(255,255,255,0.12)");
+      safeAddStop(rim, 1, "rgba(255,255,255,0)");
+      paint.fillStyle = rim;
+      paint.fillRect(0, 0, width, height);
+
+      paint.beginPath();
+      paint.arc(center, center, inner * 1.18, 0, Math.PI * 2);
+      paint.arc(center, center, inner, 0, Math.PI * 2, true);
+      paint.fillStyle = "rgba(40,0,44,0.42)";
+      paint.fill();
+
+      paint.beginPath();
+      paint.arc(center, center, inner + radius * 0.03, Math.PI * 1.02, Math.PI * 1.78);
+      paint.strokeStyle = "rgba(255,255,255,0.55)";
+      paint.lineWidth = radius * 0.07;
+      paint.stroke();
+
+      paint.beginPath();
+      paint.arc(center, center, outer * 0.965, Math.PI * 0.12, Math.PI * 0.94);
+      paint.strokeStyle = "rgba(60,0,50,0.26)";
+      paint.lineWidth = radius * 0.1;
+      paint.stroke();
+
+      paint.beginPath();
+      paint.arc(center, center, outer * 0.99, Math.PI * 1.08, Math.PI * 1.92);
+      paint.strokeStyle = "rgba(255,255,255,0.4)";
+      paint.lineWidth = radius * 0.035;
+      paint.stroke();
+      paint.restore();
+
+      if (ellipsePath(paint, center - radius * 0.5, center - radius * 0.55, radius * 0.2, radius * 0.08, -0.7)) {
+        paint.fillStyle = "rgba(255,255,255,0.82)";
+        paint.fill();
+      }
+    });
+  }
+
+  function bakeBallSprite(radius, ballColor) {
+    var size = radius * 2.6;
+    var center = size / 2;
+    return bakeSprite(size, size, function (paint) {
+      if (!hasPathApi(paint)) {
+        return;
+      }
+      var body = paint.createRadialGradient(
+        center - radius * 0.35, center - radius * 0.4, radius * 0.06,
+        center, center, radius * 1.08
+      );
+      safeAddStop(body, 0, "#ffffff");
+      safeAddStop(body, 0.14, toColorString(lightenTriple(ballColor, 0.72), 1));
+      safeAddStop(body, 0.46, toColorString(ballColor, 1));
+      safeAddStop(body, 0.78, toColorString(darkenTriple(ballColor, 0.4), 1));
+      safeAddStop(body, 1, toColorString(darkenTriple(ballColor, 0.66), 1));
+      paint.save();
+      paint.shadowColor = "rgba(26,0,32,0.42)";
+      paint.shadowBlur = radius * 0.4;
+      paint.shadowOffsetY = radius * 0.14;
+      paint.beginPath();
+      paint.arc(center, center, radius, 0, Math.PI * 2);
+      paint.fillStyle = body;
+      paint.fill();
+      paint.restore();
+
+      paint.save();
+      paint.beginPath();
+      paint.arc(center, center, radius, 0, Math.PI * 2);
+      paint.clip();
+      var bounce = paint.createRadialGradient(
+        center + radius * 0.42, center + radius * 0.5, radius * 0.02,
+        center + radius * 0.42, center + radius * 0.5, radius * 0.9
+      );
+      safeAddStop(bounce, 0, "rgba(160,255,255,0.55)");
+      safeAddStop(bounce, 1, "rgba(160,255,255,0)");
+      paint.fillStyle = bounce;
+      paint.fillRect(0, 0, size, size);
+      paint.restore();
+
+      var specular = paint.createRadialGradient(
+        center - radius * 0.36, center - radius * 0.42, 0,
+        center - radius * 0.36, center - radius * 0.42, radius * 0.42
+      );
+      safeAddStop(specular, 0, "rgba(255,255,255,0.95)");
+      safeAddStop(specular, 0.35, "rgba(255,255,255,0.45)");
+      safeAddStop(specular, 1, "rgba(255,255,255,0)");
+      paint.fillStyle = specular;
+      paint.fillRect(0, 0, size, size);
+    });
+  }
+
+  function bakeHeartSprite(radius, heartColor) {
+    var size = radius * 3;
+    var center = size / 2;
+    return bakeSprite(size, size, function (paint) {
+      if (!hasPathApi(paint) || typeof paint.bezierCurveTo !== "function") {
+        return;
+      }
+      paint.beginPath();
+      paint.moveTo(center, center + radius * 0.78);
+      paint.bezierCurveTo(center - radius * 1.42, center - radius * 0.08, center - radius * 0.82, center - radius * 1.1, center, center - radius * 0.4);
+      paint.bezierCurveTo(center + radius * 0.82, center - radius * 1.1, center + radius * 1.42, center - radius * 0.08, center, center + radius * 0.78);
+      paint.closePath();
+      paint.save();
+      paint.shadowColor = "rgba(26,0,32,0.42)";
+      paint.shadowBlur = radius * 0.42;
+      paint.shadowOffsetY = radius * 0.16;
+      var body = paint.createLinearGradient(center - radius, center - radius, center + radius, center + radius);
+      safeAddStop(body, 0, toColorString(lightenTriple(heartColor, 0.82), 1));
+      safeAddStop(body, 0.32, toColorString(lightenTriple(heartColor, 0.25), 1));
+      safeAddStop(body, 0.72, toColorString(heartColor, 1));
+      safeAddStop(body, 1, toColorString(darkenTriple(heartColor, 0.42), 1));
+      paint.fillStyle = body;
+      paint.fill();
+      paint.restore();
+
+      paint.save();
+      paint.clip();
+      if (ellipsePath(paint, center - radius * 0.42, center - radius * 0.42, radius * 0.46, radius * 0.26, -0.55)) {
+        var gloss = paint.createLinearGradient(0, center - radius * 0.75, 0, center - radius * 0.1);
+        safeAddStop(gloss, 0, "rgba(255,255,255,0.85)");
+        safeAddStop(gloss, 1, "rgba(255,255,255,0)");
+        paint.fillStyle = gloss;
+        paint.fill();
+      }
+      if (ellipsePath(paint, center + radius * 0.5, center + radius * 0.42, radius * 0.22, radius * 0.1, 0.5)) {
+        paint.fillStyle = "rgba(255,220,255,0.45)";
+        paint.fill();
+      }
+      paint.restore();
+
+      paint.beginPath();
+      paint.moveTo(center - radius * 0.16, center + radius * 0.72);
+      paint.lineTo(center + radius * 0.16, center + radius * 0.72);
+      paint.lineTo(center, center + radius * 0.98);
+      paint.closePath();
+      paint.fillStyle = toColorString(darkenTriple(heartColor, 0.3), 0.95);
+      paint.fill();
+    });
+  }
+
+  function bakeCanSprite(radius) {
+    var bodyWidth = radius * 1.1;
+    var bodyHeight = radius * 2.5;
+    var sizeWidth = bodyWidth * 1.6;
+    var sizeHeight = bodyHeight * 1.16;
+    return bakeSprite(sizeWidth, sizeHeight, function (paint, width, height) {
+      var bodyX = (width - bodyWidth) / 2;
+      var bodyY = height * 0.055;
+      var cornerRadius = bodyWidth * 0.42;
+      paint.save();
+      paint.shadowColor = "rgba(26,0,32,0.5)";
+      paint.shadowBlur = radius * 0.34;
+      paint.shadowOffsetY = radius * 0.12;
+      if (!roundedRectPath(paint, bodyX, bodyY, bodyWidth, bodyHeight, cornerRadius)) {
+        paint.restore();
+        return;
+      }
+      var metal = paint.createLinearGradient(bodyX, 0, bodyX + bodyWidth, 0);
+      safeAddStop(metal, 0, "#33093c");
+      safeAddStop(metal, 0.07, "#b7a4d6");
+      safeAddStop(metal, 0.19, "#ffffff");
+      safeAddStop(metal, 0.34, toColorString(lightenTriple(accentColor, 0.4), 1));
+      safeAddStop(metal, 0.52, toColorString(darkenTriple(accentColor, 0.38), 1));
+      safeAddStop(metal, 0.68, toColorString(accentColor, 1));
+      safeAddStop(metal, 0.86, "#ffeaf9");
+      safeAddStop(metal, 1, "#2a0530");
+      paint.fillStyle = metal;
+      paint.fill();
+      paint.restore();
+
+      paint.save();
+      if (!roundedRectPath(paint, bodyX, bodyY, bodyWidth, bodyHeight, cornerRadius)) {
+        paint.restore();
+        return;
+      }
+      paint.clip();
+
+      var labelTop = bodyY + bodyHeight * 0.37;
+      var labelHeight = bodyHeight * 0.3;
+      var labelGradient = paint.createLinearGradient(0, labelTop, 0, labelTop + labelHeight);
+      safeAddStop(labelGradient, 0, "rgba(120,250,255,0.96)");
+      safeAddStop(labelGradient, 0.5, "rgba(20,220,255,0.9)");
+      safeAddStop(labelGradient, 1, "rgba(20,150,255,0.94)");
+      paint.fillStyle = labelGradient;
+      paint.fillRect(bodyX, labelTop, bodyWidth, labelHeight);
+      paint.fillStyle = "rgba(255,255,255,0.85)";
+      paint.fillRect(bodyX, labelTop, bodyWidth, labelHeight * 0.14);
+      paint.fillRect(bodyX, labelTop + labelHeight * 0.86, bodyWidth, labelHeight * 0.14);
+
+      paint.textAlign = "center";
+      paint.textBaseline = "middle";
+      var labelFont = labelHeight * 0.42;
+      paint.font = "900 " + Math.round(labelFont) + "px \"PingFang SC\", \"Microsoft YaHei\", sans-serif";
+      var labelWidth = paint.measureText("GLOSS").width;
+      if (isFinite(labelWidth) && labelWidth > bodyWidth * 0.82 && labelWidth > 0) {
+        labelFont = Math.max(6, labelFont * ((bodyWidth * 0.82) / labelWidth));
+        paint.font = "900 " + Math.round(labelFont) + "px \"PingFang SC\", \"Microsoft YaHei\", sans-serif";
+      }
+      paint.fillStyle = "rgba(38,0,50,0.9)";
+      paint.fillText("GLOSS", bodyX + bodyWidth / 2, labelTop + labelHeight * 0.52);
+
+      paint.fillStyle = "rgba(255,255,255,0.7)";
+      for (var dotIndex = 0; dotIndex < 5; dotIndex += 1) {
+        var dotX = bodyX + bodyWidth * (0.18 + dotIndex * 0.17);
+        var dotY = bodyY + bodyHeight * (0.14 + (dotIndex % 3) * 0.06);
+        if (ellipsePath(paint, dotX, dotY, radius * 0.045, radius * 0.075, 0)) {
+          paint.fill();
+        }
+      }
+      paint.restore();
+
+      if (ellipsePath(paint, bodyX + bodyWidth / 2, bodyY + bodyWidth * 0.05, bodyWidth * 0.5, bodyWidth * 0.11, 0)) {
+        paint.fillStyle = "rgba(255,255,255,0.55)";
+        paint.fill();
+        if (ellipsePath(paint, bodyX + bodyWidth / 2, bodyY + bodyWidth * 0.05, bodyWidth * 0.36, bodyWidth * 0.07, 0)) {
+          paint.fillStyle = "rgba(50,8,60,0.55)";
+          paint.fill();
+        }
+        if (ellipsePath(paint, bodyX + bodyWidth / 2, bodyY + bodyWidth * 0.05, bodyWidth * 0.13, bodyWidth * 0.035, 0)) {
+          paint.fillStyle = "rgba(255,255,255,0.8)";
+          paint.fill();
+        }
+      }
+      if (ellipsePath(paint, bodyX + bodyWidth / 2, bodyY + bodyHeight * 0.975, bodyWidth * 0.44, bodyWidth * 0.07, 0)) {
+        paint.fillStyle = "rgba(32,4,40,0.45)";
+        paint.fill();
+      }
+    });
+  }
+
+  function bakeSpikeSprite(radius, spikeColor) {
+    var size = radius * 3;
+    var center = size / 2;
+    return bakeSprite(size, size, function (paint) {
+      if (!hasPathApi(paint)) {
+        return;
+      }
+      var spikeCount = 10;
+      for (var spikeIndex = 0; spikeIndex < spikeCount; spikeIndex += 1) {
+        var angle = (spikeIndex / spikeCount) * Math.PI * 2;
+        var tipX = center + Math.cos(angle) * radius * 1.28;
+        var tipY = center + Math.sin(angle) * radius * 1.28;
+        var baseX = center + Math.cos(angle) * radius * 0.42;
+        var baseY = center + Math.sin(angle) * radius * 0.42;
+        var perpX = Math.cos(angle + Math.PI / 2) * radius * 0.24;
+        var perpY = Math.sin(angle + Math.PI / 2) * radius * 0.24;
+        paint.beginPath();
+        paint.moveTo(tipX, tipY);
+        paint.lineTo(baseX + perpX, baseY + perpY);
+        paint.lineTo(baseX - perpX, baseY - perpY);
+        paint.closePath();
+        var spikeGradient = paint.createLinearGradient(baseX, baseY, tipX, tipY);
+        safeAddStop(spikeGradient, 0, toColorString(darkenTriple(spikeColor, 0.35), 1));
+        safeAddStop(spikeGradient, 0.6, toColorString(spikeColor, 1));
+        safeAddStop(spikeGradient, 1, "#ffffff");
+        paint.fillStyle = spikeGradient;
+        paint.fill();
+      }
+      var body = paint.createRadialGradient(
+        center - radius * 0.3, center - radius * 0.34, radius * 0.05,
+        center, center, radius * 0.78
+      );
+      safeAddStop(body, 0, "#ffffff");
+      safeAddStop(body, 0.26, toColorString(lightenTriple(spikeColor, 0.6), 1));
+      safeAddStop(body, 0.7, toColorString(spikeColor, 1));
+      safeAddStop(body, 1, toColorString(darkenTriple(spikeColor, 0.5), 1));
+      paint.beginPath();
+      paint.arc(center, center, radius * 0.72, 0, Math.PI * 2);
+      paint.fillStyle = body;
+      paint.fill();
+      if (ellipsePath(paint, center - radius * 0.22, center - radius * 0.26, radius * 0.16, radius * 0.09, -0.6)) {
+        paint.fillStyle = "rgba(255,255,255,0.9)";
+        paint.fill();
+      }
+    });
+  }
+
+  function drawBalloonString(originX, originY, radius, timeSec, phase) {
+    if (typeof context.quadraticCurveTo !== "function") {
+      return;
+    }
+    var length = radius * 2.4;
+    var sway = Math.sin(timeSec * 0.9 + phase) * radius * 0.4 * motionScale;
+    context.save();
+    context.strokeStyle = "rgba(255,238,250,0.5)";
+    context.lineWidth = Math.max(1, radius * 0.03);
+    context.beginPath();
+    context.moveTo(originX, originY);
+    context.quadraticCurveTo(originX + sway * 0.5, originY + length * 0.55, originX + sway, originY + length);
+    context.stroke();
+    context.restore();
+  }
+
+  function drawProps(timeSec) {
+    ensurePropList();
+    if (stageState.frames > 16) {
+      ensurePropsBaked();
+    }
+    var unit = Math.min(viewWidth, viewHeight);
+    for (var index = 0; index < propList.length; index += 1) {
+      var prop = propList[index];
+      if (!prop.sprite || !canUseAsImage(prop.sprite.canvas)) {
+        continue;
+      }
+      if (typeof prop.appear !== "number") {
+        prop.appear = 0;
+      }
+      if (prop.appear < 1) {
+        prop.appear = Math.min(1, prop.appear + 0.08);
+      }
+      var enterEase = prop.appear * prop.appear * (3 - 2 * prop.appear);
+      var radius = propRadius(prop);
+      var driftX = Math.cos(timeSec * 0.5 + prop.phase) * unit * 0.014 * motionScale;
+      var driftY = Math.sin(timeSec * 0.72 + prop.phase) * unit * 0.02 * motionScale;
+      var pulse = (1 + beatPulse * prop.beatScale * Math.sin(timeSec * 2.2 + prop.phase)) * (0.82 + 0.18 * enterEase);
+      context.save();
+      context.globalAlpha = enterEase;
+      context.translate(prop.nx * viewWidth + driftX, prop.ny * viewHeight + driftY);
+      context.rotate(prop.tilt + Math.sin(timeSec * 0.55 + prop.phase) * 0.07 * motionScale);
+      context.scale(pulse, pulse);
+      context.drawImage(
+        prop.sprite.canvas,
+        -prop.sprite.cssWidth / 2,
+        -prop.sprite.cssHeight / 2,
+        prop.sprite.cssWidth,
+        prop.sprite.cssHeight
+      );
+      context.restore();
+      if (prop.kind === "heart") {
+        drawBalloonString(prop.nx * viewWidth + driftX, prop.ny * viewHeight + driftY + radius * 0.8, radius, timeSec, prop.phase);
+      }
+    }
+  }
+
+  function ensureShadowSprite() {
+    if (shadowSprite && canUseAsImage(shadowSprite.canvas)) {
+      return shadowSprite;
+    }
+    var size = 128;
+    shadowSprite = bakeSprite(size, size, function (paint) {
+      var gradient = paint.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+      safeAddStop(gradient, 0, "rgba(18,0,24,0.6)");
+      safeAddStop(gradient, 0.5, "rgba(18,0,24,0.28)");
+      safeAddStop(gradient, 1, "rgba(18,0,24,0)");
+      paint.fillStyle = gradient;
+      paint.fillRect(0, 0, size, size);
+    });
+    return shadowSprite;
+  }
+
+  function getSlimeTone() {
+    if (!slimeTone) {
+      slimeTone = {
+        cyan: toColorString([120, 246, 255], 1),
+        white: "#ffffff",
+        accent: toColorString(accentColor, 1),
+        accentLight: toColorString(lightenTriple(accentColor, 0.55), 1),
+        deep: "rgba(36,4,44,1)",
+        violet: "rgba(110,50,255,1)"
+      };
+    }
+    return slimeTone;
+  }
+
+  function drawChromeSlime(timeSec) {
+    var unit = Math.min(viewWidth, viewHeight);
+    var centerX = viewWidth * 0.33;
+    var centerY = viewHeight * 0.89;
+    var radiusX = Math.min(viewWidth * 0.27, unit * 0.33);
+    var radiusY = radiusX * 0.32;
+    if (!hasPathApi(context)) {
+      return;
+    }
+    var tone = getSlimeTone();
+    var wobbleAmount = 1 + beatPulse * 0.05;
+    var squash = 1 - beatPulse * 0.12 - stageState.bass * 0.04;
+    radiusY *= squash;
+    radiusX *= wobbleAmount;
+
+    context.save();
+    context.beginPath();
+    for (var pointIndex = 0; pointIndex <= 40; pointIndex += 1) {
+      var angle = (pointIndex / 40) * Math.PI * 2;
+      var wobble = 1
+        + Math.sin(angle * 3 + timeSec * 1.5) * 0.055 * motionScale
+        + Math.sin(angle * 5 - timeSec * 2.1) * 0.035 * motionScale;
+      var pointX = centerX + Math.cos(angle) * radiusX * wobble;
+      var pointY = centerY + Math.sin(angle) * radiusY * wobble;
+      if (pointIndex === 0) {
+        context.moveTo(pointX, pointY);
+      } else {
+        context.lineTo(pointX, pointY);
+      }
+    }
+    context.closePath();
+    var softShadow = ensureShadowSprite();
+    if (softShadow && canUseAsImage(softShadow.canvas)) {
+      context.drawImage(
+        softShadow.canvas,
+        centerX - radiusX * 1.18,
+        centerY - radiusY * 0.35,
+        radiusX * 2.36,
+        radiusY * 2.5
+      );
+    }
+    var metal = context.createLinearGradient(centerX - radiusX, centerY - radiusY, centerX + radiusX, centerY + radiusY);
+    safeAddStop(metal, 0, tone.cyan);
+    safeAddStop(metal, 0.14, tone.white);
+    safeAddStop(metal, 0.3, "#ffd9f4");
+    safeAddStop(metal, 0.44, tone.violet);
+    safeAddStop(metal, 0.53, tone.deep);
+    safeAddStop(metal, 0.6, tone.accent);
+    safeAddStop(metal, 0.74, tone.white);
+    safeAddStop(metal, 0.86, tone.cyan);
+    safeAddStop(metal, 1, tone.violet);
+    context.fillStyle = metal;
+    context.fill();
+
+    context.save();
+    context.clip();
+    var sheen = context.createLinearGradient(centerX, centerY - radiusY, centerX, centerY + radiusY * 0.9);
+    safeAddStop(sheen, 0, "rgba(255,255,255,0.72)");
+    safeAddStop(sheen, 0.45, "rgba(255,255,255,0.06)");
+    safeAddStop(sheen, 1, "rgba(255,255,255,0)");
+    context.fillStyle = sheen;
+    context.fillRect(centerX - radiusX * 1.2, centerY - radiusY * 1.4, radiusX * 2.4, radiusY * 2.8);
+    context.strokeStyle = "rgba(255,255,255,0.6)";
+    context.lineWidth = Math.max(1.5, radiusY * 0.05);
+    context.beginPath();
+    context.ellipse
+      ? context.ellipse(centerX - radiusX * 0.3, centerY - radiusY * 0.1, radiusX * 0.5, radiusY * 0.4, 0, Math.PI * 1.05, Math.PI * 1.85)
+      : context.arc(centerX - radiusX * 0.3, centerY - radiusY * 0.1, radiusY * 0.4, Math.PI * 1.05, Math.PI * 1.85);
+    context.stroke();
+    context.restore();
+
+    for (var dripIndex = 0; dripIndex < 3; dripIndex += 1) {
+      var progress = (timeSec * 0.34 + dripIndex * 0.31) % 1;
+      var dripX = centerX + (dripIndex - 1) * radiusX * 0.52;
+      var dripY = centerY + radiusY * 0.55 + progress * radiusY * 1.5;
+      var dripRadius = radiusY * 0.19 * (1 - progress * 0.3);
+      context.beginPath();
+      context.moveTo(dripX, dripY - dripRadius * 1.9);
+      context.quadraticCurveTo(dripX + dripRadius * 0.95, dripY - dripRadius * 0.2, dripX, dripY + dripRadius);
+      context.quadraticCurveTo(dripX - dripRadius * 0.95, dripY - dripRadius * 0.2, dripX, dripY - dripRadius * 1.9);
+      context.closePath();
+      context.fillStyle = "rgba(255,255,255,0.55)";
+      context.fill();
+      context.strokeStyle = "rgba(120,240,255,0.55)";
+      context.lineWidth = 1;
+      context.stroke();
+    }
+    context.restore();
+  }
+
+  function ensureGlowSprite(tint) {
+    var existing = glowSprites[tint];
+    if (existing === false) {
+      return null;
+    }
+    if (existing && canUseAsImage(existing.canvas)) {
+      return existing;
+    }
+    var color = tint === "cyan" ? [120, 246, 255] : accentColor;
+    var size = 96;
+    var sprite = bakeSprite(size, size, function (paint) {
+      var gradient = paint.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+      safeAddStop(gradient, 0, toColorString(lightenTriple(color, 0.5), 0.9));
+      safeAddStop(gradient, 0.4, toColorString(color, 0.35));
+      safeAddStop(gradient, 1, toColorString(color, 0));
+      paint.fillStyle = gradient;
+      paint.fillRect(0, 0, size, size);
+    });
+    glowSprites[tint] = sprite || false;
+    return sprite;
+  }
+
+  function drawFloatingOrbs(timeSec) {
+    var orbSpecs = [
+      { nx: 0.24, ny: 0.32, size: 0.09, tint: "cyan", phase: 0.4 },
+      { nx: 0.63, ny: 0.18, size: 0.06, tint: "accent", phase: 1.9 },
+      { nx: 0.47, ny: 0.78, size: 0.08, tint: "accent", phase: 2.7 },
+      { nx: 0.92, ny: 0.55, size: 0.07, tint: "cyan", phase: 3.4 },
+      { nx: 0.05, ny: 0.42, size: 0.055, tint: "accent", phase: 4.1 },
+      { nx: 0.79, ny: 0.94, size: 0.05, tint: "cyan", phase: 5.2 }
+    ];
+    var unit = Math.min(viewWidth, viewHeight);
+    context.save();
+    context.globalCompositeOperation = "lighter";
+    for (var index = 0; index < orbSpecs.length; index += 1) {
+      var orb = orbSpecs[index];
+      var sprite = ensureGlowSprite(orb.tint);
+      if (!sprite || !canUseAsImage(sprite.canvas)) {
+        continue;
+      }
+      var size = orb.size * unit * (1 + Math.sin(timeSec * 1.3 + orb.phase) * 0.12 * motionScale);
+      var orbX = orb.nx * viewWidth + Math.sin(timeSec * 0.4 + orb.phase) * unit * 0.02 * motionScale;
+      var orbY = orb.ny * viewHeight + Math.cos(timeSec * 0.33 + orb.phase) * unit * 0.03 * motionScale;
+      context.globalAlpha = 0.42 + beatPulse * 0.3;
+      context.drawImage(sprite.canvas, orbX - size / 2, orbY - size / 2, size, size);
+    }
+    context.restore();
+  }
+
+  function drawSparkles(timeSec) {
+    var sparkleSpecs = [
+      { nx: 0.36, ny: 0.2, size: 0.014, speed: 1.4, phase: 0.2 },
+      { nx: 0.56, ny: 0.13, size: 0.01, speed: 1.1, phase: 1.1 },
+      { nx: 0.68, ny: 0.34, size: 0.012, speed: 1.7, phase: 2.3 },
+      { nx: 0.31, ny: 0.6, size: 0.011, speed: 1.3, phase: 3.4 },
+      { nx: 0.61, ny: 0.7, size: 0.016, speed: 1.5, phase: 4.6 },
+      { nx: 0.16, ny: 0.5, size: 0.009, speed: 1.2, phase: 5.2 },
+      { nx: 0.9, ny: 0.44, size: 0.013, speed: 1.6, phase: 0.8 },
+      { nx: 0.48, ny: 0.88, size: 0.01, speed: 1.35, phase: 2.9 },
+      { nx: 0.78, ny: 0.6, size: 0.009, speed: 1.8, phase: 3.7 },
+      { nx: 0.08, ny: 0.3, size: 0.012, speed: 1.45, phase: 4.9 }
+    ];
+    var unit = Math.min(viewWidth, viewHeight);
+    context.save();
+    context.globalCompositeOperation = "lighter";
+    for (var index = 0; index < sparkleSpecs.length; index += 1) {
+      var sparkle = sparkleSpecs[index];
+      var twinkle = 0.5 + 0.5 * Math.sin(timeSec * sparkle.speed * 2 + sparkle.phase);
+      var radius = sparkle.size * unit * (0.6 + twinkle * 0.8 + beatPulse * 0.4);
+      if (radius < 1) {
+        continue;
+      }
+      context.globalAlpha = 0.35 + twinkle * 0.5;
+      context.fillStyle = index % 3 === 0 ? toColorString([190, 255, 255], 1) : "rgba(255,250,255,1)";
+      if (sparklePath(context, sparkle.nx * viewWidth, sparkle.ny * viewHeight, radius, 0.22)) {
+        context.fill();
+      }
+    }
+    context.restore();
+  }
+
+  function drawFrame(nowMs) {
+    if (!context) {
+      return;
+    }
+    var timeSec = nowMs / 1000;
+    if (!lastFrameAt) {
+      lastFrameAt = nowMs;
+    }
+    var delta = clampNumber((nowMs - lastFrameAt) / 1000, 0, 0.1);
+    lastFrameAt = nowMs;
+
+    motionScale = stageState.reducedMotion ? 0.22 : 1;
+    beatPulse += (0 - beatPulse) * Math.min(1, delta * 5.5);
+    smoothedLevel += (stageState.liveLevel - smoothedLevel) * Math.min(1, delta * 4);
+
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = "source-over";
+
+    drawBackground(timeSec);
+    drawProps(timeSec);
+    drawChromeSlime(timeSec);
+    drawScrim();
+    drawLyrics(timeSec);
+    drawFloatingOrbs(timeSec);
+    drawSparkles(timeSec);
+    drawVignette();
+  }
+
+  function frame(nowMs) {
+    var startAt = (typeof window.performance !== "undefined" && window.performance.now) ? window.performance.now() : Date.now();
+    try {
+      drawFrame(typeof nowMs === "number" ? nowMs : startAt);
+    } catch (error) {
+      noteError("frame", error);
+    }
+    stageState.frames += 1;
+    var endAt = (typeof window.performance !== "undefined" && window.performance.now) ? window.performance.now() : Date.now();
+    stageState.jsMs = Math.round((endAt - startAt) * 100) / 100;
+    window.requestAnimationFrame(frame);
+  }
+
+  function handleMessage(event) {
+    var message = event ? event.data : null;
+    if (!message || message.__c100 !== 1) {
+      return;
+    }
+    try {
+      if (message.type === "init") {
+        applyInit(message.payload || {});
+      } else if (message.type === "tick") {
+        applyTick(message.payload || {});
+      } else if (message.type === "beat") {
+        applyBeat(message.payload || {});
+      } else if (message.type === "live") {
+        applyLive(message.payload || {});
+      }
+    } catch (error) {
+      noteError("message:" + message.type, error);
+    }
+  }
+
+  window.addEventListener("message", handleMessage, false);
+  window.addEventListener("resize", function () {
+    try {
+      applyViewportSize();
+    } catch (error) {
+      noteError("resize", error);
+    }
+    if (resizeTimer) {
+      window.clearTimeout(resizeTimer);
+    }
+    resizeTimer = window.setTimeout(function () {
+      resizeTimer = 0;
+      try {
+        layoutCache.key = "";
+        layoutCache.layout = null;
+        backgroundCache.key = "";
+        resetPropCaches();
+      } catch (error) {
+        noteError("resize:cache", error);
+      }
+    }, 160);
+  }, false);
+
+  applyViewportSize();
+  window.requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

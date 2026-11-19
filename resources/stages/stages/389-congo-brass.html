@@ -1,0 +1,1678 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>铜管夜行</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #08171a; overflow: hidden; }
+  body { -webkit-font-smoothing: antialiased; }
+  #stage { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+"use strict";
+
+/* ---- 自检口：脚本最外层无条件赋值，第一段 ---- */
+window.__stage = function () {
+  var line = state.lines[state.idx] || null;
+  return {
+    lines: state.lines.length,
+    idx: state.idx,
+    t: state.t,
+    playing: state.playing,
+    frames: state.frames,
+    js: state.js,
+    err: state.err,
+    text: line && typeof line.text === "string" ? line.text : "",
+    gl: false,
+    rm: state.reduced
+  };
+};
+
+var state = {
+  lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "",
+  reduced: false, duration: 0, accent: [201, 151, 63],
+  songName: "", artists: "", ready: false,
+  beatLevel: 0, level: 0, bass: 0, mid: 0, treble: 0, bpm: 0
+};
+
+var errorLogAt = {};
+function reportError(where, err) {
+  var now = Date.now();
+  var key = String(where);
+  if (!errorLogAt[key] || now - errorLogAt[key] >= 1000) {
+    errorLogAt[key] = now;
+    console.error("[389 " + key + "]", err);
+    state.err = String((err && err.message) || err);
+  }
+}
+
+var canvas = document.getElementById("stage");
+var ctx = canvas.getContext("2d", { alpha: false });
+var view = { w: 1440, h: 900, dpr: 1 };
+var plateDirty = true;
+var plateScheduled = false;
+var plateFailures = 0;
+
+function schedulePlate() {
+  if (plateScheduled) return;
+  plateScheduled = true;
+  setTimeout(function () {
+    plateScheduled = false;
+    try {
+      buildPlate();
+      plateDirty = false;
+      plateFailures = 0;
+    } catch (err) {
+      plateFailures += 1;
+      reportError("plate", err);
+      if (plateFailures >= 3) plateDirty = false;
+    }
+    setTimeout(function () {
+      try { buildParadeSprites(); buildTarotSprite(); }
+      catch (err) { reportError("sprites", err); }
+    }, 0);
+  }, 0);
+}
+
+function resize() {
+  var w = Math.round(window.innerWidth || 0);
+  var h = Math.round(window.innerHeight || 0);
+  if (!isFinite(w) || !isFinite(h) || w <= 0 || h <= 0) { w = 1440; h = 900; }
+  var dpr = Math.min(Math.max(window.devicePixelRatio || 1, 1), 2);
+  view.w = w; view.h = h; view.dpr = dpr;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  plateDirty = true;
+  schedulePlate();
+}
+
+function sendReady() {
+  if (state.ready) return;
+  state.ready = true;
+  try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); }
+  catch (err) { reportError("ready", err); }
+}
+
+/* ---- 数据 ---- */
+function finiteOr(value, fallback) {
+  var num = Number(value);
+  return isFinite(num) ? num : fallback;
+}
+
+function parseLines(raw) {
+  var out = [];
+  if (!Array.isArray(raw)) return out;
+  var count = Math.min(raw.length, 2000);
+  for (var lineIndex = 0; lineIndex < count; lineIndex += 1) {
+    var item = raw[lineIndex];
+    if (!item || typeof item !== "object") continue;
+    var text = typeof item.text === "string" ? item.text : (item.text == null ? "" : String(item.text));
+    if (!text.trim()) continue;
+    var start = finiteOr(item.t, 0);
+    if (start < 0) start = 0;
+    var dur = finiteOr(item.dur, 0);
+    if (dur <= 0) dur = Math.max(1.2, text.length * 0.22);
+    var chars = null;
+    if (Array.isArray(item.chars) && item.chars.length) {
+      chars = [];
+      var charCount = Math.min(item.chars.length, Math.max(text.length, 1) * 4);
+      for (var charIndex = 0; charIndex < charCount; charIndex += 1) {
+        var rawChar = item.chars[charIndex];
+        if (!rawChar || typeof rawChar !== "object") continue;
+        var charText = typeof rawChar.c === "string" ? rawChar.c : (rawChar.c == null ? "" : String(rawChar.c));
+        if (!charText) continue;
+        chars.push({ c: charText, t: finiteOr(rawChar.t, start) });
+      }
+      if (!chars.length) chars = null;
+    }
+    out.push({ t: start, dur: dur, text: text, chars: chars });
+  }
+  out.sort(function (left, right) { return left.t - right.t; });
+  return out;
+}
+
+function findIndex(time) {
+  var lines = state.lines;
+  if (!lines.length) return -1;
+  if (time < lines[0].t) return -1;
+  var lo = 0, hi = lines.length - 1, best = 0;
+  while (lo <= hi) {
+    var mid = (lo + hi) >> 1;
+    if (lines[mid].t <= time) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return best;
+}
+
+/* ---- 消息 ---- */
+function handleInit(payload) {
+  try {
+    var song = (payload && payload.song) || {};
+    var artists = song.artists;
+    if (Array.isArray(artists)) artists = artists.filter(Boolean).join(" / ");
+    state.artists = typeof artists === "string" ? artists : "";
+    state.songName = typeof song.name === "string" ? song.name : "";
+    state.duration = finiteOr(payload && payload.duration, 0);
+    if (state.duration < 0) state.duration = 0;
+    if (payload && Array.isArray(payload.accent) && payload.accent.length >= 3) {
+      state.accent = payload.accent.slice(0, 3).map(function (v) { return Math.max(0, Math.min(255, Math.round(finiteOr(v, 0)))); });
+    }
+    state.lines = parseLines(payload && payload.lines);
+    if (payload && typeof payload.playing === "boolean") state.playing = payload.playing;
+    else state.playing = true;
+    state.idx = findIndex(state.t);
+    palette = buildPalette();
+    plateDirty = true;
+    schedulePlate();
+  } catch (err) { reportError("init", err); }
+  try { paint(); } catch (err2) { reportError("init-paint", err2); }
+}
+
+function handleMessage(event) {
+  var data = event && event.data;
+  if (!data || data.__c100 !== 1) return;
+  try {
+    if (data.type === "init") { handleInit(data.payload); }
+    else if (data.type === "tick") {
+      var tickPayload = data.payload || {};
+      var time = Number(tickPayload.time);
+      if (isFinite(time)) state.t = time;
+      if (typeof tickPayload.playing === "boolean") state.playing = tickPayload.playing;
+      state.idx = findIndex(state.t);
+    }
+    else if (data.type === "beat") {
+      var beatPayload = data.payload || {};
+      state.beatLevel = Math.max(0.25, Math.min(1, finiteOr(beatPayload.level, 0.6)));
+    }
+    else if (data.type === "live") {
+      var livePayload = data.payload || {};
+      state.bpm = finiteOr(livePayload.bpm, state.bpm);
+      state.level = Math.max(0, Math.min(1, finiteOr(livePayload.level, state.level)));
+      state.bass = Math.max(0, Math.min(1, finiteOr(livePayload.bass, state.bass)));
+      state.mid = Math.max(0, Math.min(1, finiteOr(livePayload.mid, state.mid)));
+      state.treble = Math.max(0, Math.min(1, finiteOr(livePayload.treble, state.treble)));
+      if (typeof livePayload.playing === "boolean") state.playing = livePayload.playing;
+    }
+  } catch (err) { reportError("message", err); }
+}
+window.addEventListener("message", handleMessage);
+window.addEventListener("resize", function () { try { resize(); paint(); } catch (err) { reportError("resize", err); } });
+
+function syncReducedMotion() {
+  try {
+    if (!window.matchMedia) return;
+    state.reduced = !!window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  } catch (err) { reportError("media", err); }
+}
+syncReducedMotion();
+try {
+  var motionQuery = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+  if (motionQuery) {
+    if (typeof motionQuery.addEventListener === "function") motionQuery.addEventListener("change", syncReducedMotion);
+    else if (typeof motionQuery.addListener === "function") motionQuery.addListener(syncReducedMotion);
+  }
+} catch (err) { reportError("media-listener", err); }
+
+/* ---- 调色板与工具 ---- */
+var GOLD = [216, 168, 74];
+
+function clampByte(value) {
+  var num = Math.round(Number(value));
+  if (!isFinite(num)) return 0;
+  return num < 0 ? 0 : (num > 255 ? 255 : num);
+}
+
+function mixRgb(first, second, amount) {
+  var ratio = Math.max(0, Math.min(1, amount));
+  return [
+    first[0] + (second[0] - first[0]) * ratio,
+    first[1] + (second[1] - first[1]) * ratio,
+    first[2] + (second[2] - first[2]) * ratio
+  ];
+}
+
+function luminanceOf(rgb) {
+  return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+}
+
+function cssRgb(rgb, alpha) {
+  var red = clampByte(rgb[0]);
+  var green = clampByte(rgb[1]);
+  var blue = clampByte(rgb[2]);
+  var alphaValue = typeof alpha === "number" ? Math.max(0, Math.min(1, alpha)) : 1;
+  return "rgba(" + red + "," + green + "," + blue + "," + alphaValue + ")";
+}
+
+function addStop(gradient, pos, color) {
+  try { gradient.addColorStop(Math.max(0, Math.min(1, pos)), color); }
+  catch (err) { reportError("addColorStop", err); }
+}
+
+function makeCanvas(pixelW, pixelH) {
+  var node = document.createElement("canvas");
+  node.width = Math.max(1, Math.round(pixelW));
+  node.height = Math.max(1, Math.round(pixelH));
+  return node;
+}
+
+function mulberry32(seed) {
+  var seedState = seed >>> 0;
+  return function () {
+    seedState = (seedState + 0x6D2B79F5) >>> 0;
+    var mixed = seedState;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function buildPalette() {
+  var accent = [clampByte(state.accent[0]), clampByte(state.accent[1]), clampByte(state.accent[2])];
+  var bright = luminanceOf(accent);
+  var useAccent = bright > 0.2;
+  return {
+    ink: [6, 24, 27],
+    deep: [10, 38, 43],
+    peacock: [16, 78, 85],
+    teal: [30, 116, 120],
+    patina: [64, 150, 143],
+    gold: GOLD.slice(),
+    goldDim: [138, 101, 44],
+    ochre: [176, 104, 48],
+    rust: [142, 58, 42],
+    bone: [240, 224, 192],
+    brass: useAccent ? mixRgb(GOLD, accent, 0.4) : GOLD.slice(),
+    lit: useAccent ? mixRgb([255, 233, 188], accent, 0.5) : [255, 233, 188],
+    accent: accent
+  };
+}
+
+var palette = buildPalette();
+
+/* ---- 版面 ---- */
+var layout = {
+  w: 1440, h: 900, friezeH: 76, streetTop: 640, streetH: 260,
+  lyricTop: 260, lyricBottom: 600, lyricCenter: 430, lyricMaxW: 1040,
+  moonX: 720, moonY: 430, moonR: 300
+};
+
+function computeLayout(w, h) {
+  var friezeH = Math.min(Math.max(h * 0.085, 46), 110);
+  var streetH = Math.min(Math.max(h * 0.27, 132), h * 0.42);
+  var streetTop = h - streetH;
+  var zoneTop = friezeH;
+  var zoneH = Math.max(60, streetTop - zoneTop);
+  var lyricTop = zoneTop + zoneH * 0.1;
+  var lyricBottom = streetTop - zoneH * 0.06;
+  layout.w = w;
+  layout.h = h;
+  layout.friezeH = friezeH;
+  layout.streetTop = streetTop;
+  layout.streetH = streetH;
+  layout.lyricTop = lyricTop;
+  layout.lyricBottom = lyricBottom;
+  layout.lyricCenter = (lyricTop + lyricBottom) * 0.5;
+  layout.lyricMaxW = Math.min(w * (w < 760 ? 0.86 : 0.76), 1060);
+  layout.moonX = w * 0.5;
+  layout.moonY = lyricTop + (lyricBottom - lyricTop) * 0.46;
+  layout.moonR = Math.min(w * 0.3, (lyricBottom - lyricTop) * 0.62, h * 0.3);
+}
+
+/* ---- 顶部图腾横楣：双头蛇 + 铜灯笼 ---- */
+function serpentY(x, w) {
+  var friezeH = layout.friezeH;
+  return friezeH * 0.46 + Math.sin((x / Math.max(1, w)) * Math.PI * 3.2) * friezeH * 0.15;
+}
+
+function drawSerpentHead(brush, x, y, direction, size) {
+  brush.save();
+  brush.translate(x, y);
+  brush.scale(direction, 1);
+  brush.rotate(-0.06);
+
+  brush.fillStyle = cssRgb(palette.goldDim, 0.98);
+  brush.beginPath();
+  brush.moveTo(-size * 0.55, -size * 0.26);
+  brush.quadraticCurveTo(size * 0.4, -size * 0.4, size * 0.98, -size * 0.02);
+  brush.quadraticCurveTo(size * 0.45, size * 0.32, -size * 0.55, size * 0.24);
+  brush.closePath();
+  brush.fill();
+
+  brush.strokeStyle = cssRgb(palette.ink, 0.6);
+  brush.lineWidth = Math.max(1, size * 0.05);
+  brush.beginPath();
+  brush.moveTo(-size * 0.4, size * 0.04);
+  brush.quadraticCurveTo(size * 0.3, size * 0.1, size * 0.9, size * 0.0);
+  brush.stroke();
+
+  brush.fillStyle = cssRgb(palette.ink, 0.6);
+  brush.beginPath();
+  brush.arc(-size * 0.05, -size * 0.11, size * 0.13, 0, Math.PI * 2);
+  brush.fill();
+  brush.fillStyle = cssRgb(palette.bone, 0.92);
+  brush.beginPath();
+  brush.arc(-size * 0.05, -size * 0.11, size * 0.055, 0, Math.PI * 2);
+  brush.fill();
+
+  brush.strokeStyle = cssRgb(palette.rust, 0.95);
+  brush.lineWidth = Math.max(1, size * 0.055);
+  brush.beginPath();
+  brush.moveTo(size * 0.9, -size * 0.01);
+  brush.lineTo(size * 1.16, -size * 0.07);
+  brush.moveTo(size * 0.9, -size * 0.01);
+  brush.lineTo(size * 1.16, size * 0.05);
+  brush.stroke();
+
+  /* 齿 */
+  brush.fillStyle = cssRgb(palette.bone, 0.85);
+  brush.beginPath();
+  brush.moveTo(size * 0.72, size * 0.08);
+  brush.lineTo(size * 0.78, size * 0.2);
+  brush.lineTo(size * 0.82, size * 0.07);
+  brush.closePath();
+  brush.fill();
+  brush.restore();
+}
+
+var lanternPositions = [];
+
+function drawLantern(brush, x, topY, size) {
+  brush.save();
+  var halo = brush.createRadialGradient(x, topY + size * 1.15, 0, x, topY + size * 1.15, size * 2.6);
+  addStop(halo, 0, cssRgb(palette.lit, 0.16));
+  addStop(halo, 0.45, cssRgb(palette.brass, 0.07));
+  addStop(halo, 1, cssRgb(palette.brass, 0));
+  brush.fillStyle = halo;
+  brush.fillRect(x - size * 2.6, topY - size * 1.5, size * 5.2, size * 5.2);
+
+  brush.strokeStyle = cssRgb(palette.goldDim, 0.8);
+  brush.lineWidth = Math.max(1, size * 0.05);
+  brush.beginPath();
+  brush.moveTo(x, topY);
+  brush.lineTo(x, topY + size * 0.28);
+  brush.stroke();
+
+  brush.fillStyle = cssRgb(palette.goldDim, 0.95);
+  brush.beginPath();
+  brush.moveTo(x - size * 0.2, topY + size * 0.32);
+  brush.lineTo(x + size * 0.2, topY + size * 0.32);
+  brush.lineTo(x + size * 0.13, topY + size * 0.44);
+  brush.lineTo(x - size * 0.13, topY + size * 0.44);
+  brush.closePath();
+  brush.fill();
+
+  var glass = brush.createLinearGradient(0, topY + size * 0.46, 0, topY + size * 1.28);
+  addStop(glass, 0, cssRgb(palette.lit, 0.55));
+  addStop(glass, 0.55, cssRgb(palette.brass, 0.34));
+  addStop(glass, 1, cssRgb(palette.rust, 0.3));
+  brush.fillStyle = glass;
+  brush.beginPath();
+  brush.moveTo(x - size * 0.22, topY + size * 0.48);
+  brush.lineTo(x + size * 0.22, topY + size * 0.48);
+  brush.lineTo(x + size * 0.16, topY + size * 1.24);
+  brush.lineTo(x - size * 0.16, topY + size * 1.24);
+  brush.closePath();
+  brush.fill();
+
+  brush.strokeStyle = cssRgb(palette.ink, 0.55);
+  brush.lineWidth = Math.max(1, size * 0.035);
+  brush.beginPath();
+  brush.moveTo(x, topY + size * 0.48);
+  brush.lineTo(x, topY + size * 1.24);
+  brush.stroke();
+
+  brush.fillStyle = cssRgb(palette.goldDim, 0.95);
+  brush.fillRect(x - size * 0.2, topY + size * 1.22, size * 0.4, size * 0.1);
+  brush.beginPath();
+  brush.moveTo(x, topY + size * 1.46);
+  brush.lineTo(x + size * 0.07, topY + size * 1.32);
+  brush.lineTo(x - size * 0.07, topY + size * 1.32);
+  brush.closePath();
+  brush.fill();
+  brush.restore();
+}
+
+function drawFrieze(brush, w, h) {
+  var friezeH = layout.friezeH;
+  var band = brush.createLinearGradient(0, 0, 0, friezeH);
+  addStop(band, 0, cssRgb(palette.ink, 0.98));
+  addStop(band, 0.7, cssRgb(palette.ink, 0.82));
+  addStop(band, 1, cssRgb(palette.ink, 0.16));
+  brush.fillStyle = band;
+  brush.fillRect(0, 0, w, friezeH);
+
+  var thick = Math.max(5, friezeH * 0.19);
+  var step = Math.max(4, w / 220);
+  var points = [];
+  for (var xCoord = -24; xCoord <= w + 24; xCoord += step) points.push({ x: xCoord, y: serpentY(xCoord, w) });
+
+  function tracePath() {
+    brush.beginPath();
+    brush.moveTo(points[0].x, points[0].y);
+    for (var pointIndex = 1; pointIndex < points.length; pointIndex += 1) brush.lineTo(points[pointIndex].x, points[pointIndex].y);
+  }
+
+  brush.lineJoin = "round";
+  brush.lineCap = "round";
+  brush.strokeStyle = cssRgb(palette.ink, 0.95);
+  brush.lineWidth = thick + 4;
+  tracePath();
+  brush.stroke();
+
+  brush.strokeStyle = cssRgb(palette.goldDim, 0.98);
+  brush.lineWidth = thick;
+  tracePath();
+  brush.stroke();
+
+  brush.strokeStyle = cssRgb(palette.brass, 0.5);
+  brush.lineWidth = Math.max(1, thick * 0.3);
+  tracePath();
+  brush.stroke();
+
+  for (var scaleIndex = 3; scaleIndex < points.length - 3; scaleIndex += 3) {
+    var point = points[scaleIndex];
+    var next = points[scaleIndex + 1];
+    var angle = Math.atan2(next.y - point.y, next.x - point.x);
+    brush.save();
+    brush.translate(point.x, point.y);
+    brush.rotate(angle);
+    brush.strokeStyle = cssRgb(palette.ink, 0.6);
+    brush.lineWidth = Math.max(1, thick * 0.08);
+    brush.beginPath();
+    brush.moveTo(-thick * 0.2, -thick * 0.32);
+    brush.lineTo(thick * 0.12, 0);
+    brush.lineTo(-thick * 0.2, thick * 0.32);
+    brush.stroke();
+    brush.restore();
+  }
+
+  drawSerpentHead(brush, w * 0.052, serpentY(w * 0.052, w), -1, friezeH * 0.34);
+  drawSerpentHead(brush, w * 0.948, serpentY(w * 0.948, w), 1, friezeH * 0.34);
+
+  var lanternGap = Math.max(120, w / 7);
+  var lanternX = lanternGap * 0.5;
+  var lanternSize = friezeH * 0.14;
+  lanternPositions = [];
+  while (lanternX < w && lanternGap > 40) {
+    var lanternTop = serpentY(lanternX, w) + thick * 0.4;
+    drawLantern(brush, lanternX, lanternTop, lanternSize);
+    lanternPositions.push({ x: lanternX, y: lanternTop + lanternSize * 0.95, size: lanternSize });
+    lanternX += lanternGap;
+  }
+
+  brush.fillStyle = cssRgb(palette.brass, 0.24);
+  brush.fillRect(0, friezeH - 1.5, w, 1.5);
+}
+
+/* ---- 游行队伍：预烘焙的木刻人形 ---- */
+var TAU = Math.PI * 2;
+var SPRITE_W = 144;
+var SPRITE_H = 120;
+var SPRITE_BASE_Y = 116;
+var PERFORMER_ORDER = ["trumpet", "drum", "trombone", "dancer", "tuba", "bone", "trumpet", "trombone", "drum", "bone"];
+var spriteCache = { ready: false, front: {}, back: {} };
+var spriteBuildSize = 0;
+
+function beginPathSafe(brush) {
+  if (!brush || typeof brush.beginPath !== "function") return false;
+  brush.beginPath();
+  return true;
+}
+
+function strokeLine(brush, points, width, color) {
+  if (!points || points.length < 2 || !beginPathSafe(brush)) return;
+  brush.moveTo(points[0][0], points[0][1]);
+  for (var index = 1; index < points.length; index += 1) brush.lineTo(points[index][0], points[index][1]);
+  brush.lineCap = "round";
+  brush.lineJoin = "round";
+  brush.strokeStyle = color;
+  brush.lineWidth = width;
+  brush.stroke();
+}
+
+function fillPoly(brush, points, color) {
+  if (!points || points.length < 3 || !beginPathSafe(brush)) return;
+  brush.moveTo(points[0][0], points[0][1]);
+  for (var index = 1; index < points.length; index += 1) brush.lineTo(points[index][0], points[index][1]);
+  brush.closePath();
+  brush.fillStyle = color;
+  brush.fill();
+}
+
+function fillDisc(brush, cx, cy, radius, color) {
+  if (!beginPathSafe(brush)) return;
+  brush.arc(cx, cy, Math.max(0.5, radius), 0, TAU);
+  brush.fillStyle = color;
+  brush.fill();
+}
+
+function drawHead(brush, cx, cy, radius, skin) {
+  fillDisc(brush, cx, cy, radius, skin.body);
+  if (!beginPathSafe(brush)) return;
+  brush.arc(cx, cy, radius, 0, TAU);
+  brush.strokeStyle = skin.dark;
+  brush.lineWidth = 1;
+  brush.stroke();
+  strokeLine(brush, [[cx - radius * 0.52, cy - radius * 0.12], [cx + radius * 0.14, cy - radius * 0.12]], Math.max(0.8, radius * 0.18), skin.detail);
+}
+
+function drawLegs(brush, skin, stride) {
+  strokeLine(brush, [[-2, -48], [-7 + stride, -26], [-10 + stride * 1.4, -6]], 9, skin.body);
+  strokeLine(brush, [[4, -48], [8 - stride, -24], [12 - stride * 1.4, -6]], 9, skin.body);
+  fillPoly(brush, [[-17, 0], [-7, 0], [-7, -6], [-16, -6]], skin.dark);
+  fillPoly(brush, [[9, 0], [19, 0], [19, -6], [10, -6]], skin.dark);
+}
+
+function drawTorso(brush, skin, shoulder) {
+  fillPoly(brush, [[-11, -48], [13, -48], [12, -84], [-10, -84]], skin.body);
+  strokeLine(brush, [[-9, -80], [11, -52]], 4, skin.accent);
+  strokeLine(brush, [[-10, -84], [12, -84]], Math.max(1, shoulder || 2), skin.detail);
+}
+
+function performerTrumpet(brush, skin) {
+  drawLegs(brush, skin, 4);
+  drawTorso(brush, skin, 3);
+  drawHead(brush, 1, -93, 8, skin);
+  fillPoly(brush, [[-12, -101], [14, -101], [13, -97], [-11, -97]], skin.dark);
+  fillPoly(brush, [[-9, -112], [10, -112], [11, -100], [-9, -100]], skin.body);
+  strokeLine(brush, [[-9, -106], [10, -106]], 2, skin.detail);
+  strokeLine(brush, [[10, -80], [20, -88], [13, -95]], 6, skin.body);
+  strokeLine(brush, [[-10, -80], [-15, -64], [3, -78]], 6, skin.body);
+  strokeLine(brush, [[7, -92], [29, -100]], 4, skin.brass);
+  fillPoly(brush, [[28, -104], [42, -107], [41, -95], [29, -99]], skin.brass);
+  strokeLine(brush, [[16, -98], [16, -92]], 1.6, skin.detail);
+}
+
+function performerTrombone(brush, skin) {
+  drawLegs(brush, skin, -3);
+  drawTorso(brush, skin, 3);
+  drawHead(brush, -2, -93, 8, skin);
+  fillPoly(brush, [[-11, -101], [11, -101], [11, -96], [-11, -96]], skin.dark);
+  fillPoly(brush, [[-8, -108], [8, -108], [9, -99], [-9, -99]], skin.body);
+  strokeLine(brush, [[-9, -86], [-22, -74], [-20, -58]], 6, skin.body);
+  strokeLine(brush, [[10, -84], [22, -88]], 6, skin.body);
+  strokeLine(brush, [[4, -92], [26, -96]], 3.4, skin.brass);
+  strokeLine(brush, [[26, -96], [55, -92]], 3.4, skin.brass);
+  fillPoly(brush, [[52, -98], [64, -96], [62, -84], [51, -86]], skin.brass);
+  strokeLine(brush, [[30, -92], [30, -86]], 1.6, skin.detail);
+}
+
+function performerTuba(brush, skin) {
+  drawLegs(brush, skin, 2);
+  fillPoly(brush, [[-12, -48], [13, -48], [12, -82], [-10, -82]], skin.body);
+  strokeLine(brush, [[-12, -76], [-24, -66], [-18, -50]], 6, skin.body);
+  fillDisc(brush, 4, -70, 27, skin.brass);
+  fillDisc(brush, 4, -70, 18, skin.body);
+  fillDisc(brush, 4, -70, 10, skin.dark);
+  strokeLine(brush, [[4, -43], [16, -34], [10, -50]], 5, skin.brass);
+  drawHead(brush, -2, -95, 8, skin);
+  fillPoly(brush, [[-12, -102], [8, -102], [8, -98], [-12, -98]], skin.dark);
+  fillPoly(brush, [[-9, -113], [5, -113], [6, -101], [-10, -101]], skin.body);
+  strokeLine(brush, [[-6, -88], [4, -88]], 3, skin.detail);
+}
+
+function performerDrum(brush, skin) {
+  drawLegs(brush, skin, 1);
+  drawTorso(brush, skin, 3);
+  drawHead(brush, 0, -93, 8, skin);
+  fillPoly(brush, [[-12, -101], [12, -101], [13, -97], [-13, -97]], skin.dark);
+  fillPoly(brush, [[-8, -108], [8, -108], [9, -100], [-9, -100]], skin.body);
+  fillPoly(brush, [[-17, -58], [17, -58], [17, -41], [-17, -41]], skin.body);
+  strokeLine(brush, [[-17, -58], [17, -58]], 2.4, skin.brass);
+  strokeLine(brush, [[-17, -41], [17, -41]], 2.4, skin.brass);
+  strokeLine(brush, [[-17, -49], [17, -49]], 1.4, skin.detail);
+  strokeLine(brush, [[-12, -60], [2, -84]], 2.6, skin.brass);
+  strokeLine(brush, [[10, -60], [-2, -82]], 2.6, skin.brass);
+  strokeLine(brush, [[-18, -70], [-10, -58]], 3, skin.detail);
+}
+
+function performerDancer(brush, skin) {
+  fillPoly(brush, [[-12, -52], [-24, -2], [24, -2], [12, -52]], skin.body);
+  strokeLine(brush, [[-18, -18], [18, -18]], 1.6, skin.detail);
+  strokeLine(brush, [[-8, -44], [-16, -6]], 1.4, skin.detail);
+  strokeLine(brush, [[6, -44], [15, -6]], 1.4, skin.detail);
+  fillPoly(brush, [[-8, -52], [9, -52], [7, -80], [-6, -80]], skin.body);
+  drawHead(brush, 0, -88, 7.5, skin);
+  fillDisc(brush, 0, -95, 6, skin.dark);
+  strokeLine(brush, [[-6, -80], [-16, -96]], 5, skin.body);
+  strokeLine(brush, [[7, -80], [23, -74]], 5, skin.body);
+
+  /* 第二线游行里挥动的白手帕 */
+  if (beginPathSafe(brush)) {
+    brush.moveTo(22, -77);
+    brush.quadraticCurveTo(35, -86, 31, -70);
+    brush.quadraticCurveTo(26, -65, 21, -73);
+    brush.closePath();
+    brush.fillStyle = skin.cloth;
+    brush.fill();
+  }
+  strokeLine(brush, [[-16, -96], [6, -104]], 2.6, skin.brass);
+  if (beginPathSafe(brush)) {
+    brush.moveTo(-10, -103);
+    brush.quadraticCurveTo(4, -120, 20, -103);
+    brush.quadraticCurveTo(12, -100, 4, -104);
+    brush.quadraticCurveTo(-2, -100, -10, -103);
+    brush.closePath();
+    brush.fillStyle = skin.brass;
+    brush.fill();
+  }
+  strokeLine(brush, [[-9, -102], [19, -102]], 1.4, skin.detail);
+}
+
+function performerBone(brush, skin) {
+  drawLegs(brush, skin, 5);
+  fillPoly(brush, [[-12, -60], [12, -60], [16, -18], [4, -20], [0, -46], [-4, -20], [-16, -18]], skin.body);
+  strokeLine(brush, [[0, -84], [0, -58]], 3, skin.body);
+  for (var rib = 0; rib < 3; rib += 1) {
+    var ribY = -78 + rib * 8;
+    strokeLine(brush, [[-8, ribY], [0, ribY + 2], [8, ribY]], 2.4, skin.detail);
+  }
+  fillDisc(brush, 0, -92, 9, skin.body);
+  fillDisc(brush, -3.5, -95, 2.4, skin.dark);
+  fillDisc(brush, 4, -95, 2.4, skin.dark);
+  strokeLine(brush, [[-2, -86], [3, -86]], 1.4, skin.dark);
+  fillPoly(brush, [[-11, -101], [11, -101], [11, -97], [-11, -97]], skin.dark);
+  fillPoly(brush, [[-8, -114], [9, -114], [9, -100], [-8, -100]], skin.body);
+  strokeLine(brush, [[-8, -106], [9, -106]], 2, skin.accent);
+  strokeLine(brush, [[9, -82], [22, -78]], 5, skin.body);
+  strokeLine(brush, [[10, -86], [26, -92]], 3, skin.brass);
+  fillPoly(brush, [[25, -96], [35, -94], [34, -85], [25, -87]], skin.brass);
+}
+
+function drawPerformer(brush, kind, skin) {
+  brush.lineCap = "round";
+  brush.lineJoin = "round";
+  if (kind === "trumpet") performerTrumpet(brush, skin);
+  else if (kind === "trombone") performerTrombone(brush, skin);
+  else if (kind === "tuba") performerTuba(brush, skin);
+  else if (kind === "drum") performerDrum(brush, skin);
+  else if (kind === "dancer") performerDancer(brush, skin);
+  else performerBone(brush, skin);
+}
+
+function makeSkin(tone) {
+  if (tone === "back") {
+    return {
+      body: cssRgb(mixRgb(palette.deep, palette.teal, 0.45), 0.92),
+      dark: cssRgb(palette.ink, 0.94),
+      detail: cssRgb(palette.patina, 0.3),
+      brass: cssRgb(palette.goldDim, 0.6),
+      accent: cssRgb(palette.accent, 0.35),
+      cloth: cssRgb(mixRgb(palette.bone, palette.patina, 0.45), 0.55)
+    };
+  }
+  return {
+    body: cssRgb(mixRgb(palette.ochre, palette.brass, 0.55), 0.97),
+    dark: cssRgb(palette.ink, 0.92),
+    detail: cssRgb(palette.ink, 0.55),
+    brass: cssRgb(palette.lit, 0.92),
+    accent: cssRgb(palette.rust, 0.8),
+    cloth: cssRgb(palette.bone, 0.9)
+  };
+}
+
+function buildSprite(kind, tone, size) {
+  var unit = size / 116;
+  var spriteDpr = Math.min(view.dpr, 1.75);
+  var cssW = SPRITE_W * unit;
+  var cssH = SPRITE_H * unit;
+  var node = makeCanvas(cssW * spriteDpr, cssH * spriteDpr);
+  var brush = node.getContext("2d");
+  if (!brush) return null;
+  brush.setTransform(spriteDpr, 0, 0, spriteDpr, 0, 0);
+  brush.translate(cssW * 0.5, SPRITE_BASE_Y * unit);
+  brush.scale(unit, unit);
+  drawPerformer(brush, kind, makeSkin(tone));
+  return { canvas: node, cssW: cssW, cssH: cssH, baseY: SPRITE_BASE_Y * unit };
+}
+
+function buildParadeSprites() {
+  var size = Math.max(64, Math.min(layout.streetH * 0.66, 200));
+  if (spriteCache.ready && Math.abs(size - spriteBuildSize) < 3) return;
+  var previousSize = spriteBuildSize;
+  spriteBuildSize = size;
+  var front = {};
+  var back = {};
+  var ok = true;
+  for (var index = 0; index < PERFORMER_ORDER.length; index += 1) {
+    var kind = PERFORMER_ORDER[index];
+    if (!front[kind]) {
+      front[kind] = buildSprite(kind, "front", size);
+      if (!front[kind]) ok = false;
+    }
+    if (!back[kind]) {
+      back[kind] = buildSprite(kind, "back", size);
+      if (!back[kind]) ok = false;
+    }
+  }
+  if (!ok) {
+    spriteBuildSize = previousSize;
+    return;
+  }
+  spriteCache = { ready: true, front: front, back: back };
+}
+
+/* ---- 游行 ---- */
+function drawParadeRow(sprites, count, spacing, feetY, shift, scale, alpha, kindOffset, time, reflection) {
+  ctx.save();
+  for (var index = 0; index < count; index += 1) {
+    var kind = PERFORMER_ORDER[(index + kindOffset) % PERFORMER_ORDER.length];
+    var sprite = sprites[kind];
+    if (!sprite || !sprite.canvas || sprite.canvas.width <= 0 || sprite.canvas.height <= 0) continue;
+    var xPos = index * spacing + shift - spacing * 1.4;
+    var phase = index * 0.92 + kindOffset;
+    var bob = Math.sin(time * 3.4 + phase) * 3.4 * scale * (0.45 + Math.min(state.beatLevel, 1) * 1.15);
+    var tilt = Math.sin(time * 2.05 + phase * 0.7) * 0.028;
+
+    if (reflection) {
+      ctx.save();
+      ctx.globalAlpha = alpha * 0.14;
+      ctx.translate(xPos, feetY + bob + 3);
+      ctx.scale(scale, -scale * 0.58);
+      ctx.drawImage(sprite.canvas, -sprite.cssW * 0.5, -sprite.baseY, sprite.cssW, sprite.cssH);
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(xPos, feetY + bob);
+    ctx.rotate(tilt);
+    ctx.scale(scale, scale);
+    ctx.drawImage(sprite.canvas, -sprite.cssW * 0.5, -sprite.baseY, sprite.cssW, sprite.cssH);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawParade() {
+  if (!spriteCache || !spriteCache.ready) return;
+  var streetH = layout.streetH;
+  var time = state.t;
+  var spacing = Math.max(72, Math.min(view.w / 9, 200));
+  var frontFeet = layout.streetTop + streetH * 0.88;
+  var backFeet = layout.streetTop + streetH * 0.5;
+  var speed = state.playing ? (state.reduced ? 9 : 26) : 3;
+  var shift = (time * speed) % spacing;
+  var count = Math.ceil(view.w / spacing) + 3;
+
+  drawParadeRow(spriteCache.back, count, spacing * 0.84, backFeet, shift * 0.5 + spacing * 0.4, 0.58, 0.62, 3, time, false);
+  drawParadeRow(spriteCache.front, count, spacing, frontFeet, shift, 1, 1, 0, time, true);
+}
+
+/* ---- 底板 ---- */
+var plate = null;
+
+function drawSky(brush, w, h, groundY) {
+  var sky = brush.createLinearGradient(0, 0, 0, Math.max(1, groundY));
+  addStop(sky, 0, cssRgb(palette.ink));
+  addStop(sky, 0.42, cssRgb(mixRgb(palette.deep, palette.peacock, 0.55)));
+  addStop(sky, 0.8, cssRgb(palette.peacock));
+  addStop(sky, 1, cssRgb(mixRgb(palette.peacock, palette.teal, 0.55)));
+  brush.fillStyle = sky;
+  brush.fillRect(0, 0, w, groundY + 1);
+
+  var horizon = brush.createRadialGradient(w * 0.5, groundY, 0, w * 0.5, groundY, Math.max(w, h) * 0.62);
+  addStop(horizon, 0, cssRgb(palette.brass, 0.15));
+  addStop(horizon, 0.5, cssRgb(palette.ochre, 0.06));
+  addStop(horizon, 1, cssRgb(palette.ochre, 0));
+  brush.fillStyle = horizon;
+  brush.fillRect(0, 0, w, groundY + 1);
+}
+
+function drawMoon(brush) {
+  var cx = layout.moonX, cy = layout.moonY, radius = Math.max(40, layout.moonR);
+  var disc = brush.createRadialGradient(cx, cy, radius * 0.05, cx, cy, radius);
+  addStop(disc, 0, cssRgb(palette.bone, 0.115));
+  addStop(disc, 0.62, cssRgb(palette.bone, 0.07));
+  addStop(disc, 0.93, cssRgb(palette.patina, 0.05));
+  addStop(disc, 1, cssRgb(palette.patina, 0));
+  brush.fillStyle = disc;
+  brush.beginPath();
+  brush.arc(cx, cy, radius, 0, Math.PI * 2);
+  brush.fill();
+
+  brush.save();
+  brush.globalAlpha = 0.16;
+  brush.strokeStyle = cssRgb(palette.brass, 0.55);
+  brush.lineWidth = 1.2;
+  brush.beginPath();
+  brush.arc(cx, cy, radius * 0.995, 0, Math.PI * 2);
+  brush.stroke();
+  brush.beginPath();
+  brush.arc(cx, cy, radius * 0.93, 0, Math.PI * 2);
+  brush.stroke();
+  brush.restore();
+
+  /* 月面上的旧刻痕：稀疏弧线与星点，像铁皮招牌的磨痕 */
+  var rng = mulberry32(38901);
+  brush.save();
+  brush.globalAlpha = 0.1;
+  brush.strokeStyle = cssRgb(palette.bone, 0.5);
+  brush.lineWidth = 1;
+  for (var markIndex = 0; markIndex < 26; markIndex += 1) {
+    var markAngle = rng() * Math.PI * 2;
+    var markDist = radius * (0.2 + rng() * 0.7);
+    var markLength = radius * (0.03 + rng() * 0.12);
+    brush.beginPath();
+    brush.arc(cx, cy, markDist, markAngle, markAngle + markLength / Math.max(1, markDist));
+    brush.stroke();
+  }
+  brush.restore();
+}
+
+function drawTownhouses(brush, w, h, groundY) {
+  var rng = mulberry32(38917);
+  var houseW = Math.max(70, Math.min(170, w / 6.4));
+  var maxHouseH = Math.max(50, Math.min(h * 0.185, w * 0.12));
+  var houseX = -houseW * 0.4;
+  var guard = 0;
+  while (houseX < w + houseW * 0.4 && guard < 32) {
+    guard += 1;
+    var width = houseW * (0.85 + rng() * 0.55);
+    var height = maxHouseH * (0.62 + rng() * 0.55);
+    var top = groundY - height;
+    var wall = mixRgb(palette.deep, palette.ink, 0.3 + rng() * 0.4);
+
+    brush.fillStyle = cssRgb(wall, 0.98);
+    brush.fillRect(houseX, top, width, height + 2);
+
+    /* 女儿墙与檐口 */
+    brush.fillStyle = cssRgb(mixRgb(wall, palette.patina, 0.35), 0.95);
+    brush.fillRect(houseX, top, width, Math.max(2, h * 0.004));
+    brush.fillStyle = cssRgb(palette.ink, 0.35);
+    brush.fillRect(houseX, top + Math.max(2, h * 0.004), width, Math.max(2, h * 0.006));
+
+    /* 铁艺长廊（三叶草栏板） */
+    var galleryY = top + height * 0.52;
+    brush.fillStyle = cssRgb(palette.ink, 0.55);
+    brush.fillRect(houseX + 1, galleryY, width - 2, Math.max(2, h * 0.004));
+    brush.strokeStyle = cssRgb(palette.brass, 0.34);
+    brush.lineWidth = 1;
+    brush.beginPath();
+    brush.moveTo(houseX + 2, galleryY);
+    brush.lineTo(houseX + width - 2, galleryY);
+    brush.stroke();
+    var balusterGap = Math.max(4, width / 9);
+    var balusterX = houseX + balusterGap * 0.5;
+    while (balusterX < houseX + width - 2 && balusterGap > 0.5) {
+      brush.beginPath();
+      brush.arc(balusterX, galleryY + balusterGap * 0.28, balusterGap * 0.22, Math.PI, 0);
+      brush.stroke();
+      balusterX += balusterGap;
+    }
+
+    /* 落地窗 */
+    var windowW = Math.max(4, width / 7);
+    var windowH = Math.max(7, height * 0.26);
+    var cols = Math.max(2, Math.floor(width / (windowW * 1.9)));
+    var colStep = width / cols;
+    for (var col = 0; col < cols; col += 1) {
+      var windowX = houseX + colStep * (col + 0.5) - windowW * 0.5;
+      var litWindow = rng() > 0.62;
+      brush.fillStyle = litWindow ? cssRgb(palette.brass, 0.2 + rng() * 0.16) : cssRgb(palette.ink, 0.5);
+      brush.fillRect(windowX, top + height * 0.14, windowW, windowH);
+      brush.fillStyle = cssRgb(palette.ink, 0.45);
+      brush.fillRect(windowX, top + height * 0.14, windowW, Math.max(2, windowH * 0.14));
+    }
+
+    houseX += width + Math.max(2, w * 0.002);
+  }
+}
+
+function drawGround(brush, w, h, groundY) {
+  var street = brush.createLinearGradient(0, groundY, 0, h);
+  addStop(street, 0, cssRgb(mixRgb(palette.ink, palette.deep, 0.55)));
+  addStop(street, 0.45, cssRgb(palette.ink));
+  addStop(street, 1, cssRgb([3, 12, 14]));
+  brush.fillStyle = street;
+  brush.fillRect(0, groundY, w, h - groundY);
+
+  /* 湿石板路的横向弧线 */
+  brush.save();
+  brush.strokeStyle = cssRgb(palette.patina, 0.13);
+  brush.lineWidth = 1;
+  var rowH = Math.max(9, (h - groundY) / 9);
+  for (var row = 0; row < 10; row += 1) {
+    var rowY = groundY + rowH * row + rowH * 0.6;
+    var rowStep = rowH * (1.6 + row * 0.24);
+    var rowOffset = (row % 2) * rowStep * 0.5;
+    for (var stoneX = -rowStep; stoneX < w + rowStep; stoneX += rowStep) {
+      brush.beginPath();
+      brush.arc(stoneX + rowOffset, rowY, rowStep * 0.42, Math.PI * 1.08, Math.PI * 1.92);
+      brush.stroke();
+    }
+  }
+  brush.restore();
+
+  /* 路灯/橱窗在湿街上的倒影 */
+  var rng = mulberry32(38933);
+  brush.save();
+  for (var beamIndex = 0; beamIndex < 9; beamIndex += 1) {
+    var beamX = rng() * w;
+    var beamW = w * (0.005 + rng() * 0.016);
+    var beamH = (h - groundY) * (0.3 + rng() * 0.5);
+    var beam = brush.createLinearGradient(0, groundY, 0, groundY + beamH);
+    addStop(beam, 0, cssRgb(palette.brass, 0.12));
+    addStop(beam, 1, cssRgb(palette.brass, 0));
+    brush.fillStyle = beam;
+    brush.fillRect(beamX, groundY, beamW, beamH);
+  }
+  brush.restore();
+}
+
+function drawWeathering(brush, w, h) {
+  var rng = mulberry32(38939);
+
+  /* 斑驳色块 */
+  brush.save();
+  for (var blobIndex = 0; blobIndex < 14; blobIndex += 1) {
+    var blobX = rng() * w;
+    var blobY = rng() * h;
+    var blobRadius = Math.max(60, (0.14 + rng() * 0.34) * Math.max(w, h));
+    var tint = rng() > 0.6 ? palette.ochre : (rng() > 0.35 ? palette.teal : palette.ink);
+    var blob = brush.createRadialGradient(blobX, blobY, 0, blobX, blobY, blobRadius);
+    addStop(blob, 0, cssRgb(tint, 0.05 + rng() * 0.05));
+    addStop(blob, 1, cssRgb(tint, 0));
+    brush.fillStyle = blob;
+    brush.fillRect(blobX - blobRadius, blobY - blobRadius, blobRadius * 2, blobRadius * 2);
+  }
+  brush.restore();
+
+  /* 纸纹与铁皮划痕 */
+  var tile = makeCanvas(128, 128);
+  var tileCtx = tile.getContext("2d");
+  if (tileCtx) {
+    var img = tileCtx.createImageData(128, 128);
+    var data = img.data;
+    for (var py = 0; py < 128; py += 1) {
+      for (var px = 0; px < 128; px += 1) {
+        var idx = (py * 128 + px) * 4;
+        var grainValue = rng();
+        data[idx] = 236;
+        data[idx + 1] = 224;
+        data[idx + 2] = 196;
+        data[idx + 3] = grainValue > 0.988 ? 86 : (grainValue > 0.9 ? 22 : 0);
+      }
+    }
+    tileCtx.putImageData(img, 0, 0);
+    var pattern = brush.createPattern(tile, "repeat");
+    if (pattern) {
+      brush.save();
+      brush.globalAlpha = 0.5;
+      brush.fillStyle = pattern;
+      brush.fillRect(0, 0, w, h);
+      brush.restore();
+    }
+  }
+
+  brush.save();
+  brush.strokeStyle = cssRgb(palette.bone, 0.05);
+  brush.lineWidth = 1;
+  for (var scratchIndex = 0; scratchIndex < 40; scratchIndex += 1) {
+    var scratchX = rng() * w;
+    var scratchY = rng() * h;
+    var scratchLength = 20 + rng() * 160;
+    brush.beginPath();
+    brush.moveTo(scratchX, scratchY);
+    brush.lineTo(scratchX + scratchLength, scratchY + (rng() - 0.5) * 4);
+    brush.stroke();
+  }
+  brush.restore();
+}
+
+function drawVignette(brush, w, h) {
+  var edge = brush.createRadialGradient(w * 0.5, h * 0.46, Math.min(w, h) * 0.28, w * 0.5, h * 0.5, Math.max(w, h) * 0.78);
+  addStop(edge, 0, cssRgb(palette.ink, 0));
+  addStop(edge, 0.72, cssRgb(palette.ink, 0.35));
+  addStop(edge, 1, cssRgb(palette.ink, 0.88));
+  brush.fillStyle = edge;
+  brush.fillRect(0, 0, w, h);
+}
+
+function frameLine(brush, x1, y1, x2, y2, rng) {
+  var length = Math.max(1, Math.hypot(x2 - x1, y2 - y1));
+  var steps = Math.max(4, Math.min(40, Math.ceil(length / 34)));
+  for (var stepIndex = 0; stepIndex < steps; stepIndex += 1) {
+    if (rng() < 0.22) continue;
+    var from = stepIndex / steps;
+    var to = Math.min(1, (stepIndex + 0.74) / steps);
+    brush.beginPath();
+    brush.moveTo(x1 + (x2 - x1) * from, y1 + (y2 - y1) * from);
+    brush.lineTo(x1 + (x2 - x1) * to, y1 + (y2 - y1) * to);
+    brush.stroke();
+  }
+}
+
+/* 铁皮招牌的旧边框：缺口的金线 + 四角铆钉 */
+function drawSignFrame(brush, w, h) {
+  var inset = Math.max(9, Math.min(w, h) * 0.019);
+  var rng = mulberry32(38959);
+  brush.save();
+  brush.lineCap = "butt";
+  brush.strokeStyle = cssRgb(palette.brass, 0.2);
+  brush.lineWidth = 1.4;
+  frameLine(brush, inset, inset, w - inset, inset, rng);
+  frameLine(brush, inset, inset, inset, h - inset, rng);
+  frameLine(brush, w - inset, inset, w - inset, h - inset, rng);
+  frameLine(brush, inset, h - inset, w - inset, h - inset, rng);
+
+  brush.strokeStyle = cssRgb(palette.bone, 0.07);
+  brush.lineWidth = 1;
+  frameLine(brush, inset + 5, inset + 5, w - inset - 5, inset + 5, rng);
+  frameLine(brush, inset + 5, h - inset - 5, w - inset - 5, h - inset - 5, rng);
+
+  var rivet = Math.max(2, inset * 0.28);
+  var corners = [
+    [inset, inset], [w - inset, inset], [inset, h - inset], [w - inset, h - inset]
+  ];
+  brush.fillStyle = cssRgb(palette.brass, 0.5);
+  for (var cornerIndex = 0; cornerIndex < corners.length; cornerIndex += 1) {
+    brush.beginPath();
+    brush.arc(corners[cornerIndex][0], corners[cornerIndex][1], rivet, 0, TAU);
+    brush.fill();
+    brush.beginPath();
+    brush.arc(corners[cornerIndex][0], corners[cornerIndex][1], rivet * 0.45, 0, TAU);
+    brush.fillStyle = cssRgb(palette.ink, 0.8);
+    brush.fill();
+    brush.fillStyle = cssRgb(palette.brass, 0.5);
+  }
+  brush.restore();
+}
+
+/* 街口的暖雾：煤气灯、橱窗、人堆的热气 */
+function drawWarmHaze(brush, w, h) {
+  var rng = mulberry32(38961);
+  var groundY = layout.streetTop;
+  brush.save();
+  brush.globalCompositeOperation = "lighter";
+  for (var hazeIndex = 0; hazeIndex < 5; hazeIndex += 1) {
+    var hazeX = w * (0.1 + rng() * 0.8);
+    var hazeRadius = Math.max(60, w * (0.055 + rng() * 0.07));
+    var hazeY = groundY - h * 0.035;
+    var haze = brush.createRadialGradient(hazeX, hazeY, 0, hazeX, hazeY, hazeRadius);
+    addStop(haze, 0, cssRgb(palette.lit, 0.1));
+    addStop(haze, 0.55, cssRgb(palette.ochre, 0.04));
+    addStop(haze, 1, cssRgb(palette.brass, 0));
+    brush.fillStyle = haze;
+    brush.fillRect(hazeX - hazeRadius, hazeY - hazeRadius, hazeRadius * 2, hazeRadius * 2);
+  }
+  brush.restore();
+}
+
+/* 丝网印刷的网点屏 */
+function drawHalftone(brush, w, h) {
+  var tileSize = 12;
+  var tile = makeCanvas(tileSize, tileSize);
+  var tileCtx = tile.getContext("2d");
+  if (!tileCtx) return;
+  tileCtx.fillStyle = cssRgb(palette.bone, 0.55);
+  tileCtx.beginPath();
+  tileCtx.arc(tileSize * 0.5, tileSize * 0.5, 1.35, 0, TAU);
+  tileCtx.fill();
+  var pattern = brush.createPattern(tile, "repeat");
+  if (!pattern) return;
+  brush.save();
+  brush.globalAlpha = 0.16;
+  brush.fillStyle = pattern;
+  brush.fillRect(0, layout.friezeH, w, Math.max(0, layout.streetTop - layout.friezeH));
+  brush.restore();
+}
+
+function buildPlate() {
+  var w = view.w, h = view.h, dpr = view.dpr;
+  var pw = Math.max(1, Math.round(w * dpr));
+  var ph = Math.max(1, Math.round(h * dpr));
+  if (!plate) plate = makeCanvas(pw, ph);
+  else if (plate.width !== pw || plate.height !== ph) { plate.width = pw; plate.height = ph; }
+  var brush = plate.getContext("2d");
+  if (!brush) return;
+  brush.setTransform(dpr, 0, 0, dpr, 0, 0);
+  brush.clearRect(0, 0, w, h);
+
+  computeLayout(w, h);
+  drawSky(brush, w, h, layout.streetTop);
+  drawMoon(brush);
+  drawTownhouses(brush, w, h, layout.streetTop);
+  drawGround(brush, w, h, layout.streetTop);
+  drawWarmHaze(brush, w, h);
+  drawHalftone(brush, w, h);
+  drawWeathering(brush, w, h);
+  drawFrieze(brush, w, h);
+  drawVignette(brush, w, h);
+  drawSignFrame(brush, w, h);
+}
+
+/* ---- 歌词 ---- */
+var lyricCache = { key: "", rows: null };
+
+function lyricFont(size) {
+  return "600 " + Math.round(size) + "px 'Songti SC','STSong','SimSun','Noto Serif CJK SC',Georgia,serif";
+}
+
+function lyricCaptionFont(size) {
+  return "500 " + Math.round(size) + "px Georgia,'Times New Roman',serif";
+}
+
+function charTimeAt(line, index) {
+  var chars = line.chars;
+  if (chars && chars.length > 1 && line.text.length > 1) {
+    var mapped = Math.floor((index / line.text.length) * chars.length);
+    if (mapped < 0) mapped = 0;
+    if (mapped > chars.length - 1) mapped = chars.length - 1;
+    return chars[mapped].t;
+  }
+  var span = Math.max(0.4, line.dur);
+  return line.t + span * (index / Math.max(1, line.text.length));
+}
+
+function tokenizeLine(text) {
+  var tokens = [];
+  var index = 0;
+  var guard = 0;
+  while (index < text.length && guard < 600) {
+    guard += 1;
+    var charCode = text.charCodeAt(index);
+    if (charCode >= 0x2E80 || text.charAt(index) === "\u3000") {
+      tokens.push({ text: text.substr(index, 1), start: index });
+      index += 1;
+    } else {
+      var start = index;
+      while (index < text.length && text.charCodeAt(index) < 0x2E80) index += 1;
+      tokens.push({ text: text.substring(start, index), start: start });
+    }
+  }
+  return tokens;
+}
+
+function wrapTokens(line, maxWidth) {
+  ctx.font = lyricFont(lyricCache.size || 40);
+  var tokens = tokenizeLine(line.text || "");
+  var rows = [];
+  var row = { units: [], width: 0 };
+  for (var index = 0; index < tokens.length; index += 1) {
+    var token = tokens[index];
+    var tokenText = token.text;
+    var width = ctx.measureText(tokenText).width;
+    if (row.width + width > maxWidth && row.units.length > 0) {
+      rows.push(row);
+      row = { units: [], width: 0 };
+      if (/^\s+$/.test(tokenText)) continue;
+      tokenText = tokenText.replace(/^\s+/, "");
+      width = ctx.measureText(tokenText).width;
+      if (!tokenText) continue;
+    }
+    row.units.push({ text: tokenText, width: width, time: charTimeAt(line, token.start) });
+    row.width += width;
+  }
+  if (row.units.length) rows.push(row);
+  if (!rows.length) rows.push({ units: [], width: 0 });
+  return rows;
+}
+
+function rowsFor(line, maxWidth, size) {
+  var key = line.text + "|" + Math.round(line.t * 100) + "|" + Math.round(size) + "|" + Math.round(maxWidth);
+  if (lyricCache.key === key && lyricCache.rows) return lyricCache.rows;
+  lyricCache.size = size;
+  var rows = wrapTokens(line, maxWidth);
+  lyricCache = { key: key, rows: rows, size: size };
+  return rows;
+}
+
+function fitLyric(line, maxWidth, baseSize, availableHeight) {
+  var size = Math.max(12, baseSize);
+  var rows = rowsFor(line, maxWidth, size);
+  for (var attempt = 0; attempt < 4; attempt += 1) {
+    var blockHeight = rows.length * size * 1.36;
+    var widest = 0;
+    for (var index = 0; index < rows.length; index += 1) widest = Math.max(widest, rows[index].width);
+    var maxRows = Math.max(2, Math.min(4, Math.floor(availableHeight / (size * 1.36))));
+    if (rows.length <= maxRows && blockHeight <= availableHeight && widest <= maxWidth * 1.06) break;
+    size = Math.max(12, size * 0.82);
+    rows = rowsFor(line, maxWidth, size);
+  }
+  return { rows: rows, size: size };
+}
+
+function drawRow(row, centerX, y, size, time, litColor, dimColor, squeeze) {
+  if (!row.units.length) return;
+  var prefix = centerX - (row.width * squeeze) * 0.5;
+
+  ctx.save();
+  ctx.translate(prefix, 0);
+  ctx.scale(squeeze, 1);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  /* 压印影 + 未唱到的骨白 + 赭石套色幽灵 */
+  var shadowX = Math.max(1, size * 0.03) / squeeze;
+  var shadowY = Math.max(1.2, size * 0.045);
+  var ghostX = Math.max(0.8, size * 0.022) / squeeze;
+  var ghostY = Math.max(1, size * 0.028);
+  var penX = 0;
+  for (var index = 0; index < row.units.length; index += 1) {
+    var unit = row.units[index];
+    ctx.fillStyle = cssRgb(palette.ink, 0.48);
+    ctx.fillText(unit.text, penX + shadowX, y + shadowY);
+    ctx.fillStyle = dimColor;
+    ctx.fillText(unit.text, penX, y);
+    ctx.fillStyle = cssRgb(palette.ochre, 0.22);
+    ctx.fillText(unit.text, penX - ghostX, y - ghostY);
+    penX += unit.width;
+  }
+
+  /* 唱到的字：暗金点亮 */
+  penX = 0;
+  for (var litIndex = 0; litIndex < row.units.length; litIndex += 1) {
+    var litUnit = row.units[litIndex];
+    var age = time - litUnit.time;
+    if (age > 0) {
+      var reveal = Math.min(1, age / 0.12);
+      ctx.globalAlpha = 0.35 + reveal * 0.65;
+      ctx.fillStyle = litColor;
+      ctx.fillText(litUnit.text, penX, y);
+      ctx.globalAlpha = 1;
+    }
+    penX += litUnit.width;
+  }
+  ctx.restore();
+}
+
+function drawOrnament(centerX, y, halfWidth) {
+  ctx.save();
+  ctx.strokeStyle = cssRgb(palette.brass, 0.5);
+  ctx.lineWidth = 1.2;
+  if (typeof ctx.beginPath === "function") {
+    ctx.beginPath();
+    ctx.moveTo(centerX - halfWidth, y);
+    ctx.lineTo(centerX - 16, y);
+    ctx.moveTo(centerX + 16, y);
+    ctx.lineTo(centerX + halfWidth, y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(centerX, y - 5);
+    ctx.lineTo(centerX + 5, y);
+    ctx.lineTo(centerX, y + 5);
+    ctx.lineTo(centerX - 5, y);
+    ctx.closePath();
+    ctx.fillStyle = cssRgb(palette.brass, 0.7);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawProgressRule(centerX, y, width, fraction) {
+  ctx.save();
+  ctx.fillStyle = cssRgb(palette.goldDim, 0.45);
+  ctx.fillRect(centerX - width * 0.5, y, width, 2);
+  var filled = Math.max(0, Math.min(1, fraction));
+  ctx.fillStyle = cssRgb(palette.brass, 0.95);
+  ctx.fillRect(centerX - width * 0.5, y, width * filled, 2);
+  ctx.beginPath();
+  ctx.arc(centerX - width * 0.5 + width * filled, y + 1, 3.2, 0, TAU);
+  ctx.fillStyle = cssRgb(palette.lit, 0.9);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawSigil(centerX, centerY, size) {
+  ctx.save();
+  ctx.strokeStyle = cssRgb(palette.brass, 0.85);
+  ctx.lineWidth = Math.max(1.2, size * 0.05);
+  ctx.lineCap = "round";
+  if (typeof ctx.beginPath !== "function") { ctx.restore(); return; }
+
+  /* 双头蛇 */
+  ctx.beginPath();
+  ctx.moveTo(centerX - size * 0.46, centerY + size * 0.1);
+  ctx.bezierCurveTo(centerX - size * 0.2, centerY + size * 0.42, centerX + size * 0.1, centerY - size * 0.2, centerX + size * 0.46, centerY + size * 0.14);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(centerX - size * 0.5, centerY + size * 0.02, size * 0.075, 0, TAU);
+  ctx.fillStyle = cssRgb(palette.brass, 0.85);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(centerX + size * 0.5, centerY + size * 0.06, size * 0.075, 0, TAU);
+  ctx.fill();
+
+  /* 小号 */
+  ctx.beginPath();
+  ctx.moveTo(centerX - size * 0.24, centerY + size * 0.36);
+  ctx.lineTo(centerX + size * 0.24, centerY + size * 0.36);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(centerX + size * 0.24, centerY + size * 0.26);
+  ctx.lineTo(centerX + size * 0.4, centerY + size * 0.24);
+  ctx.lineTo(centerX + size * 0.4, centerY + size * 0.48);
+  ctx.lineTo(centerX + size * 0.24, centerY + size * 0.46);
+  ctx.closePath();
+  ctx.fillStyle = cssRgb(palette.brass, 0.42);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawEmptyState() {
+  var centerX = layout.moonX;
+  var centerY = layout.lyricCenter;
+  var radius = Math.max(48, Math.min(layout.moonR * 0.62, view.h * 0.19, view.w * 0.22));
+
+  ctx.save();
+  ctx.strokeStyle = cssRgb(palette.brass, 0.42);
+  ctx.lineWidth = 1.3;
+  if (typeof ctx.beginPath === "function") {
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius, 0, TAU);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius * 0.9, 0, TAU);
+    ctx.stroke();
+    for (var tick = 0; tick < 24; tick += 1) {
+      var angle = (tick / 24) * TAU;
+      var inner = radius * (tick % 3 === 0 ? 0.9 : 0.94);
+      ctx.beginPath();
+      ctx.moveTo(centerX + Math.cos(angle) * inner, centerY + Math.sin(angle) * inner);
+      ctx.lineTo(centerX + Math.cos(angle) * radius, centerY + Math.sin(angle) * radius);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+
+  drawSigil(centerX, centerY - radius * 0.3, radius * 0.62);
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = lyricFont(Math.min(radius * 0.5, view.w * 0.075));
+  ctx.fillStyle = cssRgb(palette.lit, 0.94);
+  ctx.fillText("纯器乐", centerX, centerY + radius * 0.34);
+
+  ctx.font = lyricCaptionFont(Math.max(9, Math.min(radius * 0.15, 15)));
+  ctx.fillStyle = cssRgb(palette.patina, 0.9);
+  ctx.fillText("I N S T R U M E N T A L", centerX, centerY + radius * 0.66);
+}
+
+function drawLyrics() {
+  var time = state.t;
+  if (!state.lines.length) { drawEmptyState(); return; }
+
+  var centerX = layout.moonX;
+  var baseSize = Math.min(view.w * (view.w < 640 ? 0.072 : 0.05), view.h * 0.088, 96);
+  var maxWidth = layout.lyricMaxW;
+  var availableHeight = Math.max(80, layout.lyricBottom - layout.lyricTop);
+
+  if (state.idx < 0) {
+    var upcoming = state.lines[0];
+    if (!upcoming) { drawEmptyState(); return; }
+    var preview = fitLyric(upcoming, maxWidth, baseSize * 0.82, availableHeight);
+    var previewTop = layout.lyricCenter - (preview.rows.length * preview.size * 1.36) * 0.5;
+    ctx.save();
+    ctx.globalAlpha = 0.62;
+    ctx.font = lyricFont(preview.size);
+    for (var previewRow = 0; previewRow < preview.rows.length; previewRow += 1) {
+      drawRow(preview.rows[previewRow], centerX, previewTop + previewRow * preview.size * 1.36 + preview.size * 0.5, preview.size, time, cssRgb(palette.lit, 0.85), cssRgb(mixRgb(palette.bone, palette.patina, 0.45), 0.7), 1);
+    }
+    ctx.restore();
+    return;
+  }
+
+  var line = state.lines[state.idx];
+  if (!line) { drawEmptyState(); return; }
+
+  var fitted = fitLyric(line, maxWidth, baseSize, availableHeight * 0.8);
+  var size = fitted.size;
+  ctx.font = lyricFont(size);
+  var lineHeight = size * 1.36;
+  var blockHeight = fitted.rows.length * lineHeight;
+  var top = layout.lyricCenter - blockHeight * 0.5;
+  var blockBottom = top + blockHeight;
+
+  var widest = 0;
+  for (var rowIndex = 0; rowIndex < fitted.rows.length; rowIndex += 1) widest = Math.max(widest, fitted.rows[rowIndex].width);
+  var squeeze = widest > maxWidth ? Math.max(0.6, maxWidth / widest) : 1;
+
+  var ornamentY = Math.max(layout.friezeH + size * 0.55, top - size * 0.72);
+  drawOrnament(centerX, ornamentY, Math.min(maxWidth * 0.42, size * 6));
+
+  var litColor = cssRgb(palette.lit, 1);
+  var dimColor = cssRgb(mixRgb(palette.bone, palette.patina, 0.4), 0.78);
+  for (var rowDraw = 0; rowDraw < fitted.rows.length; rowDraw += 1) {
+    drawRow(fitted.rows[rowDraw], centerX, top + rowDraw * lineHeight + lineHeight * 0.5, size, time, litColor, dimColor, squeeze);
+  }
+
+  var progress = line.dur > 0 ? (time - line.t) / line.dur : 0;
+  var ruleY = Math.min(blockBottom + size * 0.5, layout.streetTop - size * 0.2);
+  drawProgressRule(centerX, ruleY, Math.min(maxWidth * 0.5, size * 7), progress);
+
+  var nextLine = state.lines[state.idx + 1];
+  if (nextLine && blockHeight < availableHeight * 0.68) {
+    var nextSize = Math.max(12, size * 0.46);
+    var nextY = Math.min(blockBottom + size * 1.45, layout.streetTop - size * 0.42);
+    ctx.save();
+    ctx.globalAlpha = 0.42;
+    ctx.font = lyricFont(nextSize);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    var nextText = nextLine.text.length > 34 ? nextLine.text.substr(0, 33) + "…" : nextLine.text;
+    ctx.fillStyle = cssRgb(mixRgb(palette.bone, palette.patina, 0.45), 0.85);
+    ctx.fillText(nextText, centerX, nextY);
+    ctx.restore();
+  }
+}
+
+/* ---- 气层：灯、卡、尘 ---- */
+var sparkSeeds = [];
+var tarotSprite = null;
+
+function initSparks() {
+  var rng = mulberry32(38977);
+  sparkSeeds = [];
+  for (var index = 0; index < 34; index += 1) {
+    sparkSeeds.push({
+      x: rng(), y: rng(),
+      drift: 0.4 + rng() * 1.1,
+      size: 0.7 + rng() * 2.0,
+      phase: rng() * TAU
+    });
+  }
+}
+
+function drawLanternPulse() {
+  if (!lanternPositions.length) return;
+  var energy = Math.min(1, state.bass * 0.65 + state.beatLevel * 0.7 + state.level * 0.25);
+  for (var index = 0; index < lanternPositions.length; index += 1) {
+    var lamp = lanternPositions[index];
+    var radius = lamp.size * (4.6 + energy * 3.4);
+    var glow = ctx.createRadialGradient(lamp.x, lamp.y, 0, lamp.x, lamp.y, radius);
+    addStop(glow, 0, cssRgb(palette.lit, 0.08 + energy * 0.16));
+    addStop(glow, 0.45, cssRgb(palette.brass, 0.04 + energy * 0.06));
+    addStop(glow, 1, cssRgb(palette.brass, 0));
+    ctx.fillStyle = glow;
+    ctx.fillRect(lamp.x - radius, lamp.y - radius, radius * 2, radius * 2);
+  }
+}
+
+function drawSparks() {
+  if (state.reduced || !sparkSeeds.length) return;
+  var energy = 0.25 + Math.min(1, state.treble) * 0.75;
+  var top = layout.friezeH + 6;
+  var bottom = layout.streetTop - 8;
+  var height = bottom - top;
+  if (height <= 0) return;
+  var time = state.t;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = cssRgb(palette.brass, 1);
+  for (var index = 0; index < sparkSeeds.length; index += 1) {
+    var seed = sparkSeeds[index];
+    var progress = ((seed.y - time * 0.016 * seed.drift) % 1 + 1) % 1;
+    var pulse = Math.sin(seed.phase + time * 1.6);
+    pulse = pulse * pulse;
+    var alpha = (0.1 + energy * 0.32) * (0.35 + 0.65 * pulse);
+    if (alpha <= 0.01) continue;
+    var xPos = seed.x * layout.w + Math.sin(time * 0.45 + seed.phase) * layout.w * 0.014;
+    var yPos = bottom - progress * height;
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(xPos, yPos, seed.size, 0, TAU);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function buildTarotSprite() {
+  tarotSprite = null;
+  var cardH = Math.min(layout.streetH * 0.78, view.h * 0.27, 250);
+  if (cardH < 96 || view.w < 760) return;
+  var cardW = cardH * 0.62;
+  var spriteDpr = Math.min(view.dpr, 1.75);
+  var node = makeCanvas(cardW * spriteDpr, cardH * spriteDpr);
+  var brush = node.getContext("2d");
+  if (!brush) return;
+  brush.setTransform(spriteDpr, 0, 0, spriteDpr, 0, 0);
+  brush.scale(cardW / 100, cardH / 164);
+
+  var cardBg = brush.createLinearGradient(0, 0, 0, 164);
+  addStop(cardBg, 0, cssRgb(palette.ink, 0.98));
+  addStop(cardBg, 0.5, cssRgb(mixRgb(palette.deep, palette.peacock, 0.55), 0.98));
+  addStop(cardBg, 1, cssRgb(palette.ink, 0.98));
+  brush.fillStyle = cardBg;
+  brush.fillRect(0, 0, 100, 164);
+
+  brush.strokeStyle = cssRgb(palette.brass, 0.9);
+  brush.lineWidth = 1.8;
+  brush.strokeRect(4, 4, 92, 156);
+  brush.strokeStyle = cssRgb(palette.brass, 0.42);
+  brush.lineWidth = 0.9;
+  brush.strokeRect(7.5, 7.5, 85, 149);
+
+  brush.save();
+  brush.strokeStyle = cssRgb(palette.brass, 0.45);
+  brush.lineWidth = 0.9;
+  for (var ray = 0; ray < 16; ray += 1) {
+    var angle = (ray / 16) * TAU;
+    var inner = ray % 2 === 0 ? 22 : 19;
+    brush.beginPath();
+    brush.moveTo(50 + Math.cos(angle) * inner, 76 + Math.sin(angle) * inner);
+    brush.lineTo(50 + Math.cos(angle) * (inner + 9), 76 + Math.sin(angle) * (inner + 9));
+    brush.stroke();
+  }
+  brush.restore();
+
+  /* 戴礼帽的骷髅 */
+  fillDisc(brush, 50, 74, 15, cssRgb(mixRgb(palette.bone, palette.patina, 0.35), 0.95));
+  fillDisc(brush, 44.5, 71, 4.2, cssRgb(palette.ink, 0.95));
+  fillDisc(brush, 55.5, 71, 4.2, cssRgb(palette.ink, 0.95));
+  fillPoly(brush, [[50, 76], [46.5, 81], [53.5, 81]], cssRgb(palette.ink, 0.9));
+  strokeLine(brush, [[44, 86], [56, 86]], 1, cssRgb(palette.ink, 0.7));
+  strokeLine(brush, [[48, 86], [48, 90]], 0.8, cssRgb(palette.ink, 0.7));
+  strokeLine(brush, [[52, 86], [52, 90]], 0.8, cssRgb(palette.ink, 0.7));
+  fillPoly(brush, [[34, 60], [66, 60], [64, 56], [36, 56]], cssRgb(palette.ink, 0.95));
+  fillPoly(brush, [[41, 56], [59, 56], [57, 36], [43, 36]], cssRgb(palette.ink, 0.95));
+  strokeLine(brush, [[43, 47], [57, 47]], 1.2, cssRgb(palette.brass, 0.8));
+
+  /* 交叉的小号与骨头 */
+  strokeLine(brush, [[16, 124], [66, 104]], 2, cssRgb(palette.brass, 0.85));
+  fillPoly(brush, [[62, 101], [76, 99], [74, 108], [61, 107]], cssRgb(palette.brass, 0.7));
+  strokeLine(brush, [[30, 106], [84, 126]], 2.4, cssRgb(mixRgb(palette.bone, palette.patina, 0.3), 0.8));
+  fillDisc(brush, 30, 106, 2.6, cssRgb(mixRgb(palette.bone, palette.patina, 0.3), 0.85));
+  fillDisc(brush, 84, 126, 2.6, cssRgb(mixRgb(palette.bone, palette.patina, 0.3), 0.85));
+
+  /* 底部符号行 */
+  strokeLine(brush, [[24, 143], [76, 143]], 0.9, cssRgb(palette.brass, 0.5));
+  fillDisc(brush, 42, 148, 1.4, cssRgb(palette.brass, 0.8));
+  fillDisc(brush, 50, 148, 1.4, cssRgb(palette.brass, 0.8));
+  fillDisc(brush, 58, 148, 1.4, cssRgb(palette.brass, 0.8));
+
+  tarotSprite = { canvas: node, cssW: cardW, cssH: cardH };
+}
+
+function drawTarot() {
+  if (!tarotSprite || !tarotSprite.canvas || tarotSprite.canvas.width <= 0) return;
+  var sway = state.reduced ? 0 : Math.sin(state.t * 0.55) * 0.025;
+  var drift = state.reduced ? 0 : Math.sin(state.t * 0.8 + 1.2) * 3.5;
+  var xPos = view.w - tarotSprite.cssW * 0.5 - view.w * 0.035;
+  var yPos = layout.streetTop - layout.streetH * 0.42 + drift;
+  ctx.save();
+  ctx.translate(xPos, yPos);
+  ctx.rotate(-0.1 + sway);
+  ctx.globalAlpha = 0.94;
+  ctx.drawImage(tarotSprite.canvas, -tarotSprite.cssW * 0.5, -tarotSprite.cssH * 0.5, tarotSprite.cssW, tarotSprite.cssH);
+  ctx.restore();
+}
+
+function drawCaption() {
+  if (view.h < 400 || view.w < 560) return;
+  var margin = Math.max(14, view.w * 0.022);
+  var textSize = Math.max(8, Math.min(view.w * 0.0085, 11));
+  ctx.save();
+  ctx.textBaseline = "alphabetic";
+  ctx.font = lyricCaptionFont(textSize);
+  ctx.textAlign = "left";
+  ctx.fillStyle = cssRgb(palette.patina, 0.5);
+  ctx.fillText("N E W   O R L E A N S  ·  S E C O N D   L I N E", margin, view.h - margin * 0.7);
+  ctx.textAlign = "right";
+  ctx.fillStyle = cssRgb(palette.brass, 0.55);
+  ctx.fillText("3 8 9", view.w - margin, view.h - margin * 0.7);
+  ctx.restore();
+}
+
+/* 鼓点上街面的一层暖光 */
+function drawBeatGlow() {
+  var energy = Math.min(1, state.beatLevel);
+  if (energy <= 0.01) return;
+  var top = layout.streetTop - layout.streetH * 0.7;
+  var flash = ctx.createLinearGradient(0, top, 0, view.h);
+  addStop(flash, 0, cssRgb(palette.lit, 0));
+  addStop(flash, 0.55, cssRgb(palette.ochre, 0.05 * energy));
+  addStop(flash, 1, cssRgb(palette.ochre, 0.13 * energy));
+  ctx.fillStyle = flash;
+  ctx.fillRect(0, top, view.w, Math.max(0, view.h - top));
+}
+
+/* ---- 绘制 ---- */
+function paint() {
+  var w = view.w, h = view.h;
+  if (!plate || plateDirty) schedulePlate();
+  if (plate && plate.width > 0 && plate.height > 0) {
+    ctx.drawImage(plate, 0, 0, w, h);
+  } else {
+    ctx.fillStyle = cssRgb(palette.ink, 1);
+    ctx.fillRect(0, 0, w, h);
+  }
+
+  drawLanternPulse();
+  drawSparks();
+  drawCaption();
+  drawTarot();
+  drawBeatGlow();
+  drawParade();
+  drawLyrics();
+}
+
+var lastFrameAt = 0;
+function frame(now) {
+  state.frames += 1;
+  var start = performance.now();
+  var delta = lastFrameAt > 0 ? Math.min(0.12, Math.max(0, (now - lastFrameAt) / 1000)) : 0.016;
+  state.beatLevel = Math.max(0, state.beatLevel - delta * 3.4);
+  try { paint(); } catch (err) { reportError("frame", err); }
+  state.js = Math.min(999, performance.now() - start);
+  lastFrameAt = now;
+  requestAnimationFrame(frame);
+}
+
+resize();
+initSparks();
+requestAnimationFrame(function (now) {
+  sendReady();
+  frame(now);
+});
+setTimeout(sendReady, 800);
+</script>
+</body>
+</html>

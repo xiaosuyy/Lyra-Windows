@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>回火</title>
+<!--
+  机制：画面底下横着一条火线，十万缕火苗从线上竖着长出来，一簇一簇、有高有低，火舌被热浪抽得左右
+        摆；字从火里升起来，停在火线上方那片黑里。手感最重的那段（8.6–12.4s）火先被一口气吸回线下
+        —— 整条火线跟着暗掉、火苗缩短—— 然后猛地窜上来，火舌越过字，把字整个盖进热里再露出来。
+  用了：WebGL2 实例化（drawArraysInstanced，10 万缕火苗 = 10 万个细长实例，每帧 CPU 只发 12 个
+        uniform）；火线上的落点 / 一簇一簇的火高 / 火舌摆动 / 吸火与回火的包络，全部在顶点着色器里
+        解析算出，CPU 每帧不碰粒子。
+        无 getImageData：字是真 DOM 文字，从火里升上来。
+  最像的三个：010 余烬歌词 / 149 熔炉 / 096 灰烬复燃
+  差在哪：那些是"火在底下烧、字浮在上面"，火和字是两层；这里火是往回吸的——吸的那一下整条火线熄灭、
+        整片火缩回线下，再回火窜过字。字是被火吞掉一次又露出来的东西，不是贴在火上的贴纸。
+-->
+<style>
+  html,body{margin:0;height:100%;background:#070403;overflow:hidden}
+  body{font-family:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;
+       color:#fdeee0}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;z-index:1}
+  #type{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:2;--lit:.2}
+  .slot{position:absolute;left:50%;top:31%;width:max-content;max-width:76vw;
+        transform:translate(-50%,-50%);text-align:center;opacity:0;filter:blur(7px);z-index:2;isolation:isolate}
+  .slot::before{content:'';position:absolute;inset:-62% -16%;z-index:-1;pointer-events:none;
+        background:radial-gradient(60% 58% at 50% 56%,rgba(5,3,2,.97) 0%,rgba(5,3,2,.74) 48%,rgba(5,3,2,0) 82%)}
+  .slot .in{display:block;font-weight:900;font-size:clamp(32px,6.9vh,98px);line-height:1.24;
+        letter-spacing:.10em;color:#ffffff;text-wrap:balance;white-space:pre-wrap;
+        text-shadow:0 0 52px rgba(0,0,0,.96),0 6px 26px rgba(0,0,0,.94),0 1px 2px rgba(0,0,0,.96),
+                    0 4px 0 rgba(255,178,72,calc(var(--lit) * .52)),
+                    0 20px 50px rgba(255,116,16,calc(var(--lit) * .36)),
+                    0 -3px 26px rgba(255,86,8,calc(var(--lit) * .22))}
+  .slot .in span{display:inline-block}
+  #vig{position:fixed;inset:0;pointer-events:none;z-index:3;
+       background:radial-gradient(132% 102% at 50% 58%,rgba(0,0,0,0) 32%,rgba(3,2,1,.58) 100%)}
+  #hint{position:fixed;left:50%;bottom:15px;transform:translateX(-50%);pointer-events:none;z-index:4;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(255,176,120,.34);transition:opacity .8s;white-space:nowrap}
+  html.fb #c{display:none}
+  html.fb body{background:radial-gradient(120% 96% at 50% 86%,#40160a 0%,#1a0a06 46%,#070403 100%)}
+  html.fb #type{z-index:1}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="type"></div>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ══════════════════════════════════════════════════════════════════════
+   A 车道内核（单文件内联，每个形态自带一份）
+   协议 / 时钟 / 两句槽位（前奏·进场·余韵）/ 暂停冻结 / resize / RM / 降级
+   形态只提供：片元与顶点着色器、配色、以及 stage 钩子
+   ══════════════════════════════════════════════════════════════════════ */
+const cv = document.getElementById('c');
+const typeBox = document.getElementById('type');
+const hint = document.getElementById('hint');
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+
+const N = 100000;                 /* 10 万缕火苗，全部住在 GPU 上 */
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, beatN = 0, bass = 0, treb = 0, beatAt = -9;
+let frames = 0, jsMs = 0, errMsg = '';
+let readySent = false, hintOn = true;
+let inAmt = 0, preAmt = 0, act = 0, pol = 0, sweep = 1;
+let cur = null, ghost = null, ghostAt = 0, slotFlip = 0, ghostStartV = 0;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+const ease3 = (x) => 1 - Math.pow(1 - x, 3);
+
+/* prefers-reduced-motion：随时切换都要跟得上 */
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const onMQ = (e) => { RM = !!e.matches; skipToEnd(); };
+    if (mq.addEventListener) mq.addEventListener('change', onMQ);
+    else if (mq.addListener) mq.addListener(onMQ);
+  }
+} catch (_) {}
+function skipToEnd() { if (cur && cur.chars) for (const c of cur.chars) { c.style.opacity = '1'; c.style.transform = 'none'; } }
+
+/* ---------------- 文字槽位：两句交替，旧句留残影 ---------------- */
+function mkSlot() {
+  const el = document.createElement('div'); el.className = 'slot';
+  const inner = document.createElement('div'); inner.className = 'in';
+  el.appendChild(inner); typeBox.appendChild(el);
+  return { el, inner, chars: [], cx: [], t0: 0, voice: 0, dir: 1, noanim: false, text: '' };
+}
+const slots = [mkSlot(), mkSlot()];
+
+function fillSlot(slot, text) {
+  slot.inner.textContent = '';
+  slot.chars = [];
+  slot.cx = [];
+  const arr = Array.from(text);
+  for (let i = 0; i < arr.length; i++) {
+    const sp = document.createElement('span');
+    sp.textContent = arr[i];
+    sp.style.opacity = '0';
+    slot.inner.appendChild(sp);
+    slot.chars.push(sp);
+  }
+  slot.text = text;
+  for (const sp of slot.chars) {
+    const r = sp.getBoundingClientRect();
+    slot.cx.push((r.left + r.width / 2) / W * 2 - 1);
+  }
+}
+
+function showLine(ci, instant) {
+  const s = slots[slotFlip]; slotFlip ^= 1;
+  if (cur && cur !== s) { ghost = cur; ghostAt = now(); ghostStartV = vT; }
+  cur = s; ghost === s && (ghost = null);
+  s.el.style.transform = 'translate(-50%,-50%)';
+  fillSlot(s, (lines[ci] || {}).text || '');
+  s.noanim = true;
+  s.t0 = instant ? now() - 2 : lines[ci].t;
+  s.voice = ci % 3;
+  s.dir = (ci % 2) ? 1 : -1;
+  s.amb = ci % 2;
+  s.el.style.zIndex = '3';
+  if (ghost) ghost.el.style.zIndex = '2';
+  s.el.style.opacity = '1';
+  s.el.style.filter = 'none';
+  for (const c of s.chars) { c.style.opacity = instant ? '1' : '0'; c.style.transform = instant ? 'none' : ''; }
+  hintOn = false; hint.style.opacity = '0';
+}
+
+function hideAll() {
+  cur = null; ghost = null;
+  for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; }
+  hintOn = true; hint.style.opacity = '0.9';
+}
+
+/* ---------------- 时钟：空歌词 / seek / 句首 ---------------- */
+function timing(T) {
+  if (!lines.length) { if (idx !== -1) { idx = -1; hideAll(); } lastT = T; return; }
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) {
+    const jump = (lastT > -1e8 && (Math.abs(T - lastT) > 0.9 || ci > idx + 1 || ci < idx));
+    idx = ci;
+    if (ci < 0) { hideAll(); }
+    else showLine(ci, jump);
+  }
+  lastT = T;
+}
+
+/* ---------------- 每帧：uniform 状态 ---------------- */
+let gust = 0, draft = 0, actPh = 0;
+function state(T) {
+  if (idx >= 0 && lines[idx]) {
+    const lt = lines[idx].t;
+    inAmt = clamp01((T - lt) / 1.10);
+    const nx = lines[idx + 1];
+    preAmt = nx ? clamp01(1 - (nx.t - T) / 0.30) : 0;
+  } else { inAmt = 0; preAmt = 0; }
+  act = (vT > 8.6 && vT < 12.4) ? 1 : 0;
+  pol = beatN % 2;
+  sweep = idx >= 0 ? clamp01((inAmt * 1.10 - 0.02) / 0.95) : 0;
+  /* 拍点顶一下热浪，慢慢泄掉；贝斯托着基础火势 */
+  const want = Math.max(beatPulse, bass * 0.55);
+  gust = RM ? 0.30 : gust + (want - gust) * 0.20;
+  /* uAct 窗口：每 1.9s 一次"吸回去 → 回火窜上来" */
+  if (act) {
+    actPh = ((vT - 8.6) / 1.9) % 1;
+    draft = actPh < 0.30 ? ease3(actPh / 0.30) : Math.max(0, 1 - (actPh - 0.30) / 0.14);
+  } else { actPh = -1; draft = 0; }
+  typeBox.style.setProperty('--lit', (0.12 + 0.88 * Math.max(beatPulse, inAmt * 0.55, act * 0.92)).toFixed(3));
+}
+
+/* ---------------- 文字：从火里升起来 ---------------- */
+function updDom(T) {
+  if (cur) {
+    const stg = 0.026, dur = 0.68;
+    for (let i = 0; i < cur.chars.length; i++) {
+      const p = cur.noanim ? 1 : clamp01((T - (cur.t0 + i * stg)) / dur);
+      const e = ease3(p);
+      const c = cur.chars[i];
+      const vis = RM ? 1 : clamp01((inAmt * 1.50 + 0.08 - i * 0.013) / 0.26);
+      /* 火把字往上顶，回火那一下字被热浪推得抖 */
+      const j = act ? Math.sin(vT * 8.3 + i * 2.1) * 1.9 : 0;
+      const dy = (1 - e) * 58 - beatPulse * 5 + j;
+      c.style.transform = 'translate(' + (j * 0.6).toFixed(2) + 'px,' + dy.toFixed(2) + 'px) scale(' + (0.90 + 0.10 * e).toFixed(3) + ')';
+      c.style.opacity = (clamp01(p * 1.15) * vis).toFixed(3);
+    }
+    cur.el.style.filter = 'blur(' + ((1 - clamp01((T - cur.t0) / 0.38)) * 7.0).toFixed(2) + 'px)';
+    /* 整句被热浪抬起一点 */
+    const gy = -beatPulse * 3 - (act ? 2.5 : 0);
+    cur.el.style.transform = 'translate(-50%,-50%) translateY(' + gy.toFixed(2) + 'px)';
+  }
+  if (ghost) {
+    const q = clamp01((T - ghostAt) / 0.80);
+    if (q >= 1) { ghost.el.style.opacity = '0'; ghost = null; }
+    else {
+      ghost.el.style.opacity = (0.24 * (1 - q) * (1 - q)).toFixed(3);
+      ghost.el.style.filter = 'blur(' + (q * 16).toFixed(2) + 'px)';
+      /* 残影被火吃掉：往上飘、烧散 */
+      ghost.el.style.transform = 'translate(-50%,-50%) translateY(' + (-q * 44).toFixed(2) + 'px) scale(' + (1 + q * 0.05).toFixed(3) + ')';
+    }
+  }
+}
+
+/* ══════════════════════════════ GPU ══════════════════════════════ */
+const GL_OPT = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false };
+let gl = null, P = null, U = {}, bgP = null, bgU = {}, pVao = null, bgVao = null, glOk = false, dirty = true;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'shader');
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link');
+  return p;
+}
+function locs(p, names) { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; }
+
+/* —— 背景：底下一条火线 + 往上衰减的热辉，上半是冷黑（好让字有地方站） —— */
+const BG_VS = `#version 300 es
+in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform float uT, uAct, uPol, uDraft;
+uniform vec2 uRes;
+float h21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+void main(){
+  vec2 p = vUV;
+  float asp = uRes.x / uRes.y;
+  float x = (p.x - 0.5) * asp;
+  float h = 1.0 - p.y;                          /* 0 = 画面底，1 = 顶 */
+  /* 火线上一簇一簇的热点：中间那一簇最旺 */
+  float cl = vn(vec2(x * 3.1 + 11.0, 0.5)) * 0.62 + vn(vec2(x * 7.4 + 3.0, 2.5)) * 0.38;
+  cl += 0.62 * pow(max(0.0, 1.0 - abs(x + 0.04) / 0.46), 2.2);
+  vec3 c = vec3(0.013, 0.007, 0.005);
+  /* 底部热辉：贴着地面往上衰减 */
+  c += vec3(0.072, 0.022, 0.005) * exp(-h * 3.6) * (0.55 + 0.75 * cl);
+  /* 火线本身：压在画面最底下，火是从画外底下烧上来的 */
+  /* 火线本身：就压在画面最下沿，火是从画外底下烧上来的 */
+  float line = exp(-pow(p.y / 0.050, 2.0));
+  c += vec3(0.30, 0.12, 0.026) * line * pow(0.15 + 1.10 * cl, 2.0);
+  /* 火上面的热烟：不亮，只在中间那一片染一点暖，黑不许被洗白 */
+  c += vec3(0.011, 0.004, 0.0015) * exp(-h * 1.9) * (0.45 + 0.85 * cl);
+  /* 被吸回去的那一下：火线先暗掉 */
+  c *= 1.0 - 0.70 * uDraft;
+  /* 回火：整条线更亮 */
+  c += vec3(0.30, 0.115, 0.020) * line * uAct;
+  /* 上半：残余的冷黑，越往上越冷一点点，和火分开 */
+  c += vec3(0.011, 0.014, 0.020) * pow(clamp(p.y, 0.0, 1.0), 2.4);
+  c += vec3(0.0012, 0.0009, 0.0008) * h21(floor(p * uRes * 0.5) + fract(uT) * 7.0);
+  o = vec4(c, 1.0);
+}`;
+
+/* —— 粒子：火线上长出来的十万缕火苗（竖着的丝，越高越细越暗） —— */
+const P_VS = `#version 300 es
+precision highp float;
+in vec2 aQ; in vec4 aSeed;
+uniform float uT, uBass, uTre, uBeat, uPre, uIn, uPol, uAct, uGust, uDraft;
+uniform vec2 uRes;
+uniform vec4 uText;
+out vec2 vQ; out vec3 vCol; out float vA;
+
+float h21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+
+void main(){
+  float act = step(0.5, uAct);
+  float dr  = uDraft;
+  float Y0  = -1.005;                              /* 火线在画面下沿之外，火从画外烧进来 */
+  float jw  = h21(vec2(aSeed.x * 97.13, aSeed.y * 41.70));
+  float hx  = aSeed.x * 2.30 - 1.15;               /* 落在火线上的位置，比画面宽一点 */
+
+  /* ── 火舌：沿火线一舌一舌（高频噪声），舌头之间有暗缝 ── */
+  float tgn = vn(vec2(hx * 6.8 + 2.0, 0.5)) * 0.66 + vn(vec2(hx * 14.0 + 5.0, 3.5)) * 0.34;
+  float tg  = pow(clamp(tgn * 1.38 - 0.12, 0.0, 1.0), 1.30);   /* 0 = 暗缝，1 = 最旺的舌头 */
+
+  /* ── 每一舌自己有多高；少数一撮窜得特别高 ── */
+  float HH0   = 0.22 + 0.85 * tg;
+  float tallW = smoothstep(0.62, 1.00, aSeed.z);
+  float hTall = 1.42 + 0.30 * h21(vec2(aSeed.x * 31.0, 1.7));
+
+  /* ── 回火的包络：吸的那一下整片火缩回线下，再回火窜起来盖过字 ── */
+  float grow = 1.0 + 0.45 * act * (1.0 - dr);
+  float wT   = tallW * (0.10 + 0.55 * act * (1.0 - dr));
+  /* 只往上加，绝不往下削 —— 回火是长上去的，不是被压平的 */
+  float HH   = HH0 * grow;
+  HH += wT * (hTall - HH);
+  HH *= 1.0 - 0.76 * dr;
+
+  /* ── 生命：0 在火线上，1 在火舌尖 ── */
+  float spd = (0.130 + 0.040 * uBass) * (1.0 + 0.35 * uGust) * (1.0 + 0.55 * act);
+  float s = fract(aSeed.y + uT * spd);
+
+  /* ── 横向：舌身窄，暗缝宽；越高越收，同一舌一起摆 ── */
+  float spread = (0.020 + 0.030 * (1.0 - tg)) * mix(1.0, 0.45, wT);
+  float lat = (jw * 2.0 - 1.0) * spread * (1.0 - 0.50 * s);
+  lat += (0.045 + 0.130 * tg) * pow(s, 1.55) * sin(s * 4.2 - uT * (1.35 + 1.10 * tg) + hx * 3.1);
+  lat *= 1.0 - 0.30 * dr;                          /* 被吸的时候火舌往中间收 */
+
+  float x = hx + lat;
+  float y = Y0 + s * HH;
+
+  /* ── 尺寸：竖着的丝，别太长，太长就成草了 ── */
+  float sz = 0.0019 + 0.0042 * pow(s, 0.60);
+  float sx = sz * 1.00 * (1.0 + 0.30 * dr);
+  float sy = sz * (1.70 + 2.30 * s) * (1.0 + 0.10 * act);
+  sx = mix(sx, sx * 0.62, wT);
+  sy = mix(sy, sy * 1.70, wT);
+
+  /* ── 亮度：整条舌身是亮的，只在舌尖收口 —— 火有舌头，不是一片草 ── */
+  float a = (0.090 + 0.600 * tg) * (0.45 + 0.55 * aSeed.w);
+  float fil = vn(vec2(x * 26.0, s * 9.0 - uT * 2.4));   /* 一丝一丝，不是一片 */
+  a *= 0.15 + 1.30 * pow(fil, 2.20);
+  a *= 1.0 - smoothstep(0.70, 1.00, s);
+  a *= mix(1.0, 0.55, wT);
+  a *= 1.0 + 0.30 * uGust + 0.60 * uPre;
+
+  /* ── 颜色：底白 → 中橙 → 尖暗红 ── */
+  vec3 col = mix(vec3(1.00, 0.90, 0.62), vec3(1.00, 0.52, 0.12), smoothstep(0.0, 0.16, s));
+  col = mix(col, vec3(0.62, 0.14, 0.040), smoothstep(0.30, 0.90, s));
+
+  /* ── 回火：火更热、更白，还一鼓一鼓地喘 ── */
+  float er = act * (0.58 + 0.42 * sin((uT - 8.6) * 5.0)) * (1.0 - dr);
+  a *= 1.0 + 0.80 * er;
+  col = mix(col, vec3(1.00, 0.86, 0.60), 0.34 * er);
+
+  /* ── 字：平时火绕开字（少往字上舔），回火时火直接盖过去 ── */
+  vec2 th = vec2(uText.z, uText.w);
+  float wd = length(vec2((x - uText.x) / (th.x * 0.95 + 0.030),
+                         (y - uText.y) / (th.y * 1.15 + 0.050)));
+  a *= 1.0 - 0.58 * smoothstep(1.05, 0.20, wd) * (1.0 - act);
+  a *= 1.0 + 0.50 * (smoothstep(0.95, 1.20, wd) * smoothstep(1.70, 1.28, wd));
+
+  /* ── 出画淡出：顶到框之前就化掉 ── */
+  a *= smoothstep(1.10, 0.90, abs(y));
+  a *= smoothstep(1.30, 1.10, abs(x));
+
+  vA = a; vQ = aQ; vCol = col;
+
+  /* 局部方块：竖长条，整体顺着热浪缓慢倾一点；每一丝自己再微微弯一下 */
+  vec2 lq2 = (aQ - 0.5) * vec2(sx * 2.0, sy * 2.0);
+  float qq = lq2.y / max(sy * 2.0, 1e-5);
+  lq2.x += qq * abs(qq) * sx * 4.0 * (jw * 2.0 - 1.0);
+  lq2.x += lq2.y * (0.24 * sin(uT * 0.62 + hx * 3.0));
+  gl_Position = vec4(vec2(x, y) + lq2, 0.0, 1.0);
+}`;
+
+const P_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec3 vCol; in float vA; out vec4 o;
+void main(){
+  vec2 d = vQ - 0.5;
+  /* 横向收得紧、纵向放得松：一丝火，不是一个点，也不是一片雾 */
+  float fx = pow(smoothstep(0.5, 0.0, abs(d.x)), 2.40);
+  float fy = pow(smoothstep(0.5, 0.0, abs(d.y)), 0.55);
+  o = vec4(vCol * vA * fx * fy, 1.0);
+}`;
+
+function initGL() {
+  try { gl = cv.getContext('webgl2', GL_OPT); } catch (_) { gl = null; }
+  if (!gl) { document.documentElement.classList.add('fb'); return false; }
+  P = program(P_VS, P_FS);
+  U = locs(P, ['uT','uBass','uTre','uBeat','uPre','uIn','uPol','uAct','uGust','uDraft','uRes','uText']);
+  bgP = program(BG_VS, BG_FS);
+  bgU = locs(bgP, ['uT','uAct','uPol','uDraft','uRes']);
+
+  const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  /* 分层抽样（Halton）保证 10 万缕铺得均匀，不结块 */
+  const hal = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+  let sd = 20260245;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  const seeds = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    seeds[i*4] = hal(i + 1, 2); seeds[i*4+1] = hal(i + 1, 3);
+    seeds[i*4+2] = rnd(); seeds[i*4+3] = rnd();
+  }
+  const sb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+
+  pVao = gl.createVertexArray(); gl.bindVertexArray(pVao);
+  const aQ = gl.getAttribLocation(P, 'aQ'), aS = gl.getAttribLocation(P, 'aSeed');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(aQ); gl.vertexAttribPointer(aQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(aS, 1);
+
+  bgVao = gl.createVertexArray(); gl.bindVertexArray(bgVao);
+  const bQ = gl.getAttribLocation(bgP, 'aQ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(bQ); gl.vertexAttribPointer(bQ, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(null);
+  gl.clearColor(0.014, 0.008, 0.006, 1);
+  gl.disable(gl.DEPTH_TEST);
+  glOk = true;
+  return true;
+}
+
+let uTextV = [0, 0, 0.3, 0.1];
+function draw() {
+  if (!glOk) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.BLEND);
+  gl.useProgram(bgP); gl.bindVertexArray(bgVao);
+  gl.uniform1f(bgU.uT, vT); gl.uniform1f(bgU.uAct, act); gl.uniform1f(bgU.uPol, pol);
+  gl.uniform1f(bgU.uDraft, draft);
+  gl.uniform2f(bgU.uRes, W, H);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.useProgram(P); gl.bindVertexArray(pVao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniform1f(U.uT, vT); gl.uniform1f(U.uBass, bass); gl.uniform1f(U.uTre, treb);
+  gl.uniform1f(U.uBeat, beatPulse); gl.uniform1f(U.uPre, preAmt); gl.uniform1f(U.uIn, inAmt);
+  gl.uniform1f(U.uPol, pol); gl.uniform1f(U.uAct, act); gl.uniform1f(U.uGust, gust);
+  gl.uniform1f(U.uDraft, draft);
+  gl.uniform2f(U.uRes, W, H); gl.uniform4f(U.uText, uTextV[0], uTextV[1], uTextV[2], uTextV[3]);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+  gl.bindVertexArray(null);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  if (glOk) { gl.viewport(0, 0, cv.width, cv.height); }
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+function textRect() {
+  if (!cur || !cur.chars.length) return [0, 0, 0.34, 0.09];
+  const r = cur.el.getBoundingClientRect();
+  return [ (r.left + r.width/2) / W * 2 - 1, 1 - (r.top + r.height/2) / H * 2,
+           Math.max(0.02, r.width / W), Math.max(0.02, r.height / H) ];
+}
+
+/* ══════════════════════════════ 主循环 ══════════════════════════════ */
+let last = performance.now(), raf = 0;
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  vT = RM ? T * 0.24 : T;
+  if (playing) {
+    beatPulse *= Math.exp(-dt * 3.6);
+    bass *= Math.exp(-dt * 0.08);
+    treb *= Math.exp(-dt * 0.10);
+  }
+  try { timing(T); } catch (e) { errMsg = 'timing: ' + (e && e.message ? e.message : e); }
+  state(T);
+  if (!RM && cur) uTextV = textRect();
+  try {
+    if (playing || dirty) { draw(); updDom(T); dirty = false; }
+  } catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------- 协议 ---------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9;
+    cur = null; ghost = null;
+    for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; s.el.style.transform = 'translate(-50%,-50%)'; }
+    vT = 0; beatPulse = 0; bass = 0; treb = 0; beatN = 0; beatAt = -9; gust = 0; draft = 0;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    inAmt = 0; preAmt = 0;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now();
+    playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5);
+    beatN++; dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, clamp01(l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, clamp01(l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+/* ---------------- 自查 ---------------- */
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx].text) ? lines[idx].text : '',
+  gl: glOk, rm: RM, vT: +vT.toFixed(2)
+});
+
+/* ---------------- 启动 ---------------- */
+resize();
+try { initGL(); } catch (e) { errMsg = 'gl: ' + (e && e.message ? e.message : e); document.documentElement.classList.add('fb'); }
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

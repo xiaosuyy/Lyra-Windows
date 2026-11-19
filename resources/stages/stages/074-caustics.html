@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>焦散水纹</title>
+<style>
+  html,body{margin:0;height:100%;background:#02100f;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(118% 94% at 50% 48%,transparent 32%,rgba(1,8,8,.58) 76%,rgba(0,2,3,.96))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,255,238,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   lyra09 · 焦散水纹 —— 字是水底那层**焦散光网**亮起来的地方，不是粒子摆出来的
+   ---------------------------------------------------------------------------
+   机制：**波的干涉 ≈ 焦散**（和 013 水波涟漪 完全不同：013 是把字形当作被扰动的水面，
+   这里是字**只在光网变亮的地方**才显形；涟漪是形变，焦散是照明）
+
+   物理/光学近似：
+     水面有两组斜向行波，折射到池底后叠加成一张移动的光网：
+       I(x,y,t) = sin(k1·p + ω1 t) · sin(k2·p + ω2 t)
+     取它的 **三次方**：大部分区域压到接近 0，只有两条波峰相交那条细脊亮起来 ——
+     那些细亮的曲线就是真实的焦散(caustic)纹理，也就是"水底光斑"。
+     字 = I 高的那些采样点。所以字是**被光照出来的**，一直在流动、一直在变形。
+
+   两层：
+     · 池底散光：整个池底都有一张同样的光网，但暗得多、且与字不同相位 —— 提供环境
+     · 字的焦散：字形采样点上同样的光网，亮一个数量级
+
+   AE 手法：
+     · 波干涉的持续形变（焦散本身就在动，不需要额外动画）
+     · 升格与缓急 —— 池底那层用 0.6 倍速流动，字那层是 1 倍速，产生"景深差"
+     · 冲击波环 —— 换团时从该团扩一圈涟漪（界面上真的有一圈涟漪在扩）
+     · 定向震动 + 顿帧 + 白闪 —— 换句
+     · 多层级视差（池底 0.6 速 / 字 1.0 速 / 水面高光 1.3 速）
+     · 镜头极缓慢横移 + 呼吸变焦
+
+   配色：青绿 + 冷白高光（水下）
+   ========================================================================== */
+
+/* ============================ 0 · 画布 ============================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+let W = 0, H = 0, DPR = 1;
+let bgCv = null, surf = null;         // 水面高光条（预烘）
+let L = null, curIdx = -1;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBg();
+  buildSurf();
+  if (L && curIdx >= 0) assignLine(curIdx);
+}
+addEventListener('resize', resize);
+
+/* ============================ 1 · 时钟 ============================ */
+let lines = [];
+let accent = [120, 255, 232];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* ============================ 2 · 分词 ============================ */
+let DICT = null;
+fetch('/segdict.bin').then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); }).catch(() => {});
+const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+function isWord(s, i, Ln) {
+  if (!DICT) return false;
+  const h = fnv(s.substr(i, Ln));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) { const m = (lo + hi) >> 1, v = DICT[m]; if (v === h) return true; if (v < h) lo = m + 1; else hi = m - 1; }
+  return false;
+}
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, text.length - i); Ln >= 2; Ln--) if (isWord(text, i, Ln)) { hit = Ln; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, j); Ln >= 2; Ln--) if (isWord(text, j - Ln, Ln)) { hit = Ln; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+function isLatin(text) { let la = 0, cjk = 0; for (let i = 0; i < text.length; i++) { const c = text[i]; if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++; else if (c >= '\u4e00' && c <= '\u9fff') cjk++; } return la > cjk; }
+function latinSpans(text) {
+  const out = []; let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i; while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j }); i = j;
+  }
+  return out;
+}
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+const countChars = (s) => { let n = 0; for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++; return n; };
+function groupByWords(text) {
+  const words = segWords(text), out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos; pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; } else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+function groupByRule(text) {
+  const out = []; let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const s = PUNCT.test(text[i]) || SPACE.test(text[i]);
+    if (!s) chars++;
+    if (s && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!s && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+const spansForLine = (t) => (isLatin(t) ? latinSpans(t) : (DICT ? groupByWords(t) : groupByRule(t)));
+
+/* ============================ 3 · 字形采样 ============================ */
+const offCv = document.createElement('canvas');
+const octx = offCv.getContext('2d', { willReadFrequently: true });
+const FONT = (px, wt) => `${wt || 800} ${px}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+function wrapText(text, fs, maxW, wt) {
+  octx.font = FONT(fs, wt);
+  const latin = isLatin(text);
+  const rows = []; let start = 0, w = 0;
+  for (let i = 0; i < text.length; i++) {
+    const cw = octx.measureText(text[i]).width;
+    if (!cw) continue;
+    if (w + cw > maxW && i > start) {
+      let brk = i;
+      if (latin) { let j = i; while (j > start && !SPACE.test(text[j])) j--; if (j > start) brk = j; }
+      rows.push({ i0: start, i1: brk, w: octx.measureText(text.slice(start, brk)).width });
+      start = brk; w = 0;
+      while (start < text.length && SPACE.test(text[start])) start++;
+      if (start >= text.length) break;
+      i = start - 1; continue;
+    }
+    w += cw;
+  }
+  if (start < text.length) rows.push({ i0: start, i1: text.length, w: octx.measureText(text.slice(start)).width });
+  for (const r of rows) while (r.i1 - r.i0 > 1 && SPACE.test(text[r.i0])) r.i0++;
+  return rows.length ? rows : [{ i0: 0, i1: text.length, w: octx.measureText(text).width }];
+}
+function sampleGlyph(text, opt) {
+  opt = opt || {};
+  const wt = opt.weight || 800;
+  let fs = opt.fs || 92;
+  const maxW = opt.maxW || Math.min(W * 0.70, 1120);
+  const maxH = opt.maxH || H * 0.46;
+  let rows = wrapText(text, fs, maxW, wt);
+  let lh = fs * 1.16;
+  if (rows.length * lh > maxH) { fs *= maxH / (rows.length * lh); rows = wrapText(text, fs, maxW, wt); lh = fs * 1.16; }
+  octx.font = FONT(fs, wt);
+  const widest = Math.max(1, ...rows.map((r) => octx.measureText(text.slice(r.i0, r.i1)).width));
+  const padW = Math.ceil(widest) + 24, padH = Math.ceil(lh * rows.length) + 12;
+  offCv.width = padW; offCv.height = padH;
+  octx.font = FONT(fs, wt);           // 改尺寸会重置上下文 → font 必须重设
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.clearRect(0, 0, padW, padH);
+  const n = text.length;
+  const charCx = new Float32Array(n), charCy = new Float32Array(n);
+  const rowMaps = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r], str = text.slice(row.i0, row.i1);
+    const cy = padH / 2 + (r - (rows.length - 1) / 2) * lh;
+    octx.fillText(str, padW / 2, cy);
+    const x0 = (padW - row.w) / 2, map = new Int16Array(padW).fill(-1);
+    let acc = 0;
+    for (let i = row.i0; i < row.i1; i++) {
+      const cw = octx.measureText(text[i]).width;
+      charCx[i] = x0 + acc + cw / 2 - padW / 2; charCy[i] = cy - padH / 2;
+      for (let x = Math.max(0, Math.floor(x0 + acc)); x < Math.min(padW, Math.ceil(x0 + acc + cw)); x++) map[x] = i;
+      acc += cw;
+    }
+    rowMaps.push({ y0: cy - lh / 2, y1: cy + lh / 2, map });
+  }
+  const d = octx.getImageData(0, 0, padW, padH).data;
+  const pxA = [], pyA = [], ownA = [];
+  const step = opt.step || 3;
+  for (let y = 0; y < padH; y += step) {
+    let rm = null;
+    for (let r = 0; r < rowMaps.length; r++) { const m = rowMaps[r]; if (y >= m.y0 && y < m.y1) { rm = m; break; } }
+    if (!rm) continue;
+    const map = rm.map, base = y * padW;
+    for (let x = 0; x < padW; x += step) {
+      if (d[(base + x) * 4 + 3] <= 128) continue;
+      const c = map[x]; if (c < 0) continue;
+      pxA.push(x - padW / 2); pyA.push(y - padH / 2); ownA.push(c);
+    }
+  }
+  return { px: Float32Array.from(pxA), py: Float32Array.from(pyA), own: Int16Array.from(ownA),
+           pc: pxA.length, n, charCx, charCy, fs, w: widest, h: lh * rows.length, rows: rows.length };
+}
+
+/* ============================ 4 · 句索引 ============================ */
+let brewIdx = -1, lastT = -1;
+const hintShow = (s, o) => { hint.textContent = s; hint.style.opacity = o; };
+
+/* ============================ 5 · 相机 ============================ */
+const cam = { x: 0, y: 0, z: 1, tz: 1, vz: 0, tx: 0, ty: 0, rot: 0, vrot: 0, sh: 0, dirx: 0, diry: 0, shx: 0, shy: 0 };
+function camShake(dx, dy, amp) { const l = Math.hypot(dx, dy) || 1; cam.dirx = dx / l; cam.diry = dy / l; cam.sh = Math.min(20, Math.max(cam.sh, amp)); }
+function camUpdate(dt, T) {
+  const ke = 1 - Math.pow(0.002, dt);
+  cam.x += (cam.tx - cam.x) * ke * 0.9;
+  cam.y += (cam.ty - cam.y) * ke * 0.9;
+  cam.vz += ((cam.tz - cam.z) * 140 - cam.vz * 20) * dt;
+  cam.z += cam.vz * dt;
+  cam.vrot += (-cam.rot * 230 - cam.vrot * 20) * dt;
+  cam.rot += cam.vrot * dt;
+  cam.sh *= Math.pow(0.000045, dt);
+  const wob = Math.sin(T * 55.7) * 0.6 + Math.sin(T * 38.9 + 1.3) * 0.4;
+  cam.shx = cam.dirx * cam.sh * wob;
+  cam.shy = cam.diry * cam.sh * wob;
+}
+
+/* ============================ 6 · 顿帧 / 闪白 ============================ */
+const AE = { freeze: 0, flash: 0 };
+const hitStop = (s) => { AE.freeze = Math.max(AE.freeze, s); };
+const flash = (v) => { AE.flash = Math.max(AE.flash, v); };
+
+/* ============================ 7 · 光网（焦散） ============================ */
+/* 两组斜向行波的方向 + 波数 + 速度。换句时换一组方向 —— 水面"换了一种浪" */
+const wv = { a1: 0.42, a2: 1.31, k1: 0.0135, k2: 0.0102, w1: 1.9, w2: -1.45, mix: 0.5 };
+
+/* 池底环境光点（一圈一圈撒出去，不用字形） */
+const NE = 1500;
+const ex = new Float32Array(NE), ey = new Float32Array(NE);
+for (let i = 0; i < NE; i++) { ex[i] = rnd(-0.15, 1.15) * W; ey[i] = rnd(-0.15, 1.15) * H; }
+
+/* 涟漪 */
+let ripples = [];
+let spanFired = new Uint8Array(0);
+let charChars = null;
+let charGlow = new Float32Array(0);
+let spans = [];
+let blockGx = 0, blockGy = 0;
+
+function buildBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  const bw = Math.round(W / 2), bh = Math.round(H / 2);
+  bgCv.width = bw; bgCv.height = bh;
+  const g = bgCv.getContext('2d');
+  /* 水下：上暗下亮的竖向渐变（越往下光越散） */
+  const grd = g.createLinearGradient(0, 0, 0, bh);
+  grd.addColorStop(0, '#02100f');
+  grd.addColorStop(0.45, '#04201d');
+  grd.addColorStop(1, '#062a26');
+  g.fillStyle = grd; g.fillRect(0, 0, bw, bh);
+  const rg = g.createRadialGradient(bw * 0.5, bh * 0.62, 0, bw * 0.5, bh * 0.62, bw * 0.62);
+  rg.addColorStop(0, 'rgba(60,160,150,0.18)');
+  rg.addColorStop(1, 'rgba(60,160,150,0)');
+  g.fillStyle = rg; g.fillRect(0, 0, bw, bh);
+}
+/* 水面高光：几条横向的亮带（预烘一次，之后按不同速度平移 = 视差层） */
+function buildSurf() {
+  if (!surf) surf = document.createElement('canvas');
+  surf.width = Math.max(2, Math.round(W)); surf.height = Math.max(2, Math.round(H * 0.5));
+  const g = surf.getContext('2d');
+  g.clearRect(0, 0, surf.width, surf.height);
+  for (let i = 0; i < 5; i++) {
+    const y = surf.height * (0.08 + i * 0.17);
+    const grd = g.createLinearGradient(0, y - 40, 0, y + 40);
+    grd.addColorStop(0, 'rgba(150,255,235,0)');
+    grd.addColorStop(0.5, `rgba(150,255,235,${(0.05 + Math.random() * 0.04).toFixed(3)})`);
+    grd.addColorStop(1, 'rgba(150,255,235,0)');
+    g.fillStyle = grd;
+    g.fillRect(0, y - 40, surf.width, 80);
+  }
+}
+
+/* ============================ 8 · 布局（预取） ============================ */
+let prep = null;
+function prepLine(idx) {
+  const line = lines[idx];
+  if (!line || !line.text) return null;
+  const text = line.text;
+  const latin = isLatin(text);
+  const fs0 = latin ? 76 : (text.length <= 10 ? 100 : text.length <= 16 ? 86 : 72);
+  const g = sampleGlyph(text, { fs: fs0, maxW: Math.min(W * 0.70, 1120), maxH: H * 0.44 });
+  if (!g.pc) return null;
+  g.text = text;
+  charChars = line.chars && line.chars.length === text.length ? line.chars : null;
+  const raw = spansForLine(text);
+  const spanOf = new Int16Array(g.n).fill(-1);
+  const spList = [];
+  for (let k = 0; k < raw.length; k++) {
+    const s = raw[k];
+    if (!s || s.i1 <= s.i0) continue;
+    let t;
+    if (charChars && charChars[s.i0] && typeof charChars[s.i0].t === 'number') t = charChars[s.i0].t;
+    else t = line.t + (line.dur || 4) * (s.i0 / Math.max(1, text.length));
+    spList.push({ i0: s.i0, i1: s.i1, t });
+    for (let c = s.i0; c < s.i1; c++) spanOf[c] = spList.length - 1;
+  }
+  if (!spList.length) return null;
+  for (let k = 1; k < spList.length; k++) if (spList[k].t < spList[k - 1].t) spList[k].t = spList[k - 1].t;
+  return { idx, g, spans: spList, spanOf, cc: charChars };
+}
+
+function assignLine(idx) {
+  const use = (prep && prep.idx === idx) ? prep : prepLine(idx);
+  if (!use) { L = null; return; }
+  const g = use.g;
+  L = g; spans = use.spans; charChars = use.cc;
+  charGlow = new Float32Array(g.n);
+  spanFired = new Uint8Array(spans.length);
+  blockGx = W / 2;
+  blockGy = H * 0.455;
+  /* 换句 = 水面换了一种浪：波向整组转一下 */
+  wv.a1 = rnd(0.1, 1.5);
+  wv.a2 = wv.a1 + rnd(0.7, 1.5);
+  wv.k1 = rnd(0.010, 0.017);
+  wv.k2 = rnd(0.008, 0.014);
+  cam.tz = 1.0;
+}
+
+/* ============================ 9 · 主循环 ============================ */
+let last = performance.now();
+let T0 = 0;
+let lookX = 0, lookY = 0;
+
+function frame(nowMs) {
+  const dtReal = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; T0 += dtReal;
+  if (AE.freeze > 0) AE.freeze -= dtReal;
+  const dt = AE.freeze > 0 ? 0 : dtReal;
+
+  const T = now();
+  timing(T);
+
+  /* ---- 镜头：极缓慢横移 + 呼吸变焦 ---- */
+  if (L && curIdx >= 0 && L.n > 0) {
+    let c = 0;
+    if (charChars) { for (let k = 0; k < charChars.length; k++) if (charChars[k].t <= T) c = k; }
+    else c = Math.min(L.n - 1, Math.floor(clamp01((T - lines[curIdx].t) / Math.max(0.3, lines[curIdx].dur || 4)) * L.n));
+    lookX += (blockGx + L.charCx[c] - lookX) * Math.min(1, dtReal * 1.8);
+    lookY += (blockGy + L.charCy[c] - lookY) * Math.min(1, dtReal * 1.8);
+  }
+  cam.tx = W / 2 + (lookX - W / 2) * 0.26 + Math.sin(T0 * 0.07) * 26;
+  cam.ty = H / 2 + (lookY - H / 2) * 0.26;
+  cam.tz = 1.02 + Math.sin(T0 * 0.1) * 0.025;
+  camUpdate(dtReal, T0);
+  const z = cam.z;
+  const cosR = Math.cos(cam.rot), sinR = Math.sin(cam.rot);
+  const exx = W / 2 + cam.shx, eyy = H / 2 + cam.shy;
+  const pjX = (x, y) => { const dx = (x - cam.x) * z, dy = (y - cam.y) * z; return exx + dx * cosR - dy * sinR; };
+  const pjY = (x, y) => { const dx = (x - cam.x) * z, dy = (y - cam.y) * z; return eyy + dx * sinR + dy * cosR; };
+
+  /* ---- 逐字亮度 ---- */
+  if (L) {
+    if (charChars) for (let c = 0; c < L.n; c++) charGlow[c] = charChars[c] ? clamp01((T - charChars[c].t) / 0.22) : 0;
+    else {
+      const lt = lines[curIdx] ? lines[curIdx].t : 0, ld = lines[curIdx] ? (lines[curIdx].dur || 4) : 4;
+      for (let c = 0; c < L.n; c++) charGlow[c] = clamp01((T - lt - ld * 0.85 * c / L.n) / 0.3);
+    }
+  }
+
+  /* ---- 每团到点：涟漪 + 顿帧 + 震动 ---- */
+  if (L && curIdx >= 0) {
+    for (let k = 0; k < spans.length; k++) {
+      if (spanFired[k] || T < spans[k].t) continue;
+      spanFired[k] = 1;
+      const first = k === 0;
+      hitStop(first ? 0.04 : 0.02);
+      flash(first ? 0.42 : 0.22);
+      camShake(Math.cos(k * 1.9), Math.sin(k * 1.9) - 0.4, first ? 7 : 4);
+      const s = spans[k];
+      let cx0 = 0, cy0 = 0, cnt = 0;
+      for (let c = s.i0; c < s.i1; c++) { cx0 += L.charCx[c]; cy0 += L.charCy[c]; cnt++; }
+      ripples.push({ x: blockGx + cx0 / Math.max(1, cnt), y: blockGy + cy0 / Math.max(1, cnt), t: 0, life: 0.85, power: first ? 1 : 0.55 });
+    }
+  }
+  for (let k = ripples.length - 1; k >= 0; k--) { ripples[k].t += dtReal; if (ripples[k].t > ripples[k].life) ripples.splice(k, 1); }
+
+  /* ================= 绘制 ================= */
+  const [ar, ag2, ab] = accent;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#02100f';
+  ctx.fillRect(0, 0, W, H);
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+
+  /* 水面高光带：1.3 倍速平移（最前层，视差） */
+  if (surf) {
+    ctx.globalCompositeOperation = 'lighter';
+    const off = ((T0 * 16) % W);
+    ctx.globalAlpha = 0.55;
+    ctx.drawImage(surf, -off, H * 0.02, W, surf.height);
+    ctx.drawImage(surf, W - off, H * 0.02, W, surf.height);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---- 焦散光网 ----
+     字和池底用同一个波场，只是相位/亮度不同。
+     每颗点算一次强度，按 4 档亮度分批（一个 fill 一档），绝不逐颗设色。 */
+  const c1 = Math.cos(wv.a1), s1 = Math.sin(wv.a1);
+  const c2 = Math.cos(wv.a2), s2 = Math.sin(wv.a2);
+  const t1 = T0 * wv.w1, t2 = T0 * wv.w2;
+  /* 池底那层慢 0.6 倍（"更深、更远"），形成景深差 */
+  const t1b = T0 * wv.w1 * 0.6, t2b = T0 * wv.w2 * 0.6;
+
+  ctx.globalCompositeOperation = 'lighter';
+
+  /* ① 池底环境光网：暗、稀疏 */
+  for (let band = 0; band < 3; band++) {
+    const kk = [1.6, 2.4, 3.4][band];
+    ctx.fillStyle = `rgba(${Math.min(255, ar - 70)},${Math.min(255, ag2 - 30)},${Math.min(255, ab - 40)},${[0.10, 0.15, 0.22][band]})`;
+    ctx.beginPath();
+    for (let i = band; i < NE; i += 3) {
+      const px2 = ex[i], py2 = ey[i];
+      const v1 = Math.sin(wv.k1 * (px2 * c1 + py2 * s1) + t1b);
+      const v2 = Math.sin(wv.k2 * (px2 * c2 + py2 * s2) + t2b);
+      let I = v1 * v2;
+      I = I * I * I;                       // 三次方：只留波峰相交的细脊
+      if (I < 0.02) continue;
+      const b2 = I > 0.5 ? 2 : I > 0.18 ? 1 : 0;
+      if (b2 !== band) continue;
+      const sx = pjX(px2, py2), sy = pjY(px2, py2);
+      if (sx < -8 || sx > W + 8 || sy < -8 || sy > H + 8) continue;
+      const s = kk * 1.5 * z;
+      ctx.rect(sx - s * 0.5, sy - s * 0.5, s, s);
+    }
+    ctx.fill();
+  }
+
+  /* ② 字的焦散：亮一个数量级，用同一张光网（同相位 → 字是光网的一部分） */
+  if (L) {
+    for (let band = 0; band < 4; band++) {
+      const alpha = [0.20, 0.34, 0.58, 0.92][band];
+      ctx.fillStyle = `rgba(${Math.min(255, ar - 10 + band * 8)},${Math.min(255, ag2 + band * 4)},${Math.min(255, ab + band * 6)},${alpha})`;
+      ctx.beginPath();
+      let any = false;
+      for (let k = band; k < L.pc; k += 4) {
+        const px2 = blockGx + L.px[k], py2 = blockGy + L.py[k];
+        const v1 = Math.sin(wv.k1 * (px2 * c1 + py2 * s1) + t1);
+        const v2 = Math.sin(wv.k2 * (px2 * c2 + py2 * s2) + t2);
+        let I = v1 * v2;
+        I = I * I * I;
+        const lit = charGlow[L.own[k]];          // YRC：唱到的字更亮
+        /* 加一个亮度地板：纯 sin 乘积在波谷处会把点压到全黑，字就被"闪断"了。
+           垫 0.17 的底，字始终在，只是波谷处更暗 —— 读得出，又保住了焦散的明暗流动。 */
+        const vv = 0.17 + Math.abs(I) * (0.45 + 0.85 * lit);
+        const b2 = vv > 0.52 ? 3 : vv > 0.3 ? 2 : vv > 0.15 ? 1 : 0;
+        if (b2 !== band) continue;
+        const sx = pjX(px2, py2), sy = pjY(px2, py2);
+        if (sx < -8 || sx > W + 8 || sy < -8 || sy > H + 8) continue;
+        const s = (1.9 + Math.abs(I) * 2.6) * z;
+        ctx.rect(sx - s * 0.5, sy - s * 0.5, s, s);
+        any = true;
+      }
+      if (any) ctx.fill();
+    }
+  }
+
+  /* ③ 涟漪：一圈很淡的环（换团的物理反馈） */
+  for (let k = 0; k < ripples.length; k++) {
+    const r = ripples[k], p = r.t / r.life;
+    const rad = (18 + 230 * r.power) * (1 - Math.pow(1 - p, 3)) * z;
+    const a = 0.26 * r.power * Math.pow(1 - p, 2.2);
+    const sx = pjX(r.x, r.y), sy = pjY(r.x, r.y);
+    ctx.strokeStyle = `rgba(${Math.min(255, ar)},${Math.min(255, ag2 + 20)},${Math.min(255, ab + 10)},${a.toFixed(3)})`;
+    ctx.lineWidth = 1.5 * (1 - p);
+    ctx.beginPath(); ctx.arc(sx, sy, rad, 0, 6.2832); ctx.stroke();
+    ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`;
+    ctx.lineWidth = 0.9 * (1 - p);
+    ctx.beginPath(); ctx.arc(sx, sy, rad * 0.82, 0, 6.2832); ctx.stroke();
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+
+  if (AE.flash > 0.012) {
+    ctx.fillStyle = `rgba(190,255,242,${(AE.flash * 0.045).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    AE.flash *= Math.pow(0.0000045, dtReal);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ============================ 10 · 节奏 ============================ */
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; L = null; prep = null;
+    ripples.length = 0;
+  }
+  lastT = T;
+  let c = curIdx;
+  while (c + 1 < lines.length && T >= lines[c + 1].t) c++;
+  if (c !== curIdx) {
+    curIdx = c; brewIdx = -1; prep = null;
+    if (curIdx >= 0) { lookX = W / 2; lookY = H * 0.455; assignLine(curIdx); hintShow('', 0); }
+    else hintShow(lines.length ? '等待第一句…' : '这首没有歌词', 0.5);
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    if (T >= lines[nx].t - Math.min(1.5, Math.max(0.55, gap * 0.5))) { brewIdx = nx; prep = prepLine(nx); }
+  }
+}
+
+/* ============================ 11 · 通信协议 ============================ */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length >= 3) {
+      /* 水下：把封面色往青绿压，保留一点原色相 */
+      accent = [Math.round(p.accent[0] * 0.3 + 70), Math.round(p.accent[1] * 0.62 + 128), Math.round(p.accent[2] * 0.5 + 118)];
+    }
+    curIdx = -1; brewIdx = -1; lastT = -1; L = null; prep = null;
+    ripples.length = 0;
+    clockT = 0; clockAt = performance.now();
+    hintShow(lines.length ? '等待第一句…' : '这首没有歌词', lines.length ? 1 : 0.5);
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整池水一起晃（相干） */
+    const lv = (d.payload && d.payload.level) || 0.6;
+    camShake(Math.cos(T0 * 1.1), Math.sin(T0 * 1.1), 1.6 + lv * 2.6);
+    wv.w1 += (Math.random() < 0.5 ? -1 : 1) * lv * 0.06;
+    wv.w2 += (Math.random() < 0.5 ? -1 : 1) * lv * 0.05;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  curIdx, n: lines.length, pc: L ? L.pc : 0, spans: spans.length,
+  z: +cam.z.toFixed(3), a1: +wv.a1.toFixed(2), t: +now().toFixed(2),
+});
+
+/* ============================ 12 · 启动 ============================ */
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

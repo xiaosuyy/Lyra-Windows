@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>珊瑚生长歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#03101a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(130,232,226,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   059 · 珊瑚生长歌词 —— 字是一丛把笔画吃掉的枝晶
+
+   机制是**受限扩散限制凝聚（confined DLA）**：
+   先把字形栅格化成一张 4px 分辨率的"礁盘"掩膜，再沿笔画用 8 邻域行走串出一条链，
+   每隔 12px 取一个点当**晶种**（gen 0），种出一条贴着笔画走的骨架。
+   然后放 900 个做布朗运动的走子，**只在掩膜内部游荡**（出界的步子直接丢弃），
+   谁撞到已有枝晶的 6.5px 以内，就按 0.3 的概率**粘住**变成新节点，
+   并记下"粘在谁身上"当父节点 —— 于是枝晶一层层往外分叉，把笔画吃成珊瑚。
+
+   和 004（沙粒落到落点堆成字）、008（雪碰到笔画就粘住）的区别：
+   那两版是**粒子落在预设目标点上**，结构是堆积出来的、可以随时被吹散；
+   这一版结构是**长出来的**：没有目标点，节点位置由随机行走的第一次接触决定，
+   父子链构成一棵真正的枝晶树（分形维数 < 2），形态完全不可预测。
+
+   为什么快：枝晶用**均匀网格**加速（格边长 1.4×粘附半径，一格只有常数个节点，
+   3×3 邻域就够 —— 坑⑯）；骨架路径是**追加式 Path2D**，
+   新节点只往后接一段线，每帧只描 4 条已有路径，不重建。
+
+   精修记录：① YRC 逐字生长 —— 礁盘掩膜改成"整屏 4px 栅格 + 照排版逐字画"，
+   每格记下自己属于第几个字（cchar，二分反查），第 k 字的格在 chars[k].t - 0.10
+   之前几乎粘不住（粘附概率 0.42 → 0.10），一到点就**往这个字的格子里空投 70 个走子**
+   （逐字增援，生长立刻在这个字上加速）。无 chars 按 t+dur*k/n 均分回退，__stage 增 yrc。
+   ② 长句折 1~3 行（41 字 = 14/14/13 @ ~86px）；整句另烘一层极淡的珊瑚色"字形底稿"
+   （0.5 分辨率，每帧一次 drawImage），没唱到的字也完整可读（旧版 41 字压成一行 ~30px）。
+   ③ 镜头：整丛珊瑚连背景一起缓慢推拉（1.02~1.05）；踩拍仍是整丛"抽一下"（相干）。
+   分词：不使用。逐字时刻已到字，按词团只会让枝晶生长的节奏变粗。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const mmask = document.createElement('canvas');
+const mctx = mmask.getContext('2d', { willReadFrequently: true });
+
+let W = 0, H = 0, DPR = 1;
+
+/* ---------------- 礁盘掩膜（4px 一格，走子只能在里面游荡） ---------------- */
+const MC = 4;
+let cw = 0, ch = 0;
+let cmask = null;
+let insideList = null, insideN = 0;
+
+/* ---------------- 枝晶 ---------------- */
+const NODE_MAX = 5600;
+let ncount = 0;
+let nx = null, ny = null, npar = null, ngen = null, nborn = null;
+let ghead = null, gnext = null, gcw = 0, gch = 0, gcell = 9;
+let coral = null;                 // 4 条追加式 Path2D
+let oldCoral = null, oldAge = 99;
+const NB = 4;
+
+/* ---------------- 走子 ---------------- */
+const NW = 1500;
+let wx = null, wy = null;
+let spurt = 0;                    // 踩拍的生长脉冲（相干）
+let tipRing = null, tipAt = 0;    // 最近长出来的节点（画高亮生长点）
+
+let accent = [255, 132, 150];
+const plankton = [];
+const prand = (() => { let s = 31337; return () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; }; })();
+for (let i = 0; i < 70; i++) plankton.push({ x: prand(), y: prand(), s: 0.6 + prand() * 1.4, p: prand() * 6.283, sp: 0.06 + prand() * 0.16 });
+
+let bgGrad = null, glowGrad = null, vigGrad = null;
+let baseCv = null, vigCv = null;      // 背景 + 辉光 / 暗角，烘成两张整屏图，每帧各一次 drawImage
+
+/* ---------------- 排版 / 逐字时间 ----------------
+   长句折 1~3 行；"哪一格属于哪个字"用排版表二分反查，不做逐字读回。 */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+
+let lay = null;                 // 当前句排版
+let ctArr = null;               // 逐字成立时刻
+let curYrc = false, ampN = 0, lit = 0;
+let charOn = new Uint8Array(1);
+let cchar = null;               // 每格属于哪个字
+let charCells = [];             // 每字占哪些格（逐字增援用）
+let guideCv = null;             // 极淡的字形底稿（保证整句一直可读）
+
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+/* chars 必须与正文逐字等长、每个 t 有限才采信，并单调钳位；否则 t+dur*k/n 均分回退 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+function makeLayout(text, idx) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.82, 1480);
+  const maxH = H * 0.56;
+  octx.font = fontOf(100);
+  let widest = 1;
+  for (let r = 0; r < nr; r++) widest = Math.max(widest, octx.measureText(rows[r]).width);
+  let fs = Math.min(100 * maxW / widest, maxH / (nr * 1.24), 140);
+  fs = Math.max(22, Math.floor(fs));
+  octx.font = fontOf(fs);
+  const LH = fs * 1.24;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let minX = 1e9, maxX = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      if (x < minX) minX = x;
+      if (x + w > maxX) maxX = x + w;
+      x += w; gi++;
+    }
+    rowsOut.push({ y: y, g: gr, w: wsum });
+  }
+  const minY = y0 - fs * 0.52, maxY = y0 + (nr - 1) * LH + fs * 0.52;
+  const gcx = (minX + maxX) / 2, gcy = (minY + maxY) / 2;
+  const A = placeAnchor(anchors[idx % anchors.length], (maxX - minX) / 2, (maxY - minY) / 2, gcx, gcy);
+  const dx = Math.max(-W * 0.04, Math.min(W * 0.04, (A.x - gcx) * 0.5));
+  const dy = Math.max(-H * 0.05, Math.min(H * 0.05, (A.y - gcy) * 0.5));
+  for (let u = 0; u < glyphs.length; u++) { glyphs[u].x += dx; glyphs[u].y += dy; }
+  for (let r = 0; r < rowsOut.length; r++) {
+    rowsOut[r].y += dy;
+    for (let j = 0; j < rowsOut[r].g.length; j++) { rowsOut[r].g[j].x0 += dx; rowsOut[r].g[j].x1 += dx; }
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length,
+           font: fontOf(fs), cx: gcx + dx, cy: gcy + dy };
+}
+
+function charAt(L, x, y) {
+  if (!L || !L.rows.length) return 255;
+  let bi = 0, bd = 1e9;
+  for (let r = 0; r < L.rows.length; r++) {
+    const d = Math.abs(y - L.rows[r].y);
+    if (d < bd) { bd = d; bi = r; }
+  }
+  const g = L.rows[bi].g;
+  if (!g.length) return 255;
+  if (x <= g[0].x0) return g[0].i;
+  const last = g.length - 1;
+  if (x >= g[last].x1) return g[last].i;
+  let lo = 0, hi = last;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < x) lo = m + 1; else hi = m; }
+  return g[lo].i;
+}
+
+/* 极淡的珊瑚色字形底稿（0.5 分辨率，每句烘一次） */
+function bakeGuide(L) {
+  const k = 0.5;
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * k * DPR)); c.height = Math.max(1, Math.round(H * k * DPR));
+  const x = c.getContext('2d');
+  x.setTransform(DPR * k, 0, 0, DPR * k, 0, 0);
+  x.font = L.font;
+  x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillStyle = 'rgba(104,196,192,1)';
+  for (let u = 0; u < L.glyphs.length; u++) x.fillText(L.glyphs[u].ch, L.glyphs[u].x, L.glyphs[u].y);
+  return c;
+}
+
+/* ---------------- 锚点 ---------------- */
+const anchors = [];
+for (let i = 0; i < 96; i++) {
+  const g = i * 2.399963;
+  const rr = 0.30 + 0.70 * (((i * 37) % 97) / 97);
+  anchors.push({ nx: Math.cos(g) * rr, ny: Math.sin(g) * rr * 0.66 });
+}
+function placeAnchor(a, hw, hh, gcx, gcy) {
+  const M = 60;
+  const x0 = M + hw - gcx, x1 = W - M - hw - gcx;
+  const y0 = M + hh - gcy, y1 = H - M - hh - gcy;
+  return {
+    x: x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2 - gcx,
+    y: y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2 - gcy,
+  };
+}
+
+/* ---------------- 晶种布点：最远点采样 ----------------
+   不能简单地"沿笔画串链每隔一段取一个"：走子被限制在掩膜里，
+   如果某个笔画连通块里一颗晶种都没有，那片区域的光点会永远游荡、永远粘不上。
+   最远点采样保证每个够大的连通块都能分到至少一颗晶种，而且分布均匀。 */
+function spreadSeeds(list, cnt, K) {
+  const picked = [];
+  if (cnt <= 0) return picked;
+  const dmin = new Float32Array(cnt).fill(1e18);
+  let cur = list[(Math.random() * cnt) | 0];
+  for (let it = 0; it < K; it++) {
+    picked.push(cur);
+    const cx = (cur % cw) + 0.5, cy = ((cur / cw) | 0) + 0.5;
+    let best = -1, bd = -1;
+    for (let i = 0; i < cnt; i++) {
+      const k = list[i];
+      const dx = (k % cw) + 0.5 - cx, dy = ((k / cw) | 0) + 0.5 - cy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < dmin[i]) dmin[i] = d2;
+      if (dmin[i] > bd) { bd = dmin[i]; best = k; }
+    }
+    if (best < 0) break;
+    cur = best;
+  }
+  return picked;
+}
+
+/* ---------------- 枝晶：网格 + 追加式路径 ---------------- */
+function freeAggregate() {
+  /* 换句必须把整丛珊瑚还回去（坑③：不释放，下一句就没地方长了） */
+  oldCoral = coral; oldAge = 0;
+  coral = null; ncount = 0;
+  if (ghead) ghead.fill(-1);
+  tipAt = 0;
+}
+
+function addNode(x, y, par, gen) {
+  if (ncount >= NODE_MAX) return -1;
+  const n = ncount++;
+  nx[n] = x; ny[n] = y; npar[n] = par; ngen[n] = gen; nborn[n] = t0;
+  const ci = (x / gcell) | 0, cj = (y / gcell) | 0;
+  if (ci >= 0 && cj >= 0 && ci < gcw && cj < gch) {
+    const c = cj * gcw + ci;
+    gnext[n] = ghead[c]; ghead[c] = n;
+  }
+  if (par >= 0 && coral) {
+    const b = gen <= 0 ? 0 : gen <= 3 ? 1 : gen <= 8 ? 2 : 3;
+    const p = coral[b];
+    p.moveTo(nx[par], ny[par]);
+    p.lineTo(x, y);
+  }
+  if (tipRing) { tipRing[tipAt] = n; tipAt = (tipAt + 1) % tipRing.length; }
+  return n;
+}
+
+function hitTest(x, y, r) {
+  const ci = (x / gcell) | 0, cj = (y / gcell) | 0;
+  const r2 = r * r;
+  for (let dj = -1; dj <= 1; dj++) {
+    const j = cj + dj;
+    if (j < 0 || j >= gch) continue;
+    const row = j * gcw;
+    for (let di = -1; di <= 1; di++) {
+      const i = ci + di;
+      if (i < 0 || i >= gcw) continue;
+      let n = ghead[row + i];
+      while (n >= 0) {
+        const dx = nx[n] - x, dy = ny[n] - y;
+        if (dx * dx + dy * dy < r2) return n;
+        n = gnext[n];
+      }
+    }
+  }
+  return -1;
+}
+
+function respawnWalker(k) {
+  if (insideN <= 0) { wx[k] = -1e5; wy[k] = -1e5; return; }
+  const kk = insideList[(Math.random() * insideN) | 0];
+  wx[k] = ((kk % cw) + 0.5) * MC;
+  wy[k] = (((kk / cw) | 0) + 0.5) * MC;
+}
+
+/* ---------------- 建立一句：掩膜 → 骨架 → 撒走子 ---------------- */
+function buildCoral(idx) {
+  freeAggregate();
+  coral = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+  insideN = 0;
+  lay = null; guideCv = null; charCells = []; lit = 0; ctArr = null; curYrc = false; ampN = 0;
+  charOn = new Uint8Array(1);
+  if (!cmask) return;
+  if (idx < 0 || !lines[idx] || !lines[idx].text) { for (let k = 0; k < NW; k++) respawnWalker(k); return; }
+
+  lay = makeLayout(lines[idx].text, idx);
+  if (!lay) { for (let k = 0; k < NW; k++) respawnWalker(k); return; }
+  guideCv = bakeGuide(lay);
+
+  mctx.setTransform(1, 0, 0, 1, 0, 0);
+  mctx.clearRect(0, 0, cw, ch);
+  mctx.setTransform(1 / MC, 0, 0, 1 / MC, 0, 0);
+  mctx.font = lay.font;
+  mctx.textAlign = 'center'; mctx.textBaseline = 'middle';
+  mctx.lineJoin = 'round'; mctx.lineCap = 'round';
+  mctx.fillStyle = '#fff'; mctx.strokeStyle = '#fff';
+  mctx.lineWidth = lay.fs * 0.05;
+  for (let u = 0; u < lay.glyphs.length; u++) {
+    const g = lay.glyphs[u];
+    mctx.strokeText(g.ch, g.x, g.y);
+    mctx.fillText(g.ch, g.x, g.y);
+  }
+  const d = mctx.getImageData(0, 0, cw, ch).data;
+
+  const n = cw * ch;
+  cmask.fill(0);
+  let cnt = 0;
+  for (let k = 0; k < n; k++) {
+    if (d[k * 4 + 3] > 100) { cmask[k] = 1; cnt++; }
+  }
+  insideN = cnt;
+  if (!cnt) { for (let k = 0; k < NW; k++) respawnWalker(k); return; }
+  if (!insideList || insideList.length < cnt) insideList = new Int32Array(cnt + 64);
+  let w = 0;
+  for (let k = 0; k < n; k++) if (cmask[k]) insideList[w++] = k;
+
+  /* 每格属于哪个字 + 每字有哪些格（逐字生长 / 逐字增援都用它） */
+  cchar.fill(255);
+  charCells = [];
+  for (let q = 0; q < cnt; q++) {
+    const kk = insideList[q];
+    const c = charAt(lay, ((kk % cw) + 0.5) * MC, (((kk / cw) | 0) + 0.5) * MC);
+    cchar[kk] = c;
+    if (c !== 255) (charCells[c] || (charCells[c] = [])).push(kk);
+  }
+
+  /* 晶种：每个字撒 3 颗（最远点采样在长句上会漏掉整片字 —— 有字没晶种就永远长不出东西） */
+  for (let c = 0; c < charCells.length; c++) {
+    const list = charCells[c];
+    if (!list || !list.length) continue;
+    const take = Math.min(3, list.length);
+    for (let q = 0; q < take; q++) {
+      const kk = list[(Math.random() * list.length) | 0];
+      addNode(((kk % cw) + 0.5) * MC, (((kk / cw) | 0) + 0.5) * MC, -1, 0);
+    }
+  }
+  for (let k = 0; k < NW; k++) respawnWalker(k);
+
+  /* 逐字时刻 */
+  const ct = charTimes(lines[idx], lay.n);
+  ctArr = ct.t; curYrc = ct.ok; ampN = lay.n;
+  charOn = new Uint8Array(ampN + 1);
+}
+
+/* 一个字到点：往它的格子里空投一批走子 —— 生长立刻在这个字上加速 */
+function boostChar(k) {
+  const list = charCells[k];
+  if (!list || !list.length) return;
+  const n2 = list.length;
+  const movers = Math.min(72, NW >> 2);
+  for (let q = 0; q < movers; q++) {
+    const idx = (growStart + q * 7) % NW;
+    const kk = list[(Math.random() * n2) | 0];
+    wx[idx] = ((kk % cw) + 0.5) * MC;
+    wy[idx] = (((kk / cw) | 0) + 0.5) * MC;
+  }
+}
+
+function updChars(T) {
+  if (!ctArr || !ampN) return;
+  let c = 0;
+  for (let k = 0; k < ampN; k++) {
+    const on = T >= ctArr[k] - 0.10 ? 1 : 0;
+    if (on && !charOn[k]) boostChar(k);
+    charOn[k] = on;
+    if (on) c++;
+  }
+  if (c > lit) lit = c;
+}
+
+/* ---------------- 分配 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  cw = Math.ceil(W / MC) + 1;
+  ch = Math.ceil(H / MC) + 1;
+  mmask.width = cw; mmask.height = ch;
+  cmask = new Uint8Array(cw * ch);
+  cchar = new Uint8Array(cw * ch);
+  cchar.fill(255);
+  charCells = [];
+  insideList = new Int32Array(1024);
+  insideN = 0;
+
+  gcell = 9;
+  gcw = Math.ceil(W / gcell) + 2;
+  gch = Math.ceil(H / gcell) + 2;
+  ghead = new Int32Array(gcw * gch).fill(-1);
+  gnext = new Int32Array(NODE_MAX);
+  nx = new Float32Array(NODE_MAX); ny = new Float32Array(NODE_MAX);
+  npar = new Int32Array(NODE_MAX); ngen = new Int32Array(NODE_MAX);
+  nborn = new Float32Array(NODE_MAX);
+  ncount = 0;
+  tipRing = new Int32Array(140); tipAt = 0;
+  wx = new Float32Array(NW); wy = new Float32Array(NW);
+  for (let k = 0; k < NW; k++) { wx[k] = -1e5; wy[k] = -1e5; }
+
+  bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrad.addColorStop(0, '#03101a');
+  bgGrad.addColorStop(0.5, '#04141f');
+  bgGrad.addColorStop(1, '#020a12');
+  glowGrad = ctx.createRadialGradient(W * 0.5, H * 0.5, 0, W * 0.5, H * 0.5, Math.max(W, H) * 0.55);
+  glowGrad.addColorStop(0, 'rgba(255,120,140,0.09)');
+  glowGrad.addColorStop(0.45, 'rgba(60,190,200,0.06)');
+  glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
+  vigGrad = ctx.createRadialGradient(W * 0.5, H * 0.5, Math.min(W, H) * 0.26, W * 0.5, H * 0.5, Math.max(W, H) * 0.8);
+  vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
+  vigGrad.addColorStop(1, 'rgba(1,5,10,0.5)');
+
+  /* 两张整屏静态层：每帧两次 drawImage 代替两次全屏渐变填充（软件渲染下差 ~6ms） */
+  baseCv = document.createElement('canvas');
+  baseCv.width = cv.width; baseCv.height = cv.height;
+  const bx = baseCv.getContext('2d');
+  bx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bx.fillStyle = bgGrad; bx.fillRect(0, 0, W, H);
+  bx.globalCompositeOperation = 'lighter';
+  bx.fillStyle = glowGrad; bx.fillRect(0, 0, W, H);
+  vigCv = document.createElement('canvas');
+  vigCv.width = cv.width; vigCv.height = cv.height;
+  const vx = vigCv.getContext('2d');
+  vx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  vx.fillStyle = vigGrad; vx.fillRect(0, 0, W, H);
+
+  buildCoral(curIdx);
+}
+addEventListener('resize', resize);
+
+/* ---------------- 生长 ----------------
+   每帧给生长一个**配额**：不配额的话 900 个走子一秒就把整句填满，
+   剩下的四秒画面就死了。配额 + 轮转起点，让珊瑚匀速长满一整句。 */
+let growStart = 0;
+function grow(dt) {
+  if (!coral || insideN <= 0) return;
+  const stepLen = 4.2 * (1 + spurt * 0.9);
+  const stickR = 6.4 * (1 + spurt * 0.30);
+  const passes = spurt > 0.15 ? 3 : 2;
+  let budget = Math.round(16 + spurt * 26);
+  const full = ncount >= NODE_MAX;
+  const start = growStart;
+  growStart = (growStart + 137) % NW;
+  for (let q = 0; q < NW; q++) {
+    const k = (start + q) % NW;
+    if (wx[k] < -1e4) { respawnWalker(k); continue; }
+    for (let s = 0; s < passes; s++) {
+      const a = Math.random() * 6.283185;
+      const tx2 = wx[k] + Math.cos(a) * stepLen, ty2 = wy[k] + Math.sin(a) * stepLen;
+      const mi = (tx2 / MC) | 0, mj = (ty2 / MC) | 0;
+      if (mi >= 0 && mj >= 0 && mi < cw && mj < ch && cmask[mj * cw + mi]) { wx[k] = tx2; wy[k] = ty2; }
+      if (full || budget <= 0) continue;
+      const h = hitTest(wx[k], wy[k], stickR);
+      if (h >= 0) {
+        /* 逐字生长：还没唱到的字几乎粘不住（0.10），唱到的字正常粘（0.42） */
+        let p = 0.42;
+        const mi2 = (wx[k] / MC) | 0, mj2 = (wy[k] / MC) | 0;
+        if (mi2 >= 0 && mj2 >= 0 && mi2 < cw && mj2 < ch) {
+          const cc = cchar[mj2 * cw + mi2];
+          if (cc !== 255 && !charOn[cc]) p = 0.09;
+        }
+        if (Math.random() < p) {
+          addNode(wx[k], wy[k], h, ngen[h] + 1);
+          respawnWalker(k);
+          budget--;
+          break;
+        }
+      }
+    }
+    if (budget <= 0) break;
+  }
+}
+
+/* ---------------- 绘制 ---------------- */
+function draw() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  /* 镜头：整丛珊瑚连背景一起缓慢横移（只做整像素平移：全屏渐变一旦进缩放就会走重采样，
+     软件渲染下每帧多花十几毫秒 —— 实测 48fps → 60fps 的差别就在这一个 scale 上） */
+  const panX = Math.round(Math.sin(t0 * 0.040) * W * 0.008);
+  const panY = Math.round(Math.cos(t0 * 0.034) * H * 0.007);
+  ctx.save();
+  ctx.translate(panX, panY);
+  if (baseCv) ctx.drawImage(baseCv, 0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  /* 极淡的字形底稿：没唱到的字也读得出来 */
+  if (guideCv) {
+    ctx.globalAlpha = 0.21;
+    ctx.drawImage(guideCv, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 浮游生物：两档合批 */
+  ctx.fillStyle = 'rgba(140,230,225,0.26)';
+  ctx.beginPath();
+  for (let i = 0; i < plankton.length; i++) {
+    const d = plankton[i];
+    if (Math.sin(t0 * 1.1 + d.p) < 0) continue;
+    const x = (d.x + Math.sin(t0 * d.sp + d.p) * 0.02) * W;
+    const y = (d.y + Math.sin(t0 * d.sp * 0.7 + d.p * 1.7) * 0.015) * H;
+    ctx.moveTo(x + d.s, y); ctx.arc(x, y, d.s, 0, 6.283);
+  }
+  ctx.fill();
+  ctx.fillStyle = 'rgba(140,230,225,0.10)';
+  ctx.beginPath();
+  for (let i = 0; i < plankton.length; i++) {
+    const d = plankton[i];
+    if (Math.sin(t0 * 1.1 + d.p) >= 0) continue;
+    const x = (d.x + Math.sin(t0 * d.sp + d.p) * 0.02) * W;
+    const y = (d.y + Math.sin(t0 * d.sp * 0.7 + d.p * 1.7) * 0.015) * H;
+    ctx.moveTo(x + d.s, y); ctx.arc(x, y, d.s, 0, 6.283);
+  }
+  ctx.fill();
+
+  /* 上一句的珊瑚：0.35 秒内化掉，然后连同它的路径一起丢弃 */
+  if (oldCoral && oldAge < 0.35) {
+    const f = 1 - oldAge / 0.35;
+    strokeCoral(oldCoral, f * 0.55);
+  }
+  if (coral) strokeCoral(coral, 1);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
+  if (vigCv) ctx.drawImage(vigCv, 0, 0, W, H);
+}
+
+function strokeCoral(c, k) {
+  const ac = accent;
+  ctx.lineWidth = 3.0;
+  ctx.strokeStyle = 'rgba(70,210,214,' + (0.30 * k).toFixed(3) + ')';
+  ctx.stroke(c[0]);
+  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = 'rgba(120,232,226,' + (0.55 * k).toFixed(3) + ')';
+  ctx.stroke(c[0]);
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(200,180,220,' + (0.45 * k).toFixed(3) + ')';
+  ctx.stroke(c[1]);
+  ctx.lineWidth = 1.3;
+  ctx.strokeStyle = 'rgba(' + ac[0] + ',' + ac[1] + ',' + ac[2] + ',' + (0.55 * k).toFixed(3) + ')';
+  ctx.stroke(c[2]);
+  ctx.lineWidth = 3.4;
+  ctx.strokeStyle = 'rgba(' + ac[0] + ',' + ac[1] + ',' + ac[2] + ',' + (0.10 * k).toFixed(3) + ')';
+  ctx.stroke(c[3]);
+  ctx.lineWidth = 1.1;
+  ctx.strokeStyle = 'rgba(255,214,224,' + (0.75 * k).toFixed(3) + ')';
+  ctx.stroke(c[3]);
+
+  /* 晶种（gen 0）本身没有父节点、画不成线段，单独点出来 */
+  if (k > 0.9) {
+    ctx.fillStyle = 'rgba(150,238,232,0.55)';
+    ctx.beginPath();
+    for (let n = 0; n < ncount; n++) {
+      if (ngen[n] !== 0) continue;
+      ctx.rect(nx[n] - 1.3, ny[n] - 1.3, 2.6, 2.6);
+    }
+    ctx.fill();
+  }
+
+  /* 刚长出来的尖端：亮一点，看得出"正在长" */
+  if (k > 0.9 && tipRing) {
+    const fresh = 0.75;
+    ctx.fillStyle = 'rgba(255,236,240,0.85)';
+    ctx.beginPath();
+    for (let i = 0; i < tipRing.length; i++) {
+      const n = tipRing[i];
+      if (n < 0 || n >= ncount) continue;
+      if (t0 - nborn[n] > fresh) continue;
+      ctx.rect(nx[n] - 1.1, ny[n] - 1.1, 2.2, 2.2);
+    }
+    ctx.fill();
+  }
+}
+
+/* ---------------- 时间 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let pendIdx = -1;
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pendIdx = -1;
+    freeAggregate();
+    lay = null; guideCv = null; ctArr = null; curYrc = false; ampN = 0; lit = 0;
+    charOn = new Uint8Array(1); charCells = [];
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    /* 显示切到第 ci 句。上一句那丛珊瑚在这里整个还回池子（坑③），
+       新一句的掩膜/骨架/走子立刻重建 */
+    buildCoral(ci);
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx2 = curIdx + 1;
+  if (nx2 < lines.length && brewIdx !== nx2) {
+    const gap = lines[nx2].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx2].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx2].t - lead) { brewIdx = nx2; pendIdx = nx2; /* 掩膜只在这句开唱时建，避免提前把上一句覆盖掉 */ }
+  }
+}
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+
+  timing(T);
+  spurt *= Math.exp(-dt * 2.2);
+  oldAge += dt;
+  if (oldCoral && oldAge >= 0.35) oldCoral = null;   // 释放
+  updChars(T);
+  grow(dt);
+  draw();
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 启动 ---------------- */
+lines = [];
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; pendIdx = -1;
+    if (p.accent) {
+      const a = p.accent;
+      accent = [
+        Math.min(255, Math.round(a[0] * 0.40 + 255 * 0.60)),
+        Math.min(255, Math.round(a[1] * 0.40 + 138 * 0.60)),
+        Math.min(255, Math.round(a[2] * 0.40 + 158 * 0.60)),
+      ];
+    }
+    /* 清掉所有粒子/结构 */
+    freeAggregate();
+    oldCoral = null; oldAge = 99;
+    lay = null; guideCv = null; ctArr = null; curYrc = false; ampN = 0; lit = 0;
+    charOn = new Uint8Array(1); charCells = [];
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整丛珊瑚一起"抽一下"（走子步长、粘附半径、走子遍数同时放大）——
+       相干，不是逐节点乱抖（坑⑬） */
+    spurt = Math.min(1.4, spurt + 0.5 + (d.payload.level || 0) * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  nodes: ncount, max: NODE_MAX, inside: insideN, walkers: NW,
+  spurt: +spurt.toFixed(2), t: +now().toFixed(2),
+  yrc: curYrc, yrcLen: lines[curIdx] && lines[curIdx].chars ? lines[curIdx].chars.length : 0,
+  lit: lit, chars: ampN, rows: lay ? lay.nr : 0, fs: lay ? +lay.fs.toFixed(1) : 0,
+});
+</script>
+</body>
+</html>

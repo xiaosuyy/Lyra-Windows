@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>烟影</title>
+<!--
+  机制：十万缕冷烟被一股横风从左往右抽走；字站在气流中间，烟被字顶开、绕着字上下擦过去，于是在字周围
+        留出一条漆黑的航迹（wake），烟在航迹的边沿积成一圈亮边。拍点一到风向整个倒过来（左右反刮），
+        手感最重的那段（8.6–12.4s）先被抽空，再有一道阵风锋从左边扫过来把烟重新灌满。
+  用了：WebGL2 实例化（drawArraysInstanced，10 万缕烟 = 10 万条细长实例，每帧 CPU 只发 11 个 uniform）；
+        风场推进 / 绕字分流 / 航迹暗带 / 阵风锋全部在顶点着色器里解析算出，CPU 每帧不碰粒子。
+        无 getImageData：字是真 DOM 文字，横着被风吹进来。
+  最像的三个：181 体积迷雾歌词 / 175 雾幕投影 / 203 煤烟玻璃（soot-glass）
+  差在哪：那些是"雾在字后面飘"或"字被烟熏黑"；这里烟有流场——它必须从字旁边挤过去，字是被流场
+        绕开的障碍物，航迹的暗和边沿的亮是同一股烟的两面，字本身不发光也不冒烟。
+-->
+<style>
+  html,body{margin:0;height:100%;background:#05070a;overflow:hidden}
+  body{font-family:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;
+       color:#e8f1fa}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;z-index:1}
+  #type{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:2;--lit:.2}
+  .slot{position:absolute;left:26%;top:31%;width:max-content;max-width:56vw;
+        transform:translate(-50%,-50%);text-align:left;opacity:0;filter:blur(6px);z-index:2;isolation:isolate}
+  .slot::before{content:'';position:absolute;inset:-52% -10%;z-index:-1;pointer-events:none;
+        background:radial-gradient(56% 54% at 50% 50%,rgba(4,6,9,.96) 0%,rgba(4,6,9,.66) 50%,rgba(4,6,9,0) 78%)}
+  .slot .in{display:block;font-weight:900;font-size:clamp(34px,6.6vh,92px);line-height:1.26;
+        letter-spacing:.11em;color:#ffffff;text-wrap:balance;white-space:pre-wrap;
+        text-shadow:0 0 46px rgba(0,0,0,.95),0 4px 22px rgba(0,0,0,.92),0 1px 2px rgba(0,0,0,.95),
+                    0 0 2px rgba(186,220,255,calc(var(--lit) * .50)),
+                    -10px 0 34px rgba(120,180,255,calc(var(--lit) * .34)),
+                    10px 2px 52px rgba(70,140,230,calc(var(--lit) * .20))}
+  .slot .in span{display:inline-block}
+  #vig{position:fixed;inset:0;pointer-events:none;z-index:3;
+       background:radial-gradient(130% 100% at 50% 46%,rgba(0,0,0,0) 34%,rgba(2,4,7,.52) 100%)}
+  #hint{position:fixed;left:50%;bottom:15px;transform:translateX(-50%);pointer-events:none;z-index:4;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(150,190,230,.36);transition:opacity .8s;white-space:nowrap}
+  html.fb #c{display:none}
+  html.fb body{background:radial-gradient(120% 92% at 50% 46%,#16202b 0%,#0a1119 58%,#04060a 100%)}
+  html.fb #type{z-index:1}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="type"></div>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ══════════════════════════════════════════════════════════════════════
+   A 车道内核（单文件内联，每个形态自带一份）
+   协议 / 时钟 / 两句槽位（前奏·进场·余韵）/ 暂停冻结 / resize / RM / 降级
+   形态只提供：片元与顶点着色器、配色、以及 stage 钩子
+   ══════════════════════════════════════════════════════════════════════ */
+const cv = document.getElementById('c');
+const typeBox = document.getElementById('type');
+const hint = document.getElementById('hint');
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+
+const N = 100000;                 /* 10 万缕烟，全部住在 GPU 上 */
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, beatN = 0, bass = 0, treb = 0, beatAt = -9;
+let frames = 0, jsMs = 0, errMsg = '';
+let readySent = false, hintOn = true;
+let inAmt = 0, preAmt = 0, act = 0, pol = 0, sweep = 1;
+let cur = null, ghost = null, ghostAt = 0, slotFlip = 0, ghostStartV = 0;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+const ease3 = (x) => 1 - Math.pow(1 - x, 3);
+
+/* prefers-reduced-motion：随时切换都要跟得上 */
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const onMQ = (e) => { RM = !!e.matches; skipToEnd(); };
+    if (mq.addEventListener) mq.addEventListener('change', onMQ);
+    else if (mq.addListener) mq.addListener(onMQ);
+  }
+} catch (_) {}
+function skipToEnd() { if (cur && cur.chars) for (const c of cur.chars) { c.style.opacity = '1'; c.style.transform = 'none'; } }
+
+/* ---------------- 文字槽位：两句交替，旧句留残影 ---------------- */
+function mkSlot() {
+  const el = document.createElement('div'); el.className = 'slot';
+  const inner = document.createElement('div'); inner.className = 'in';
+  el.appendChild(inner); typeBox.appendChild(el);
+  return { el, inner, chars: [], cx: [], t0: 0, voice: 0, dir: 1, noanim: false, text: '' };
+}
+const slots = [mkSlot(), mkSlot()];
+
+function fillSlot(slot, text) {
+  slot.inner.textContent = '';
+  slot.chars = [];
+  slot.cx = [];
+  const arr = Array.from(text);
+  for (let i = 0; i < arr.length; i++) {
+    const sp = document.createElement('span');
+    sp.textContent = arr[i];
+    sp.style.opacity = '0';
+    slot.inner.appendChild(sp);
+    slot.chars.push(sp);
+  }
+  slot.text = text;
+  for (const sp of slot.chars) {
+    const r = sp.getBoundingClientRect();
+    slot.cx.push((r.left + r.width / 2) / W * 2 - 1);
+  }
+}
+
+function showLine(ci, instant) {
+  const s = slots[slotFlip]; slotFlip ^= 1;
+  if (cur && cur !== s) { ghost = cur; ghostAt = now(); ghostStartV = vT; }
+  cur = s; ghost === s && (ghost = null);
+  s.el.style.transform = 'translate(-50%,-50%)';
+  fillSlot(s, (lines[ci] || {}).text || '');
+  s.noanim = true;
+  s.t0 = instant ? now() - 2 : lines[ci].t;
+  s.voice = ci % 3;
+  s.dir = (ci % 2) ? 1 : -1;
+  s.amb = ci % 2;
+  s.el.style.zIndex = '3';
+  if (ghost) ghost.el.style.zIndex = '2';
+  s.el.style.opacity = '1';
+  s.el.style.filter = 'none';
+  for (const c of s.chars) { c.style.opacity = instant ? '1' : '0'; c.style.transform = instant ? 'none' : ''; }
+  hintOn = false; hint.style.opacity = '0';
+}
+
+function hideAll() {
+  cur = null; ghost = null;
+  for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; }
+  hintOn = true; hint.style.opacity = '0.9';
+}
+
+/* ---------------- 时钟：空歌词 / seek / 句首 ---------------- */
+function timing(T) {
+  if (!lines.length) { if (idx !== -1) { idx = -1; hideAll(); } lastT = T; return; }
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) {
+    const jump = (lastT > -1e8 && (Math.abs(T - lastT) > 0.9 || ci > idx + 1 || ci < idx));
+    idx = ci;
+    if (ci < 0) { hideAll(); }
+    else showLine(ci, jump);
+  }
+  lastT = T;
+}
+
+/* ---------------- 每帧：uniform 状态 ---------------- */
+let gust = 0, gustFix = 0, actPh = 0;
+function state(T) {
+  if (idx >= 0 && lines[idx]) {
+    const lt = lines[idx].t;
+    inAmt = clamp01((T - lt) / 1.10);
+    const nx = lines[idx + 1];
+    preAmt = nx ? clamp01(1 - (nx.t - T) / 0.30) : 0;
+  } else { inAmt = 0; preAmt = 0; }
+  act = (vT > 8.6 && vT < 12.4) ? 1 : 0;
+  pol = beatN % 2;
+  sweep = idx >= 0 ? clamp01((inAmt * 1.10 - 0.02) / 0.95) : 0;
+  /* 阵风：拍点顶一下，慢慢泄掉；贝斯托着基础风力 */
+  const want = Math.max(beatPulse, bass * 0.45);
+  gust = RM ? 0.35 : gust + (want - gust) * 0.18;
+  /* uAct 窗口里每 1.9s 一次"抽空→灌满"的周期相位 */
+  actPh = act ? (((vT - 8.6) / 1.9) % 1) : -1;
+  typeBox.style.setProperty('--lit', (0.12 + 0.88 * Math.max(beatPulse, preAmt * 0.45, inAmt * 0.6)).toFixed(3));
+}
+
+/* ---------------- 文字：横着被风吹进来 ---------------- */
+function updDom(T) {
+  if (cur) {
+    const stg = 0.030, dur = 0.62;
+    for (let i = 0; i < cur.chars.length; i++) {
+      const p = cur.noanim ? 1 : clamp01((T - (cur.t0 + i * stg)) / dur);
+      const e = ease3(p);
+      const c = cur.chars[i];
+      const vis = RM ? 1 : clamp01((inAmt * 1.55 + 0.08 - i * 0.014) / 0.26);
+      /* 阵风把字吹得比风快一点，风一大整句微微歪 */
+      const j = act ? Math.sin(vT * 9.7 + i * 1.9) * 2.6 : 0;
+      const dx = (1 - e) * -78 + j + beatPulse * 4;
+      c.style.transform = 'translateX(' + dx.toFixed(2) + 'px) skewX(' + (((1 - e) * 13) + (act ? -2.4 : 0)).toFixed(2) + 'deg)';
+      c.style.opacity = (clamp01(p * 1.15) * vis).toFixed(3);
+    }
+    cur.el.style.filter = 'blur(' + ((1 - clamp01((T - cur.t0) / 0.34)) * 6.0).toFixed(2) + 'px)';
+    /* 整句在风里非常轻地摆；风大时被往前推 */
+    const gx = (gust - 0.35) * 12 + (sweep * 2 - 1) * 3;
+    cur.el.style.transform = 'translate(-50%,-50%) translate(' + gx.toFixed(2) + 'px,' + (-beatPulse * 2).toFixed(2) + 'px)';
+  }
+  if (ghost) {
+    const q = clamp01((T - ghostAt) / 0.85);
+    if (q >= 1) { ghost.el.style.opacity = '0'; ghost = null; }
+    else {
+      ghost.el.style.opacity = (0.26 * (1 - q) * (1 - q)).toFixed(3);
+      ghost.el.style.filter = 'blur(' + (q * 14).toFixed(2) + 'px)';
+      /* 残影被风刮走 */
+      ghost.el.style.transform = 'translate(-50%,-50%) translateX(' + (q * 62).toFixed(2) + 'px) scale(' + (1 + q * 0.03).toFixed(3) + ') skewX(' + (q * 7).toFixed(2) + 'deg)';
+    }
+  }
+}
+
+/* ══════════════════════════════ GPU ══════════════════════════════ */
+const GL_OPT = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false };
+let gl = null, P = null, U = {}, bgP = null, bgU = {}, pVao = null, bgVao = null, glOk = false;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'shader');
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link');
+  return p;
+}
+function locs(p, names) { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; }
+
+/* —— 背景：冷空气。一点上冷下更冷的渐变 + 一条极淡的气流亮带 + 轻微颗粒 —— */
+const BG_VS = `#version 300 es
+in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform float uT, uAct, uPol;
+uniform vec2 uRes;
+float h21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+vec2 srcNow(float t){ return vec2(-0.95 + 0.070*sin(t*0.13), -0.62 + 0.050*sin(t*0.09 + 1.0)); }
+void main(){
+  vec2 p = vUV;
+  float asp = uRes.x / uRes.y;
+  vec2 q = vec2((p.x - 0.5) * asp, p.y - 0.5);
+  vec3 c = vec3(0.006, 0.009, 0.013);
+  /* 冷空气：上缘只亮一点点，天光从顶上漏进来 */
+  c += vec3(0.026, 0.035, 0.048) * pow(clamp(1.0 - p.y, 0.0, 1.0), 1.6);
+  /* 喷口：左下角外一个会动的亮点，连它照亮的那一小片 */
+  vec2 S0 = srcNow(uT);
+  vec2 S = vec2(S0.x * asp * 0.5, S0.y * 0.5);
+  vec2 dq = q - S;
+  float dS = length(dq * vec2(1.0, 1.12));
+  c += vec3(0.16, 0.21, 0.28) * exp(-pow(dS / 0.055, 2.0));
+  c += vec3(0.030, 0.042, 0.058) * exp(-pow(dS / 0.30, 2.0));
+  /* 主轴：一条极淡的亮楔，烟要走的那条路 */
+  float ax = dq.x * 0.848 + dq.y * 0.530;
+  float pr = -dq.x * 0.530 + dq.y * 0.848;
+  float wedge = smoothstep(-0.04, 0.12, ax)
+              * exp(-pow(pr / (0.075 + 0.235 * clamp(ax, 0.0, 1.0)), 2.0))
+              * clamp(1.0 - ax / 1.9, 0.0, 1.0);
+  c += vec3(0.013, 0.018, 0.025) * wedge;
+  /* uAct：整条主轴被点着 */
+  c += vec3(0.034, 0.046, 0.062) * wedge * uAct;
+  c += vec3(0.0015, 0.002, 0.003) * h21(floor(p * uRes * 0.5) + fract(uT) * 7.0);
+  o = vec4(c, 1.0);
+}`;
+
+/* —— 粒子：一条从画面外左下角喷出来的冷烟（近口细亮直，远端粗暗卷） —— */
+const P_VS = `#version 300 es
+precision highp float;
+in vec2 aQ; in vec4 aSeed;
+uniform float uT, uBass, uTre, uBeat, uPre, uIn, uPol, uAct, uGust;
+uniform vec2 uRes;
+uniform vec4 uText;
+out vec2 vQ; out vec3 vCol; out float vA;
+
+float h21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+
+void main(){
+  float asp = uRes.x / uRes.y;
+  float act = step(0.5, uAct);
+  float rev = mix(1.0, -1.0, uPol);
+  float jw = h21(vec2(aSeed.x * 97.13, aSeed.y * 41.70));
+
+  /* ── 喷口：在画面左下角外面，自己会慢慢游 ── */
+  vec2 S = vec2(-0.95 + 0.070*sin(uT*0.13), -0.62 + 0.050*sin(uT*0.09 + 1.0));
+  vec2 DIR = vec2(0.848, 0.530);              /* 主轴：向右上 32° */
+  vec2 PER = vec2(-0.530, 0.848);
+
+  /* ── 生命 s：0 在喷口，1 在尾端。近口跑得快，远端被拖着慢下来 ── */
+  float spd = (0.100 + 0.030 * uBass) * (1.0 + 0.50 * uGust);
+  spd *= 1.0 + 0.60 * act;                    /* 喷发时整条烟加速 */
+  float u = fract(aSeed.y + uT * spd * rev);
+  float s = 1.0 - pow(1.0 - u, 1.75);
+  float s2 = s * s;
+
+  /* ── 锥形张开：近口细，远端散 ── */
+  float halfW = 0.010 + 0.320 * pow(s, 1.30);
+  float lat = (jw * 2.0 - 1.0) * halfW;
+  lat *= 0.45 + 1.00 * h21(vec2(aSeed.x * 13.7, 3.9));   /* 同一层里也有厚薄 */
+
+  /* ── 涡：curl 噪声把横向位置拧起来，越远越卷 ── */
+  vec2 vp = vec2(lat * 2.6 + 2.7, s * 2.4 - uT * 0.30 * rev);
+  float n1 = vn(vp), n2 = vn(vp * 2.15 + 5.3);
+  float swirl = (n1 - 0.5) + 0.55 * (n2 - 0.5);
+  lat += swirl * (0.070 + 0.460 * s);
+  /* 沿轴的蛇形摆：整条烟在摆，越远越明显 */
+  lat += 0.050 * sin(s * 6.5 - uT * 1.05 + jw * 6.283) * s2;
+
+  float L = s * 1.85;                          /* 沿轴走过的距离 */
+  float lx = S.x + DIR.x * L + PER.x * lat;
+  float ly = S.y + DIR.y * L + PER.y * lat;
+
+  /* ── 尺寸：近口又细又亮（方向性强），远端又粗又糊 ── */
+  float sz = 0.0016 + 0.0042 * pow(s, 1.30);
+  float sx = sz * (2.2 + 4.2 * s) * (1.0 + 0.35 * uGust + 0.55 * act);
+  float sy = sz * 1.05;
+  /* 朝向：顺着主轴拉长的丝 */
+  float ca = cos(0.558), sa = sin(0.558);
+
+  /* ── 亮度：近口白亮，远端暗下去；丝缕上有 1–2px 的细边 ── */
+  float a = (0.36 - 0.26 * pow(s, 0.80)) * (0.40 + 0.60 * aSeed.w);
+  float fil = vn(vec2(lat * 16.0, s * 11.0 - uT * 0.40 * rev));
+  a *= 0.30 + 1.05 * fil * fil;
+  a *= 1.0 + 0.25 * uGust + 0.55 * uAct + 0.25 * uPre;
+  /* 尾端不许戛然而止：越远越稀，最后一截化进黑里 */
+  a *= smoothstep(1.0, 0.74, s);
+  /* 远处的边不齐：噪声把整片咬出缺口 */
+  a *= smoothstep(0.0, 0.30, vn(vec2(lat * 2.4 + 7.1, s * 1.8 - uT * 0.18 * rev)) + 0.30 * (1.0 - s));
+  vec3 col = mix(vec3(0.88, 0.94, 1.00), vec3(0.15, 0.22, 0.34), clamp(pow(s, 0.85), 0.0, 1.0));
+
+  /* ── uAct：一次喷发 —— 整条主轴更浓、更白，还在一鼓一鼓地喘 ── */
+  float er = act * (0.55 + 0.45 * sin((uT - 8.6) * 5.4));
+  a *= 1.0 + 0.95 * er;
+  col = mix(col, vec3(0.96, 0.99, 1.00), 0.34 * er);
+  lat *= 1.0 + 0.20 * er;
+  lx = S.x + DIR.x * L + PER.x * lat;
+  ly = S.y + DIR.y * L + PER.y * lat;
+
+  /* ── 字是障碍物：烟绕着字走（字在烟最淡的左上角） ── */
+  vec2 th = vec2(uText.z, uText.w);
+  float wd = length(vec2((lx - uText.x) / (th.x * 1.30 + 0.055),
+                         (ly - uText.y) / (th.y * 1.85 + 0.085)));
+  a *= 1.0 - 0.86 * smoothstep(1.0, 0.22, wd);
+  a *= 1.0 + 0.55 * (smoothstep(0.95, 1.25, wd) * smoothstep(1.75, 1.30, wd));
+
+  /* ── 出画淡出：别顶到框 ── */
+  a *= smoothstep(1.14, 0.94, abs(ly));
+  a *= smoothstep(1.42, 1.18, abs(lx));
+
+  vA = a; vQ = aQ; vCol = col;
+  /* 局部方块顺着主轴转 32°，丝才会沿着烟的方向拉长 */
+  vec2 lq2 = (aQ - 0.5) * vec2(sx * 2.0, sy * 2.0);
+  vec2 lq = vec2(lq2.x * ca - lq2.y * sa, lq2.x * sa + lq2.y * ca);
+  gl_Position = vec4(vec2(lx, ly) + lq, 0.0, 1.0);
+}`;
+
+const P_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec3 vCol; in float vA; out vec4 o;
+void main(){
+  vec2 d = vQ - 0.5;
+  /* 两头收尖、上下羽化：一丝烟，不是一块带子 */
+  float fx = pow(smoothstep(0.5, 0.0, abs(d.x)), 1.10);
+  float fy = pow(smoothstep(0.5, 0.0, abs(d.y)), 1.30);
+  o = vec4(vCol * vA * fx * fy, 1.0);
+}`;
+
+function initGL() {
+  try { gl = cv.getContext('webgl2', GL_OPT); } catch (_) { gl = null; }
+  if (!gl) { document.documentElement.classList.add('fb'); return false; }
+  P = program(P_VS, P_FS);
+  U = locs(P, ['uT','uBass','uTre','uBeat','uPre','uIn','uPol','uAct','uGust','uRes','uText']);
+  bgP = program(BG_VS, BG_FS);
+  bgU = locs(bgP, ['uT','uAct','uPol','uRes']);
+
+  const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  /* 分层抽样（Halton）保证 10 万缕铺得均匀，不结块 */
+  const hal = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+  let sd = 20260244;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  const seeds = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    seeds[i*4] = hal(i + 1, 2); seeds[i*4+1] = hal(i + 1, 3);
+    seeds[i*4+2] = rnd(); seeds[i*4+3] = rnd();
+  }
+  const sb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+
+  pVao = gl.createVertexArray(); gl.bindVertexArray(pVao);
+  const aQ = gl.getAttribLocation(P, 'aQ'), aS = gl.getAttribLocation(P, 'aSeed');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(aQ); gl.vertexAttribPointer(aQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(aS, 1);
+
+  bgVao = gl.createVertexArray(); gl.bindVertexArray(bgVao);
+  const bQ = gl.getAttribLocation(bgP, 'aQ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(bQ); gl.vertexAttribPointer(bQ, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(null);
+  gl.clearColor(0.007, 0.010, 0.014, 1);
+  gl.disable(gl.DEPTH_TEST);
+  glOk = true;
+  return true;
+}
+
+let uTextV = [0, 0, 0.3, 0.1];
+function draw() {
+  if (!glOk) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.BLEND);
+  gl.useProgram(bgP); gl.bindVertexArray(bgVao);
+  gl.uniform1f(bgU.uT, vT); gl.uniform1f(bgU.uAct, act); gl.uniform1f(bgU.uPol, pol);
+  gl.uniform2f(bgU.uRes, W, H);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.useProgram(P); gl.bindVertexArray(pVao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniform1f(U.uT, vT); gl.uniform1f(U.uBass, bass); gl.uniform1f(U.uTre, treb);
+  gl.uniform1f(U.uBeat, beatPulse); gl.uniform1f(U.uPre, preAmt); gl.uniform1f(U.uIn, inAmt);
+  gl.uniform1f(U.uPol, pol); gl.uniform1f(U.uAct, act); gl.uniform1f(U.uGust, gust);
+  gl.uniform2f(U.uRes, W, H); gl.uniform4f(U.uText, uTextV[0], uTextV[1], uTextV[2], uTextV[3]);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+  gl.bindVertexArray(null);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  if (glOk) { gl.viewport(0, 0, cv.width, cv.height); }
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+function textRect() {
+  if (!cur || !cur.chars.length) return [0, 0, 0.34, 0.09];
+  const r = cur.el.getBoundingClientRect();
+  return [ (r.left + r.width/2) / W * 2 - 1, 1 - (r.top + r.height/2) / H * 2,
+           Math.max(0.02, r.width / W), Math.max(0.02, r.height / H) ];
+}
+
+/* ══════════════════════════════ 主循环 ══════════════════════════════ */
+let last = performance.now(), raf = 0, dirty = true;
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  vT = RM ? T * 0.24 : T;
+  if (playing) {
+    beatPulse *= Math.exp(-dt * 3.6);
+    bass *= Math.exp(-dt * 0.08);
+    treb *= Math.exp(-dt * 0.10);
+  }
+  try { timing(T); } catch (e) { errMsg = 'timing: ' + (e && e.message ? e.message : e); }
+  state(T);
+  if (!RM && cur) uTextV = textRect();
+  try {
+    if (playing || dirty) { draw(); updDom(T); dirty = false; }
+  } catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------- 协议 ---------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9;
+    cur = null; ghost = null;
+    for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; s.el.style.transform = 'translate(-50%,-50%)'; }
+    vT = 0; beatPulse = 0; bass = 0; treb = 0; beatN = 0; beatAt = -9; gust = 0;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    inAmt = 0; preAmt = 0;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now();
+    playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5);
+    beatN++; dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, clamp01(l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, clamp01(l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+/* ---------------- 自查 ---------------- */
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx].text) ? lines[idx].text : '',
+  gl: glOk, rm: RM, vT: +vT.toFixed(2)
+});
+
+/* ---------------- 启动 ---------------- */
+resize();
+try { initGL(); } catch (e) { errMsg = 'gl: ' + (e && e.message ? e.message : e); document.documentElement.classList.add('fb'); }
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

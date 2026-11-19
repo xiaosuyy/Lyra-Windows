@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>点阵截面歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060b;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;color:rgba(150,190,255,.26);
+        letter-spacing:.16em;pointer-events:none;transition:opacity .6s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   223 · 点阵截面 —— 一片斜插进画面深处的点阵，字是被点亮的那些格子
+
+   机制一句话：整个下半屏是一张按透视排布的点阵"地面"（屏幕上的列距恒定，
+   行的深度按几何级数分布，所以行距也基本均匀），点阵以恒定速度朝镜头流过来；
+   凡是投影落在当前句笔画墨迹里的格子，被一盏看不见的投影灯点亮成近白色。
+   → 字不随点阵流走：它是一块**被照亮的截面**，点阵一直在穿过它。
+
+   · 行相位在 log 空间推进并取模 → 无限流、无缝循环、没有重排。
+   · 墨迹判定用半分辨率掩码（1 次 getImageData）。
+   · 点按亮度分 4 档合批（每档一次 fillStyle），全屏约 12k 个点。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 1, H = 1, DPR = 1, VX = 1, VY = 1;
+const RM = (() => { try { return matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; } })();
+
+let ACC = [126, 178, 255];
+let FOG = [4, 7, 14];
+function buildColors() {
+  const r = ACC[0] | 0, g = ACC[1] | 0, b = ACC[2] | 0;
+  FOG = [2 + (r * 0.04) | 0, 3 + (g * 0.05) | 0, 7 + (b * 0.06) | 0];
+}
+
+/* ---------------------------- 排版 ---------------------------- */
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+const fontStr = (fs) => '800 ' + fs + 'px ' + FAMILY;
+const TRACK = 0.035;
+const OPUNCT = '，。、；：！？）】》」』”’,.!?;:)]}%…';
+const LPUNCT = '（【《「『“‘({[';
+const measCtx = document.createElement('canvas').getContext('2d');
+
+function measureStr(s, fs) {
+  measCtx.font = fontStr(fs);
+  let w = 0;
+  for (let i = 0; i < s.length; i++) w += measCtx.measureText(s[i]).width + fs * TRACK;
+  return Math.max(0, w - fs * TRACK);
+}
+function splitRows(s, L) {
+  const n = s.length, cuts = [];
+  for (let i = 1; i < L; i++) {
+    let c = Math.round(i * n / L);
+    while (c < n && OPUNCT.indexOf(s[c]) >= 0) c++;
+    if (c > 0 && c < n && LPUNCT.indexOf(s[c - 1]) >= 0) c--;
+    if (c <= 0 || c >= n) continue;
+    if (cuts.length && c <= cuts[cuts.length - 1]) continue;
+    cuts.push(c);
+  }
+  const rows = [];
+  let prev = 0;
+  for (let i = 0; i < cuts.length; i++) { rows.push(s.slice(prev, cuts[i])); prev = cuts[i]; }
+  rows.push(s.slice(prev));
+  return rows.filter((r) => r.length > 0);
+}
+function layout(raw) {
+  if (!raw) return null;
+  const s = raw.replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const n = s.length;
+  const maxW = Math.min(W * 0.74, 1100);
+  const maxH = H * 0.34;
+  const maxL = n <= 12 ? 1 : (n <= 24 ? 2 : 3);
+  let best = null;
+  for (let L = 1; L <= maxL; L++) {
+    if (L > 1 && n < L + 2) continue;
+    const rows = splitRows(s, L);
+    let w100 = 0;
+    for (let i = 0; i < rows.length; i++) w100 = Math.max(w100, measureStr(rows[i], 100));
+    const fs = Math.min(maxW / (Math.max(1, w100) / 100), maxH / (1.22 * rows.length), 168);
+    if (fs < 24) continue;
+    if (best && fs < best.fs * 1.07) continue;
+    best = { rows: rows, fs: fs };
+  }
+  if (!best) {
+    const w100 = Math.max(1, measureStr(s, 100));
+    best = { rows: [s], fs: Math.max(20, Math.min(maxW / (w100 / 100), maxH / 1.22, 168)) };
+  }
+  const fs = best.fs, lh = fs * 1.22;
+  measCtx.font = fontStr(fs);
+  const rows = [];
+  let bw = 0;
+  for (let r = 0; r < best.rows.length; r++) {
+    const txt = best.rows[r], chars = [];
+    let x = 0;
+    for (let k = 0; k < txt.length; k++) {
+      const c = txt[k], wch = measCtx.measureText(c).width;
+      if (c !== ' ') chars.push({ c: c, x: x, w: wch });
+      x += wch + fs * TRACK;
+    }
+    const rw = Math.max(0, x - fs * TRACK);
+    rows.push({ chars: chars, w: rw, ly: (r + 0.5) * lh });
+    if (rw > bw) bw = rw;
+  }
+  const bh = lh * rows.length;
+  return { rows: rows, fs: fs, lh: lh, bw: Math.max(1, bw), bh: bh };
+}
+function paintRows(g, lay, ox, oy) {
+  g.font = fontStr(lay.fs);
+  g.textAlign = 'left';
+  g.textBaseline = 'middle';
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let k = 0; k < row.chars.length; k++) g.fillText(row.chars[k].c, ox + row.chars[k].x, oy + row.ly);
+  }
+}
+
+/* ---------------------------- 掩码 ---------------------------- */
+const MS = 0.5;
+const offCv = document.createElement('canvas');
+const offCtx = offCv.getContext('2d', { willReadFrequently: true });
+let mask = null, mw = 0, mh = 0, mox = 0, moy = 0;
+
+function inkAt(sx, sy) {
+  if (!mask) return 0;
+  const i = ((sy - moy) * MS) | 0, j = ((sx - mox) * MS) | 0;
+  if (i < 0 || j < 0 || i >= mh || j >= mw) return 0;
+  return mask[i * mw + j];
+}
+
+/* ---------------------------- 预烘 ---------------------------- */
+function bakeLine(text) {
+  const lay = layout(text);
+  if (!lay) return null;
+  const pad = Math.round(lay.fs * 0.30) + 16;
+  const bw = Math.ceil(lay.bw) + pad * 2;
+  const bh = Math.ceil(lay.bh) + pad * 2;
+  const gx = VX - bw / 2, gy = VY - bh / 2;
+
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(bw * DPR));
+  c.height = Math.max(2, Math.round(bh * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.fillStyle = '#fff';
+  paintRows(g, lay, pad, pad);
+
+  /* 被照亮区域的柔光：点阵之外也留一圈余光，字才"亮" */
+  const gl = document.createElement('canvas');
+  gl.width = Math.max(2, Math.round(bw));
+  gl.height = Math.max(2, Math.round(bh));
+  const gg = gl.getContext('2d');
+  gg.filter = 'blur(' + Math.max(8, Math.round(lay.fs * 0.14)) + 'px)';
+  gg.fillStyle = 'rgb(' + Math.min(255, ACC[0] + 40) + ',' + Math.min(255, ACC[1] + 46) + ',' + Math.min(255, ACC[2] + 30) + ')';
+  paintRows(gg, lay, pad, pad);
+  gg.filter = 'none';
+
+  mw = Math.max(2, Math.round(bw * MS));
+  mh = Math.max(2, Math.round(bh * MS));
+  offCv.width = mw; offCv.height = mh;
+  offCtx.setTransform(1, 0, 0, 1, 0, 0);
+  offCtx.clearRect(0, 0, mw, mh);
+  offCtx.setTransform(MS, 0, 0, MS, 0, 0);
+  offCtx.fillStyle = '#fff';
+  paintRows(offCtx, lay, pad, pad);
+  mox = gx; moy = gy;
+  const d = offCtx.getImageData(0, 0, mw, mh).data;
+  mask = new Uint8Array(mw * mh);
+  for (let y = 0; y < mh; y++) {
+    for (let x = 0; x < mw; x++) if (d[(y * mw + x) * 4 + 3] > 110) mask[y * mw + x] = 1;
+  }
+  return { lay: lay, crisp: c, glow: gl, bw: bw, bh: bh, gx: gx, gy: gy, pad: pad };
+}
+
+/* ---------------------------- 点阵几何 ----------------------------
+   行深度 z = Z0·r^(i-phase)：几何级数让"屏幕上"的行距基本均匀；
+   相位在 log 空间推进，取模后无缝。 */
+const ROW_N = 92;
+const Z0 = 320, ZR = 1.038;
+const FOCAL = 900;
+const CAM_H = 232;               // 相机离地高度
+const COL_STEP = 6.2;            // 屏幕上列间距（像素）
+let horizonY = 1;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(2, window.innerWidth);
+  H = Math.max(2, window.innerHeight);
+  VX = W / 2;
+  VY = H * 0.455;
+  horizonY = Math.round(H * 0.285);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBG();
+  buildVig();
+  needRebake = true;
+}
+
+let bgGrad = null, vigGrad = null;
+function buildBG() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, 'rgb(' + FOG[0] + ',' + FOG[1] + ',' + (FOG[2] + 6) + ')');
+  g.addColorStop(0.28, 'rgb(' + (FOG[0] + 8) + ',' + (FOG[1] + 11) + ',' + (FOG[2] + 20) + ')');
+  g.addColorStop(1, 'rgb(' + FOG[0] + ',' + FOG[1] + ',' + (FOG[2] + 3) + ')');
+  bgGrad = g;
+}
+function buildVig() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, 'rgba(1,2,6,0.55)');
+  g.addColorStop(0.42, 'rgba(1,2,6,0)');
+  g.addColorStop(1, 'rgba(1,2,6,0.45)');
+  vigGrad = g;
+}
+
+/* ---------------------------- 状态 ---------------------------- */
+let lines = [], curIdx = -1, brewIdx = -1, lastT = -1;
+let prep = null, prepIdx = -1, glyph = null, reveal = 0, needRebake = false;
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let vT = 0, beat = 0;
+let phase = 0;
+
+function timing(T) {
+  if (!lines.length) { if (glyph) { glyph = null; curIdx = -1; mask = null; } return; }
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; prep = null; prepIdx = -1; glyph = null; mask = null; reveal = 0; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci; brewIdx = -1;
+    glyph = ci >= 0 ? ((prep && prepIdx === ci) ? prep : bakeLine(lines[ci].text)) : null;
+    if (!glyph) mask = null;
+    reveal = 0; prep = null; prepIdx = -1;
+    hint.style.opacity = ci >= 0 ? '0' : '1';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(1.7, Math.max(0.55, gap * 0.62));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prep = bakeLine(lines[nx].text); prepIdx = nx; }
+  }
+}
+
+/* ---------------------------- 主循环 ---------------------------- */
+let last = performance.now(), frames = 0, raf = 0;
+const CAP = 24000;
+const SXa = new Float32Array(CAP), SYa = new Float32Array(CAP);
+const SZ = new Float32Array(CAP), SB = new Uint8Array(CAP);
+
+function frame(ms) {
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  vT += dt * (playing ? 1 : 0.06);
+  beat *= Math.exp(-dt * 2.8);
+  if (needRebake) {
+    needRebake = false;
+    if (curIdx >= 0 && lines[curIdx]) { glyph = bakeLine(lines[curIdx].text); reveal = 1; }
+    else { glyph = null; mask = null; }
+  }
+  timing(now());
+  if (reveal < 1) reveal = Math.min(1, reveal + dt / 0.45);
+
+  phase += dt * (RM ? 0.18 : 0.80) * (playing ? 1 : 0.10);
+  if (phase > ROW_N) phase -= ROW_N;
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  if (glyph) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.34 * reveal;
+    ctx.drawImage(glyph.glow, glyph.gx, glyph.gy, glyph.bw, glyph.bh);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 0.15 * reveal;
+    ctx.drawImage(glyph.crisp, glyph.gx, glyph.gy, glyph.bw, glyph.bh);
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---- 点阵：先投影到屏幕，再按亮度分 4 档合批 ---- */
+  let n = 0;
+  const drift = RM ? 0.15 : 0.55;
+  const litOn = reveal > 0.45;
+  for (let i = 0; i < ROW_N; i++) {
+    const z = Z0 * Math.pow(ZR, i - phase);
+    if (z > 7200) continue;                        // 缩在地平线上的行就不画了
+    const stepW = COL_STEP * z / FOCAL;
+    const halfW = (W * 0.5) * z / FOCAL + stepW * 2;
+    const cols = Math.min(320, Math.ceil(halfW * 2 / stepW) + 1);
+    const scroll = (vT * drift * 46) % stepW;
+    const y = horizonY + CAM_H * FOCAL / z;
+    if (y > H + 8) continue;
+    const size = Math.min(4.2, 0.8 + 760 / z);
+    const fog = Math.min(1, 0.22 + 330 / z);
+    const rowFade = 1 - Math.min(1, Math.max(0, (z - 4200) / 3000));
+    for (let c = 0; c < cols; c++) {
+      const sx = VX + (-halfW + c * stepW + scroll) * FOCAL / z;
+      if (sx < -6 || sx > W + 6) continue;
+      if (n >= CAP) break;
+      SXa[n] = sx; SYa[n] = y;
+      SZ[n] = size * (0.35 + 0.65 * rowFade);
+      let b;
+      if (litOn && inkAt(sx, y)) b = 3;
+      else b = fog > 0.72 ? 2 : (fog > 0.45 ? 1 : 0);
+      SB[n] = b;
+      n++;
+    }
+  }
+  ctx.globalCompositeOperation = 'lighter';
+  for (let band = 3; band >= 0; band--) {
+    if (band === 3) {
+      ctx.fillStyle = 'rgba(246,251,255,0.86)';
+    } else if (band === 2) {
+      ctx.fillStyle = 'rgba(' + Math.min(255, ACC[0] + 70) + ',' + Math.min(255, ACC[1] + 76) + ',' + Math.min(255, ACC[2] + 60) + ',0.34)';
+    } else if (band === 1) {
+      ctx.fillStyle = 'rgba(' + Math.min(255, ACC[0] + 40) + ',' + Math.min(255, ACC[1] + 44) + ',' + Math.min(255, ACC[2] + 36) + ',0.20)';
+    } else {
+      ctx.fillStyle = 'rgba(' + Math.min(255, ACC[0] + 16) + ',' + Math.min(255, ACC[1] + 18) + ',' + Math.min(255, ACC[2] + 16) + ',0.12)';
+    }
+    for (let i = 0; i < n; i++) {
+      if (SB[i] !== band) continue;
+      const s = band === 3 ? 5.6 : SZ[i];           // 亮格铺满格位：笔画才连成一片
+      ctx.fillRect(SXa[i] - s / 2, SYa[i] - s / 2, s, s);
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* 地平线：一道极淡的光缝，把"远处"交代清楚 */
+  const hg = ctx.createLinearGradient(0, horizonY - 26, 0, horizonY + 26);
+  hg.addColorStop(0, 'rgba(' + ACC[0] + ',' + ACC[1] + ',' + ACC[2] + ',0)');
+  hg.addColorStop(0.5, 'rgba(' + Math.min(255, ACC[0] + 60) + ',' + Math.min(255, ACC[1] + 70) + ',' + Math.min(255, ACC[2] + 60) + ',0.09)');
+  hg.addColorStop(1, 'rgba(' + ACC[0] + ',' + ACC[1] + ',' + ACC[2] + ',0)');
+  ctx.fillStyle = hg;
+  ctx.fillRect(0, horizonY - 26, W, 52);
+
+  ctx.fillStyle = vigGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------------------- 协议 ---------------------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; prep = null; prepIdx = -1;
+    glyph = null; mask = null; reveal = 0;
+    clockT = 0; clockAt = performance.now();
+    if (p.accent && p.accent.length >= 3) {
+      ACC = [p.accent[0] | 0, p.accent[1] | 0, p.accent[2] | 0];
+      buildColors(); buildBG();
+    }
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.45';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    beat = Math.min(1.0, beat + 0.3 + (d.payload.level || 0) * 0.5);
+    phase += 0.5 + (d.payload.level || 0) * 0.5;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+addEventListener('pagehide', () => { cancelAnimationFrame(raf); });
+
+buildColors();
+resize();
+raf = requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, idx: curIdx, curIdx: curIdx, t: +now().toFixed(2), playing: playing,
+  frames: frames, reveal: +reveal.toFixed(2), ink: !!glyph,
+  rows: ROW_N, horizon: horizonY, phase: +phase.toFixed(2), vT: +vT.toFixed(2)
+});
+</script>
+</body>
+</html>

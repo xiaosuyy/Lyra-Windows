@@ -1,0 +1,1168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>裂面嘶鸣</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #d9cfb8; overflow: hidden; }
+  #wrap { position: fixed; inset: 0; overflow: hidden; }
+  #art { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #scrim {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 56%;
+    background: linear-gradient(to right, rgba(220,209,186,.88) 0%, rgba(220,209,186,.62) 46%, rgba(220,209,186,0) 100%);
+    pointer-events: none;
+  }
+  #lyrics {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 46%;
+    display: flex; flex-direction: column; justify-content: center;
+    gap: clamp(7px, 1.5vh, 16px);
+    padding: 0 3vw 0 5vw; box-sizing: border-box;
+    pointer-events: none;
+    color: #17120e;
+    font-family: "Songti SC", "Noto Serif SC", "Source Han Serif SC", SimSun, "STSong", Georgia, serif;
+    text-align: left;
+    transform: rotate(-0.35deg);
+  }
+  .ghost {
+    font-size: clamp(15px, 2.05vw, 27px);
+    line-height: 1.42; letter-spacing: .015em;
+    opacity: .3; overflow-wrap: anywhere;
+    text-shadow: .04em .04em 0 rgba(84,66,42,.14);
+  }
+  #cur {
+    position: relative;
+    padding-left: .5em;
+    font-size: calc(clamp(29px, 4.55vw, 64px) * var(--fit, 1));
+    line-height: 1.26; letter-spacing: .012em;
+    font-weight: 700; overflow-wrap: anywhere;
+    text-shadow: .032em .034em 0 rgba(84,66,42,.17), -.012em -.008em 0 rgba(84,66,42,.08);
+    will-change: transform;
+  }
+  #cur::before {
+    content: ''; position: absolute; left: 0; top: .16em; bottom: .16em;
+    width: 3px; background: #1b1510; opacity: .4; transform: rotate(1.6deg);
+    box-shadow: 3px 1px 0 rgba(27,21,16,.16);
+  }
+  #cur .char { opacity: .22; transition: opacity 200ms linear; }
+  #cur .char.lit { opacity: 1; }
+  #empty { display: flex; flex-direction: column; align-items: flex-start; }
+  #empty[hidden] { display: none; }
+  .empty-rule { width: 44%; height: 3px; background: #1b1510; opacity: .45; transform: rotate(-1.4deg); margin-bottom: 2.2vh; }
+  .empty-title {
+    font-size: clamp(26px, 3.5vw, 46px); letter-spacing: .3em;
+    opacity: .52; text-shadow: .04em .04em 0 rgba(84,66,42,.14);
+  }
+  .empty-sub {
+    margin-top: 1.8vh; font-size: clamp(10px, 1.15vw, 14px);
+    letter-spacing: .26em; opacity: .36; text-transform: uppercase;
+  }
+  @media (max-aspect-ratio: 11/10) {
+    #scrim {
+      left: 0; right: 0; top: auto; bottom: 0; width: auto; height: 46%;
+      background: linear-gradient(to top, rgba(220,209,186,.95) 0%, rgba(220,209,186,.72) 48%, rgba(220,209,186,0) 100%);
+    }
+    #lyrics {
+      top: auto; bottom: 0; width: 100%; height: 46%;
+      justify-content: flex-end;
+      padding: 0 7vw 7.5vh;
+      gap: clamp(5px, 1vh, 10px);
+    }
+    #cur { font-size: calc(clamp(26px, 7.4vw, 40px) * var(--fit, 1)); }
+    .ghost { font-size: clamp(14px, 3.4vw, 19px); }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="art"></canvas>
+  <div id="scrim"></div>
+  <section id="lyrics">
+    <div id="prev" class="ghost"></div>
+    <div id="cur"></div>
+    <div id="next" class="ghost"></div>
+    <div id="empty" hidden>
+      <div class="empty-rule"></div>
+      <div class="empty-title">此曲无词</div>
+      <div class="empty-sub"></div>
+    </div>
+  </section>
+</div>
+<script>
+window.__stage = function () {
+  return {
+    lines: state.lines.length, idx: state.idx, t: state.time, playing: state.playing,
+    frames: state.frames, js: state.js, err: '', text: state.text, gl: false, rm: state.reduced
+  };
+};
+
+var state = {
+  lines: [], idx: -1, time: 0, playing: true, frames: 0, js: 0, text: '',
+  reduced: false, song: { name: '', artists: '' }, accent: [180, 120, 70], duration: 0,
+  beatAt: -1e9, beatLevel: 0, live: { bpm: 0, level: 0.2, bass: 0.2, mid: 0.2, treble: 0.2 }
+};
+
+var artCanvas = document.getElementById('art');
+var artContext = artCanvas.getContext('2d');
+var lyricsBox = document.getElementById('lyrics');
+var prevBox = document.getElementById('prev');
+var curBox = document.getElementById('cur');
+var nextBox = document.getElementById('next');
+var emptyBox = document.getElementById('empty');
+var emptySub = emptyBox ? emptyBox.querySelector('.empty-sub') : null;
+
+var readySent = false;
+var errorTimes = [];
+
+function reportError(where, error) {
+  var now = (window.performance && performance.now) ? performance.now() : Date.now();
+  errorTimes = errorTimes.filter(function (stamp) { return now - stamp < 1000; });
+  if (errorTimes.length > 0) { return; }
+  errorTimes.push(now);
+  if (window.console && console.error) { console.error('[375] ' + where, error); }
+}
+
+function sendReady() {
+  if (readySent) { return; }
+  readySent = true;
+  try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }
+  catch (error) { reportError('ready', error); }
+}
+
+try {
+  state.reduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+} catch (error) { reportError('reduced-motion', error); }
+
+function resizeCanvas() {
+  var width = Math.round(artCanvas.clientWidth) || 0;
+  var height = Math.round(artCanvas.clientHeight) || 0;
+  if (!(width > 0) || !(height > 0) || !isFinite(width) || !isFinite(height)) { width = 1440; height = 900; }
+  artCanvas.width = width;
+  artCanvas.height = height;
+  try { updateFigureLayout(); } catch (error) { reportError('layout', error); }
+}
+
+/* ---------- shared small helpers ---------- */
+
+function clampNumber(value, low, high) {
+  var number = Number(value);
+  if (!isFinite(number)) { return low; }
+  return number < low ? low : (number > high ? high : number);
+}
+
+function clampByte(value) {
+  return Math.round(clampNumber(value, 0, 255));
+}
+
+function inkColor(red, green, blue, alpha) {
+  return 'rgba(' + clampByte(red) + ',' + clampByte(green) + ',' + clampByte(blue) + ',' +
+    clampNumber(alpha, 0, 1).toFixed(3) + ')';
+}
+
+function lerpNumber(from, to, amount) {
+  return from + (to - from) * clampNumber(amount, 0, 1);
+}
+
+function seededRandom(seed) {
+  var local = seed >>> 0;
+  return function nextRandom() {
+    local = (local + 0x6d2b79f5) >>> 0;
+    var value = local;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function isDrawableCanvas(source) {
+  if (!source || typeof source !== 'object') { return false; }
+  if (typeof source.getContext !== 'function') { return false; }
+  if (Object.prototype.toString.call(source) !== '[object HTMLCanvasElement]') { return false; }
+  return source.width > 0 && source.height > 0;
+}
+
+function blitCanvas(target, source, left, top, width, height) {
+  if (!target || typeof target.drawImage !== 'function') { return false; }
+  if (!isDrawableCanvas(source)) { return false; }
+  try {
+    target.drawImage(source, left, top, width, height);
+    return true;
+  } catch (error) {
+    reportError('blit', error);
+    return false;
+  }
+}
+
+/* ---------- paper materials ---------- */
+
+var materials = { noiseTile: null, backdrop: null, grain: null };
+var palette = { paper: [217, 206, 183], umber: [104, 82, 58], soot: [26, 21, 17] };
+
+function makeNoiseTile() {
+  var size = 256;
+  var tile = document.createElement('canvas');
+  tile.width = size;
+  tile.height = size;
+  var context = tile.getContext('2d');
+  if (!context) { return null; }
+  var image = context.createImageData(size, size);
+  var data = image.data;
+  var random = seededRandom(20261102);
+  for (var pixel = 0; pixel < size * size; pixel += 1) {
+    var offset = pixel * 4;
+    var grain = random();
+    var warm = random();
+    data[offset] = clampByte(150 + grain * 78 - warm * 16);
+    data[offset + 1] = clampByte(140 + grain * 70 - warm * 20);
+    data[offset + 2] = clampByte(120 + grain * 58 - warm * 14);
+    data[offset + 3] = clampByte(18 + grain * 64);
+  }
+  context.putImageData(image, 0, 0);
+  return tile;
+}
+
+function drawStains(context, width, height, random) {
+  var stains = 7;
+  for (var index = 0; index < stains; index += 1) {
+    var centerX = random() * width;
+    var centerY = random() * height;
+    var radius = (0.06 + random() * 0.3) * Math.max(width, height);
+    var tint = random() > 0.45 ? palette.umber : palette.paper;
+    try {
+      var wash = context.createRadialGradient(centerX, centerY, radius * 0.1, centerX, centerY, radius);
+      wash.addColorStop(0, inkColor(tint[0] + 22, tint[1] + 16, tint[2] + 8, 0.1 + random() * 0.12));
+      wash.addColorStop(0.62, inkColor(tint[0], tint[1], tint[2], 0.05));
+      wash.addColorStop(1, inkColor(tint[0], tint[1], tint[2], 0));
+      context.fillStyle = wash;
+      context.fillRect(centerX - radius, centerY - radius, radius * 2, radius * 2);
+    } catch (error) { reportError('stain-gradient', error); }
+  }
+}
+
+function drawFibres(context, width, height, random) {
+  var strokes = 220;
+  context.lineCap = 'round';
+  for (var index = 0; index < strokes; index += 1) {
+    var startX = random() * width;
+    var startY = random() * height;
+    var length = 8 + random() * 52;
+    var angle = random() * Math.PI * 2;
+    context.strokeStyle = inkColor(96, 78, 54, 0.05 + random() * 0.09);
+    context.lineWidth = 0.6 + random() * 1.1;
+    context.beginPath();
+    context.moveTo(startX, startY);
+    context.lineTo(startX + Math.cos(angle) * length, startY + Math.sin(angle) * length);
+    context.stroke();
+  }
+}
+
+function drawSplatter(context, width, height, random) {
+  var blots = 130;
+  var span = Math.max(width, height);
+  for (var index = 0; index < blots; index += 1) {
+    var centerX = random() * width;
+    var centerY = random() * height;
+    var radius = (0.0012 + random() * random() * 0.011) * span;
+    var alpha = 0.1 + random() * 0.55;
+    context.fillStyle = inkColor(palette.soot[0] + random() * 26, palette.soot[1] + random() * 20, palette.soot[2] + random() * 16, alpha);
+    context.beginPath();
+    var lobes = 5 + Math.floor(random() * 4);
+    for (var lobe = 0; lobe < lobes; lobe += 1) {
+      var spread = (lobe / lobes) * Math.PI * 2;
+      var wobble = radius * (0.55 + random() * 0.75);
+      var pointX = centerX + Math.cos(spread) * wobble;
+      var pointY = centerY + Math.sin(spread) * wobble;
+      if (lobe === 0) { context.moveTo(pointX, pointY); } else { context.lineTo(pointX, pointY); }
+    }
+    context.closePath();
+    context.fill();
+    if (random() > 0.82 && radius > 1.6) {
+      var satellites = 2 + Math.floor(random() * 4);
+      for (var satellite = 0; satellite < satellites; satellite += 1) {
+        var toss = random() * Math.PI * 2;
+        var distance = radius * (1.6 + random() * 4.4);
+        context.beginPath();
+        context.arc(centerX + Math.cos(toss) * distance, centerY + Math.sin(toss) * distance,
+          Math.max(0.4, radius * (0.12 + random() * 0.3)), 0, Math.PI * 2);
+        context.fill();
+      }
+    }
+  }
+}
+
+function drawEdgeBurn(context, width, height) {
+  try {
+    var centreX = width * 0.5;
+    var centreY = height * 0.48;
+    var burn = context.createRadialGradient(centreX, centreY, Math.min(width, height) * 0.34, centreX, centreY, Math.max(width, height) * 0.82);
+    burn.addColorStop(0, 'rgba(70,52,32,0)');
+    burn.addColorStop(1, 'rgba(52,38,24,0.42)');
+    context.fillStyle = burn;
+    context.fillRect(0, 0, width, height);
+  } catch (error) { reportError('edge-burn', error); }
+}
+
+function bakeBackdrop() {
+  var width = artCanvas.width;
+  var height = artCanvas.height;
+  if (!(width > 0) || !(height > 0)) { width = 1440; height = 900; }
+  var backdrop = document.createElement('canvas');
+  backdrop.width = width;
+  backdrop.height = height;
+  var context = backdrop.getContext('2d');
+  if (!context) { return null; }
+  var random = seededRandom(375375);
+  context.fillStyle = inkColor(palette.paper[0], palette.paper[1], palette.paper[2], 1);
+  context.fillRect(0, 0, width, height);
+  if (!materials.noiseTile) { materials.noiseTile = makeNoiseTile(); }
+  var tile = materials.noiseTile;
+  if (isDrawableCanvas(tile)) {
+    try {
+      var grainPattern = context.createPattern(tile, 'repeat');
+      if (grainPattern) {
+        context.fillStyle = grainPattern;
+        context.globalAlpha = 0.5;
+        context.fillRect(0, 0, width, height);
+      }
+    } catch (error) { reportError('paper-grain', error); }
+    context.globalAlpha = 0.2;
+    blitCanvas(context, tile, 0, 0, width, height);
+    context.globalAlpha = 1;
+  }
+  drawStains(context, width, height, random);
+  drawFibres(context, width, height, random);
+  drawSplatter(context, width, height, random);
+  drawEdgeBurn(context, width, height);
+  return backdrop;
+}
+
+function ensureBackdrop() {
+  var width = artCanvas.width;
+  var height = artCanvas.height;
+  var current = materials.backdrop;
+  if (isDrawableCanvas(current) && current.width === width && current.height === height) { return; }
+  materials.backdrop = bakeBackdrop();
+}
+
+function paintPaper() {
+  var width = artCanvas.width;
+  var height = artCanvas.height;
+  artContext.fillStyle = inkColor(palette.paper[0], palette.paper[1], palette.paper[2], 1);
+  artContext.fillRect(0, 0, width, height);
+  var boilX = state.reduced ? 0 : Math.sin(state.frames * 0.037) * 0.85;
+  var boilY = state.reduced ? 0 : Math.cos(state.frames * 0.029) * 0.7;
+  blitCanvas(artContext, materials.backdrop, boilX, boilY, width, height);
+}
+
+/* ---------- the figure: fractured charcoal bust ---------- */
+
+var FACE_TABLE = [
+  [90, 3.02], [84, 2.96], [78, 2.87], [72, 2.72], [66, 2.40], [60, 2.06],
+  [56, 1.94], [50, 2.04], [44, 2.16], [38, 2.24], [30, 2.30], [22, 2.30],
+  [14, 2.33], [6, 2.37], [0, 2.41], [-8, 2.38], [-16, 2.32], [-26, 2.22],
+  [-38, 2.02], [-50, 1.70], [-62, 1.40], [-72, 1.22], [-82, 1.11], [-90, 1.07],
+  [-98, 1.10], [-108, 1.22], [-120, 1.44], [-132, 1.76], [-142, 1.98],
+  [-152, 2.08], [-164, 2.13], [-176, 2.14], [-184, 2.14], [-196, 2.12],
+  [-208, 2.10], [-216, 2.06], [-226, 2.04], [-232, 1.84], [-238, 2.22],
+  [-246, 2.40], [-254, 2.52], [-262, 2.70], [-270, 2.92]
+];
+
+var TONE_RAMP = [
+  [24, 20, 16], [40, 34, 28], [58, 49, 40], [78, 66, 53], [102, 88, 71], [132, 116, 94]
+];
+
+var figure = {
+  shards: [],
+  smudges: [],
+  boundary: [],
+  accents: [],
+  focus: { x: 0, y: 0.52 },
+  layout: { centerX: 1000, centerY: 480, scale: 150, width: 1440, height: 900, portrait: false },
+  built: false
+};
+
+function chaikinPass(points) {
+  var result = [];
+  for (var index = 0; index < points.length; index += 1) {
+    var current = points[index];
+    var next = points[(index + 1) % points.length];
+    result.push({ x: current.x * 0.75 + next.x * 0.25, y: current.y * 0.75 + next.y * 0.25 });
+    result.push({ x: current.x * 0.25 + next.x * 0.75, y: current.y * 0.25 + next.y * 0.75 });
+  }
+  return result;
+}
+
+function pointInPolygon(points, probeX, probeY) {
+  var inside = false;
+  for (var index = 0, previous = points.length - 1; index < points.length; previous = index, index += 1) {
+    var one = points[index];
+    var two = points[previous];
+    var crosses = ((one.y > probeY) !== (two.y > probeY)) &&
+      (probeX < (two.x - one.x) * (probeY - one.y) / ((two.y - one.y) || 1e-6) + one.x);
+    if (crosses) { inside = !inside; }
+  }
+  return inside;
+}
+
+function buildFigure() {
+  var boundary = [];
+  for (var index = 0; index < FACE_TABLE.length; index += 1) {
+    var entry = FACE_TABLE[index];
+    var radians = entry[0] * Math.PI / 180;
+    boundary.push({ x: Math.cos(radians) * entry[1], y: Math.sin(radians) * entry[1] });
+  }
+  boundary = chaikinPass(boundary);
+  figure.boundary = boundary;
+
+  var random = seededRandom(375902);
+  var accent = state.accent;
+  var shards = [];
+  for (var step = 0; step < boundary.length; step += 1) {
+    var one = boundary[step];
+    var two = boundary[(step + 1) % boundary.length];
+    var midX = (one.x + two.x) * 0.5;
+    var midY = (one.y + two.y) * 0.5;
+    var lightDot = (midX * -0.42 + midY * 0.91) / 2.7;
+    var brightness = clampNumber(0.44 + lightDot * 0.72 + (random() - 0.5) * 0.34, 0, 1);
+    var toneIndex = Math.round(Math.pow(brightness, 1.35) * (TONE_RAMP.length - 1));
+    var tint = TONE_RAMP[clampNumber(toneIndex, 0, TONE_RAMP.length - 1)];
+    var accentShard = random() > 0.9;
+    if (accentShard) {
+      tint = [
+        lerpNumber(tint[0], accent[0], 0.38),
+        lerpNumber(tint[1], accent[1], 0.34),
+        lerpNumber(tint[2], accent[2], 0.3)
+      ];
+    }
+    shards.push({
+      one: one,
+      two: two,
+      tone: [clampByte(tint[0]), clampByte(tint[1]), clampByte(tint[2])],
+      erase: random() > 0.93,
+      base: random() * 1.7,
+      kick: 0.25 + random() * random() * 1.5,
+      phase: random() * Math.PI * 2,
+      direction: Math.atan2(midY, midX)
+    });
+  }
+  figure.shards = shards;
+
+  var smudges = [];
+  for (var attempt = 0; attempt < 420 && smudges.length < 210; attempt += 1) {
+    var startX = (random() - 0.5) * 4.7;
+    var startY = random() * 4.2 - 1.05;
+    if (!pointInPolygon(boundary, startX, startY)) { continue; }
+    var length = 0.05 + random() * 0.34;
+    var angle = random() * Math.PI * 2;
+    smudges.push({
+      x: startX, y: startY,
+      toX: startX + Math.cos(angle) * length,
+      toY: startY + Math.sin(angle) * length,
+      width: 0.006 + random() * 0.055,
+      alpha: 0.05 + random() * 0.3,
+      light: random() > 0.62
+    });
+  }
+  figure.smudges = smudges;
+
+  var accents = [];
+  for (var accentStep = 0; accentStep < 26; accentStep += 1) {
+    var accentAngle = random() * Math.PI * 2;
+    var accentDistance = 1.0 + random() * 2.1;
+    accents.push({
+      x: Math.cos(accentAngle) * accentDistance,
+      y: Math.sin(accentAngle) * accentDistance * 0.85 + 1.55,
+      radius: 0.03 + random() * 0.17,
+      alpha: 0.05 + random() * 0.15,
+      phase: random() * Math.PI * 2,
+      lobes: 5 + Math.floor(random() * 4)
+    });
+  }
+  figure.accents = accents;
+  figure.built = true;
+}
+
+function updateFigureLayout() {
+  var width = artCanvas.width;
+  var height = artCanvas.height;
+  var portrait = width / Math.max(1, height) < 0.95;
+  var scale = portrait
+    ? Math.min(width * 0.32, height * 0.125)
+    : Math.min(height * 0.196, width * 0.128);
+  figure.layout = {
+    portrait: portrait,
+    width: width,
+    height: height,
+    scale: Math.max(24, scale),
+    centerX: portrait ? width * 0.56 : width * 0.712,
+    centerY: portrait ? height * 0.38 : height * 0.545
+  };
+}
+
+function strokePath(context, fromX, fromY, toX, toY, color, widthLocal) {
+  context.strokeStyle = color;
+  context.lineWidth = widthLocal;
+  context.beginPath();
+  context.moveTo(fromX, fromY);
+  context.lineTo(toX, toY);
+  context.stroke();
+}
+
+function fillPolygon(context, points, color) {
+  if (!points || points.length < 3) { return; }
+  context.fillStyle = color;
+  context.beginPath();
+  context.moveTo(points[0].x, points[0].y);
+  for (var index = 1; index < points.length; index += 1) {
+    context.lineTo(points[index].x, points[index].y);
+  }
+  context.closePath();
+  context.fill();
+}
+
+function drawShards(context, pulse, tremble, scale) {
+  var shards = figure.shards;
+  var focus = figure.focus;
+  for (var index = 0; index < shards.length; index += 1) {
+    var shard = shards[index];
+    if (shard.erase) { continue; }
+    var push = shard.base + pulse * shard.kick * 26 + tremble * shard.kick * 4;
+    var angle = shard.direction + Math.sin(state.frames * 0.03 + shard.phase) * 0.06;
+    var offsetX = (Math.cos(angle) * push) / scale;
+    var offsetY = (Math.sin(angle) * push) / scale;
+    var one = shard.one;
+    var two = shard.two;
+    context.fillStyle = inkColor(shard.tone[0], shard.tone[1], shard.tone[2], 1);
+    context.beginPath();
+    context.moveTo(focus.x + offsetX, focus.y + offsetY);
+    context.lineTo(one.x + offsetX, one.y + offsetY);
+    context.lineTo(two.x + offsetX, two.y + offsetY);
+    context.closePath();
+    context.fill();
+    if (push > 2.2) {
+      context.strokeStyle = inkColor(214, 203, 180, clampNumber(push / 46, 0.12, 0.66));
+      context.lineWidth = 1.1 / scale;
+      context.beginPath();
+      context.moveTo(focus.x + offsetX * 0.4, focus.y + offsetY * 0.4);
+      context.lineTo(one.x + offsetX, one.y + offsetY);
+      context.stroke();
+    }
+  }
+}
+
+function drawSmudges(context, scale) {
+  var smudges = figure.smudges;
+  context.lineCap = 'round';
+  for (var index = 0; index < smudges.length; index += 1) {
+    var smudge = smudges[index];
+    context.strokeStyle = smudge.light
+      ? inkColor(206, 194, 170, smudge.alpha * 0.62)
+      : inkColor(22, 18, 15, smudge.alpha);
+    context.lineWidth = smudge.width;
+    context.beginPath();
+    context.moveTo(smudge.x, smudge.y);
+    context.lineTo(smudge.toX, smudge.toY);
+    context.stroke();
+  }
+}
+
+function drawFace(context, pulse, scale) {
+  var soot = inkColor(18, 15, 12, 0.92);
+  var deep = inkColor(12, 10, 8, 0.95);
+  var chalk = inkColor(226, 214, 190, 0.72);
+  var soft = inkColor(30, 24, 19, 0.4);
+  var hairLift = pulse * 0.05;
+
+  /* hair mass over the crown */
+  fillPolygon(context, [
+    { x: -1.02, y: 2.28 }, { x: -0.86, y: 2.78 }, { x: -0.4, y: 3.08 + hairLift },
+    { x: 0.24, y: 3.06 }, { x: 0.82, y: 2.76 }, { x: 1.0, y: 2.16 },
+    { x: 0.74, y: 2.42 }, { x: 0.36, y: 2.66 }, { x: -0.2, y: 2.7 }, { x: -0.7, y: 2.44 }
+  ], inkColor(16, 13, 11, 0.9));
+  context.lineCap = 'round';
+  for (var strand = 0; strand < 22; strand += 1) {
+    var strandAngle = -0.2 - strand * 0.055;
+    strokePath(context,
+      Math.cos(strandAngle) * 0.45, 2.62 + Math.sin(strandAngle) * 0.32,
+      Math.cos(strandAngle) * (1.3 + (strand % 3) * 0.12), 2.5 + Math.sin(strandAngle) * 0.9,
+      inkColor(14, 11, 9, 0.32 + (strand % 4) * 0.08), 0.02 + (strand % 3) * 0.012);
+  }
+
+  /* left eye: socket, chalk slit, pupil */
+  fillPolygon(context, [
+    { x: -0.76, y: 2.2 }, { x: -0.52, y: 2.32 }, { x: -0.16, y: 2.26 },
+    { x: -0.1, y: 2.04 }, { x: -0.44, y: 1.96 }, { x: -0.72, y: 2.04 }
+  ], soot);
+  context.fillStyle = inkColor(228, 216, 192, 0.62);
+  context.beginPath();
+  context.ellipse(-0.44, 2.13, 0.2, 0.045, -0.06, 0, Math.PI * 2);
+  context.fill();
+  context.fillStyle = deep;
+  context.beginPath();
+  context.arc(-0.42, 2.13, 0.052, 0, Math.PI * 2);
+  context.fill();
+
+  /* right eye: displaced double vision */
+  context.save();
+  context.translate(0.44, 2.2 + pulse * 0.05);
+  context.rotate(0.22);
+  fillPolygon(context, [
+    { x: -0.26, y: 0.1 }, { x: 0.04, y: 0.16 }, { x: 0.26, y: 0.04 },
+    { x: 0.2, y: -0.12 }, { x: -0.08, y: -0.16 }, { x: -0.24, y: -0.04 }
+  ], inkColor(18, 14, 11, 0.86));
+  context.fillStyle = chalk;
+  context.beginPath();
+  context.ellipse(0.0, 0.01, 0.15, 0.032, 0.1, 0, Math.PI * 2);
+  context.fill();
+  context.restore();
+  strokePath(context, 0.12, 2.36, 0.62, 2.3, inkColor(16, 12, 9, 0.5), 0.022);
+
+  /* brow bars */
+  strokePath(context, -0.72, 2.42, -0.16, 2.34, inkColor(14, 11, 9, 0.72), 0.05);
+  strokePath(context, 0.18, 2.42, 0.72, 2.3 + pulse * 0.03, inkColor(14, 11, 9, 0.62), 0.045);
+  strokePath(context, -0.68, 1.86, -0.2, 1.8, inkColor(14, 11, 9, 0.3), 0.028);
+
+  /* nose: dark ridge and chalk edge */
+  fillPolygon(context, [
+    { x: 0.02, y: 2.1 }, { x: 0.16, y: 1.86 }, { x: 0.12, y: 1.66 },
+    { x: -0.06, y: 1.62 }, { x: -0.04, y: 1.82 }
+  ], inkColor(26, 21, 17, 0.62));
+  strokePath(context, -0.02, 2.02, -0.04, 1.68, inkColor(220, 208, 184, 0.5), 0.018);
+  strokePath(context, -0.14, 1.6, 0.16, 1.62, inkColor(14, 11, 9, 0.55), 0.024);
+
+  /* mouth: jagged black band plus scream smear running off the face */
+  fillPolygon(context, [
+    { x: -0.44, y: 1.5 }, { x: -0.22, y: 1.4 }, { x: 0.02, y: 1.52 },
+    { x: 0.24, y: 1.42 }, { x: 0.4, y: 1.48 }, { x: 0.34, y: 1.3 },
+    { x: 0.06, y: 1.36 }, { x: -0.18, y: 1.26 }, { x: -0.42, y: 1.34 }
+  ], inkColor(13, 10, 8, 0.94));
+  context.save();
+  context.globalAlpha = 0.5;
+  fillPolygon(context, [
+    { x: 0.38, y: 1.52 }, { x: 0.86, y: 1.44 }, { x: 1.3, y: 1.5 },
+    { x: 1.62, y: 1.4 }, { x: 1.44, y: 1.24 }, { x: 0.92, y: 1.26 }, { x: 0.4, y: 1.3 }
+  ], inkColor(20, 16, 13, 0.85));
+  context.restore();
+  strokePath(context, 0.4, 1.55, 1.5, 1.46 + Math.sin(state.frames * 0.05) * 0.02, inkColor(200, 188, 164, 0.28), 0.012);
+
+  /* cheek and jaw shading */
+  context.strokeStyle = soft;
+  context.lineWidth = 0.055;
+  context.beginPath();
+  context.moveTo(-0.7, 1.78);
+  context.quadraticCurveTo(-0.9, 1.5, -0.62, 1.26);
+  context.stroke();
+  strokePath(context, -0.36, 1.16, 0.3, 1.14, inkColor(24, 19, 15, 0.45), 0.03);
+  strokePath(context, -0.1, 1.1, -0.16, 0.62, inkColor(20, 16, 13, 0.3), 0.05);
+  strokePath(context, 0.16, 1.06, 0.12, 0.58, inkColor(20, 16, 13, 0.22), 0.04);
+
+  /* geometric cuts: chalk scoring + dark offset shadow */
+  var cuts = [
+    [-1.1, 2.5, 0.9, 1.72], [-0.9, 1.34, 0.8, 2.66], [-0.3, 2.98, 0.44, 1.1],
+    [0.62, 2.9, -0.2, 1.42], [-1.24, 1.94, 1.1, 2.02]
+  ];
+  for (var cut = 0; cut < cuts.length; cut += 1) {
+    var line = cuts[cut];
+    strokePath(context, line[0], line[1], line[2], line[3], inkColor(16, 13, 10, 0.22), 2.2 / scale);
+    strokePath(context, line[0], line[1], line[2], line[3], inkColor(214, 202, 178, 0.5), 1.05 / scale);
+  }
+
+  /* torn-out chalk block, misregistered */
+  context.save();
+  context.translate(0.34, 2.62);
+  context.rotate(-0.28 + pulse * 0.12);
+  context.fillStyle = inkColor(216, 205, 181, 0.42);
+  context.fillRect(-0.24, -0.11, 0.5, 0.22);
+  context.strokeStyle = inkColor(18, 14, 11, 0.55);
+  context.lineWidth = 1.2 / scale;
+  context.strokeRect(-0.24, -0.11, 0.5, 0.22);
+  context.restore();
+
+  /* ink drips under the mouth */
+  for (var drip = 0; drip < 3; drip += 1) {
+    var dripX = -0.24 + drip * 0.26;
+    var dripBottom = 0.36 + (drip % 2) * 0.18;
+    context.strokeStyle = inkColor(16, 13, 10, 0.34 - drip * 0.06);
+    context.lineWidth = 0.028;
+    context.beginPath();
+    context.moveTo(dripX, 1.28);
+    context.lineTo(dripX + 0.02, dripBottom);
+    context.stroke();
+    context.fillStyle = inkColor(16, 13, 10, 0.4 - drip * 0.07);
+    context.beginPath();
+    context.arc(dripX + 0.02, dripBottom, 0.035, 0, Math.PI * 2);
+    context.fill();
+  }
+}
+
+function drawAccentBlots(context, pulse) {
+  var accents = figure.accents;
+  var accent = state.accent;
+  var swell = 1 + state.live.bass * 0.5 + pulse * 0.35;
+  for (var index = 0; index < accents.length; index += 1) {
+    var blot = accents[index];
+    var radius = blot.radius * swell;
+    for (var layerIndex = 0; layerIndex < 2; layerIndex += 1) {
+      var offsetX = layerIndex === 0 ? 0 : radius * 0.32;
+      var offsetY = layerIndex === 0 ? 0 : -radius * 0.2;
+      context.fillStyle = layerIndex === 0
+        ? inkColor(accent[0], accent[1], accent[2], blot.alpha)
+        : inkColor(28, 22, 17, blot.alpha * 0.5);
+      context.beginPath();
+      for (var lobe = 0; lobe < blot.lobes; lobe += 1) {
+        var spread = (lobe / blot.lobes) * Math.PI * 2;
+        var wobble = radius * (0.55 + Math.abs(Math.sin(spread * 2.7 + blot.phase)) * 0.8);
+        var pointX = blot.x + offsetX + Math.cos(spread) * wobble;
+        var pointY = blot.y + offsetY + Math.sin(spread) * wobble;
+        if (lobe === 0) { context.moveTo(pointX, pointY); } else { context.lineTo(pointX, pointY); }
+      }
+      context.closePath();
+      context.fill();
+    }
+  }
+}
+
+function drawSilhouetteOutline(context, scale) {
+  var boundary = figure.boundary;
+  if (!boundary || boundary.length < 3) { return; }
+  context.strokeStyle = inkColor(20, 16, 13, 0.34);
+  context.lineWidth = 3.2 / scale;
+  context.beginPath();
+  context.moveTo(boundary[0].x, boundary[0].y);
+  for (var index = 1; index < boundary.length; index += 1) {
+    context.lineTo(boundary[index].x, boundary[index].y);
+  }
+  context.closePath();
+  context.stroke();
+}
+
+function drawFigure(pulse, tremble) {
+  if (!artContext) { return; }
+  if (!figure.built) { buildFigure(); }
+  var layout = figure.layout;
+  var scale = layout.scale;
+  artContext.save();
+  try {
+    artContext.setTransform(scale, 0, 0, -scale, layout.centerX, layout.centerY);
+    drawSilhouetteOutline(artContext, scale);
+    drawAccentBlots(artContext, pulse);
+    drawShards(artContext, pulse, tremble, scale);
+    drawSmudges(artContext, scale);
+    drawFace(artContext, pulse, scale);
+  } catch (error) {
+    reportError('figure', error);
+  }
+  artContext.restore();
+}
+
+function drawCageAndScream(pulse) {
+  var layout = figure.layout;
+  var scale = layout.scale;
+  var width = artCanvas.width;
+  var height = artCanvas.height;
+  artContext.save();
+  try {
+    artContext.setTransform(1, 0, 0, 1, 0, 0);
+    /* Bacon style space cage: thin chalk rules around the head */
+    var left = layout.centerX - scale * 1.5;
+    var right = layout.centerX + scale * 1.42;
+    var top = layout.centerY - scale * 2.9;
+    var bottom = layout.centerY + scale * 1.9;
+    var cage = inkColor(206, 193, 168, 0.34);
+    artContext.strokeStyle = cage;
+    artContext.lineWidth = 1.4;
+    artContext.beginPath();
+    artContext.moveTo(left, top); artContext.lineTo(right, top * 1.02 + 8);
+    artContext.moveTo(right, top * 1.02 + 8); artContext.lineTo(right, bottom);
+    artContext.moveTo(left, top); artContext.lineTo(left - 12, bottom * 0.98);
+    artContext.moveTo(left - 12, bottom * 0.98); artContext.lineTo(right, bottom);
+    artContext.stroke();
+
+    /* horizontal scream bands crossing the face */
+    for (var band = 0; band < 3; band += 1) {
+      var bandY = layout.centerY - scale * (2.2 - band * 0.92) + Math.sin(state.frames * 0.02 + band) * 4;
+      var thickness = scale * (0.08 + band * 0.05) * (1 + pulse * 0.5);
+      artContext.fillStyle = inkColor(18, 14, 11, 0.06 + band * 0.045 + pulse * 0.1);
+      artContext.beginPath();
+      artContext.moveTo(width * 0.06, bandY);
+      artContext.lineTo(width * 0.94, bandY - 6 + band * 3);
+      artContext.lineTo(width * 0.93, bandY + thickness);
+      artContext.lineTo(width * 0.08, bandY + thickness * 0.7);
+      artContext.closePath();
+      artContext.fill();
+    }
+  } catch (error) {
+    reportError('cage', error);
+  }
+  artContext.restore();
+}
+
+function drawRhythmStaff(pulse) {
+  var layout = figure.layout;
+  if (layout.portrait) { return; }
+  var width = artCanvas.width;
+  var height = artCanvas.height;
+  var left = width * 0.055;
+  var right = width * 0.425;
+  var staffTop = height * 0.792;
+  var gap = Math.max(5, height * 0.011);
+  var staffLines = 4;
+  var ink = inkColor(32, 26, 20, 0.2);
+  artContext.save();
+  try {
+    artContext.setTransform(1, 0, 0, 1, 0, 0);
+    artContext.strokeStyle = ink;
+    artContext.lineWidth = 1;
+    for (var lineIndex = 0; lineIndex < staffLines; lineIndex += 1) {
+      var lineY = staffTop + lineIndex * gap;
+      artContext.beginPath();
+      artContext.moveTo(left, lineY);
+      artContext.lineTo(right, lineY + Math.sin(lineIndex * 1.7) * 0.8);
+      artContext.stroke();
+    }
+    var bpm = state.live.bpm > 0 ? state.live.bpm : 132;
+    var eighthPosition = state.time * (bpm / 60) * 2;
+    var metre = 7;
+    var barFraction = ((eighthPosition % metre) + metre) % metre / metre;
+    var ticks = metre * 2;
+    for (var tickIndex = 0; tickIndex < ticks; tickIndex += 1) {
+      var tickX = left + (right - left) * (tickIndex / ticks);
+      var accentTick = tickIndex % 2 === 0;
+      artContext.strokeStyle = inkColor(30, 24, 18, accentTick ? 0.26 : 0.11);
+      artContext.lineWidth = accentTick ? 1.5 : 0.9;
+      artContext.beginPath();
+      artContext.moveTo(tickX, staffTop - (accentTick ? 5 : 2.5));
+      artContext.lineTo(tickX, staffTop + (staffLines - 1) * gap + (accentTick ? 5 : 2.5));
+      artContext.stroke();
+    }
+    var markerX = left + (right - left) * barFraction;
+    artContext.fillStyle = inkColor(28, 22, 17, 0.22 + pulse * 0.3);
+    artContext.fillRect(markerX - 1, staffTop - gap * 0.9, 2, (staffLines - 1) * gap + gap * 1.8);
+    artContext.font = '600 ' + Math.max(9, Math.round(height * 0.0155)) + 'px Georgia, serif';
+    artContext.fillStyle = inkColor(34, 28, 21, 0.34);
+    artContext.fillText('7/8', left, staffTop - gap * 2.1);
+    artContext.fillText(Math.round(bpm) + ' BPM', right, staffTop - gap * 2.1);
+  } catch (error) {
+    reportError('staff', error);
+  }
+  artContext.restore();
+}
+
+function drawFilmGrain() {
+  var tile = materials.noiseTile;
+  if (!isDrawableCanvas(tile) || state.reduced) { return; }
+  artContext.save();
+  try {
+    if (!materials.grain) { materials.grain = artContext.createPattern(tile, 'repeat'); }
+    if (!materials.grain) { return; }
+    artContext.setTransform(1, 0, 0, 1, (Math.random() - 0.5) * 90, (Math.random() - 0.5) * 90);
+    artContext.globalCompositeOperation = 'multiply';
+    artContext.globalAlpha = 0.07;
+    artContext.fillStyle = materials.grain;
+    artContext.fillRect(-120, -120, artCanvas.width + 240, artCanvas.height + 240);
+  } catch (error) {
+    reportError('grain', error);
+  }
+  artContext.restore();
+}
+
+function computePulse(nowMilliseconds) {
+  var elapsed = nowMilliseconds - state.beatAt;
+  if (!(elapsed >= 0) || elapsed > 950) { return 0; }
+  var decay = 1 - elapsed / 950;
+  var pulse = clampNumber(state.beatLevel * decay * decay, 0, 1);
+  return state.reduced ? pulse * 0.3 : pulse;
+}
+
+function renderFrame() {
+  var startedAt = (window.performance && performance.now) ? performance.now() : Date.now();
+  state.frames += 1;
+  var pulse = computePulse(startedAt);
+  var tremble = state.reduced ? 0 : (Math.sin(state.frames * 0.47) * 0.5 + 0.5);
+  if (artContext) {
+    try { paintPaper(); } catch (error) { reportError('paint-paper', error); }
+    try { drawFigure(pulse, tremble); } catch (error) { reportError('figure-frame', error); }
+    try { drawCageAndScream(pulse); } catch (error) { reportError('cage-frame', error); }
+    try { drawRhythmStaff(pulse); } catch (error) { reportError('staff-frame', error); }
+    try { drawFilmGrain(); } catch (error) { reportError('grain-frame', error); }  }
+  try { syncLyrics(pulse); } catch (error) { reportError('lyrics-frame', error); }
+  var endedAt = (window.performance && performance.now) ? performance.now() : Date.now();
+  state.js = Math.max(0, Math.round((endedAt - startedAt) * 100) / 100);
+  requestAnimationFrame(renderFrame);
+}
+
+/* ---------- lyrics engine ---------- */
+
+var lyricView = { spans: [], litCount: 0, activeIndex: -2 };
+
+function normalizeArtistText(artists) {
+  var names = [];
+  if (Array.isArray(artists)) {
+    for (var index = 0; index < Math.min(artists.length, 8); index += 1) {
+      if (artists[index]) { names.push(String(artists[index])); }
+    }
+    return names.join(' / ');
+  }
+  if (typeof artists === 'string') { return artists; }
+  return '';
+}
+
+function normalizeLines(rawLines) {
+  var cleaned = [];
+  if (!Array.isArray(rawLines)) { return cleaned; }
+  var totalLines = Math.min(rawLines.length, 400);
+  for (var index = 0; index < totalLines; index += 1) {
+    var raw = rawLines[index];
+    if (!raw || typeof raw !== 'object') { continue; }
+    var start = Number(raw.t);
+    if (!isFinite(start)) { start = 0; }
+    var text = typeof raw.text === 'string' ? raw.text
+      : (raw.text === null || raw.text === undefined ? '' : String(raw.text));
+    var span = Number(raw.dur);
+    if (!isFinite(span) || span <= 0) { span = 0; }
+    var charTimes = [];
+    var characters = Array.isArray(raw.chars) ? raw.chars : [];
+    var charCount = Math.min(characters.length, 240);
+    for (var charIndex = 0; charIndex < charCount; charIndex += 1) {
+      var item = characters[charIndex];
+      var at = item ? Number(item.t) : NaN;
+      var glyph = item && typeof item.c === 'string' ? item.c : '';
+      if (!glyph) { continue; }
+      if (!isFinite(at)) { at = start; }
+      charTimes.push({ c: glyph, at: at });
+    }
+    if (charTimes.length === 0 && text.length > 0) {
+      var estimatedSpan = span > 0 ? span : Math.max(1.2, text.length * 0.24);
+      var glyphCount = Math.min(text.length, 240);
+      for (var glyphIndex = 0; glyphIndex < glyphCount; glyphIndex += 1) {
+        charTimes.push({
+          c: text.charAt(glyphIndex),
+          at: start + estimatedSpan * (glyphIndex / Math.max(1, glyphCount))
+        });
+      }
+    }
+    var rebuilt = text;
+    if (!rebuilt && charTimes.length > 0) {
+      var pieces = [];
+      for (var pieceIndex = 0; pieceIndex < charTimes.length; pieceIndex += 1) { pieces.push(charTimes[pieceIndex].c); }
+      rebuilt = pieces.join('');
+    }
+    cleaned.push({ t: start, dur: span, text: rebuilt, chars: charTimes });
+  }
+  cleaned.sort(function (alpha, beta) { return alpha.t - beta.t; });
+  return cleaned;
+}
+
+function lyricIndexAt(seconds) {
+  var lines = state.lines;
+  if (lines.length === 0) { return -1; }
+  if (!(seconds >= lines[0].t - 0.06)) { return -1; }
+  var low = 0;
+  var high = lines.length - 1;
+  var found = 0;
+  for (var step = 0; step < 12 && low <= high; step += 1) {
+    var middle = (low + high) >> 1;
+    if (lines[middle].t <= seconds + 0.001) { found = middle; low = middle + 1; }
+    else { high = middle - 1; }
+  }
+  return found;
+}
+
+function lyricFitScale(text) {
+  var length = text ? text.length : 0;
+  if (length <= 15) { return 1; }
+  if (length <= 24) { return 0.87; }
+  if (length <= 34) { return 0.76; }
+  if (length <= 46) { return 0.66; }
+  if (length <= 64) { return 0.58; }
+  return 0.5;
+}
+
+function clearCurrentLine() {
+  for (var step = 0; step < 300 && curBox.firstChild; step += 1) {
+    curBox.removeChild(curBox.firstChild);
+  }
+}
+
+function buildLineContent(index) {
+  var lines = state.lines;
+  var line = index >= 0 && index < lines.length ? lines[index] : null;
+  var earlier = index - 1 >= 0 ? lines[index - 1] : null;
+  var later = index + 1 < lines.length ? lines[index + 1] : null;
+  var upcoming = later ? later.text : (index < 0 && lines.length > 0 ? lines[0].text : '');
+  prevBox.textContent = earlier ? earlier.text : '';
+  nextBox.textContent = upcoming;
+  prevBox.hidden = !(earlier && earlier.text);
+  nextBox.hidden = !upcoming;
+  curBox.hidden = !line;
+  clearCurrentLine();
+  lyricView.spans = [];
+  lyricView.litCount = 0;
+  if (!line) {
+    state.text = '';
+    curBox.style.setProperty('--fit', '1');
+    return;
+  }
+  state.text = line.text;
+  curBox.style.setProperty('--fit', String(lyricFitScale(line.text)));
+  if (line.chars.length === 0) {
+    curBox.textContent = line.text;
+    return;
+  }
+  var fragment = document.createDocumentFragment();
+  for (var index2 = 0; index2 < line.chars.length; index2 += 1) {
+    var glyphNode = document.createElement('span');
+    glyphNode.className = 'char';
+    glyphNode.textContent = line.chars[index2].c;
+    fragment.appendChild(glyphNode);
+    lyricView.spans.push({ node: glyphNode, at: line.chars[index2].at });
+  }
+  curBox.appendChild(fragment);
+  try {
+    if (!state.reduced && typeof curBox.animate === 'function') {
+      curBox.animate([{ opacity: 0.28 }, { opacity: 1 }], { duration: 240, easing: 'linear' });
+    }
+  } catch (error) { reportError('ink-in', error); }
+}
+
+function updateLitChars(seconds) {
+  var spans = lyricView.spans;
+  if (spans.length === 0) { return; }
+  var count = lyricView.litCount;
+  if (count > 0 && spans[count - 1].at > seconds + 0.001) {
+    count = 0;
+    for (var resetIndex = 0; resetIndex < spans.length; resetIndex += 1) {
+      spans[resetIndex].node.classList.remove('lit');
+    }
+  }
+  var cursor = count;
+  for (; cursor < spans.length && spans[cursor].at <= seconds; cursor += 1) {
+    spans[cursor].node.classList.add('lit');
+  }
+  lyricView.litCount = cursor;
+}
+
+function syncLyrics(pulse) {
+  var index = lyricIndexAt(state.time);
+  if (index !== lyricView.activeIndex) {
+    lyricView.activeIndex = index;
+    buildLineContent(index);
+  }
+  state.idx = index;
+  updateLitChars(state.time);
+  var joltX = state.reduced ? 0 : Math.sin(state.frames * 0.13) * 0.5 + pulse * 1.7;
+  var joltY = state.reduced ? 0 : Math.sin(state.frames * 0.19) * 0.4 - pulse * 3.4;
+  var tilt = state.reduced ? 0 : pulse * 0.5;
+  curBox.style.transform = 'translate3d(' + joltX.toFixed(2) + 'px,' + joltY.toFixed(2) + 'px,0) rotate(' + tilt.toFixed(2) + 'deg)';
+}
+
+/* ---------- protocol ---------- */
+
+function applyInit(payload) {
+  var data = payload && typeof payload === 'object' ? payload : {};
+  try {
+    var song = data.song && typeof data.song === 'object' ? data.song : {};
+    state.song = {
+      name: typeof song.name === 'string' ? song.name : '',
+      artists: normalizeArtistText(song.artists)
+    };
+    if (Array.isArray(data.accent) && data.accent.length >= 3) {
+      var nextAccent = [clampByte(data.accent[0]), clampByte(data.accent[1]), clampByte(data.accent[2])];
+      if (nextAccent[0] !== state.accent[0] || nextAccent[1] !== state.accent[1] || nextAccent[2] !== state.accent[2]) {
+        state.accent = nextAccent;
+        figure.built = false;
+      }
+    }
+    var total = Number(data.duration);
+    state.duration = isFinite(total) && total > 0 ? total : 0;
+    state.lines = normalizeLines(data.lines);
+    state.idx = -1;
+    state.text = '';
+    state.playing = true;
+    prevBox.textContent = '';
+    nextBox.textContent = '';
+    clearCurrentLine();
+    lyricView.spans = [];
+    lyricView.litCount = 0;
+    var hasLyrics = state.lines.length > 0;
+    lyricView.activeIndex = hasLyrics ? lyricIndexAt(state.time) : -1;
+    buildLineContent(hasLyrics ? lyricView.activeIndex : -1);
+    emptyBox.hidden = hasLyrics;
+    if (emptySub) {
+      emptySub.textContent = [state.song.name, state.song.artists].filter(function (part) { return !!part; }).join(' · ') || 'INSTRUMENTAL';
+    }
+  } catch (error) { reportError('init-lyrics', error); }
+  try {
+    resizeCanvas();
+    updateFigureLayout();
+    scheduleBackdrop();
+  } catch (error) { reportError('init-frame', error); }
+}
+
+function applyTick(payload) {
+  var seconds = Number(payload.time);
+  if (isFinite(seconds)) { state.time = seconds; }
+  if (typeof payload.playing === 'boolean') { state.playing = payload.playing; }
+}
+
+function applyBeat(payload) {
+  var level = Number(payload.level);
+  state.beatLevel = isFinite(level) ? clampNumber(level, 0, 1) : 0.55;
+  state.beatAt = (window.performance && performance.now) ? performance.now() : Date.now();
+}
+
+function applyLive(payload) {
+  state.live.bass = clampNumber(payload.bass, 0, 1);
+  state.live.mid = clampNumber(payload.mid, 0, 1);
+  state.live.treble = clampNumber(payload.treble, 0, 1);
+  state.live.level = clampNumber(payload.level, 0, 1);
+  state.live.bpm = clampNumber(payload.bpm, 0, 400);
+  if (typeof payload.playing === 'boolean') { state.playing = payload.playing; }
+}
+
+window.addEventListener('message', function (event) {
+  var data = event && event.data;
+  if (!data || data.__c100 !== 1) { return; }
+  try {
+    if (data.type === 'init') { applyInit(data.payload || {}); }
+    else if (data.type === 'tick') { applyTick(data.payload || {}); }
+    else if (data.type === 'beat') { applyBeat(data.payload || {}); }
+    else if (data.type === 'live') { applyLive(data.payload || {}); }
+  } catch (error) { reportError('message-' + (data && data.type), error); }
+});
+
+window.addEventListener('error', function (event) {
+  reportError('window', event && event.error ? event.error : event);
+});
+
+var backdropTimer = 0;
+var backdropDirty = false;
+
+function scheduleBackdrop() {
+  backdropDirty = true;
+  if (backdropTimer) { return; }
+  backdropTimer = setTimeout(function () {
+    backdropTimer = 0;
+    if (!backdropDirty) { return; }
+    backdropDirty = false;
+    try { ensureBackdrop(); } catch (error) { reportError('bake-backdrop', error); }
+  }, 180);
+}
+
+function handleResize() {
+  try {
+    resizeCanvas();
+    scheduleBackdrop();
+  } catch (error) { reportError('resize', error); }
+}
+
+resizeCanvas();
+scheduleBackdrop();
+requestAnimationFrame(function () { sendReady(); });
+setTimeout(sendReady, 900);
+requestAnimationFrame(renderFrame);
+window.addEventListener('resize', handleResize);
+window.addEventListener('orientationchange', handleResize);
+</script>
+</body>
+</html>

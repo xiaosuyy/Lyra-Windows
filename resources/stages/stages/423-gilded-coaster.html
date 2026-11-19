@@ -1,0 +1,2213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>镀金狂欢</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #080311; }
+  body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  #stage { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="stage" aria-label="镀金狂欢"></canvas>
+<script>
+"use strict";
+
+/* ---------- 0. 自检口：脚本最外层无条件赋值 ---------- */
+var stageState = {
+  lines: 0, idx: -1, t: 0, playing: true,
+  frames: 0, js: 0, err: "", text: "", gl: false, rm: false
+};
+
+window.__stage = function () {
+  return {
+    lines: stageState.lines,
+    idx: stageState.idx,
+    t: stageState.t,
+    playing: stageState.playing,
+    frames: stageState.frames,
+    js: stageState.js,
+    err: stageState.err,
+    text: stageState.text,
+    gl: stageState.gl,
+    rm: stageState.rm
+  };
+};
+
+/* ---------- 1. ready：第一个 rAF 无条件发出 + 定时兜底（早于一切 boot） ---------- */
+var readySent = false;
+
+function sendReadyOnce() {
+  if (readySent) { return; }
+  readySent = true;
+  try {
+    parent.postMessage({ __c100: 1, type: "ready" }, "*");
+  } catch (rootError) {
+    console.error("[423-gilded-coaster] ready postMessage failed", rootError);
+  }
+}
+
+setTimeout(sendReadyOnce, 700);
+
+if (typeof requestAnimationFrame === "function") {
+  requestAnimationFrame(function () {
+    sendReadyOnce();
+    bootStage();
+  });
+} else {
+  sendReadyOnce();
+  setTimeout(bootStage, 16);
+}
+
+/* ---------- 2. 基础工具 ---------- */
+var lastErrorAt = -1000;
+
+function reportError(where, problem) {
+  var now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  if (now - lastErrorAt < 1000) { return; }
+  lastErrorAt = now;
+  console.error("[423-gilded-coaster] " + where, problem);
+}
+
+function clampNumber(value, low, high) {
+  var numeric = Number(value);
+  if (!isFinite(numeric)) { return low; }
+  if (numeric < low) { return low; }
+  if (numeric > high) { return high; }
+  return numeric;
+}
+
+function colorString(red, green, blue, alpha) {
+  var outRed = Math.round(clampNumber(red, 0, 255));
+  var outGreen = Math.round(clampNumber(green, 0, 255));
+  var outBlue = Math.round(clampNumber(blue, 0, 255));
+  var outAlpha = clampNumber(alpha === undefined ? 1 : alpha, 0, 1);
+  return "rgba(" + outRed + "," + outGreen + "," + outBlue + "," + outAlpha + ")";
+}
+
+function addColorStopSafe(gradient, offset, color) {
+  try {
+    if (gradient && typeof gradient.addColorStop === "function") {
+      gradient.addColorStop(clampNumber(offset, 0, 1), color);
+    }
+  } catch (gradientError) {
+    reportError("addColorStop", gradientError);
+  }
+}
+
+function hslColor(hue, saturation, lightness, alpha) {
+  var hueValue = Number(hue);
+  if (!isFinite(hueValue)) { hueValue = 28; }
+  hueValue = ((hueValue % 360) + 360) % 360;
+  var satValue = clampNumber(saturation, 0, 100) / 100;
+  var lightValue = clampNumber(lightness, 0, 100) / 100;
+  var chroma = (1 - Math.abs(2 * lightValue - 1)) * satValue;
+  var second = chroma * (1 - Math.abs(((hueValue / 60) % 2) - 1));
+  var match = lightValue - chroma / 2;
+  var red = 0;
+  var green = 0;
+  var blue = 0;
+  if (hueValue < 60) { red = chroma; green = second; }
+  else if (hueValue < 120) { red = second; green = chroma; }
+  else if (hueValue < 180) { green = chroma; blue = second; }
+  else if (hueValue < 240) { green = second; blue = chroma; }
+  else if (hueValue < 300) { red = second; blue = chroma; }
+  else { red = chroma; blue = second; }
+  return colorString((red + match) * 255, (green + match) * 255, (blue + match) * 255, alpha);
+}
+
+function hueFromAccent(rgb, fallbackHue) {
+  if (!rgb || rgb.length < 3) { return fallbackHue; }
+  var red = clampNumber(rgb[0], 0, 255) / 255;
+  var green = clampNumber(rgb[1], 0, 255) / 255;
+  var blue = clampNumber(rgb[2], 0, 255) / 255;
+  var highest = Math.max(red, green, blue);
+  var lowest = Math.min(red, green, blue);
+  var delta = highest - lowest;
+  if (delta < 0.05 || highest < 0.08) { return fallbackHue; }
+  var hue = 0;
+  if (highest === red) { hue = 60 * (((green - blue) / delta) % 6); }
+  else if (highest === green) { hue = 60 * ((blue - red) / delta + 2); }
+  else { hue = 60 * ((red - green) / delta + 4); }
+  return ((hue % 360) + 360) % 360;
+}
+
+var palette = {
+  deepSky: "rgba(18,4,38,1)",
+  upperSky: "rgba(38,8,62,1)",
+  midSky: "rgba(72,14,78,1)",
+  lowSky: "rgba(124,24,74,1)",
+  horizon: "rgba(255,144,74,1)",
+  haze: "rgba(255,186,120,1)",
+  sandFar: "rgba(122,58,96,1)",
+  sandMid: "rgba(84,30,70,1)",
+  sandNear: "rgba(38,12,40,1)",
+  railSteel: "rgba(255,244,224,1)",
+  railGlow: "rgba(255,196,120,1)",
+  gold: "rgba(255,206,110,1)",
+  goldLight: "rgba(255,246,206,1)",
+  goldDark: "rgba(112,52,12,1)",
+  hot: "rgba(255,86,150,1)",
+  magenta: "rgba(255,52,148,1)",
+  violet: "rgba(146,86,255,1)",
+  cyan: "rgba(74,238,232,1)",
+  ink: "rgba(12,4,20,1)",
+  accent: "rgba(255,196,120,1)",
+  accentSoft: "rgba(255,226,180,1)"
+};
+
+var accentHue = 28;
+
+function buildPalette(rgb) {
+  accentHue = hueFromAccent(rgb, 28);
+  palette.deepSky = hslColor(256, 66, 8, 1);
+  palette.upperSky = hslColor(266, 62, 14, 1);
+  palette.midSky = hslColor(292, 58, 20, 1);
+  palette.lowSky = hslColor(318, 62, 27, 1);
+  palette.horizon = hslColor(20, 94, 60, 1);
+  palette.haze = hslColor(30, 88, 74, 1);
+  palette.sandFar = hslColor(292, 42, 32, 1);
+  palette.sandMid = hslColor(286, 44, 20, 1);
+  palette.sandNear = hslColor(276, 48, 11, 1);
+  palette.gold = hslColor(42, 92, 62, 1);
+  palette.goldLight = hslColor(46, 96, 86, 1);
+  palette.goldDark = hslColor(24, 76, 26, 1);
+  palette.hot = hslColor(336, 94, 60, 1);
+  palette.magenta = hslColor(320, 92, 62, 1);
+  palette.violet = hslColor(272, 86, 64, 1);
+  palette.cyan = hslColor(180, 84, 62, 1);
+  palette.accent = hslColor(accentHue, 84, 60, 1);
+  palette.accentSoft = hslColor(accentHue, 76, 76, 1);
+}
+
+/* ---------- 3. 画布 ---------- */
+var stageCanvas = document.getElementById("stage");
+var stageCtx = null;
+var stageWidth = 0;
+var stageHeight = 0;
+var stageDpr = 1;
+var lyricLines = [];
+var wrappedCache = new Map();
+var stageSong = { name: "", artists: "", cover: "" };
+var stageAccent = [255, 176, 82];
+var stageDuration = 0;
+
+function fallbackWidth() {
+  var width = stageCanvas ? stageCanvas.clientWidth : 0;
+  if (!isFinite(width) || width <= 0) { width = window.innerWidth; }
+  if (!isFinite(width) || width <= 0) { width = 1440; }
+  return Math.round(width);
+}
+
+function fallbackHeight() {
+  var height = stageCanvas ? stageCanvas.clientHeight : 0;
+  if (!isFinite(height) || height <= 0) { height = window.innerHeight; }
+  if (!isFinite(height) || height <= 0) { height = 900; }
+  return Math.round(height);
+}
+
+function resizeStage() {
+  stageWidth = fallbackWidth();
+  stageHeight = fallbackHeight();
+  stageDpr = clampNumber(window.devicePixelRatio || 1, 1, 2);
+  stageCanvas.width = Math.max(1, Math.round(stageWidth * stageDpr));
+  stageCanvas.height = Math.max(1, Math.round(stageHeight * stageDpr));
+  stageCanvas.style.width = stageWidth + "px";
+  stageCanvas.style.height = stageHeight + "px";
+  stageCtx.setTransform(stageDpr, 0, 0, stageDpr, 0, 0);
+  stageCtx.textBaseline = "alphabetic";
+  stageCtx.textAlign = "left";
+  wrappedCache.clear();
+  wrapCache.clear();
+  buildStageGradients();
+  buildOverlays();
+  bakeSky();
+  buildBokeh();
+}
+
+function bootStage() {
+  try {
+    stageCtx = stageCanvas.getContext("2d", { alpha: false });
+    if (!stageCtx) { throw new Error("2d context unavailable"); }
+    buildPalette(stageAccent);
+    resizeStage();
+    window.addEventListener("resize", function () {
+      try {
+        resizeStage();
+      } catch (resizeError) { reportError("resize", resizeError); }
+    });
+    window.addEventListener("message", handleMessage);
+    requestAnimationFrame(renderFrame);
+  } catch (bootError) {
+    stageState.err = String(bootError && bootError.message ? bootError.message : bootError);
+    reportError("boot", bootError);
+  }
+}
+
+/* ---------- 4. 歌词选择 ---------- */
+function lineIndexAtTime(time) {
+  var found = -1;
+  var scan = 0;
+  while (scan < lyricLines.length) {
+    var entry = lyricLines[scan];
+    if (entry && entry.t <= time) { found = scan; } else { break; }
+    scan += 1;
+  }
+  return found;
+}
+
+function updateLyricState() {
+  var index = lineIndexAtTime(stageState.t);
+  stageState.idx = index;
+  stageState.text = index >= 0 ? String(lyricLines[index].text || "") : "";
+}
+
+/* ---------- 5. 消息 ---------- */
+function applyInit(payload) {
+  var safePayload = payload && typeof payload === "object" ? payload : {};
+  var incoming = Array.isArray(safePayload.lines) ? safePayload.lines : [];
+  lyricLines = [];
+  var limit = Math.min(incoming.length, 4000);
+  var scan = 0;
+  while (scan < limit) {
+    var raw = incoming[scan] || {};
+    var text = raw.text === null || raw.text === undefined ? "" : String(raw.text);
+    lyricLines.push({
+      t: isFinite(Number(raw.t)) ? Number(raw.t) : 0,
+      dur: isFinite(Number(raw.dur)) ? Math.max(0, Number(raw.dur)) : 0,
+      text: text,
+      chars: Array.isArray(raw.chars) ? raw.chars : null
+    });
+    scan += 1;
+  }
+  stageState.lines = lyricLines.length;
+  stageState.idx = -1;
+  stageState.text = "";
+  stageState.playing = safePayload.playing === undefined ? true : !!safePayload.playing;
+
+  hasLyricText = false;
+  var textScan = 0;
+  while (textScan < lyricLines.length) {
+    if (String(lyricLines[textScan].text || "").trim().length > 0) {
+      hasLyricText = true;
+      break;
+    }
+    textScan += 1;
+  }
+  timingCache.clear();
+
+  var songInfo = safePayload.song && typeof safePayload.song === "object" ? safePayload.song : {};
+  var artistText = songInfo.artists;
+  if (Array.isArray(artistText)) {
+    artistText = artistText.join(" / ");
+  }
+  stageSong.name = songInfo.name === null || songInfo.name === undefined ? "" : String(songInfo.name);
+  stageSong.artists = artistText === null || artistText === undefined ? "" : String(artistText);
+  stageSong.cover = songInfo.cover === null || songInfo.cover === undefined ? "" : String(songInfo.cover);
+
+  var accentValue = safePayload.accent;
+  if (accentValue && accentValue.length >= 3) {
+    stageAccent = [
+      clampNumber(accentValue[0], 0, 255),
+      clampNumber(accentValue[1], 0, 255),
+      clampNumber(accentValue[2], 0, 255)
+    ];
+    buildPalette(stageAccent);
+    bakeSky();
+  }
+
+  stageDuration = isFinite(Number(safePayload.duration)) ? Math.max(0, Number(safePayload.duration)) : 0;
+  wrappedCache.clear();
+  updateLyricState();
+}
+
+function handleMessage(event) {
+  try {
+    var data = event ? event.data : null;
+    if (!data || data.__c100 !== 1) { return; }
+    if (data.type === "init") {
+      applyInit(data.payload);
+    } else if (data.type === "tick") {
+      var tickPayload = data.payload || {};
+      var incomingTime = Number(tickPayload.time);
+      stageState.t = isFinite(incomingTime) ? incomingTime : 0;
+      if (tickPayload.playing !== undefined) { stageState.playing = !!tickPayload.playing; }
+      updateLyricState();
+    } else if (data.type === "live") {
+      var livePayload = data.payload || {};
+      liveState.level = clampNumber(livePayload.level, 0, 1);
+      liveState.bass = clampNumber(livePayload.bass, 0, 1);
+      liveState.mid = clampNumber(livePayload.mid, 0, 1);
+      liveState.treble = clampNumber(livePayload.treble, 0, 1);
+      liveState.bpm = clampNumber(livePayload.bpm, 0, 300);
+      if (livePayload.playing !== undefined) { liveState.playing = !!livePayload.playing; }
+      liveState.active = true;
+    } else if (data.type === "beat") {
+      var beatPayload = data.payload || {};
+      var beatIndexValue = Math.round(clampNumber(beatPayload.index, -1, 100000000));
+      if (beatIndexValue !== lastBeatIndex) {
+        lastBeatIndex = beatIndexValue;
+        beatFlash = Math.min(1, 0.55 + clampNumber(beatPayload.level, 0, 1) * 0.6);
+        if (typeof spawnFireworkBurst === "function") {
+          spawnFireworkBurst(clampNumber(beatPayload.level, 0, 1));
+        }
+      }
+    }
+  } catch (messageError) {
+    reportError("message", messageError);
+  }
+}
+
+/* ---------- 6. 运行时状态（供后续层共享，先定义防未定义引用） ---------- */
+var bootTimeMs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+var stageClock = 0;
+var liveState = { bpm: 0, level: 0.5, bass: 0.4, mid: 0.3, treble: 0.2, playing: true, active: false };
+var beatFlash = 0;
+var lastBeatIndex = -1;
+
+var quality = {
+  level: 2,
+  frameMs: 8,
+  slowFrames: 0,
+  duneSteps: 48,
+  starCount: 240,
+  railSteps: 62,
+  crowdCount: 88,
+  particleCap: 320
+};
+
+var seededState = 42317;
+
+function seededRandom() {
+  seededState = (seededState * 1103515245 + 12345) % 2147483648;
+  return seededState / 2147483648;
+}
+
+/* ---------- 7. 相机：等距鱼眼投影 ---------- */
+var cameraRig = { x: 0, y: 3.4, z: -7, pitch: 0.055 };
+var viewFocal = 480;
+var viewCenterX = 720;
+var viewCenterY = 450;
+var sinPitch = 0;
+var cosPitch = 1;
+var stageIsPortrait = false;
+var horizonGlow = null;
+
+function updateCameraRig() {
+  stageIsPortrait = stageHeight > stageWidth * 1.05;
+  var shakeAmount = clampNumber(liveState.bass * beatFlash * 0.012, 0, 0.02);
+  cameraRig.pitch = 0.055 + Math.sin(stageClock * 0.7) * 0.006 + shakeAmount * Math.sin(stageClock * 31);
+  cameraRig.y = 3.4 + Math.sin(stageClock * 0.43) * 0.18;
+  sinPitch = Math.sin(cameraRig.pitch);
+  cosPitch = Math.cos(cameraRig.pitch);
+  viewFocal = stageIsPortrait ? stageHeight * 0.62 : Math.min(stageWidth, stageHeight) * 0.53;
+  viewCenterX = stageWidth * (stageIsPortrait ? 0.5 : 0.5);
+  viewCenterY = stageHeight * (stageIsPortrait ? 0.47 : 0.5);
+}
+
+var projectedPoint = { x: 0, y: 0, angle: 0, depth: 0, scale: 1 };
+
+function projectWorld(worldX, worldY, worldZ, output) {
+  var target = output || projectedPoint;
+  var deltaX = worldX - cameraRig.x;
+  var deltaY = worldY - cameraRig.y;
+  var deltaZ = worldZ - cameraRig.z;
+  var depth = deltaY * sinPitch + deltaZ * cosPitch;
+  if (depth < 0.4) { return null; }
+  var vertical = deltaY * cosPitch - deltaZ * sinPitch;
+  var radial = Math.sqrt(deltaX * deltaX + vertical * vertical);
+  var angle = Math.atan2(radial, depth);
+  var normal = radial > 0.00001 ? radial : 0.00001;
+  target.x = viewCenterX + (deltaX / normal) * angle * viewFocal;
+  target.y = viewCenterY - (vertical / normal) * angle * viewFocal;
+  target.angle = angle;
+  target.depth = depth;
+  target.scale = viewFocal / Math.max(depth, 0.5);
+  return target;
+}
+
+/* ---------- 8. 天空烘焙（一次性，resize 时重做） ---------- */
+var skyCanvas = document.createElement("canvas");
+var skyReady = false;
+
+function bakeSky() {
+  try {
+    var bakeScale = 0.62;
+    var bakeWidth = Math.max(64, Math.round(stageWidth * bakeScale));
+    var bakeHeight = Math.max(64, Math.round(stageHeight * bakeScale));
+    skyCanvas.width = bakeWidth;
+    skyCanvas.height = bakeHeight;
+    var sky = skyCanvas.getContext("2d");
+    if (!sky) { skyReady = false; return; }
+    sky.globalCompositeOperation = "source-over";
+
+    var skyGradient = sky.createLinearGradient(0, 0, 0, bakeHeight);
+    addColorStopSafe(skyGradient, 0, palette.deepSky);
+    addColorStopSafe(skyGradient, 0.33, palette.upperSky);
+    addColorStopSafe(skyGradient, 0.6, palette.midSky);
+    addColorStopSafe(skyGradient, 0.8, palette.lowSky);
+    addColorStopSafe(skyGradient, 0.92, palette.horizon);
+    addColorStopSafe(skyGradient, 1, palette.haze);
+    sky.fillStyle = skyGradient;
+    sky.fillRect(0, 0, bakeWidth, bakeHeight);
+
+    seededState = 42317;
+    var nebulaColors = [palette.magenta, palette.violet, palette.accent, palette.cyan, palette.hot];
+    sky.globalCompositeOperation = "lighter";
+    var nebulaIndex = 0;
+    while (nebulaIndex < 9) {
+      var nebulaX = seededRandom() * bakeWidth;
+      var nebulaY = (0.15 + seededRandom() * 0.62) * bakeHeight;
+      var nebulaRadius = (0.1 + seededRandom() * 0.24) * bakeWidth;
+      var nebulaPaint = sky.createRadialGradient(nebulaX, nebulaY, 0, nebulaX, nebulaY, nebulaRadius);
+      addColorStopSafe(nebulaPaint, 0, nebulaColors[nebulaIndex % nebulaColors.length]);
+      addColorStopSafe(nebulaPaint, 0.45, nebulaColors[(nebulaIndex + 2) % nebulaColors.length]);
+      addColorStopSafe(nebulaPaint, 1, "rgba(20,4,32,0)");
+      sky.globalAlpha = 0.16;
+      sky.fillStyle = nebulaPaint;
+      sky.fillRect(nebulaX - nebulaRadius, nebulaY - nebulaRadius, nebulaRadius * 2, nebulaRadius * 2);
+      nebulaIndex += 1;
+    }
+    sky.globalAlpha = 1;
+
+    var starLimit = Math.min(quality.starCount, 420);
+    var starIndex = 0;
+    while (starIndex < starLimit) {
+      var starX = seededRandom() * bakeWidth;
+      var starY = Math.pow(seededRandom(), 1.35) * bakeHeight * 0.82;
+      var starRadius = 0.35 + seededRandom() * 1.5;
+      var starAlpha = 0.25 + seededRandom() * 0.7;
+      sky.fillStyle = colorString(255, 236, 214, starAlpha);
+      sky.beginPath();
+      sky.arc(starX, starY, starRadius, 0, Math.PI * 2);
+      sky.fill();
+      starIndex += 1;
+    }
+
+    var flareIndex = 0;
+    while (flareIndex < 14) {
+      var flareX = seededRandom() * bakeWidth;
+      var flareY = seededRandom() * bakeHeight * 0.6;
+      var flareSize = 2 + seededRandom() * 5;
+      sky.strokeStyle = colorString(255, 232, 196, 0.5);
+      sky.lineWidth = 1;
+      sky.beginPath();
+      sky.moveTo(flareX - flareSize, flareY);
+      sky.lineTo(flareX + flareSize, flareY);
+      sky.moveTo(flareX, flareY - flareSize * 1.4);
+      sky.lineTo(flareX, flareY + flareSize * 1.4);
+      sky.stroke();
+      flareIndex += 1;
+    }
+    sky.globalCompositeOperation = "source-over";
+
+    /* 远处的带环行星 */
+    var planetX = bakeWidth * 0.18;
+    var planetY = bakeHeight * 0.17;
+    var planetRadius = Math.min(bakeWidth, bakeHeight) * 0.072;
+    var planetPaint = sky.createRadialGradient(planetX - planetRadius * 0.35, planetY - planetRadius * 0.4, planetRadius * 0.1, planetX, planetY, planetRadius);
+    addColorStopSafe(planetPaint, 0, palette.goldLight);
+    addColorStopSafe(planetPaint, 0.55, palette.gold);
+    addColorStopSafe(planetPaint, 1, palette.sandFar);
+    sky.fillStyle = planetPaint;
+    sky.beginPath();
+    sky.arc(planetX, planetY, planetRadius, 0, Math.PI * 2);
+    sky.fill();
+    sky.save();
+    sky.translate(planetX, planetY);
+    sky.rotate(-0.34);
+    sky.strokeStyle = colorString(255, 226, 186, 0.55);
+    sky.lineWidth = Math.max(1, planetRadius * 0.06);
+    sky.beginPath();
+    sky.ellipse(0, 0, planetRadius * 1.72, planetRadius * 0.46, 0, 0, Math.PI * 2);
+    sky.stroke();
+    sky.restore();
+
+    /* 月牙 */
+    var moonX = bakeWidth * 0.8;
+    var moonY = bakeHeight * 0.2;
+    var moonRadius = Math.min(bakeWidth, bakeHeight) * 0.036;
+    sky.fillStyle = colorString(255, 238, 206, 0.9);
+    sky.beginPath();
+    sky.arc(moonX, moonY, moonRadius, 0, Math.PI * 2);
+    sky.fill();
+    sky.globalCompositeOperation = "destination-out";
+    sky.beginPath();
+    sky.arc(moonX + moonRadius * 0.52, moonY - moonRadius * 0.22, moonRadius * 0.94, 0, Math.PI * 2);
+    sky.fill();
+    sky.globalCompositeOperation = "source-over";
+
+    skyReady = skyCanvas.width > 0 && skyCanvas.height > 0;
+  } catch (bakeError) {
+    skyReady = false;
+    reportError("bakeSky", bakeError);
+  }
+}
+
+function buildStageGradients() {
+  try {
+    horizonGlow = stageCtx.createRadialGradient(
+      stageWidth * 0.5, stageHeight * 0.64, 0,
+      stageWidth * 0.5, stageHeight * 0.64, Math.max(stageWidth, stageHeight) * 0.62
+    );
+    addColorStopSafe(horizonGlow, 0, colorString(255, 176, 104, 0.5));
+    addColorStopSafe(horizonGlow, 0.35, colorString(255, 108, 92, 0.18));
+    addColorStopSafe(horizonGlow, 1, "rgba(20,4,32,0)");
+  } catch (gradientError) {
+    horizonGlow = null;
+    reportError("buildStageGradients", gradientError);
+  }
+}
+
+/* ---------- 9. 沙丘 ---------- */
+function drawDuneLayer(context, distanceZ, amplitude, ridgeColor, baseColor, phase, rimAlpha) {
+  var steps = Math.max(24, Math.round(quality.duneSteps));
+  var spanX = distanceZ * 8.5;
+  var pointsX = [];
+  var pointsY = [];
+  var scan = 0;
+  while (scan <= steps) {
+    var worldX = -spanX * 0.5 + (spanX / steps) * scan;
+    var ridge = amplitude * (0.55 + 0.45 * Math.sin(worldX * 0.021 + phase)) +
+      amplitude * 0.28 * Math.sin(worldX * 0.057 + phase * 1.9);
+    var projected = projectWorld(worldX, ridge, distanceZ, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+    if (projected) {
+      pointsX.push(projected.x);
+      pointsY.push(projected.y);
+    }
+    scan += 1;
+  }
+  if (pointsX.length < 3) { return; }
+  var paint = context.createLinearGradient(0, Math.min.apply(null, pointsY), 0, stageHeight);
+  addColorStopSafe(paint, 0, ridgeColor);
+  addColorStopSafe(paint, 1, baseColor);
+  context.fillStyle = paint;
+  context.beginPath();
+  context.moveTo(pointsX[0], pointsY[0]);
+  var index = 1;
+  while (index < pointsX.length) {
+    context.lineTo(pointsX[index], pointsY[index]);
+    index += 1;
+  }
+  context.lineTo(pointsX[pointsX.length - 1], stageHeight + 40);
+  context.lineTo(pointsX[0], stageHeight + 40);
+  context.closePath();
+  context.fill();
+
+  context.strokeStyle = colorString(255, 196, 128, rimAlpha);
+  context.lineWidth = Math.min(2.4, 1 + amplitude * 0.05);
+  context.beginPath();
+  context.moveTo(pointsX[0], pointsY[0]);
+  var edgeIndex = 1;
+  while (edgeIndex < pointsX.length) {
+    context.lineTo(pointsX[edgeIndex], pointsY[edgeIndex]);
+    edgeIndex += 1;
+  }
+  context.stroke();
+}
+
+/* ---------- 10. 镀金头颅：巨型入口雕塑 ---------- */
+var TAU = Math.PI * 2;
+var headWorld = { x: 0, y: 11.6, z: 18.5, half: 16 };
+var headFrame = null;
+
+function computeHeadFrame() {
+  var centerPoint = projectWorld(headWorld.x, headWorld.y, headWorld.z, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  var topPoint = projectWorld(headWorld.x, headWorld.y + headWorld.half, headWorld.z, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  if (!centerPoint || !topPoint) { return null; }
+  var halfPixels = Math.max(16, Math.abs(topPoint.y - centerPoint.y) / 1.02);
+  return {
+    x: centerPoint.x,
+    y: centerPoint.y,
+    half: halfPixels,
+    mouthX: centerPoint.x,
+    mouthY: centerPoint.y + 0.3 * halfPixels,
+    mouthWidth: 0.35 * halfPixels
+  };
+}
+
+function beginPathSafe(target) {
+  if (target && typeof target.beginPath === "function") {
+    target.beginPath();
+    return true;
+  }
+  return false;
+}
+
+function traceHeadShape(context) {
+  if (!beginPathSafe(context)) { return; }
+  context.moveTo(0, -1.04);
+  context.bezierCurveTo(0.3, -1.05, 0.56, -0.94, 0.66, -0.7);
+  context.bezierCurveTo(0.74, -0.52, 0.78, -0.3, 0.77, -0.08);
+  context.bezierCurveTo(0.76, 0.16, 0.7, 0.36, 0.58, 0.48);
+  context.bezierCurveTo(0.47, 0.6, 0.33, 0.67, 0.25, 0.72);
+  context.lineTo(0.27, 0.95);
+  context.bezierCurveTo(0.12, 1.0, -0.12, 1.0, -0.27, 0.95);
+  context.lineTo(-0.25, 0.72);
+  context.bezierCurveTo(-0.33, 0.67, -0.47, 0.6, -0.58, 0.48);
+  context.bezierCurveTo(-0.7, 0.36, -0.76, 0.16, -0.77, -0.08);
+  context.bezierCurveTo(-0.78, -0.3, -0.74, -0.52, -0.66, -0.7);
+  context.bezierCurveTo(-0.56, -0.94, -0.3, -1.05, 0, -1.04);
+  context.closePath();
+}
+
+function traceLensShape(context, lensWidth, lensHeight) {
+  if (!beginPathSafe(context)) { return; }
+  context.moveTo(-lensWidth * 0.5, -lensHeight * 0.16);
+  context.bezierCurveTo(-lensWidth * 0.34, -lensHeight * 0.56, lensWidth * 0.34, -lensHeight * 0.58, lensWidth * 0.5, -lensHeight * 0.14);
+  context.bezierCurveTo(lensWidth * 0.53, lensHeight * 0.22, lensWidth * 0.34, lensHeight * 0.52, 0, lensHeight * 0.52);
+  context.bezierCurveTo(-lensWidth * 0.34, lensHeight * 0.52, -lensWidth * 0.53, lensHeight * 0.22, -lensWidth * 0.5, -lensHeight * 0.16);
+  context.closePath();
+}
+
+function drawEyeLens(context, lensX, lensY, lensWidth, lensHeight, tilt, isLeft) {
+  context.save();
+  context.translate(lensX, lensY);
+  context.rotate(tilt);
+
+  traceLensShape(context, lensWidth, lensHeight);
+  context.fillStyle = "rgba(7,2,12,0.97)";
+  context.fill();
+
+  context.save();
+  traceLensShape(context, lensWidth, lensHeight);
+  context.clip();
+  var glowPaint = context.createRadialGradient(0, lensHeight * 0.18, lensWidth * 0.02, 0, lensHeight * 0.1, lensWidth * 0.78);
+  addColorStopSafe(glowPaint, 0, colorString(255, 255, 255, 0.36));
+  addColorStopSafe(glowPaint, 0.24, palette.accent);
+  addColorStopSafe(glowPaint, 0.62, isLeft ? palette.magenta : palette.violet);
+  addColorStopSafe(glowPaint, 1, "rgba(10,0,26,0.9)");
+  context.globalAlpha = 0.62 + beatFlash * 0.22;
+  context.fillStyle = glowPaint;
+  context.fillRect(-lensWidth, -lensHeight, lensWidth * 2, lensHeight * 2);
+  context.globalAlpha = 1;
+
+  context.strokeStyle = colorString(255, 236, 210, 0.5);
+  context.lineWidth = lensWidth * 0.045;
+  var spiral = 0;
+  while (spiral < 3) {
+    var spin = stageClock * (0.6 + spiral * 0.28) * (isLeft ? 1 : -1);
+    context.beginPath();
+    context.arc(0, lensHeight * 0.1, lensWidth * (0.17 + spiral * 0.17), spin + spiral * 2.1, spin + spiral * 2.1 + 2.4);
+    context.stroke();
+    spiral += 1;
+  }
+
+  var glint = context.createRadialGradient(lensWidth * 0.22, -lensHeight * 0.28, 0, lensWidth * 0.22, -lensHeight * 0.28, lensWidth * 0.3);
+  addColorStopSafe(glint, 0, colorString(255, 255, 255, 0.85));
+  addColorStopSafe(glint, 1, "rgba(255,255,255,0)");
+  context.fillStyle = glint;
+  context.fillRect(-lensWidth, -lensHeight, lensWidth * 2, lensHeight * 2);
+  context.restore();
+
+  traceLensShape(context, lensWidth, lensHeight);
+  context.lineWidth = lensWidth * 0.05;
+  context.strokeStyle = hslColor(40, 92, 66, 1);
+  context.stroke();
+  context.restore();
+}
+
+function drawMouthTunnel(context, frame) {
+  var mouthWidth = 0.35;
+  var mouthHeight = 0.22;
+  var pulse = 1 + beatFlash * 0.06;
+
+  context.save();
+  context.translate(0, 0.3);
+
+  var tunnel = context.createRadialGradient(0, mouthHeight * 0.55, 0.01, 0, 0, mouthWidth * 1.5 * pulse);
+  addColorStopSafe(tunnel, 0, colorString(255, 214, 214, 0.98));
+  addColorStopSafe(tunnel, 0.18, palette.accent);
+  addColorStopSafe(tunnel, 0.42, hslColor(334, 88, 34, 1));
+  addColorStopSafe(tunnel, 0.72, hslColor(300, 70, 12, 1));
+  addColorStopSafe(tunnel, 1, "rgba(5,0,8,1)");
+  context.beginPath();
+  context.ellipse(0, 0, mouthWidth * pulse, mouthHeight * pulse, 0, 0, TAU);
+  context.fillStyle = tunnel;
+  context.fill();
+
+  context.save();
+  context.beginPath();
+  context.ellipse(0, 0, mouthWidth, mouthHeight, 0, 0, TAU);
+  context.clip();
+
+  var toothGradient = context.createLinearGradient(0, -mouthHeight, 0, mouthHeight);
+  addColorStopSafe(toothGradient, 0, palette.goldLight);
+  addColorStopSafe(toothGradient, 0.5, palette.gold);
+  addColorStopSafe(toothGradient, 1, hslColor(30, 82, 44, 1));
+  context.fillStyle = toothGradient;
+
+  var tooth = 0;
+  while (tooth < 6) {
+    var toothX = -0.3 + tooth * 0.108;
+    context.fillRect(toothX, -mouthHeight * 1.05, 0.088, mouthHeight * 0.62);
+    tooth += 1;
+  }
+  var lowerTooth = 0;
+  while (lowerTooth < 5) {
+    var lowerX = -0.25 + lowerTooth * 0.108;
+    context.fillRect(lowerX, mouthHeight * 0.42, 0.088, mouthHeight * 0.66);
+    lowerTooth += 1;
+  }
+  context.fillStyle = "rgba(20,4,10,0.55)";
+  context.fillRect(-mouthWidth, -mouthHeight * 0.06, mouthWidth * 2, mouthHeight * 0.1);
+  context.restore();
+
+  context.beginPath();
+  context.ellipse(0, 0, mouthWidth, mouthHeight, 0, 0, TAU);
+  context.lineWidth = 0.055;
+  context.strokeStyle = hslColor(30, 90, 50, 1);
+  context.stroke();
+  context.beginPath();
+  context.ellipse(0, 0, mouthWidth * 0.98, mouthHeight * 0.98, 0, 0, TAU);
+  context.lineWidth = 0.014;
+  context.strokeStyle = colorString(255, 240, 214, 0.7);
+  context.stroke();
+  context.restore();
+}
+
+function drawGildedHead(context, frame) {
+  if (!frame || !isFinite(frame.half) || frame.half <= 0) { return; }
+  var halfPixels = frame.half;
+  context.save();
+  context.translate(
+    frame.x + Math.sin(stageClock * 0.5) * halfPixels * 0.006,
+    frame.y + Math.sin(stageClock * 0.92) * halfPixels * 0.009
+  );
+  context.rotate(Math.sin(stageClock * 0.31) * 0.013);
+  context.scale(halfPixels, halfPixels);
+
+  var bodyGradient = context.createLinearGradient(0, -1.05, 0, 1);
+  addColorStopSafe(bodyGradient, 0, palette.goldLight);
+  addColorStopSafe(bodyGradient, 0.3, palette.gold);
+  addColorStopSafe(bodyGradient, 0.64, hslColor(33, 88, 46, 1));
+  addColorStopSafe(bodyGradient, 0.87, hslColor(24, 78, 24, 1));
+  addColorStopSafe(bodyGradient, 1, hslColor(18, 70, 12, 1));
+  traceHeadShape(context);
+  context.fillStyle = bodyGradient;
+  context.fill();
+
+  context.save();
+  traceHeadShape(context);
+  context.clip();
+
+  var sideGradient = context.createLinearGradient(-0.86, 0, 0.86, 0);
+  addColorStopSafe(sideGradient, 0, colorString(34, 6, 28, 0.6));
+  addColorStopSafe(sideGradient, 0.4, "rgba(34,6,28,0)");
+  addColorStopSafe(sideGradient, 1, colorString(16, 2, 14, 0.52));
+  context.fillStyle = sideGradient;
+  context.fillRect(-1.2, -1.2, 2.4, 2.6);
+
+  var cheekGlow = context.createRadialGradient(-0.3, -0.05, 0.02, -0.3, 0.06, 0.56);
+  addColorStopSafe(cheekGlow, 0, colorString(255, 244, 206, 0.44));
+  addColorStopSafe(cheekGlow, 1, "rgba(255,244,206,0)");
+  context.fillStyle = cheekGlow;
+  context.fillRect(-1.2, -1.2, 2.4, 2.6);
+
+  context.strokeStyle = colorString(88, 42, 10, 0.4);
+  context.lineWidth = 0.012;
+  var ornament = 0;
+  while (ornament < 3) {
+    context.beginPath();
+    context.arc(0.5, -0.54, 0.11 + ornament * 0.075, -0.45, 1.55);
+    context.stroke();
+    context.beginPath();
+    context.arc(-0.5, -0.54, 0.11 + ornament * 0.075, Math.PI - 1.55, Math.PI + 0.45);
+    context.stroke();
+    ornament += 1;
+  }
+  context.restore();
+
+  /* 眉骨 */
+  context.strokeStyle = hslColor(26, 80, 22, 1);
+  context.lineWidth = 0.035;
+  context.beginPath();
+  context.moveTo(-0.6, -0.52);
+  context.bezierCurveTo(-0.36, -0.62, -0.06, -0.6, 0.02, -0.5);
+  context.stroke();
+  context.beginPath();
+  context.moveTo(0.6, -0.5);
+  context.bezierCurveTo(0.4, -0.61, 0.12, -0.6, 0.03, -0.5);
+  context.stroke();
+
+  /* 墨镜 */
+  drawEyeLens(context, -0.29, -0.33, 0.52, 0.34, 0.06, true);
+  drawEyeLens(context, 0.3, -0.31, 0.52, 0.34, -0.05, false);
+
+  /* 鼻梁与鼻翼 */
+  context.strokeStyle = colorString(104, 50, 10, 0.55);
+  context.lineWidth = 0.018;
+  context.beginPath();
+  context.moveTo(-0.03, -0.14);
+  context.bezierCurveTo(-0.08, 0.02, -0.1, 0.12, -0.14, 0.16);
+  context.stroke();
+  context.beginPath();
+  context.moveTo(0.05, -0.14);
+  context.bezierCurveTo(0.09, 0.02, 0.1, 0.12, 0.14, 0.16);
+  context.stroke();
+  context.fillStyle = colorString(46, 16, 6, 0.6);
+  context.beginPath();
+  context.ellipse(-0.08, 0.155, 0.035, 0.022, 0.2, 0, TAU);
+  context.fill();
+  context.beginPath();
+  context.ellipse(0.09, 0.155, 0.035, 0.022, -0.2, 0, TAU);
+  context.fill();
+
+  /* 嘴：隧道入口 */
+  drawMouthTunnel(context, frame);
+
+  /* 额前冰钻 */
+  var gem = 0;
+  while (gem < 11) {
+    var gemX = -0.49 + gem * 0.098;
+    var gemY = -0.73 - Math.cos((gemX / 0.55) * 1.3) * 0.05;
+    var gemSize = 0.021 + (gem % 3 === 0 ? 0.008 : 0);
+    context.fillStyle = gem % 2 === 0 ? palette.accentSoft : palette.goldLight;
+    context.globalAlpha = 0.72 + 0.25 * Math.sin(stageClock * 2.2 + gem);
+    context.beginPath();
+    context.moveTo(gemX, gemY - gemSize);
+    context.lineTo(gemX + gemSize, gemY);
+    context.lineTo(gemX, gemY + gemSize);
+    context.lineTo(gemX - gemSize, gemY);
+    context.closePath();
+    context.fill();
+    context.globalAlpha = 1;
+    gem += 1;
+  }
+
+  /* 颈链 */
+  var link = 0;
+  while (link < 13) {
+    var linkX = -0.42 + link * 0.07;
+    var linkY = 0.9 + Math.pow(linkX / 0.45, 2) * 0.14;
+    context.beginPath();
+    context.arc(linkX, linkY, 0.032, 0, TAU);
+    context.strokeStyle = link % 2 === 0 ? palette.goldLight : palette.gold;
+    context.lineWidth = 0.014;
+    context.stroke();
+    context.beginPath();
+    context.arc(linkX, linkY, 0.012, 0, TAU);
+    context.fillStyle = palette.accent;
+    context.fill();
+    link += 1;
+  }
+
+  /* 金耳环 */
+  context.strokeStyle = hslColor(42, 92, 62, 1);
+  context.lineWidth = 0.028;
+  context.beginPath();
+  context.arc(-0.78, 0.17, 0.125, 0, TAU);
+  context.stroke();
+  context.beginPath();
+  context.arc(0.78, 0.17, 0.125, 0, TAU);
+  context.stroke();
+  context.fillStyle = palette.accentSoft;
+  context.beginPath();
+  context.arc(-0.78, 0.3, 0.036, 0, TAU);
+  context.fill();
+  context.beginPath();
+  context.arc(0.78, 0.3, 0.036, 0, TAU);
+  context.fill();
+
+  /* 头顶高光 */
+  var skullShine = context.createRadialGradient(-0.3, -0.72, 0.02, -0.3, -0.68, 0.5);
+  addColorStopSafe(skullShine, 0, colorString(255, 252, 230, 0.5));
+  addColorStopSafe(skullShine, 1, "rgba(255,252,230,0)");
+  context.fillStyle = skullShine;
+  context.fillRect(-1.2, -1.2, 2.4, 2.4);
+
+  traceHeadShape(context);
+  context.lineWidth = 0.02;
+  context.strokeStyle = colorString(255, 232, 184, 0.78);
+  context.stroke();
+
+  context.restore();
+}
+
+function drawHeadRays(context, frame) {
+  if (!frame) { return; }
+  var rayCount = stageState.rm ? 8 : 16;
+  context.save();
+  context.translate(frame.x, frame.y);
+  context.globalCompositeOperation = "lighter";
+  var baseAngle = stageClock * 0.05;
+  var index = 0;
+  while (index < rayCount) {
+    var angle = baseAngle + (index / rayCount) * TAU;
+    var length = frame.half * (2.3 + 0.5 * Math.sin(index * 1.7 + stageClock * 0.55));
+    var spread = 0.03 + 0.014 * Math.sin(index * 2.1);
+    context.fillStyle = index % 2 === 0 ? colorString(255, 186, 110, 0.05) : colorString(255, 92, 150, 0.045);
+    context.beginPath();
+    context.moveTo(0, 0);
+    context.lineTo(Math.cos(angle - spread) * length, Math.sin(angle - spread) * length);
+    context.lineTo(Math.cos(angle + spread) * length, Math.sin(angle + spread) * length);
+    context.closePath();
+    context.fill();
+    index += 1;
+  }
+  context.restore();
+}
+
+function drawHeadRings(context, frame) {
+  if (!frame) { return; }
+  var ringCount = stageState.rm ? 3 : 5;
+  var ringColors = [palette.accent, palette.magenta, palette.violet, palette.cyan, palette.gold];
+  context.save();
+  context.translate(frame.x, frame.y);
+  context.globalCompositeOperation = "lighter";
+  var index = 0;
+  while (index < ringCount) {
+    var radius = frame.half * (1.3 + index * 0.24);
+    var speed = (0.16 + index * 0.06) * (index % 2 === 0 ? 1 : -1);
+    var start = stageClock * speed + index * 1.35;
+    context.globalAlpha = 0.16 + beatFlash * 0.14;
+    context.strokeStyle = ringColors[index % ringColors.length];
+    context.lineWidth = Math.max(1, frame.half * (0.008 + index * 0.004));
+    context.beginPath();
+    context.arc(0, 0, radius, start, start + 1.25 + 0.45 * Math.sin(stageClock * 0.45 + index));
+    context.stroke();
+    index += 1;
+  }
+  context.globalAlpha = 1;
+  context.restore();
+}
+
+function drawHeadHalo(context, frame) {
+  if (!frame) { return; }
+  context.save();
+  context.globalCompositeOperation = "lighter";
+  var halo = context.createRadialGradient(
+    frame.x, frame.y, frame.half * 0.3,
+    frame.x, frame.y, frame.half * 2.9
+  );
+  addColorStopSafe(halo, 0, colorString(255, 158, 96, 0.3 + beatFlash * 0.16));
+  addColorStopSafe(halo, 0.45, colorString(255, 74, 132, 0.13));
+  addColorStopSafe(halo, 1, "rgba(255,74,132,0)");
+  context.fillStyle = halo;
+  context.fillRect(0, 0, stageWidth, stageHeight);
+  context.restore();
+}
+
+/* ---------- 12. 过山车：轨道 / 车厢 ---------- */
+var trackSkyControl = [
+  { x: 0, y: 16.4, z: 19.2 },
+  { x: 9, y: 18.2, z: 20.4 },
+  { x: 19, y: 22.4, z: 23 },
+  { x: 28, y: 28.6, z: 28 },
+  { x: 33, y: 34.6, z: 36 },
+  { x: 31, y: 38.2, z: 47 },
+  { x: 24, y: 37.4, z: 59 },
+  { x: 15, y: 31.2, z: 71 },
+  { x: 8, y: 20.4, z: 84 },
+  { x: 4, y: 9.4, z: 97 },
+  { x: 2, y: 2.2, z: 110 }
+];
+
+var trackNearControl = [
+  { x: -78, y: 0, z: 2.4 },
+  { x: -46, y: 2.6, z: 4.6 },
+  { x: -27, y: 7.2, z: 7.6 },
+  { x: -13, y: 12.4, z: 11.4 },
+  { x: -4.5, y: 15.4, z: 15.6 },
+  { x: 0, y: 16.4, z: 19.2 }
+];
+
+var trackLoopControl = [];
+
+function buildLoopTrack() {
+  trackLoopControl = [];
+  var loopIndex = 0;
+  while (loopIndex <= 18) {
+    var loopAngle = (loopIndex / 18) * TAU;
+    trackLoopControl.push({
+      x: 45 + Math.cos(loopAngle) * 8.6,
+      y: 29 + Math.sin(loopAngle) * 8.6,
+      z: 62 + Math.sin(loopAngle * 2) * 1.4
+    });
+    loopIndex += 1;
+  }
+}
+buildLoopTrack();
+
+var trackSkyPoints = [];
+var trackNearPoints = [];
+var trackLoopPoints = [];
+var trackScratch = { x: 0, y: 0, angle: 0, depth: 0, scale: 1 };
+
+function catmullValue(first, second, third, fourth, local, localSquared, localCubed) {
+  return 0.5 * (
+    2 * second +
+    (-first + third) * local +
+    (2 * first - 5 * second + 4 * third - fourth) * localSquared +
+    (-first + 3 * second - 3 * third + fourth) * localCubed
+  );
+}
+
+function sampleTrack(controlPoints, param) {
+  var total = controlPoints.length;
+  if (total === 0) { return { x: 0, y: 0, z: 0 }; }
+  if (total === 1) { return controlPoints[0]; }
+  var clamped = clampNumber(param, 0, 1);
+  var scaled = clamped * (total - 1);
+  var segment = Math.min(total - 2, Math.floor(scaled));
+  var local = scaled - segment;
+  var localSquared = local * local;
+  var localCubed = localSquared * local;
+  var first = controlPoints[Math.max(0, segment - 1)];
+  var second = controlPoints[segment];
+  var third = controlPoints[Math.min(total - 1, segment + 1)];
+  var fourth = controlPoints[Math.min(total - 1, segment + 2)];
+  return {
+    x: catmullValue(first.x, second.x, third.x, fourth.x, local, localSquared, localCubed),
+    y: catmullValue(first.y, second.y, third.y, fourth.y, local, localSquared, localCubed),
+    z: catmullValue(first.z, second.z, third.z, fourth.z, local, localSquared, localCubed)
+  };
+}
+
+function rebuildTrack(controlPoints, steps, pool) {
+  var total = Math.max(2, steps + 1);
+  var index = 0;
+  while (index < total) {
+    if (!pool[index]) { pool[index] = { x: 0, y: 0, scale: 1, ok: false }; }
+    var world = sampleTrack(controlPoints, index / (total - 1));
+    var projected = projectWorld(world.x, world.y, world.z, trackScratch);
+    if (projected) {
+      pool[index].x = projected.x;
+      pool[index].y = projected.y;
+      pool[index].scale = projected.scale;
+      pool[index].ok = true;
+    } else {
+      pool[index].ok = false;
+    }
+    index += 1;
+  }
+  pool.length = total;
+  return pool;
+}
+
+function fillRibbonRun(context, edgeA, edgeB, fillColor, coreColor) {
+  if (edgeA.length < 2) { return; }
+  context.beginPath();
+  context.moveTo(edgeA[0].x, edgeA[0].y);
+  var index = 1;
+  while (index < edgeA.length) {
+    context.lineTo(edgeA[index].x, edgeA[index].y);
+    index += 1;
+  }
+  index = edgeB.length - 1;
+  while (index >= 0) {
+    context.lineTo(edgeB[index].x, edgeB[index].y);
+    index -= 1;
+  }
+  context.closePath();
+  context.fillStyle = fillColor;
+  context.fill();
+
+  if (coreColor) {
+    context.beginPath();
+    context.moveTo((edgeA[0].x + edgeB[0].x) * 0.5, (edgeA[0].y + edgeB[0].y) * 0.5);
+    var coreIndex = 1;
+    while (coreIndex < edgeA.length) {
+      context.lineTo((edgeA[coreIndex].x + edgeB[coreIndex].x) * 0.5, (edgeA[coreIndex].y + edgeB[coreIndex].y) * 0.5);
+      coreIndex += 1;
+    }
+    context.strokeStyle = coreColor;
+    context.lineWidth = 1;
+    context.stroke();
+  }
+}
+
+function drawTrackRibbon(context, pool, offsetWorld, halfWidthWorld, fillColor, coreColor) {
+  var runA = [];
+  var runB = [];
+  var index = 0;
+  while (index <= pool.length) {
+    var node = index < pool.length ? pool[index] : null;
+    if (node && node.ok) {
+      var previous = index > 0 ? pool[index - 1] : null;
+      var next = index < pool.length - 1 ? pool[index + 1] : null;
+      if (!previous || !previous.ok) { previous = node; }
+      if (!next || !next.ok) { next = node; }
+      var tangentX = next.x - previous.x;
+      var tangentY = next.y - previous.y;
+      var tangentLength = Math.sqrt(tangentX * tangentX + tangentY * tangentY);
+      if (tangentLength < 0.0001) { tangentLength = 0.0001; }
+      var normalX = -tangentY / tangentLength;
+      var normalY = tangentX / tangentLength;
+      var centerOffset = offsetWorld * node.scale;
+      var halfPixels = Math.max(0.7, halfWidthWorld * node.scale);
+      runA.push({ x: node.x + normalX * (centerOffset - halfPixels), y: node.y + normalY * (centerOffset - halfPixels) });
+      runB.push({ x: node.x + normalX * (centerOffset + halfPixels), y: node.y + normalY * (centerOffset + halfPixels) });
+    } else {
+      if (runA.length > 1) { fillRibbonRun(context, runA, runB, fillColor, coreColor); }
+      runA = [];
+      runB = [];
+    }
+    index += 1;
+  }
+}
+
+function drawTrackRail(context, pool, railOffset, railHalfWidth) {
+  var steel = "rgba(30,10,34,0.96)";
+  drawTrackRibbon(context, pool, railOffset, railHalfWidth, steel, colorString(255, 236, 200, 0.5));
+  drawTrackRibbon(context, pool, railOffset, railHalfWidth * 0.34, colorString(255, 208, 146, 0.9), null);
+}
+
+function drawTrackTies(context, pool, gauge, spacing) {
+  var index = 0;
+  context.strokeStyle = "rgba(255,196,140,0.3)";
+  while (index < pool.length) {
+    var node = pool[index];
+    if (node && node.ok) {
+      var previous = index > 0 ? pool[index - 1] : null;
+      var next = index < pool.length - 1 ? pool[index + 1] : null;
+      if (previous && previous.ok && next && next.ok) {
+        var tangentX = next.x - previous.x;
+        var tangentY = next.y - previous.y;
+        var tangentLength = Math.sqrt(tangentX * tangentX + tangentY * tangentY);
+        if (tangentLength > 0.0001) {
+          var normalX = -tangentY / tangentLength;
+          var normalY = tangentX / tangentLength;
+          var halfGauge = gauge * 0.5 * node.scale;
+          context.lineWidth = Math.max(0.7, node.scale * 0.06);
+          context.beginPath();
+          context.moveTo(node.x - normalX * halfGauge, node.y - normalY * halfGauge);
+          context.lineTo(node.x + normalX * halfGauge, node.y + normalY * halfGauge);
+          context.stroke();
+        }
+      }
+    }
+    index += spacing;
+  }
+}
+
+function drawTrackSupports(context, controlPoints, steps, spacing, maxHeight) {
+  var index = 0;
+  context.strokeStyle = "rgba(18,6,26,0.85)";
+  while (index <= steps) {
+    var world = sampleTrack(controlPoints, index / steps);
+    if (world.y < 1.2 || world.y > maxHeight) { index += spacing; continue; }
+    var topPoint = projectWorld(world.x, world.y, world.z, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+    var groundPoint = projectWorld(world.x, 0, world.z, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+    if (topPoint && groundPoint) {
+      var width = Math.max(1, topPoint.scale * 0.18);
+      context.lineWidth = width;
+      context.beginPath();
+      context.moveTo(topPoint.x, topPoint.y);
+      context.lineTo(groundPoint.x, groundPoint.y);
+      context.stroke();
+    }
+    index += spacing;
+  }
+}
+
+function traceRoundedRect(context, boxX, boxY, boxWidth, boxHeight, cornerRadius) {
+  if (!beginPathSafe(context)) { return; }
+  var radius = Math.min(cornerRadius, boxWidth * 0.5, boxHeight * 0.5);
+  context.moveTo(boxX + radius, boxY);
+  context.lineTo(boxX + boxWidth - radius, boxY);
+  context.quadraticCurveTo(boxX + boxWidth, boxY, boxX + boxWidth, boxY + radius);
+  context.lineTo(boxX + boxWidth, boxY + boxHeight - radius);
+  context.quadraticCurveTo(boxX + boxWidth, boxY + boxHeight, boxX + boxWidth - radius, boxY + boxHeight);
+  context.lineTo(boxX + radius, boxY + boxHeight);
+  context.quadraticCurveTo(boxX, boxY + boxHeight, boxX, boxY + boxHeight - radius);
+  context.lineTo(boxX, boxY + radius);
+  context.quadraticCurveTo(boxX, boxY, boxX + radius, boxY);
+  context.closePath();
+}
+
+function drawTrainCar(context, controlPoints, param, carIndex) {
+  var hereWorld = sampleTrack(controlPoints, param);
+  var here = projectWorld(hereWorld.x, hereWorld.y, hereWorld.z, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  var aheadWorld = sampleTrack(controlPoints, Math.min(1, param + 0.012));
+  var ahead = projectWorld(aheadWorld.x, aheadWorld.y, aheadWorld.z, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  if (!here || !ahead) { return; }
+  var heading = Math.atan2(ahead.y - here.y, ahead.x - here.x);
+  var sizeScale = Math.max(1.4, here.scale);
+  var carWidth = Math.max(5, sizeScale * 2.5);
+  var carHeight = Math.max(3.4, sizeScale * 1.5);
+
+  context.save();
+  context.translate(here.x, here.y);
+  context.rotate(heading);
+  traceRoundedRect(context, -carWidth * 0.5, -carHeight * 0.5, carWidth, carHeight, carHeight * 0.34);
+  context.fillStyle = "rgba(20,5,26,0.96)";
+  context.fill();
+  context.strokeStyle = colorString(255, 214, 158, 0.85);
+  context.lineWidth = Math.max(0.8, carHeight * 0.09);
+  context.stroke();
+
+  var windowPaint = context.createLinearGradient(0, -carHeight * 0.5, 0, carHeight * 0.5);
+  addColorStopSafe(windowPaint, 0, palette.accentSoft);
+  addColorStopSafe(windowPaint, 0.55, palette.accent);
+  addColorStopSafe(windowPaint, 1, palette.magenta);
+  context.fillStyle = windowPaint;
+  context.globalAlpha = 0.9;
+  traceRoundedRect(context, -carWidth * 0.34, -carHeight * 0.26, carWidth * 0.68, carHeight * 0.4, carHeight * 0.14);
+  context.fill();
+  context.globalAlpha = 1;
+
+  var lamp = context.createRadialGradient(carWidth * 0.42, 0, 0, carWidth * 0.42, 0, carHeight * 1.6);
+  addColorStopSafe(lamp, 0, colorString(255, 240, 200, 0.9));
+  addColorStopSafe(lamp, 0.35, colorString(255, 176, 120, 0.35));
+  addColorStopSafe(lamp, 1, "rgba(255,176,120,0)");
+  context.fillStyle = lamp;
+  context.beginPath();
+  context.arc(carWidth * 0.42, 0, carHeight * 1.6, 0, TAU);
+  context.fill();
+  context.restore();
+}
+
+function drawTrackTrain(context, controlPoints, leadParam, carCount, spacing) {
+  var carIndex = 0;
+  while (carIndex < carCount) {
+    var param = clampNumber(leadParam - carIndex * spacing, 0.001, 0.999);
+    drawTrainCar(context, controlPoints, param, carIndex);
+    carIndex += 1;
+  }
+}
+
+/* ---------- 13. 旋转木马 ---------- */
+function drawCarousel(context) {
+  var basePoint = projectWorld(-27, 0, 30, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  var topPoint = projectWorld(-27, 13, 30, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  if (!basePoint || !topPoint) { return; }
+  var heightPixels = Math.max(26, basePoint.y - topPoint.y);
+  var centerX = basePoint.x;
+  var groundY = basePoint.y;
+  var halfWidth = heightPixels * 0.58;
+  var deckY = groundY - heightPixels * 0.14;
+  var roofY = groundY - heightPixels * 0.66;
+  var peakY = groundY - heightPixels * 0.92;
+  var spin = stageClock * 0.42;
+
+  var carouselGlow = context.createRadialGradient(centerX, groundY - heightPixels * 0.4, 0, centerX, groundY - heightPixels * 0.4, heightPixels * 1.1);
+  addColorStopSafe(carouselGlow, 0, colorString(255, 176, 110, 0.28));
+  addColorStopSafe(carouselGlow, 1, "rgba(255,176,110,0)");
+  context.globalCompositeOperation = "lighter";
+  context.fillStyle = carouselGlow;
+  context.beginPath();
+  context.arc(centerX, groundY - heightPixels * 0.4, heightPixels * 1.1, 0, TAU);
+  context.fill();
+  context.globalCompositeOperation = "source-over";
+
+  context.fillStyle = "rgba(10,2,14,0.55)";
+  context.beginPath();
+  context.ellipse(centerX, groundY + heightPixels * 0.02, halfWidth * 1.1, heightPixels * 0.08, 0, 0, TAU);
+  context.fill();
+
+  context.strokeStyle = "rgba(255,206,144,0.5)";
+  context.lineWidth = Math.max(1, heightPixels * 0.014);
+  var legIndex = 0;
+  while (legIndex < 6) {
+    var legX = centerX + (legIndex / 5 - 0.5) * halfWidth * 1.5;
+    context.beginPath();
+    context.moveTo(legX, deckY);
+    context.lineTo(legX + (legX - centerX) * 0.08, groundY);
+    context.stroke();
+    legIndex += 1;
+  }
+
+  context.fillStyle = "rgba(26,8,30,0.95)";
+  context.beginPath();
+  context.ellipse(centerX, deckY, halfWidth, heightPixels * 0.09, 0, 0, TAU);
+  context.fill();
+  context.strokeStyle = colorString(255, 214, 150, 0.7);
+  context.lineWidth = Math.max(1, heightPixels * 0.012);
+  context.stroke();
+
+  context.fillStyle = "rgba(18,5,22,0.95)";
+  context.fillRect(centerX - heightPixels * 0.035, roofY, heightPixels * 0.07, deckY - roofY);
+
+  var poleIndex = 0;
+  while (poleIndex < 8) {
+    var polePhase = (poleIndex / 8) * TAU;
+    var poleX = centerX + Math.cos(polePhase + spin) * halfWidth * 0.82;
+    var poleDepth = Math.sin(polePhase + spin);
+    context.strokeStyle = poleDepth > 0 ? colorString(255, 216, 166, 0.8) : colorString(255, 216, 166, 0.3);
+    context.lineWidth = Math.max(1, heightPixels * 0.012);
+    context.beginPath();
+    context.moveTo(poleX, roofY + heightPixels * 0.02);
+    context.lineTo(poleX, deckY - heightPixels * 0.01);
+    context.stroke();
+    poleIndex += 1;
+  }
+
+  var canopyStep = 0;
+  while (canopyStep < 10) {
+    var startAngle = (canopyStep / 10) * TAU + spin * 0.2;
+    var nextAngle = ((canopyStep + 1) / 10) * TAU + spin * 0.2;
+    context.fillStyle = canopyStep % 2 === 0 ? hslColor(342, 78, 40, 1) : hslColor(24, 84, 48, 1);
+    context.beginPath();
+    context.moveTo(centerX, peakY);
+    context.lineTo(centerX + Math.cos(startAngle) * halfWidth, roofY);
+    context.lineTo(centerX + Math.cos(nextAngle) * halfWidth, roofY);
+    context.closePath();
+    context.fill();
+    canopyStep += 1;
+  }
+
+  context.strokeStyle = colorString(255, 220, 160, 0.85);
+  context.lineWidth = Math.max(1.2, heightPixels * 0.018);
+  context.beginPath();
+  context.ellipse(centerX, roofY, halfWidth, heightPixels * 0.085, 0, 0, TAU);
+  context.stroke();
+
+  context.globalCompositeOperation = "lighter";
+  var bulbIndex = 0;
+  while (bulbIndex < 14) {
+    var bulbAngle = (bulbIndex / 14) * TAU;
+    var bulbX = centerX + Math.cos(bulbAngle) * halfWidth * 0.98;
+    var bulbY = roofY + Math.sin(bulbAngle) * heightPixels * 0.085;
+    var bulbGlow = context.createRadialGradient(bulbX, bulbY, 0, bulbX, bulbY, heightPixels * 0.075);
+    addColorStopSafe(bulbGlow, 0, colorString(255, 244, 214, 0.85));
+    addColorStopSafe(bulbGlow, 0.3, palette.accent);
+    addColorStopSafe(bulbGlow, 1, "rgba(255,180,120,0)");
+    context.fillStyle = bulbGlow;
+    context.globalAlpha = 0.55 + 0.4 * Math.sin(stageClock * 2.4 + bulbIndex);
+    context.beginPath();
+    context.arc(bulbX, bulbY, heightPixels * 0.075, 0, TAU);
+    context.fill();
+    bulbIndex += 1;
+  }
+  context.globalAlpha = 1;
+  context.globalCompositeOperation = "source-over";
+
+  context.strokeStyle = palette.goldLight;
+  context.lineWidth = Math.max(1, heightPixels * 0.012);
+  context.beginPath();
+  context.moveTo(centerX, peakY);
+  context.lineTo(centerX, peakY - heightPixels * 0.1);
+  context.stroke();
+  context.fillStyle = palette.accentSoft;
+  context.beginPath();
+  context.moveTo(centerX, peakY - heightPixels * 0.1);
+  context.lineTo(centerX + heightPixels * 0.075, peakY - heightPixels * 0.075);
+  context.lineTo(centerX, peakY - heightPixels * 0.05);
+  context.closePath();
+  context.fill();
+
+  var horseIndex = 0;
+  while (horseIndex < 6) {
+    var horseAngle = (horseIndex / 6) * TAU + spin;
+    var horseDepth = Math.sin(horseAngle);
+    var horseX = centerX + Math.cos(horseAngle) * halfWidth * 0.72;
+    var horseBob = Math.sin(stageClock * 3 + horseIndex) * heightPixels * 0.035;
+    var horseY = deckY - heightPixels * 0.26 + horseDepth * heightPixels * 0.035 + horseBob;
+    var horseScale = heightPixels * 0.16 * (1 + horseDepth * 0.22);
+    context.globalAlpha = horseDepth > 0 ? 0.95 : 0.55;
+    context.fillStyle = "rgba(14,4,18,0.95)";
+    context.beginPath();
+    context.ellipse(horseX, horseY, horseScale * 0.72, horseScale * 0.34, 0, 0, TAU);
+    context.fill();
+    context.beginPath();
+    context.moveTo(horseX + horseScale * 0.5, horseY - horseScale * 0.16);
+    context.quadraticCurveTo(horseX + horseScale * 0.95, horseY - horseScale * 0.55, horseX + horseScale * 1.05, horseY - horseScale * 0.98);
+    context.lineTo(horseX + horseScale * 0.82, horseY - horseScale * 0.9);
+    context.lineTo(horseX + horseScale * 0.62, horseY - horseScale * 0.4);
+    context.closePath();
+    context.fill();
+    context.globalAlpha = 1;
+    horseIndex += 1;
+  }
+}
+
+/* ---------- 14. 人群剪影 ---------- */
+var crowdSpots = [];
+var crowdBuilt = false;
+
+function buildCrowd() {
+  seededState = 9182;
+  crowdSpots = [];
+  var count = Math.min(120, Math.max(30, Math.round(quality.crowdCount)));
+  var index = 0;
+  while (index < count) {
+    crowdSpots.push({
+      x: -19 + seededRandom() * 38,
+      z: 4.4 + Math.pow(seededRandom(), 0.75) * 12.5,
+      phase: seededRandom() * TAU,
+      sway: 0.6 + seededRandom() * 0.9,
+      arm: seededRandom() > 0.62,
+      phone: seededRandom() > 0.55
+    });
+    index += 1;
+  }
+  crowdSpots.sort(function (left, right) { return right.z - left.z; });
+  crowdBuilt = true;
+}
+
+function drawCrowd(context) {
+  if (!crowdBuilt) { buildCrowd(); }
+  var index = 0;
+  var energy = 0.45 + liveState.bass * 0.9;
+  while (index < crowdSpots.length) {
+    var spot = crowdSpots[index];
+    var basePoint = projectWorld(spot.x, 0, spot.z, projectedPoint);
+    if (!basePoint) { index += 1; continue; }
+    var sizeScale = Math.max(2.4, basePoint.scale * 2.05);
+    var bob = Math.sin(stageClock * 2.1 * spot.sway + spot.phase) * sizeScale * 0.1 * energy;
+    var headX = basePoint.x;
+    var headY = basePoint.y - sizeScale * 0.86 + bob;
+    var alpha = clampNumber(1.05 - spot.z * 0.028, 0.55, 0.96);
+
+    context.fillStyle = colorString(7, 2, 11, alpha);
+    context.beginPath();
+    context.arc(headX, headY, sizeScale * 0.15, 0, TAU);
+    context.fill();
+    context.beginPath();
+    context.moveTo(headX - sizeScale * 0.34, basePoint.y + sizeScale * 0.06);
+    context.quadraticCurveTo(headX - sizeScale * 0.3, headY + sizeScale * 0.12, headX, headY + sizeScale * 0.1);
+    context.quadraticCurveTo(headX + sizeScale * 0.3, headY + sizeScale * 0.12, headX + sizeScale * 0.34, basePoint.y + sizeScale * 0.06);
+    context.closePath();
+    context.fill();
+
+    context.strokeStyle = colorString(255, 178, 120, 0.22 * alpha);
+    context.lineWidth = Math.max(0.7, sizeScale * 0.035);
+    context.beginPath();
+    context.arc(headX, headY, sizeScale * 0.15, Math.PI * 1.05, Math.PI * 1.95);
+    context.stroke();
+
+    if (spot.arm) {
+      var armAngle = -1.15 + Math.sin(stageClock * 2.4 + spot.phase) * 0.4;
+      var armLength = sizeScale * 0.62;
+      context.strokeStyle = colorString(9, 3, 13, alpha);
+      context.lineWidth = sizeScale * 0.12;
+      context.beginPath();
+      context.moveTo(headX + sizeScale * 0.12, headY + sizeScale * 0.16);
+      context.lineTo(headX + sizeScale * 0.12 + Math.cos(armAngle) * armLength, headY + sizeScale * 0.16 + Math.sin(armAngle) * armLength);
+      context.stroke();
+      if (spot.phone) {
+        context.globalCompositeOperation = "lighter";
+        context.fillStyle = colorString(255, 246, 224, 0.85);
+        context.beginPath();
+        context.arc(headX + sizeScale * 0.12 + Math.cos(armAngle) * armLength, headY + sizeScale * 0.16 + Math.sin(armAngle) * armLength, Math.max(0.9, sizeScale * 0.055), 0, TAU);
+        context.fill();
+        context.globalCompositeOperation = "source-over";
+      }
+    }
+    index += 1;
+  }
+}
+
+/* ---------- 15. 烟花 / 余烬 / 流星 ---------- */
+var sparks = [];
+var meteors = [];
+var bokehDots = [];
+var emberTimer = 0;
+var meteorTimer = 2.4;
+
+function randomBetween(low, high) {
+  return low + Math.random() * (high - low);
+}
+
+function spawnFireworkBurst(level) {
+  try {
+    if (stageState.rm) { return; }
+    var strength = clampNumber(level, 0, 1);
+    var cap = Math.round(quality.particleCap);
+    var burstCount = Math.round((20 + strength * 30) * (quality.level >= 2 ? 1 : 0.65));
+    var burstX = stageWidth * randomBetween(0.1, 0.9);
+    var burstY = stageHeight * randomBetween(0.06, 0.34);
+    var burstColors = [palette.accentSoft, palette.magenta, palette.goldLight, palette.cyan, palette.violet];
+    var primary = burstColors[Math.floor(Math.random() * burstColors.length)];
+    var secondary = burstColors[Math.floor(Math.random() * burstColors.length)];
+    var index = 0;
+    while (index < burstCount) {
+      if (sparks.length >= cap) { break; }
+      var angle = Math.random() * TAU;
+      var speed = randomBetween(36, 138) * (0.7 + strength * 0.6);
+      sparks.push({
+        x: burstX,
+        y: burstY,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: randomBetween(0.7, 1.5),
+        maxLife: 1.5,
+        size: randomBetween(0.8, 2.4),
+        color: Math.random() > 0.45 ? primary : secondary
+      });
+      index += 1;
+    }
+  } catch (burstError) {
+    reportError("spawnFireworkBurst", burstError);
+  }
+}
+
+function spawnEmber() {
+  if (sparks.length >= quality.particleCap) { return; }
+  sparks.push({
+    x: stageWidth * randomBetween(0.18, 0.82),
+    y: stageHeight * randomBetween(0.72, 0.95),
+    vx: randomBetween(-8, 8),
+    vy: randomBetween(-26, -10),
+    life: randomBetween(1.6, 3.4),
+    maxLife: 3.4,
+    size: randomBetween(0.7, 1.8),
+    color: Math.random() > 0.5 ? palette.accentSoft : palette.gold
+  });
+}
+
+function spawnMeteor() {
+  var startX = stageWidth * randomBetween(-0.05, 0.7);
+  var startY = stageHeight * randomBetween(0.02, 0.22);
+  meteors.push({
+    x: startX,
+    y: startY,
+    vx: randomBetween(180, 320),
+    vy: randomBetween(70, 150),
+    life: randomBetween(0.9, 1.5),
+    maxLife: 1.5
+  });
+  if (meteors.length > 8) { meteors.splice(0, meteors.length - 8); }
+}
+
+function updateParticles(delta) {
+  var step = clampNumber(delta, 0, 0.08);
+  var index = 0;
+  while (index < sparks.length) {
+    var spark = sparks[index];
+    spark.life -= step;
+    if (spark.life <= 0) {
+      sparks[index] = sparks[sparks.length - 1];
+      sparks.pop();
+      continue;
+    }
+    spark.vy += 62 * step;
+    spark.vx *= 0.988;
+    spark.vy *= 0.992;
+    spark.x += spark.vx * step;
+    spark.y += spark.vy * step;
+    index += 1;
+  }
+
+  index = 0;
+  while (index < meteors.length) {
+    var meteor = meteors[index];
+    meteor.life -= step;
+    if (meteor.life <= 0) {
+      meteors.splice(index, 1);
+      continue;
+    }
+    meteor.x += meteor.vx * step;
+    meteor.y += meteor.vy * step;
+    index += 1;
+  }
+
+  emberTimer -= step;
+  if (emberTimer <= 0) {
+    emberTimer = 0.16 + Math.random() * 0.2;
+    spawnEmber();
+  }
+  meteorTimer -= step;
+  if (meteorTimer <= 0) {
+    meteorTimer = randomBetween(3.4, 7.5);
+    spawnMeteor();
+  }
+}
+
+function drawSparks(context) {
+  context.save();
+  context.globalCompositeOperation = "lighter";
+  var index = 0;
+  while (index < sparks.length) {
+    var spark = sparks[index];
+    var fade = clampNumber(spark.life / 1.4, 0, 1);
+    var tailX = spark.x - spark.vx * 0.02;
+    var tailY = spark.y - spark.vy * 0.02;
+    context.strokeStyle = spark.color;
+    context.globalAlpha = fade * 0.8;
+    context.lineWidth = spark.size;
+    context.beginPath();
+    context.moveTo(tailX, tailY);
+    context.lineTo(spark.x, spark.y);
+    context.stroke();
+    index += 1;
+  }
+  context.globalAlpha = 1;
+  context.restore();
+}
+
+function drawMeteors(context) {
+  context.save();
+  context.globalCompositeOperation = "lighter";
+  var index = 0;
+  while (index < meteors.length) {
+    var meteor = meteors[index];
+    var fade = clampNumber(meteor.life / meteor.maxLife, 0, 1);
+    var trailX = meteor.x - meteor.vx * 0.09;
+    var trailY = meteor.y - meteor.vy * 0.09;
+    if (Math.abs(meteor.x - trailX) + Math.abs(meteor.y - trailY) > 1) {
+      var streak = context.createLinearGradient(trailX, trailY, meteor.x, meteor.y);
+      addColorStopSafe(streak, 0, "rgba(255,196,140,0)");
+      addColorStopSafe(streak, 1, colorString(255, 246, 226, 0.9 * fade));
+      context.strokeStyle = streak;
+      context.lineWidth = 1.8;
+      context.beginPath();
+      context.moveTo(trailX, trailY);
+      context.lineTo(meteor.x, meteor.y);
+      context.stroke();
+    }
+    index += 1;
+  }
+  context.restore();
+}
+
+function buildBokeh() {
+  bokehDots = [];
+  var index = 0;
+  while (index < 16) {
+    bokehDots.push({
+      x: Math.random(),
+      y: Math.random(),
+      radius: randomBetween(5, 26),
+      phase: Math.random() * TAU,
+      drift: randomBetween(0.004, 0.02),
+      warm: Math.random() > 0.5
+    });
+    index += 1;
+  }
+}
+
+function drawBokeh(context) {
+  context.save();
+  context.globalCompositeOperation = "lighter";
+  var index = 0;
+  while (index < bokehDots.length) {
+    var dot = bokehDots[index];
+    var driftY = ((dot.y - stageClock * dot.drift) % 1 + 1) % 1;
+    var dotX = dot.x * stageWidth + Math.sin(stageClock * 0.4 + dot.phase) * 18;
+    var dotY = driftY * stageHeight;
+    var dotRadius = dot.radius * Math.min(stageWidth, stageHeight) / 900;
+    var dotPaint = context.createRadialGradient(dotX, dotY, 0, dotX, dotY, dotRadius);
+    addColorStopSafe(dotPaint, 0, dot.warm ? colorString(255, 214, 158, 0.35) : colorString(180, 230, 255, 0.22));
+    addColorStopSafe(dotPaint, 1, "rgba(255,214,158,0)");
+    context.fillStyle = dotPaint;
+    context.beginPath();
+    context.arc(dotX, dotY, dotRadius, 0, TAU);
+    context.fill();
+    index += 1;
+  }
+  context.restore();
+}
+
+/* ---------- 16. 画面覆盖层 ---------- */
+var bottomScrim = null;
+var vignettePaint = null;
+var noisePattern = null;
+
+function buildOverlays() {
+  try {
+    bottomScrim = stageCtx.createLinearGradient(0, stageHeight * 0.5, 0, stageHeight);
+    addColorStopSafe(bottomScrim, 0, "rgba(8,2,14,0)");
+    addColorStopSafe(bottomScrim, 0.55, "rgba(8,2,14,0.35)");
+    addColorStopSafe(bottomScrim, 1, "rgba(6,1,10,0.82)");
+
+    vignettePaint = stageCtx.createRadialGradient(
+      stageWidth * 0.5, stageHeight * 0.46, Math.min(stageWidth, stageHeight) * 0.22,
+      stageWidth * 0.5, stageHeight * 0.46, Math.max(stageWidth, stageHeight) * 0.78
+    );
+    addColorStopSafe(vignettePaint, 0, "rgba(4,1,10,0)");
+    addColorStopSafe(vignettePaint, 0.65, "rgba(4,1,10,0.28)");
+    addColorStopSafe(vignettePaint, 1, "rgba(3,0,8,0.82)");
+
+    var noiseTile = document.createElement("canvas");
+    noiseTile.width = 128;
+    noiseTile.height = 128;
+    var noiseContext = noiseTile.getContext("2d");
+    if (noiseContext) {
+      var noiseIndex = 0;
+      while (noiseIndex < 2600) {
+        var noiseX = Math.random() * 128;
+        var noiseY = Math.random() * 128;
+        noiseContext.fillStyle = Math.random() > 0.5 ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.07)";
+        noiseContext.fillRect(noiseX, noiseY, 1, 1);
+        noiseIndex += 1;
+      }
+      noisePattern = stageCtx.createPattern(noiseTile, "repeat");
+    }
+  } catch (overlayError) {
+    noisePattern = null;
+    reportError("buildOverlays", overlayError);
+  }
+}
+
+function drawOverlays(context) {
+  if (noisePattern) {
+    context.save();
+    context.globalAlpha = 0.5;
+    context.fillStyle = noisePattern;
+    context.fillRect(0, 0, stageWidth, stageHeight);
+    context.restore();
+  }
+  if (bottomScrim) {
+    context.fillStyle = bottomScrim;
+    context.fillRect(0, stageHeight * 0.5, stageWidth, stageHeight * 0.5);
+  }
+  if (vignettePaint) {
+    context.fillStyle = vignettePaint;
+    context.fillRect(0, 0, stageWidth, stageHeight);
+  }
+}
+
+/* ---------- 17. 自适应画质 ---------- */
+function applyQualityLevel(level) {
+  quality.level = clampNumber(level, 1, 3);
+  if (quality.level === 3) {
+    quality.duneSteps = 56;
+    quality.starCount = 300;
+    quality.railSteps = 74;
+    quality.crowdCount = 108;
+    quality.particleCap = 420;
+  } else if (quality.level === 2) {
+    quality.duneSteps = 48;
+    quality.starCount = 240;
+    quality.railSteps = 62;
+    quality.crowdCount = 88;
+    quality.particleCap = 320;
+  } else {
+    quality.duneSteps = 34;
+    quality.starCount = 150;
+    quality.railSteps = 42;
+    quality.crowdCount = 62;
+    quality.particleCap = 190;
+  }
+  crowdBuilt = false;
+  buildCrowd();
+  bakeSky();
+}
+
+function trackFrameCost(frameMs) {
+  quality.frameMs = quality.frameMs * 0.9 + frameMs * 0.1;
+  if (quality.frameMs > 21) {
+    quality.slowFrames += 1;
+    if (quality.slowFrames > 24 && quality.level > 1) {
+      quality.slowFrames = 0;
+      applyQualityLevel(quality.level - 1);
+    }
+  } else if (quality.frameMs < 11) {
+    quality.slowFrames = Math.max(0, quality.slowFrames - 1);
+    if (quality.slowFrames === 0 && quality.level < 3 && Math.random() < 0.004) {
+      applyQualityLevel(quality.level + 1);
+    }
+  } else {
+    quality.slowFrames = 0;
+  }
+}
+
+/* ---------- 18. 场景总装（逐层加入） ---------- */
+function drawStage(context) {
+  context.setTransform(stageDpr, 0, 0, stageDpr, 0, 0);
+  context.globalAlpha = 1;
+  context.globalCompositeOperation = "source-over";
+
+  if (skyReady && skyCanvas && skyCanvas.width > 0 && skyCanvas.height > 0) {
+    context.drawImage(skyCanvas, 0, 0, stageWidth, stageHeight);
+  } else {
+    context.fillStyle = palette.deepSky;
+    context.fillRect(0, 0, stageWidth, stageHeight);
+  }
+
+  if (horizonGlow) {
+    context.globalCompositeOperation = "lighter";
+    context.fillStyle = horizonGlow;
+    context.fillRect(0, 0, stageWidth, stageHeight);
+    context.globalCompositeOperation = "source-over";
+  }
+
+  drawMeteors(context);
+
+  drawDuneLayer(context, 170, 24, palette.sandFar, palette.sandNear, 0.8, 0.3);
+  drawDuneLayer(context, 88, 10, palette.sandMid, palette.sandNear, 2.4, 0.24);
+  drawDuneLayer(context, 42, 4.2, palette.sandNear, "rgba(10,3,16,1)", 4.1, 0.16);
+
+  drawCarousel(context);
+
+  var skySteps = Math.max(24, Math.round(quality.railSteps));
+  var nearSteps = Math.max(20, Math.round(quality.railSteps * 0.72));
+  rebuildTrack(trackSkyControl, skySteps, trackSkyPoints);
+  rebuildTrack(trackNearControl, nearSteps, trackNearPoints);
+  rebuildTrack(trackLoopControl, 42, trackLoopPoints);
+
+  var loopBasePoint = projectWorld(45, 0, 62, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  var loopFootPoint = projectWorld(45, 20.4, 62, { x: 0, y: 0, angle: 0, depth: 0, scale: 1 });
+  if (loopBasePoint && loopFootPoint) {
+    context.strokeStyle = "rgba(20,6,28,0.9)";
+    context.lineWidth = Math.max(1.4, loopBasePoint.scale * 0.5);
+    context.beginPath();
+    context.moveTo(loopBasePoint.x, loopBasePoint.y);
+    context.lineTo(loopFootPoint.x, loopFootPoint.y);
+    context.stroke();
+    context.lineWidth = Math.max(0.8, loopBasePoint.scale * 0.14);
+    context.beginPath();
+    context.moveTo(loopBasePoint.x - loopBasePoint.scale * 2.6, loopBasePoint.y);
+    context.lineTo(loopFootPoint.x, loopFootPoint.y);
+    context.moveTo(loopBasePoint.x + loopBasePoint.scale * 2.6, loopBasePoint.y);
+    context.lineTo(loopFootPoint.x, loopFootPoint.y);
+    context.stroke();
+  }
+
+  drawTrackRail(context, trackSkyPoints, 0.55, 0.11);
+  drawTrackRail(context, trackSkyPoints, -0.55, 0.11);
+  drawTrackTies(context, trackSkyPoints, 1.1, 4);
+  drawTrackSupports(context, trackSkyControl, skySteps, 7, 30);
+
+  drawTrackRail(context, trackLoopPoints, 0.45, 0.09);
+  drawTrackRail(context, trackLoopPoints, -0.45, 0.09);
+  drawTrackTies(context, trackLoopPoints, 0.9, 3);
+
+  drawTrackTrain(context, trackSkyControl, (stageClock * 0.055) % 1, 3, 0.022);
+
+  headFrame = computeHeadFrame();
+  drawHeadHalo(context, headFrame);
+  drawHeadRays(context, headFrame);
+  drawHeadRings(context, headFrame);
+  drawGildedHead(context, headFrame);
+
+  drawSparks(context);
+
+  drawTrackRail(context, trackNearPoints, 0.66, 0.135);
+  drawTrackRail(context, trackNearPoints, -0.66, 0.135);
+  drawTrackTies(context, trackNearPoints, 1.32, 4);
+  drawTrackSupports(context, trackNearControl, nearSteps, 5, 20);
+  drawTrackTrain(context, trackNearControl, 1 - ((stageClock * (0.1 + liveState.bass * 0.09)) % 1), 3, 0.028);
+
+  drawCrowd(context);
+  drawBokeh(context);
+
+  drawOverlays(context);
+  drawLyricsTemporary(context);
+}
+
+/* ---------- 19. 歌词 ---------- */
+var lyricFontStack = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC","Source Han Sans SC",sans-serif';
+var timingCache = new Map();
+var wrapCache = new Map();
+var hasLyricText = false;
+
+function lyricFont(size) {
+  return "800 " + Math.round(Math.max(8, size)) + "px " + lyricFontStack;
+}
+
+function buildLineTiming(line) {
+  var characters = Array.from(String(line.text || ""));
+  var count = characters.length;
+  var timing = [];
+  var knownIndexes = [];
+  var source = line.chars;
+  var index = 0;
+  while (index < count) {
+    var entry = source ? source[index] : null;
+    var entryTime = entry ? Number(entry.t) : NaN;
+    if (isFinite(entryTime)) {
+      timing.push(entryTime);
+      knownIndexes.push(index);
+    } else {
+      timing.push(null);
+    }
+    index += 1;
+  }
+
+  var holdSpan = line.dur > 0.05 ? line.dur : Math.max(0.6, count * 0.15);
+  var endTime = line.t + holdSpan;
+
+  if (knownIndexes.length === 0) {
+    var step = count > 1 ? holdSpan / (count - 1) : 0;
+    index = 0;
+    while (index < count) {
+      timing[index] = line.t + step * index;
+      index += 1;
+    }
+    return { characters: characters, times: timing };
+  }
+
+  var firstKnown = knownIndexes[0];
+  var firstTime = timing[firstKnown];
+  index = 0;
+  while (index < firstKnown) {
+    timing[index] = line.t + (firstTime - line.t) * ((index + 1) / (firstKnown + 1));
+    index += 1;
+  }
+
+  var lastKnown = knownIndexes[knownIndexes.length - 1];
+  var lastTime = timing[lastKnown];
+  index = lastKnown + 1;
+  while (index < count) {
+    timing[index] = lastTime + (endTime - lastTime) * ((index - lastKnown) / (count - lastKnown));
+    index += 1;
+  }
+
+  var knownIndex = 0;
+  while (knownIndex < knownIndexes.length - 1) {
+    var leftIndex = knownIndexes[knownIndex];
+    var rightIndex = knownIndexes[knownIndex + 1];
+    var leftTime = timing[leftIndex];
+    var rightTime = timing[rightIndex];
+    var gap = rightIndex - leftIndex;
+    index = leftIndex + 1;
+    while (index < rightIndex) {
+      timing[index] = leftTime + (rightTime - leftTime) * ((index - leftIndex) / gap);
+      index += 1;
+    }
+    knownIndex += 1;
+  }
+  return { characters: characters, times: timing };
+}
+
+function timingForLine(index) {
+  if (timingCache.has(index)) { return timingCache.get(index); }
+  var built = buildLineTiming(lyricLines[index]);
+  timingCache.set(index, built);
+  return built;
+}
+
+function wrapLyricLine(index, maxWidth, fontSize) {
+  var cacheKey = index + "|" + Math.round(maxWidth) + "|" + Math.round(fontSize);
+  if (wrapCache.has(cacheKey)) { return wrapCache.get(cacheKey); }
+  var line = lyricLines[index];
+  var timing = timingForLine(index);
+  var context = stageCtx;
+  context.font = lyricFont(fontSize);
+  var tracking = Math.max(0.4, fontSize * 0.022);
+  var rows = [];
+  var characterIndex = 0;
+  var current = { characters: [], indexes: [], widths: [], width: 0 };
+  while (characterIndex < timing.characters.length) {
+    var glyph = timing.characters[characterIndex];
+    var glyphWidth = Math.max(0.1, context.measureText(glyph).width);
+    if (current.characters.length > 0 && current.width + glyphWidth + tracking > maxWidth) {
+      rows.push(current);
+      current = { characters: [], indexes: [], widths: [], width: 0 };
+    }
+    current.characters.push(glyph);
+    current.indexes.push(characterIndex);
+    current.widths.push(glyphWidth);
+    current.width += glyphWidth + tracking;
+    characterIndex += 1;
+  }
+  if (current.characters.length > 0) { rows.push(current); }
+  var wrapped = { rows: rows, tracking: tracking, font: fontSize };
+  wrapCache.set(cacheKey, wrapped);
+  return wrapped;
+}
+
+function fitLyricLayout(index) {
+  var maxWidth = Math.min(stageWidth * (stageIsPortrait ? 0.9 : 0.82), 1040);
+  var baseSize = clampNumber(stageWidth * (stageIsPortrait ? 0.078 : 0.054), 22, 72);
+  var rowLimit = stageIsPortrait ? 3 : 2;
+  var attempt = 0;
+  var chosen = wrapLyricLine(index, maxWidth, baseSize);
+  var chosenSize = baseSize;
+  while (attempt < 3 && chosen.rows.length > rowLimit) {
+    attempt += 1;
+    chosenSize = baseSize * (1 - attempt * 0.16);
+    chosen = wrapLyricLine(index, maxWidth, chosenSize);
+  }
+  return { rows: chosen.rows, tracking: chosen.tracking, fontSize: chosenSize };
+}
+
+function drawSongTag(context) {
+  if (!stageSong.name) { return; }
+  var label = stageSong.name;
+  if (stageSong.artists) { label += "  ·  " + stageSong.artists; }
+  if (label.length > 46) { label = label.slice(0, 45) + "…"; }
+  var fontSize = clampNumber(stageWidth * 0.0085, 10, 14);
+  context.save();
+  context.font = '600 ' + Math.round(fontSize) + "px " + lyricFontStack;
+  context.textAlign = "left";
+  context.fillStyle = colorString(255, 226, 184, 0.62);
+  var tagY = stageHeight - (stageIsPortrait ? 16 : 20);
+  context.beginPath();
+  context.arc(20, tagY - fontSize * 0.34, Math.max(2, fontSize * 0.22), 0, TAU);
+  context.fillStyle = palette.accent;
+  context.fill();
+  context.fillStyle = colorString(255, 226, 184, 0.6);
+  context.fillText(label, 30, tagY);
+  context.restore();
+}
+
+function drawEmptyLyricState(context) {
+  var centerY = stageHeight * (stageIsPortrait ? 0.68 : 0.72);
+  var ringRadius = Math.min(stageWidth, stageHeight) * 0.062;
+  var centerX = stageWidth * 0.5;
+
+  context.save();
+  context.globalCompositeOperation = "lighter";
+  var emptyGlow = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, ringRadius * 3.6);
+  addColorStopSafe(emptyGlow, 0, colorString(255, 180, 110, 0.16));
+  addColorStopSafe(emptyGlow, 1, "rgba(255,180,110,0)");
+  context.fillStyle = emptyGlow;
+  context.beginPath();
+  context.arc(centerX, centerY, ringRadius * 3.6, 0, TAU);
+  context.fill();
+  context.globalCompositeOperation = "source-over";
+
+  context.strokeStyle = colorString(255, 214, 160, 0.7);
+  context.lineWidth = Math.max(1, ringRadius * 0.035);
+  context.beginPath();
+  context.arc(centerX, centerY, ringRadius, 0, TAU);
+  context.stroke();
+  context.strokeStyle = colorString(255, 226, 190, 0.4);
+  context.lineWidth = Math.max(0.8, ringRadius * 0.02);
+  context.beginPath();
+  context.arc(centerX, centerY, ringRadius * 0.76, 0, TAU);
+  context.stroke();
+
+  var spinAngle = stageClock * 0.5;
+  context.fillStyle = palette.accentSoft;
+  context.beginPath();
+  context.moveTo(centerX + Math.cos(spinAngle) * ringRadius, centerY + Math.sin(spinAngle) * ringRadius);
+  context.lineTo(centerX + Math.cos(spinAngle + 0.22) * ringRadius, centerY + Math.sin(spinAngle + 0.22) * ringRadius);
+  context.lineTo(centerX + Math.cos(spinAngle + 0.11) * ringRadius * 0.55, centerY + Math.sin(spinAngle + 0.11) * ringRadius * 0.55);
+  context.closePath();
+  context.fill();
+
+  var titleSize = clampNumber(stageWidth * (stageIsPortrait ? 0.058 : 0.038), 16, 34);
+  context.textAlign = "center";
+  context.font = lyricFont(titleSize);
+  context.fillStyle = palette.goldLight;
+  context.fillText("纯器乐 · 无人声", centerX, centerY + ringRadius * 2.05);
+
+  context.font = '600 ' + Math.round(titleSize * 0.42) + "px " + lyricFontStack;
+  context.fillStyle = colorString(255, 220, 180, 0.5);
+  context.fillText("I N S T R U M E N T A L", centerX, centerY + ringRadius * 2.05 + titleSize * 0.95);
+  if (stageSong.name) {
+    context.fillStyle = colorString(255, 226, 190, 0.62);
+    context.font = '700 ' + Math.round(titleSize * 0.58) + "px " + lyricFontStack;
+    context.fillText(stageSong.name.slice(0, 28), centerX, centerY - ringRadius * 1.85);
+  }
+  context.restore();
+}
+
+function drawLyricsTemporary(context) {
+  context.save();
+  context.textAlign = "center";
+
+  if (!lyricLines.length || !hasLyricText) {
+    drawEmptyLyricState(context);
+    drawSongTag(context);
+    context.restore();
+    return;
+  }
+
+  var currentIndex = stageState.idx;
+  if (currentIndex < 0 || currentIndex >= lyricLines.length) {
+    drawSongTag(context);
+    context.restore();
+    return;
+  }
+
+  var line = lyricLines[currentIndex];
+  var timing = timingForLine(currentIndex);
+  var layout = fitLyricLayout(currentIndex);
+  if (!layout.rows.length) {
+    drawSongTag(context);
+    context.restore();
+    return;
+  }
+
+  var fontSize = layout.fontSize;
+  var rowGap = fontSize * 1.3;
+  var anchorBottom = stageHeight * (stageIsPortrait ? 0.78 : 0.83);
+  var lastBaseline = anchorBottom;
+  var firstBaseline = lastBaseline - rowGap * (layout.rows.length - 1);
+  var lineAge = stageState.t - line.t;
+  var holdDuration = Math.max(line.dur, 2.4);
+  var fadeOut = currentIndex === lyricLines.length - 1
+    ? clampNumber(1 - (lineAge - holdDuration - 1.1) / 0.9, 0, 1)
+    : 1;
+  var entrance = clampNumber(lineAge / 0.26, 0, 1);
+  var easedEntrance = 1 - Math.pow(1 - entrance, 3);
+  var riseOffset = (1 - easedEntrance) * fontSize * 0.42;
+
+  context.globalAlpha = fadeOut;
+
+  /* 字幕底衬，保证在烟花上仍可读 */
+  var plateTop = firstBaseline - fontSize * 1.15;
+  var plateBottom = lastBaseline + fontSize * 0.6;
+  var plate = context.createLinearGradient(0, plateTop - fontSize * 0.8, 0, plateBottom + fontSize * 0.6);
+  addColorStopSafe(plate, 0, "rgba(6,1,12,0)");
+  addColorStopSafe(plate, 0.35, "rgba(6,1,12,0.34)");
+  addColorStopSafe(plate, 0.75, "rgba(6,1,12,0.4)");
+  addColorStopSafe(plate, 1, "rgba(6,1,12,0)");
+  context.fillStyle = plate;
+  context.fillRect(0, plateTop - fontSize * 0.8, stageWidth, plateBottom - plateTop + fontSize * 1.4);
+
+  var goldGradient = context.createLinearGradient(0, firstBaseline - fontSize, 0, lastBaseline + fontSize * 0.2);
+  addColorStopSafe(goldGradient, 0, palette.goldLight);
+  addColorStopSafe(goldGradient, 0.45, palette.accentSoft);
+  addColorStopSafe(goldGradient, 1, palette.gold);
+
+  context.textAlign = "left";
+  context.lineJoin = "round";
+  context.lineCap = "round";
+
+  var rowIndex = 0;
+  while (rowIndex < layout.rows.length) {
+    var row = layout.rows[rowIndex];
+    var baseline = firstBaseline + rowIndex * rowGap + riseOffset;
+    var cursorX = (stageWidth - row.width) * 0.5;
+    var charIndex = 0;
+    while (charIndex < row.characters.length) {
+      var originalIndex = row.indexes[charIndex];
+      var glyph = row.characters[charIndex];
+      var glyphWidth = row.widths[charIndex];
+      var charTime = timing.times[originalIndex];
+      if (!isFinite(charTime)) { charTime = line.t; }
+      var reveal = clampNumber((stageState.t - charTime) / 0.13, 0, 1);
+
+      context.font = lyricFont(fontSize);
+      if (reveal > 0.02) {
+        context.globalAlpha = fadeOut * (0.28 + 0.72 * reveal);
+        context.fillStyle = goldGradient;
+        context.strokeStyle = "rgba(10,2,16,0.78)";
+        context.lineWidth = fontSize * 0.13;
+        context.strokeText(glyph, cursorX, baseline - (1 - reveal) * fontSize * 0.07);
+      } else {
+        context.globalAlpha = fadeOut * 0.3;
+        context.fillStyle = "rgba(255,236,212,1)";
+      }
+      context.fillText(glyph, cursorX, baseline - (1 - reveal) * fontSize * 0.07);
+      cursorX += glyphWidth + layout.tracking;
+      charIndex += 1;
+    }
+    rowIndex += 1;
+  }
+
+  /* 下一句预览 */
+  var nextIndex = currentIndex + 1;
+  if (nextIndex < lyricLines.length && fadeOut > 0.2) {
+    var nextText = String(lyricLines[nextIndex].text || "");
+    if (nextText.length > 40) { nextText = nextText.slice(0, 39); }
+    if (nextText) {
+      context.globalAlpha = fadeOut * 0.34;
+      context.textAlign = "center";
+      context.fillStyle = colorString(255, 226, 188, 1);
+      context.font = '600 ' + Math.round(fontSize * 0.48) + "px " + lyricFontStack;
+      context.fillText(nextText, stageWidth * 0.5, lastBaseline + fontSize * 1.25, stageWidth * 0.86);
+    }
+  }
+
+  context.restore();
+  drawSongTag(context);
+}
+
+function renderFrame(stamp) {
+  var frameStart = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  stageState.frames += 1;
+  try {
+    stageClock = (frameStart - bootTimeMs) / 1000;
+    beatFlash = Math.max(0, beatFlash - 0.045);
+    updateCameraRig();
+    drawStage(stageCtx);
+  } catch (frameError) {
+    reportError("frame", frameError);
+  }
+  var frameEnd = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  stageState.js = Math.round((frameEnd - frameStart) * 100) / 100;
+  requestAnimationFrame(renderFrame);
+}
+</script>
+</body>
+</html>

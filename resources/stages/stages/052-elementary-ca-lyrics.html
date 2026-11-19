@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>初等元胞自动机</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(159,232,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   052 · 初等元胞自动机 —— 一个字就是一次初值，时空图从字下面落下去
+   ----------------------------------------------------------------------------
+   核心机制：**时空图**。横向一行 = 元胞轴（屏幕 x），纵向 = 时间（最新一代在
+   屏幕顶端，旧的往下流走）。每一代按初等 CA 的规则表（8 种邻域 → 8 位规则号）
+   从上一代算出来，一代只画一次（画进环形槽位图，之后每帧只是贴图）。
+   没有粒子、没有轨迹：画面本身就是历史。
+
+   字怎么来：**每个字是一列初值**。句子先排成 1~3 行（读得出来优先），
+   第 k 个字在 chars[k].t 那一刻，把它自己字形在纵向上的墨迹投影成一行 0/1
+   撒进当时那一代 —— 于是每个字下面都长出一朵分形扇，唱到哪个字，
+   哪个字下面就开花。字本身用同一套青蓝色亮在时空图上，暗底压住，
+   枝蔓再乱也读得清。长句分行，行距由排版给定。
+
+   和 017（Truchet）/025（ASCII）的区别：那两个是"在格子上贴图案"；这里
+   x 是元胞、y 是时间，**时间轴本身构成画面**，且初值来自字形投影。
+
+   分词：不用 —— 生成系统类逐字播种更自然，一个字一行初值。
+
+   精修记录：
+   ① 逐字时刻统一走 charTimes()（chars 长度与正文相等且可解析才采信，单调钳位，
+      否则 t+dur*k/n 均分回退），第 k 字在 chars[k].t 撒下自己的初值行；
+      window.__stage().yrc 暴露是否走 YRC。
+   ② 阅读优先：整句 1~3 行、取放得下的最大字号，行内居中；字块垫一层暗场，
+      未唱到的字保持 0.62 可见度，句尾整句仍在。
+   ③ 动效：时间轴连续下落（镜头感来自"历史在流"），beat 时整张图亮一档并
+      换一次规则冲击；进场 0.26s 淡入。
+   ④ 性能：一代只画一次（环形槽位位图），每帧 2 次 drawImage；rules/step 都是
+      几百个 Uint8 的循环。
+   ========================================================================== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hint = document.getElementById('hint');
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+/* ---- 画布 ---- */
+let W = 0, H = 0, DPR = 1;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+function fit() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(320, innerWidth); H = Math.max(240, innerHeight);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+fit();
+
+/* ================= 排版：1~3 行，逐字绝对坐标 ================= */
+const FAMILY = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif';
+const FONT = (fs) => '800 ' + fs.toFixed(1) + 'px ' + FAMILY;
+const om = document.createElement('canvas').getContext('2d');
+
+function layout(text, availW, availH, maxRows, cy) {
+  const s = text;
+  if (!/\S/.test(s)) return null;
+  const n = s.length;
+  om.font = FONT(100);
+  let best = 0, bestR = 1;
+  for (let r = 1; r <= maxRows; r++) {
+    const per = Math.ceil(n / r);
+    const wPer = om.measureText(s.slice(0, Math.min(n, per))).width / 100 || 0.01;
+    const f = Math.min(availW / wPer, availH / (r * 1.34), 96);
+    if (f > best) { best = f; bestR = r; }
+  }
+  let fs = Math.max(13, best);
+  let ranges = null;
+  for (let guard = 0; guard < 30; guard++) {
+    om.font = FONT(fs);
+    const total = om.measureText(s).width;
+    const cap = Math.max(fs * 2.2, Math.min(availW, total / bestR * 1.04));
+    const rr = [];
+    let start = 0;
+    while (start < n) {
+      let lo = start + 1, hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (om.measureText(s.slice(start, mid)).width <= cap) lo = mid; else hi = mid - 1;
+      }
+      let end = Math.max(start + 1, lo);
+      const sp = s.lastIndexOf(' ', end - 1);
+      if (sp > start + Math.max(2, (end - start) * 0.5)) end = sp;
+      rr.push([start, end]);
+      start = end;
+    }
+    if (rr.length <= maxRows) { ranges = rr; break; }
+    fs *= 0.9;
+    if (fs < 13) { fs = 13; ranges = rr; break; }
+  }
+  if (!ranges) return null;
+  const lh = fs * 1.34;
+  const rows = [];
+  let maxw = 0;
+  om.font = FONT(fs);
+  for (let q = 0; q < ranges.length; q++) {
+    const a = ranges[q][0], b = ranges[q][1];
+    let x = 0;
+    const chars = [];
+    for (let i = a; i < b; i++) {
+      const ch = s[i];
+      const w = om.measureText(ch).width;
+      chars.push({ ch, x, w, k: i });
+      x += w;
+    }
+    if (x > maxw) maxw = x;
+    rows.push({ chars, w: x });
+  }
+  const blockH = rows.length * lh;
+  const y0 = cy - blockH / 2;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const rx = (W - row.w) / 2;
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      c.ax = rx + c.x + c.w / 2;
+      c.ay = y0 + r * lh + lh / 2;
+    }
+  }
+  return { rows, fs, lh, blockW: maxw, blockH, cy };
+}
+
+/* 逐字时刻：chars 与正文逐字对齐才采信（并单调钳位），否则均分回退 */
+function charTimes(line, n) {
+  const out = new Float32Array(Math.max(1, n));
+  const chs = line ? line.chars : null;
+  const base = line ? (isFinite(line.t) ? line.t : 0) : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* ================= 单字 → 纵向墨迹投影（CA 的初值行） ================= */
+const off = document.createElement('canvas');
+off.width = 128; off.height = 128;
+const octx = off.getContext('2d', { willReadFrequently: true });
+const GLYPHF = 72;
+
+/** 返回这个字在横向 nCells 个格子里"有墨"的那些格子偏移（0..nCells-1） */
+function inkCells(ch, nCells) {
+  if (nCells < 1) return [];
+  const w = off.width, h = off.height;
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, w, h);
+  octx.font = '800 ' + GLYPHF + 'px ' + FAMILY;
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(ch, w / 2, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const gx0 = Math.round(w / 2 - GLYPHF * 0.52), gw = Math.round(GLYPHF * 1.04);
+  const out = [];
+  for (let i = 0; i < nCells; i++) {
+    const x0 = gx0 + Math.floor(i / nCells * gw);
+    const x1 = Math.max(x0 + 1, gx0 + Math.ceil((i + 1) / nCells * gw));
+    let hit = false;
+    for (let x = x0; x < x1 && !hit; x++) {
+      for (let y = 0; y < h; y++) {
+        if (d[(y * w + x) * 4 + 3] > 120) { hit = true; break; }
+      }
+    }
+    if (hit) out.push(i);
+  }
+  return out;
+}
+
+/* ================= 节奏 ================= */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+let accent = [150, 210, 255];
+let hueBase = 195;
+function hueOf(rgb) {
+  const r = rgb[0] / 255, g = rgb[1] / 255, b = rgb[2] / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  if (d < 1e-4) return 195;
+  let h;
+  if (mx === r) h = ((g - b) / d) % 6;
+  else if (mx === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return h;
+}
+
+/* ================= 元胞自动机：纵向时空图 ================= */
+const RULES = [110, 30, 90, 150, 182, 60, 102, 126, 225, 45, 73, 105, 146, 161, 54, 22];
+const ROW = 6;                        // 一代占多少像素高
+const CELL = 6;                       // 一格元胞多宽
+let cols = 0, SLOTS = 0;
+let fld = null, fctx = null;
+let cur = null, nxt = null;           // 当前代
+let gen = 0, genAcc = 0, genRate = 60;
+let rule = 110, ruleHash = 0;
+let gTime = 0;                        // 当前代对应的歌时间
+let seedRow = -1;                     // 刚刚被播种的那一代（画得亮一点）
+let flash = 0, time = 0, dtG = 0.016;
+let pend = null;                      // 酝酿好的下一句排版
+let curLyric = null;
+
+function measureGrid() {
+  cols = Math.max(48, Math.ceil(W / CELL));
+  if (!cur || cur.length !== cols) { cur = new Uint8Array(cols); nxt = new Uint8Array(cols); }
+  const slots = Math.ceil(H / ROW) + 12;
+  if (SLOTS !== slots || !fld) {
+    SLOTS = slots;
+    fld = document.createElement('canvas');
+    fld.width = Math.round(W);
+    fld.height = SLOTS * ROW;
+    fctx = fld.getContext('2d');
+    fctx.clearRect(0, 0, fld.width, fld.height);
+    gen = 0; genAcc = 0;
+    if (cur) { cur.fill(0); nxt.fill(0); }
+  }
+}
+
+function stepCA() {
+  const r = rule;
+  for (let x = 0; x < cols; x++) {
+    const l = cur[x === 0 ? cols - 1 : x - 1];
+    const m = cur[x];
+    const q = cur[x === cols - 1 ? 0 : x + 1];
+    nxt[x] = (r >> ((l << 2) | (m << 1) | q)) & 1;
+  }
+  const t = cur; cur = nxt; nxt = t;
+}
+
+/** 把上面算出来的这一代画成一行（左对齐到槽位），一代只画一次 */
+function stampRow(seed) {
+  if (!fctx) return;
+  const s = gen % SLOTS;
+  const y = s * ROW;                        /* 槽位向下排，最新一代在画布底部 */
+  fctx.clearRect(0, y, fld.width, ROW);
+  fctx.globalCompositeOperation = 'lighter';
+  fctx.fillStyle = seed ? 'hsla(' + ((hueBase + 30) % 360).toFixed(0) + ',96%,78%,0.95)'
+                        : 'hsla(' + hueBase.toFixed(0) + ',88%,' + (46 + flash * 16).toFixed(0) + '%,' +
+                          (0.62 + flash * 0.2).toFixed(3) + ')';
+  /* 把连续为 1 的格子合并成一条横线（批处理，别逐格 fillRect） */
+  let run = -1;
+  for (let x = 0; x <= cols; x++) {
+    const on = x < cols && cur[x];
+    if (on && run < 0) run = x;
+    else if (!on && run >= 0) {
+      fctx.fillRect(run * CELL, y + ROW * 0.5 - (seed ? ROW * 0.34 : ROW * 0.26),
+                    (x - run) * CELL - 0.6, seed ? ROW * 0.68 : ROW * 0.52);
+      run = -1;
+    }
+  }
+  fctx.globalCompositeOperation = 'source-over';
+}
+
+function advance() {
+  stepCA();
+  gen++;
+  gTime += 1 / Math.max(0.1, genRate);
+  seedRow = -1;
+  const sd = curLyric ? curLyric.seeds : null;
+  if (sd && sd.length) {
+    while (curLyric.seedI < sd.length && sd[curLyric.seedI].t <= gTime) {
+      const s = sd[curLyric.seedI++];
+      for (let i = 0; i < s.cells.length; i++) cur[s.cells[i]] = 1;
+      seedRow = 1;
+    }
+  }
+  stampRow(seedRow > 0);
+}
+
+/* ================= 每句的排版 + 初值 ================= */
+function buildLyric(ln, idx) {
+  const text = (ln && ln.text) || '';
+  const n = text.length;
+  if (!n) return null;
+  const ct = charTimes(ln, n);
+  const lay = layout(text, Math.min(W * 0.90, 1380), Math.min(H * 0.32, 320), 3, H * 0.44);
+  if (!lay) return null;
+  const seeds = [];
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      if (!/\S/.test(c.ch)) continue;
+      const c0 = Math.floor((c.ax - c.w * 0.5) / CELL);
+      const cn = Math.max(1, Math.round(c.w / CELL));
+      const offs = inkCells(c.ch, cn);
+      if (!offs.length) continue;
+      const cells = [];
+      for (let q = 0; q < offs.length; q++) {
+        const x = clamp(c0 + offs[q], 0, cols - 1);
+        cells.push(x);
+      }
+      seeds.push({ t: isFinite(ct.t[c.k]) ? ct.t[c.k] : 0, cells });
+    }
+  }
+  seeds.sort((a, b) => a.t - b.t);
+  return {
+    line: ln, t0: isFinite(ln.t) ? ln.t : 0, dur: ln.dur || 4, text, n, yrc: ct.yrc,
+    ct: ct.t, rows: lay.rows, fs: lay.fs, lh: lay.lh, cy: lay.cy,
+    scrim: makeScrim(lay.blockW, lay.blockH),
+    seeds, seedI: 0
+  };
+}
+
+function prepare(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  pend = buildLyric(ln, idx);
+}
+
+function startLine(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  measureGrid();
+  curLyric = (pend && pend.line === ln) ? pend : buildLyric(ln, idx);
+  pend = null;
+  if (!curLyric) return;
+  genRate = clamp((H / ROW) / Math.max(2.2, (ln.dur || 4) * 0.95), 12, 240);
+  hueBase = (hueOf(accent) + ((hashOf(curLyric.text) % 7) - 3) * 5 + 360) % 360;
+  rule = RULES[hashOf(curLyric.text) % RULES.length];
+  gTime = curLyric.t0;
+  curLyric.seedI = 0;
+  hint.style.opacity = '0';
+}
+
+function hashOf(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
+function release() {
+  curLyric = null; pend = null;
+  if (cur) { cur.fill(0); nxt.fill(0); }
+  gen = 0; genAcc = 0; gTime = 0;
+  if (fctx) fctx.clearRect(0, 0, fld.width, fld.height);
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; release(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci);
+    else release();
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prepare(nx); }
+  }
+}
+
+/* ================= 背景/暗场 ================= */
+let bgGrd = null, vg = null;
+function buildStatic() {
+  bgGrd = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrd.addColorStop(0, '#05060a');
+  bgGrd.addColorStop(0.5, '#060a12');
+  bgGrd.addColorStop(1, '#04070d');
+  vg = ctx.createRadialGradient(W * 0.5, H * 0.5, Math.min(W, H) * 0.30,
+                                W * 0.5, H * 0.5, Math.max(W, H) * 0.82);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(2,4,9,0.46)');
+}
+
+function makeScrim(bw, bh) {
+  const pad = 70;
+  const w = bw + pad * 2, h = bh + pad * 2;
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(w * DPR));
+  c.height = Math.max(2, Math.round(h * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const rx = w * 0.5, ry = Math.max(h * 0.36, 1);
+  g.save();
+  g.translate(w / 2, h / 2);
+  g.scale(1, ry / rx);
+  const rg = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+  rg.addColorStop(0, 'rgba(3,6,12,0.70)');
+  rg.addColorStop(0.62, 'rgba(3,6,12,0.52)');
+  rg.addColorStop(1, 'rgba(3,6,12,0)');
+  g.fillStyle = rg;
+  g.beginPath(); g.arc(0, 0, rx, 0, Math.PI * 2); g.fill();
+  g.restore();
+  return { cv: c, w, h };
+}
+
+/* ================= 绘制 ================= */
+let lastFs = -1;
+function drawField(of) {
+  if (!fld || !SLOTS) return;
+  const d = gen % SLOTS;
+  const o = clamp(of, 0, 1);
+  /* 最新一代贴屏幕底边，历史往上流走（时空图从地面长起来） */
+  const baseA = H - (o + d + 1) * ROW;
+  const hA = (d + 1) * ROW;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.drawImage(fld, 0, 0, fld.width, hA, 0, baseA, W, hA);
+  const hB = (SLOTS - 1 - d) * ROW;
+  if (hB > 0) {
+    const destB = baseA - SLOTS * ROW + (d + 1) * ROW;
+    if (destB + hB > 0) ctx.drawImage(fld, 0, (d + 1) * ROW, fld.width, hB, 0, destB, W, hB);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawText(T) {
+  const L = curLyric;
+  if (!L || !L.rows) return;
+  const app = clamp((T - L.t0) / 0.26, 0, 1);
+  const ap = 0.34 + 0.66 * (app * app * (3 - 2 * app));
+  if (L.scrim) {
+    ctx.globalAlpha = 0.95 * ap;
+    ctx.drawImage(L.scrim.cv, 0, 0, L.scrim.cv.width, L.scrim.cv.height,
+                  W / 2 - L.scrim.w / 2, L.cy - L.scrim.h / 2, L.scrim.w, L.scrim.h);
+    ctx.globalAlpha = 1;
+  }
+  let curCh = -1;
+  for (let k = 0; k < L.n; k++) if (T >= L.ct[k]) curCh = k;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  lastFs = -1;
+  for (let r = 0; r < L.rows.length; r++) {
+    const row = L.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      const k = c.k;
+      const lit = T >= L.ct[k];
+      const isCur = k === curCh;
+      const fsz = L.fs * (isCur ? 1.08 : 1);
+      if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+      ctx.globalAlpha = ap;
+      ctx.lineWidth = Math.max(2, fsz * 0.10);
+      ctx.strokeStyle = 'rgba(3,6,12,0.90)';
+      ctx.strokeText(c.ch, c.ax, c.ay);
+      ctx.fillStyle = isCur ? 'rgba(255,255,255,0.99)'
+        : lit ? 'hsla(' + hueBase.toFixed(0) + ',92%,88%,0.95)'
+          : 'rgba(146,168,190,0.62)';
+      ctx.fillText(c.ch, c.ax, c.ay);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ---- 消息 ---- */
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent && p.accent.length === 3) accent = p.accent;
+    hueBase = hueOf(accent);
+    measureGrid();
+    release();
+    buildStatic();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.5;
+    flash = Math.min(1, flash + 0.30 + lv * 0.45);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ---- 主循环 ---- */
+let last = performance.now();
+function frame(nowMs) {
+  dtG = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  time += dtG;
+  flash *= Math.exp(-dtG * 3.2);
+  const T = now();
+  timing(T);
+
+  if (curLyric) {
+    /* 时间轴连续下落：按真实经过的时间推进（换句不停） */
+    genAcc += dtG * genRate;
+    const cap = Math.max(2, Math.ceil(genRate / 30));
+    let k = Math.min(cap, Math.floor(genAcc - gen));
+    while (k-- > 0) advance();
+  }
+  const o = genAcc - gen;
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrd || '#05060a';
+  ctx.fillRect(0, 0, W, H);
+  /* 镜头：时空图整体缓慢横移再叠回来，画面不死板 */
+  const camX = Math.sin(time * 0.18) * 7;
+  ctx.save();
+  ctx.translate(camX, 0);
+  drawField(o);
+  ctx.restore();
+  drawText(T);
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => {
+  fit(); measureGrid(); buildStatic();
+  if (curLyric && curLyric.line) curLyric = buildLyric(curLyric.line, curIdx >= 0 ? curIdx : 0);
+});
+buildStatic();
+measureGrid();
+requestAnimationFrame(frame);
+
+window.__stage = () => {
+  let lit = 0;
+  if (curLyric) for (let k = 0; k < curLyric.n; k++) if (now() >= curLyric.ct[k]) lit++;
+  return {
+    lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+    yrc: !!(curLyric && curLyric.yrc), n: curLyric ? curLyric.n : 0,
+    fs: curLyric ? +curLyric.fs.toFixed(1) : 0,
+    rows: curLyric ? curLyric.rows.length : 0, lit,
+    seeds: curLyric ? curLyric.seeds.length : 0, gen, rule, cols
+  };
+};
+</script>
+</body>
+</html>

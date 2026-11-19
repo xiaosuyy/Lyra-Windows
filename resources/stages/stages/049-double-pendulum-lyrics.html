@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>双摆</title>
+<style>
+  html,body{margin:0;height:100%;background:#06050a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(190,165,200,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   049 · 双摆 —— 这句话是被**混沌**一笔一笔画出来的
+   ---------------------------------------------------------------------------
+   核心机制：**双摆的确定性混沌 + 字形采样**。
+     · 真实双摆方程（拉格朗日推导的那组），RK4 定步长积分，每帧 4 个子步；
+     · 9 个双摆的初始角只差 1e-3 弧度。双摆是指数发散的（Lyapunov 指数为正），
+       所以几百毫秒后它们就各走各的 —— 一开始几乎重合、然后炸开成一朵"混沌扇"。
+       这不是随机：是初值微小差异被放大，正是双摆最动人的那件事；
+     · 每个摆的第二根杆末端拖一条定长轨迹（只保留最近 N 个采样点，
+       不累加、不擦屏），于是"长曝光"的轨迹本身就是画面；
+     · 字形采样自当前这句词（步长 4，≤ 颗粒直径）。摆端扫过某个采样点附近
+       （半径 R 的接触判定，用格子索引加速）就把那个点点亮 —— 字是被摆"写"出来的；
+     · 但只靠摆扫会漏字，所以每个点还带一个**到期时间**（按字的时间轴均分）：
+       时间到了必然亮，摆扫过只是提前、并且亮得更白。这样既混沌又读得出来。
+
+   和已有形态的区别：007 铁屑靠朝向对齐、008 雪靠接触粘附 —— 都是**静态场**；
+   这里显形的原因是**运动轨迹扫过**，而且轨迹本身是指数发散的混沌，
+   每句话的笔迹都不一样（初值不同 → 轨迹不同），画完的句子留着不褪。
+   003 萤火虫也是累积光绘，但它是粒子漂移；这里是**确定性的两条杆**，
+   轨迹的形状由方程决定，看一眼就知道是双摆。
+
+   性能：9 个摆 × 4 子步 × RK4 只算标量；接触判定走格子索引（3×3 格）；
+   点按"明亮/已亮/未亮"分三档合批，每档一条路径一次 fill。
+
+   精修记录：① 逐字到期时间接 YRC——chars 仅在长度与正文相等且时间可解析时采信，
+      并单调钳位；否则 line.t + dur*k/n 均分回退，缺 chars 不报错。② 摆扫过只算"预写"
+      （比该字时刻最多早 0.9s），到点才真正点亮：轨迹负责笔迹，YRC 负责节奏；
+      点分四档（未触/预写/已亮/新鲜），单档一次 fill。③ 长句 1~3 行、字号上限提高，
+      采样步长 4→3（41 字不再糊成一团）。④ 镜头：支点极慢漂移 + 杆长呼吸，
+      踩拍仍然是全场同向冲量。⑤ 采样步长 3→2（阈值放到 100、点径 2.7）：41 字的笔画
+      只有 3px 宽，3px 格点正好在"抽到一行漏一行"的临界上，"廓/直/收"会缺角。
+      分词：不接 —— 这里的采样点是"墨"，逐字时刻已经决定了每一笔何时落下，
+      词边界不会改变笔迹。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1, CX = 0, CY = 0, PX = 0, PY = 0;
+let accent = [220, 170, 200];
+const PI = Math.PI, TAU = PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rgba = (r, g, b, a) => 'rgba(' + (clamp(r, 0, 255) | 0) + ',' + (clamp(g, 0, 255) | 0) + ',' + (clamp(b, 0, 255) | 0) + ',' + a + ')';
+
+/* ================= 双摆 ================= */
+const NP = 9;                       // 摆的个数
+const G = 30;
+const L1 = 1, L2 = 1;               // 世界单位（屏幕长度另外缩放）
+const M1 = 1, M2 = 1;
+const TH = new Float64Array(NP), TH2 = new Float64Array(NP), W1 = new Float64Array(NP), W2 = new Float64Array(NP);
+const TRAIL = 86;                   // 每个摆保留的轨迹点数
+const trX = new Float64Array(NP * TRAIL), trY = new Float64Array(NP * TRAIL);
+let trHead = 0, trLen = 0;
+let rodPx = 200;                    // 每根杆在屏幕上的像素长度
+let rodPx0 = 200;                   // 基准杆长（呼吸围绕它）
+
+function accel(t1, t2, w1, w2, out) {
+  const d = t1 - t2;
+  const den = 2 * M1 + M2 - M2 * Math.cos(2 * d);
+  const a1 = (-G * (2 * M1 + M2) * Math.sin(t1)
+    - M2 * G * Math.sin(t1 - 2 * t2)
+    - 2 * Math.sin(d) * M2 * (w2 * w2 * L2 + w1 * w1 * L1 * Math.cos(d)))
+    / (L1 * den);
+  const a2 = (2 * Math.sin(d) * (w1 * w1 * L1 * (M1 + M2)
+    + G * (M1 + M2) * Math.cos(t1)
+    + w2 * w2 * L2 * M2 * Math.cos(d)))
+    / (L2 * den);
+  out[0] = a1; out[1] = a2;
+}
+
+const k1 = [0, 0], k2 = [0, 0], k3 = [0, 0], k4 = [0, 0];
+const tmp = [0, 0];
+
+function step(h) {
+  for (let i = 0; i < NP; i++) {
+    const t1 = TH[i], t2 = TH2[i], w1 = W1[i], w2 = W2[i];
+    accel(t1, t2, w1, w2, k1);
+    accel(t1 + w1 * h / 2, t2 + w2 * h / 2, w1 + k1[0] * h / 2, w2 + k1[1] * h / 2, k2);
+    accel(t1 + (w1 + k1[0] * h / 2) * h / 2, t2 + (w2 + k1[1] * h / 2) * h / 2, w1 + k2[0] * h / 2, w2 + k2[1] * h / 2, k3);
+    accel(t1 + (w1 + k2[0] * h / 2) * h / 2, t2 + (w2 + k2[1] * h / 2) * h / 2, w1 + k3[0] * h / 2, w2 + k3[1] * h / 2, k4);
+    const nw1 = w1 + h * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]) / 6;
+    const nw2 = w2 + h * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]) / 6;
+    const nt1 = t1 + h * (w1 + 2 * (w1 + k1[0] * h / 2) + 2 * (w1 + k2[0] * h / 2) + (w1 + k3[0] * h)) / 6;
+    const nt2 = t2 + h * (w2 + 2 * (w2 + k1[1] * h / 2) + 2 * (w2 + k2[1] * h / 2) + (w2 + k3[1] * h)) / 6;
+    TH[i] = nt1; TH2[i] = nt2; W1[i] = nw1; W2[i] = nw2;
+  }
+}
+
+function seed(stagger) {
+  for (let i = 0; i < NP; i++) {
+    /* 初值只差 1e-3：几百毫秒后它们就会各走各的 —— 这就是混沌扇的来源 */
+    TH[i] = 2.10 + (i - (NP - 1) / 2) * 1e-3 + (stagger ? (i * 0.0007) : 0);
+    TH2[i] = 2.42;
+    W1[i] = 0; W2[i] = 0;
+  }
+  trHead = 0; trLen = 0;
+}
+
+/* ================= 字形采样 ================= */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FONT = (fs) => '900 ' + fs.toFixed(1) + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+let ptsX = new Float32Array(12288), ptsY = new Float32Array(12288), ptsDue = new Float32Array(12288);
+let ptsLit = new Uint8Array(12288), ptsInk = new Uint8Array(12288), ptsHot = new Float32Array(12288);
+let nPts = 0;
+let grid = new Map(), GRID = 34;
+let ptsAlphaHot = 1;
+
+/* 逐字时刻：chars 与正文逐字对齐（长度相等 + 时间可解析）才采信，并做单调钳位；
+   否则 line.t + dur*k/n 均分回退 —— 缺 chars 绝不能报错。 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const txt = line ? (line.text || '') : '';
+  const chs = line ? line.chars : null;
+  const base = line ? line.t : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* 折行：真实歌词一行可能 30~40 字，单行硬缩会缩成蚂蚁（播放器里根本读不出来） */
+function wrapAt(s, fs, availW) {
+  octx.font = FONT(fs);
+  const out = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (cur && octx.measureText(cur + ch).width > availW) {
+      const sp = cur.lastIndexOf(' ');
+      if (sp > cur.length * 0.45) { out.push(cur.slice(0, sp)); cur = cur.slice(sp + 1) + ch; }
+      else { out.push(cur); cur = ch; }
+    } else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+let glyphYrc = false;
+
+function buildGlyph(line) {
+  nPts = 0;
+  glyphYrc = false;
+  const s = (line && line.text ? line.text : '').replace(/\s+/g, ' ').trim();
+  if (!s) return;
+  const availW = Math.min(W * 0.66, rodPx * 2.30, 980);
+  const availH = Math.min(H * 0.44, rodPx * 1.30);
+
+  /* 枚举 1~3 行，取宽度与高度都放得下的最大字号 */
+  octx.font = FONT(100);
+  const w100 = Math.max(1, octx.measureText(s).width);
+  let best = { fs: 0 };
+  for (let nl = 1; nl <= 3; nl++) {
+    const fsW = availW * nl / (w100 / 100);
+    const fsH = availH / (nl * 1.42);
+    const f = Math.min(fsW, fsH, 130);
+    if (f > best.fs) best = { fs: f };
+  }
+  let fs = Math.max(14, best.fs);
+  let rows = wrapAt(s, fs, availW);
+  let guard = 0;
+  while (rows.length > 3 && fs > 12 && guard++ < 40) { fs *= 0.92; rows = wrapAt(s, fs, availW); }
+
+  const lh = fs * 1.42;
+  const pad = 10;
+  octx.font = FONT(fs);
+  let blockW = 0;
+  for (const r of rows) blockW = Math.max(blockW, octx.measureText(r).width);
+  const blockH = rows.length * lh;
+  const w = Math.ceil(blockW) + pad * 2;
+  const h = Math.ceil(blockH) + pad * 2;
+  off.width = w; off.height = h;
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  const startY = pad + Math.max(0, (h - pad * 2 - blockH) / 2);
+  for (let i = 0; i < rows.length; i++) octx.fillText(rows[i], w / 2, startY + lh * (i + 0.5));
+
+  /* 每行起始字索引：到期时间按"第几个字"算，行内再按 x 铺开 */
+  const rowStart = [];
+  let acc = 0;
+  for (const r of rows) { rowStart.push(acc); acc += r.length; }
+  const nCh = acc;
+  const ct = charTimes(line, nCh);
+  glyphYrc = ct.yrc;
+  const rowWArr = [];
+  for (const r of rows) rowWArr.push(Math.max(1, octx.measureText(r).width));
+
+  const d = octx.getImageData(0, 0, w, h).data;
+  /* 步长 2（不是 3）：字号 41px 时笔画本身只有 3px 宽，3px 的采样格正好在
+     "抽到一行、漏掉一行"的临界上，字会显出缺角（廓/直/收 最明显）。
+     落到 2px 格 + 2.7px 的点，笔画是实的；41 字约 8k 点，仍在 12288 的上限内。 */
+  const step = 2;
+  const ox = CX - w / 2, oy = CY - h / 2;
+  for (let y = 0; y < h; y += step) {
+    const ri = clamp(Math.floor((y - startY) / lh), 0, rows.length - 1);
+    const row = rows[ri];
+    const rowW = rowWArr[ri];
+    for (let x = 0; x < w; x += step) {
+      /* 阈值 100（不是 128）：格点容易正好落在笔画的抗锯齿边缘上 */
+      if (d[(y * w + x) * 4 + 3] <= 100) continue;
+      if (nPts >= 12288) break;
+      const px = ox + x, py = oy + y;
+      ptsX[nPts] = px; ptsY[nPts] = py;
+      /* 到期时间：目标字由"行 + 行内 x 比例"定，字内再按比例插值 —— 逐字压在 YRC 上 */
+      const fracX = clamp((x - (w - rowW) / 2) / rowW, 0, 0.9999);
+      const rel = rowStart[ri] + fracX * row.length;
+      const ci = Math.min(nCh - 1, Math.max(0, Math.floor(rel)));
+      const ci2 = Math.min(nCh - 1, ci + 1);
+      const f = rel - ci;
+      ptsDue[nPts] = ct.t[ci] + f * (ct.t[ci2] - ct.t[ci]);
+      ptsLit[nPts] = 0; ptsInk[nPts] = 0; ptsHot[nPts] = -1e9;
+      nPts++;
+    }
+  }
+  /* 格子索引：接触判定只查 3×3 格，不做全量距离 */
+  grid.clear();
+  for (let i = 0; i < nPts; i++) {
+    const gx = (ptsX[i] / GRID) | 0, gy = (ptsY[i] / GRID) | 0;
+    const key = gx * 10000 + gy;
+    let arr = grid.get(key);
+    if (!arr) { arr = []; grid.set(key, arr); }
+    arr.push(i);
+  }
+}
+
+/* 摆扫过只算"预写"：最多比这个字的到期时刻早 INK_LEAD 秒。
+   于是轨迹负责笔迹、YRC 负责节奏 —— 既混沌，又不会一口气把整句点完。 */
+const INK_LEAD = 0.9;
+let inkT = 0;
+
+function inkAt(x, y) {
+  const gx = (x / GRID) | 0, gy = (y / GRID) | 0;
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const arr = grid.get((gx + dx) * 10000 + (gy + dy));
+      if (!arr) continue;
+      for (let k = 0; k < arr.length; k++) {
+        const i = arr[k];
+        if (ptsInk[i]) continue;
+        if (inkT < ptsDue[i] - INK_LEAD) continue;      // 还没轮到这句
+        const ddx = ptsX[i] - x, ddy = ptsY[i] - y;
+        if (ddx * ddx + ddy * ddy < 1100) { ptsInk[i] = 1; ptsHot[i] = nowMsGlobal; }
+      }
+    }
+  }
+}
+
+/* ================= 节奏 ================= */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let curLine = null, brewLine = null;
+let pulse = 0, t0 = 0, nowMsGlobal = 0;
+let haveGlyph = false;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; curLine = null; nPts = 0; haveGlyph = false; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      curLine = lines[ci];
+      buildGlyph(curLine);
+      haveGlyph = true;
+      hint.style.opacity = '0';
+    } else { curLine = null; nPts = 0; haveGlyph = false; }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) brewIdx = nx;
+  }
+}
+
+/* ================= 渲染 ================= */
+let bgGrd = null;
+
+function buildStatic() {
+  bgGrd = ctx.createRadialGradient(CX, CY, 0, CX, CY, Math.max(W, H) * 0.75);
+  bgGrd.addColorStop(0, '#120b18');
+  bgGrd.addColorStop(0.45, '#0a0710');
+  bgGrd.addColorStop(1, '#030206');
+}
+
+const pathB = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt; nowMsGlobal = nowMs;
+  const T = now();
+  timing(T);
+  if (pulse > 0) { pulse *= Math.exp(-dt * 4.2); if (pulse < 0.004) pulse = 0; }
+
+  /* 镜头：支点极慢漂移（像手持机位），杆长随拍微微呼吸 */
+  PX = CX + Math.sin(t0 * 0.121) * W * 0.010;
+  PY = CY - H * 0.035 + Math.cos(t0 * 0.093) * H * 0.008;
+  rodPx = rodPx0 * (1 + Math.sin(t0 * 0.27) * 0.012 + pulse * 0.022);
+
+  /* 积分：4 个子步（1/240 s） */
+  const h = 1 / 240;
+  let sub = Math.max(1, Math.min(8, Math.round((dt || 1 / 60) * 240)));
+  for (let i = 0; i < sub; i++) step(h);
+
+  /* 记录轨迹（环形缓冲：trHead 只增，槽位取模） */
+  for (let i = 0; i < NP; i++) {
+    const x1 = Math.sin(TH[i]) * rodPx, y1 = Math.cos(TH[i]) * rodPx;
+    const x2 = x1 + Math.sin(TH2[i]) * rodPx, y2 = y1 + Math.cos(TH2[i]) * rodPx;
+    const slot = i * TRAIL + (trHead % TRAIL);
+    trX[slot] = PX + x2; trY[slot] = PY + y2;
+  }
+  trHead++;
+  trLen = Math.min(TRAIL, trHead);
+
+  /* 背景 */
+  ctx.fillStyle = '#06050a';
+  ctx.fillRect(0, 0, W, H);
+  if (bgGrd) { ctx.fillStyle = bgGrd; ctx.fillRect(0, 0, W, H); }
+
+  /* 未亮的字：极暗的点（保证任何时刻都看得出字在哪） */
+  pathB[0] = new Path2D();
+  pathB[1] = new Path2D();
+  pathB[2] = new Path2D();
+  pathB[3] = new Path2D();
+
+  /* 轨迹：只画最近 trLen 个点，定长窗口 —— 不累加、不擦屏 */
+  ctx.lineCap = 'round';
+  for (let i = 0; i < NP; i++) {
+    if (trLen < 3) continue;
+    const path = new Path2D();
+    let started = false;
+    for (let k = 0; k < trLen; k++) {
+      const slot = i * TRAIL + ((trHead - trLen + k + TRAIL * 4) % TRAIL);
+      const x = trX[slot], y = trY[slot];
+      if (!started) { path.moveTo(x, y); started = true; } else path.lineTo(x, y);
+    }
+    const hue = i / NP;
+    /* 轨迹颜色不能直接用 accent：深色封面的主色很暗，轨迹会看不见。
+       抬一个亮度下限，只让 accent 决定色相 */
+    ctx.strokeStyle = rgba(70 + accent[0] * 0.50 + hue * 45, 55 + accent[1] * 0.50 + hue * 20, 65 + accent[2] * 0.48 + (1 - hue) * 35, 0.24);
+    ctx.lineWidth = 1.1;
+    ctx.stroke(path);
+  }
+
+  /* 接触判定：两个摆端都算（第二个杆末端 + 第一个关节） */
+  if (haveGlyph && nPts) {
+    inkT = T;
+    for (let i = 0; i < NP; i++) {
+      const x1 = PX + Math.sin(TH[i]) * rodPx, y1 = PY + Math.cos(TH[i]) * rodPx;
+      const x2 = x1 + Math.sin(TH2[i]) * rodPx, y2 = y1 + Math.cos(TH2[i]) * rodPx;
+      inkAt(x2, y2);
+      inkAt(x1, y1);
+    }
+    /* 到期必亮：摆没扫到的地方也不会缺字（YRC 保证节奏，轨迹只负责笔迹） */
+    for (let i = 0; i < nPts; i++) if (!ptsLit[i] && T >= ptsDue[i]) ptsLit[i] = 1;
+
+    const pk = [pathB[0], pathB[1], pathB[2], pathB[3]];
+    for (let i = 0; i < nPts; i++) {
+      let b = 0;
+      if (ptsLit[i]) b = (ptsHot[i] > nowMs - 900) ? 3 : 2;
+      else if (ptsInk[i]) b = 1;
+      pk[b].rect(ptsX[i] - 1.35, ptsY[i] - 1.35, 2.7, 2.7);
+    }
+    /* 四档各一次 fill：没唱到的也必须读得出来（0.20 那档实测几乎看不见） */
+    ctx.fillStyle = rgba(accent[0] * 0.34 + 62, accent[1] * 0.34 + 62, accent[2] * 0.34 + 72, 0.48);
+    ctx.fill(pathB[0]);
+    ctx.fillStyle = rgba(accent[0] * 0.52 + 48, accent[1] * 0.52 + 44, accent[2] * 0.58 + 56, 0.70);
+    ctx.fill(pathB[1]);
+    ctx.fillStyle = rgba(accent[0] + 34, accent[1] + 24, accent[2] + 38, 0.86);
+    ctx.fill(pathB[2]);
+    ctx.fillStyle = rgba(255, 246, 252, 0.98);
+    ctx.fill(pathB[3]);
+  }
+
+  /* 杆与关节：让"这是双摆"一眼看得出来 */
+  for (let i = 0; i < NP; i++) {
+    const x1 = PX + Math.sin(TH[i]) * rodPx, y1 = PY + Math.cos(TH[i]) * rodPx;
+    const x2 = x1 + Math.sin(TH2[i]) * rodPx, y2 = y1 + Math.cos(TH2[i]) * rodPx;
+    const a = 0.10 + 0.35 * (i / NP);
+    ctx.strokeStyle = rgba(accent[0] + 20, accent[1] + 20, accent[2] + 30, a);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PX, PY); ctx.lineTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.fillStyle = rgba(255, 250, 255, 0.70);
+    ctx.beginPath(); ctx.arc(x2, y2, 1.8, 0, TAU); ctx.fill();
+  }
+  /* 支点 */
+  ctx.fillStyle = rgba(255, 245, 250, 0.55);
+  ctx.beginPath(); ctx.arc(PX, PY, 2.6, 0, TAU); ctx.fill();
+
+  if (pulse > 0) {
+    ctx.fillStyle = 'rgba(255,235,245,' + (0.05 * pulse).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ================= 尺寸 / 通信 ================= */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CX = W / 2; CY = H / 2;
+  PX = CX; PY = CY - H * 0.035;
+  rodPx = Math.min(W, H) * 0.30;
+  rodPx0 = rodPx;
+  buildStatic();
+  if (haveGlyph && curLine) buildGlyph(curLine);
+}
+addEventListener('resize', resize);
+
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent) { accent = p.accent; buildStatic(); }
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    curLine = null; brewLine = null; pulse = 0; nPts = 0; haveGlyph = false;
+    seed(true);
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：所有摆**同一个方向**吃一记角冲量（整场一起动），
+       不逐摆随机踢 —— 那会让字形立刻散掉 */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    pulse = 0.4 + lv * 0.6;
+    for (let i = 0; i < NP; i++) W1[i] += (0.55 + lv * 0.9) * 0.30;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+let last = performance.now();
+seed(true);
+resize();
+requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+  pts: nPts, lit: (() => { let c = 0; for (let i = 0; i < nPts; i++) if (ptsLit[i]) c++; return c; })(),
+  yrc: glyphYrc,
+  trail: trLen
+});
+</script>
+</body>
+</html>

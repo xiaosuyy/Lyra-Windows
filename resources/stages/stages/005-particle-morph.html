@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>粒子文字</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(175,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   005 · 粒子文字 —— 一群一直在流动的粒子，按"词"成团、跟着 YRC 逐字时间重组
+
+   这一版改了什么：
+   ① 节奏由**中文分词 + YRC** 决定（复用 004 那套，纯函数照抄）：
+      一句不再"啪"一下整体成形，而是**一个词一个词地吸附上去**，
+      每个词在它 YRC 首字的那个时刻锁定 —— 唱到哪，字就长到哪。
+   ② 粒子从 7600 加到 30000，字号 84 → 132（长句按词边界自动折行 2~3 行）。
+      多出来的粒子不硬塞进字里，而是留在四周当**尘埃星云**：
+      字里的颗粒才不会被糊成实心块，形变时那股"从星云飞进字形"的流才看得见。
+   ③ 绘制不走 Canvas 的 fillRect / 路径填充，而是**直接写 ImageData 像素**：
+      这台机器的软件光栅下，一颗一点要 1.6µs（1.5 万颗就是 40ms，帧率掉到 15），
+      而直接往 Uint32Array 里写 4 个像素是 0.01µs —— 快两个数量级。
+      画布按 CSS 像素量级渲染、由 CSS 拉伸，所以不跟 DPR，眼睛看不出差别。
+
+   还是要保持上一版的根本区别：**没有"散开"和"成形"两个阶段** ——
+   粒子永远在动，歌词只是它们暂时的目标形态。
+   ========================================================================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+let W = 0, H = 0;
+
+/* 像素缓冲：u32 就是画布本体（0xAABBGGRR），每帧先淡出、再把粒子盖上去，最后 putImageData 一次 */
+let img = null, u32 = null, lim = 0;
+
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  /* 画布分辨率 = CSS 像素（不乘 DPR）。粒子是 2~3px 的方块，retina 上多画一倍像素只剩成本。 */
+  cv.width = Math.max(320, Math.round(W));
+  cv.height = Math.max(200, Math.round(H));
+  img = ctx.createImageData(cv.width, cv.height);
+  u32 = new Uint32Array(img.data.buffer);
+  u32.fill(0xff0a0605);                 // 0xAABBGGRR → 背景 #05060a
+  lim = cv.width * cv.height;
+}
+resize();
+
+/* ============================================================================
+   分词：决定"哪几个字一起被吸上去"
+   · 词典 = public/segdict.bin —— 33 万个 2~4 字词的 32 位哈希（1.26 MB）。
+     只做二分查找、不存词原文，所以内存就是这 1.26 MB。
+   · 拿不到词典（例如直接 file:// 打开）自动退回"按标点 + 字数"硬切，形态不崩。
+   · 以下 isWord / segWords / groupByWords / groupByRule / latinSpans / spansForLine
+     与 004 完全一致，是纯函数，不依赖 004 的沙粒逻辑。
+   ========================================================================== */
+let DICT = null;
+fetch('/segdict.bin')
+  .then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); })
+  .catch(() => {});
+
+const fnv = (s) => {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+};
+
+function isWord(s, i, L) {
+  const h = fnv(s.substr(i, L));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1, v = DICT[m];
+    if (v === h) return true;
+    if (v < h) lo = m + 1; else hi = m - 1;
+  }
+  return false;
+}
+
+/* 正/反向最大匹配，取词数少的那个 —— 只用正向会偏爱长词（"一个人" vs "一个/人"） */
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let L = Math.min(4, text.length - i); L >= 2; L--) if (isWord(text, i, L)) { hit = L; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let L = Math.min(4, j); L >= 2; L--) if (isWord(text, j - L, L)) { hit = L; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+
+const MAXG = 3;      // 中文一团最多几个字。2~3 字吸一次，节奏才不像机关枪
+
+/* 标点表**不含**撇号、连字符、空格：
+   "don't" / "well-known" 里的符号是词的一部分，当成标点会把词切碎、还会让撇号消失。 */
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+
+/* 这行是中文还是拉丁文？拉丁按"整词"成团，中文才按 2~3 字合并 */
+function isLatin(text) {
+  let la = 0, cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++;
+    else if (c >= '\u4e00' && c <= '\u9fff') cjk++;
+  }
+  return la > cjk;
+}
+
+/* 拉丁：一个词一团。词内标点原样保留，白空格不占位（本来就没笔画） */
+function latinSpans(text) {
+  const out = [];
+  let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i;
+    while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j });
+    i = j;
+  }
+  return out;
+}
+
+/* 虚词的方向决定了"还健在"还是"目前还"：
+   的/了/着/过 挂**前面**的词（磨平+了），但/还/就/才 留给**后面**的词（还+健在）。 */
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+
+function countChars(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++;
+  return n;
+}
+
+/* 中文：词 → 团。贪心填到 MAXG 个汉字，标点并进本团并收尾（这样标点不会被吞掉） */
+function groupByWords(text) {
+  const words = segWords(text);
+  const out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos;
+    pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) {                  // 的/了/着：跟前面的词一起走
+      cur += w; chars++;
+      if (chars >= MAXG) flush(pos);
+      continue;
+    }
+    if (single && PREFIX.test(w) && chars >= 2) {     // 但/还/就：留给后面的词
+      flush(at); cur = w; start = at; chars = 1;
+      continue;
+    }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; }
+    else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  /* 只有 1 个汉字的孤儿（"我""却"）并到邻居，别让它自己落一团 */
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+
+/* 没词典时的兜底：不管词，按标点收尾 + MAXG 个汉字硬切（标点同样保留） */
+function groupByRule(text) {
+  const out = [];
+  let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const sep = PUNCT.test(c) || SPACE.test(c);
+    if (!sep) chars++;
+    if (sep && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!sep && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+
+/* 统一入口：拉丁按词、中文按分词 */
+function spansForLine(text) {
+  if (isLatin(text)) return latinSpans(text);
+  return DICT ? groupByWords(text) : groupByRule(text);
+}
+
+/* ============================================================================
+   粒子：随机撒满屏幕，没有任何初始造型
+   cl[i] = 0 自由漂浮（星云尘埃） / 1 正在组成某个词
+   3 万颗里，通常只有 7 千颗左右在组成字，其余都飘在四周 —— 星云越厚，
+   "从星云飞进字形"那股流越看得清。
+   ========================================================================== */
+const N = 30000;
+const px = new Float32Array(N), py = new Float32Array(N);
+const vx = new Float32Array(N), vy = new Float32Array(N);
+const tx = new Float32Array(N), ty = new Float32Array(N);
+const jt = new Float32Array(N);
+const cl = new Uint8Array(N);
+const fd = new Float32Array(N);        // claim() 里排序用的距离缓存
+for (let i = 0; i < N; i++) {
+  px[i] = tx[i] = Math.random() * W;
+  py[i] = ty[i] = Math.random() * H;
+  jt[i] = Math.random() * 6.283;
+}
+
+let accent = [175, 190, 255];
+
+/* 粒子颜色：直接写进像素的颜色字（0xAABBGGRR）。
+   每颗按 i&3 取 4 档亮度 —— 满铺的方块靠亮度抖动才像"沙"，不至于糊成一块白。
+   成字：accent 提亮到接近白；星云：同一色相压到 ~35%，当背景尘埃。 */
+const TC = new Uint32Array(4), DC = new Uint32Array(4);
+const cw = (r, g, b) => 0xff000000 | (b << 16) | (g << 8) | r;
+function palette() {
+  const [ar, ag, ab] = accent;
+  const tv = [0.86, 0.93, 1.0, 0.96];
+  const dv = [0.50, 0.80, 1.0, 0.66];
+  const q = (v) => (v > 255 ? 255 : v < 0 ? 0 : v) | 0;   // 必须夹到 255，不能 &255（260&255=4，会画成绿的）
+  for (let k = 0; k < 4; k++) {
+    TC[k] = cw(q((ar + 80) * tv[k]), q((ag + 75) * tv[k]), q((ab + 45) * tv[k]));
+    DC[k] = cw(q((ar + 14) * 0.30 * dv[k]), q((ag + 14) * 0.30 * dv[k]), q((ab + 10) * 0.30 * dv[k]));
+  }
+}
+palette();
+
+/* ============================================================================
+   字形采样与排版
+   字号 132（原来 84），一行放不下就按**团边界**折成 2~3 行 ——
+   折行只在团之间断，绝不会把一个词劈成两行。
+   ========================================================================== */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FONT = (fs) => `800 ${fs}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+const BASEF = 132;
+const ROWCAP = 3;
+
+function measureTxt(text, fs) {
+  octx.font = FONT(fs);
+  return octx.measureText(text).width;
+}
+
+/* 采样一个**词团**，返回相对 (0,0)=左缘/垂直中线 的点对数组。
+   字号由整行决定，这里绝不能各自缩放 —— 否则同一行里每个团的字会大小不一。 */
+function samplePts(text, fs) {
+  const PAD = 6;
+  const w = Math.ceil(measureTxt(text, fs)) + PAD * 2;
+  const h = Math.ceil(fs * 1.38);
+  off.width = w; off.height = h;
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'left'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(text, PAD, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const pts = [];
+  /* 步长 3 = 颗粒间距。绘制时一颗写 3×3 个像素，正好铺满这个格子：
+     既不留洞（取样点比颗粒疏，字就散了），也不重叠（重叠会并成实心块）。
+     ★ 纵向必须 round 到整数：h 是奇数，y - h/2 全是 x.5，绘制时再 (py+0.5)|0
+       正好卡在取整边界，呼吸抖动会让整行方块在上下两像素之间来回跳 ——
+       看起来就是笔画被腐蚀出一排排横线。 */
+  for (let y = 0; y < h; y += 3) {
+    for (let x = 0; x < w; x += 3) {
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - PAD, Math.round(y - h / 2));
+    }
+  }
+  return pts;
+}
+
+/* 排一句：返回 { groups:[{t,x0,y,w,pts}], ptsTotal, next } */
+function layoutLine(line, endT) {
+  const text = (line.text || '');
+  if (!text.trim()) return null;
+  const chars = (line.chars && line.chars.length === text.length) ? line.chars : null;
+  const spans = spansForLine(text);
+  if (!spans.length) return null;
+
+  const maxW = Math.min(W * 0.86, 1360);
+
+  /* 先按 BASEF 量出各团宽度，决定折几行 */
+  const sw = spans.map((s) => measureTxt(text.slice(s.i0, s.i1), BASEF));
+  const totalW = sw.reduce((a, b) => a + b, 0);
+  let nrows = 1;
+  if (totalW > maxW) nrows = Math.min(ROWCAP, Math.max(2, Math.ceil(totalW / maxW)));
+
+  /* 均衡折行：每行目标宽度 = 总宽 / 行数，超了就在**团边界**断 */
+  const target = totalW / Math.max(1, nrows);
+  const rows = [];
+  let cur = [], acc = 0;
+  for (let k = 0; k < spans.length; k++) {
+    if (cur.length && acc + sw[k] > target * 1.05 && rows.length < nrows - 1) {
+      rows.push(cur); cur = []; acc = 0;
+    }
+    cur.push(k); acc += sw[k];
+  }
+  if (cur.length) rows.push(cur);
+
+  const rowTexts = rows.map((r) => text.slice(spans[r[0]].i0, spans[r[r.length - 1]].i1));
+
+  /* 字号：BASE 封顶，最宽那行放不下再整体缩 */
+  let fs = BASEF;
+  const wmax = Math.max.apply(null, rowTexts.map((t) => measureTxt(t, BASEF)));
+  if (wmax > maxW) fs = BASEF * (maxW / wmax);
+
+  const lineH = fs * 1.46;
+  const cy0 = H / 2 - (rows.length - 1) * lineH / 2;
+
+  const groups = [];
+  let ptsTotal = 0;
+  for (let r = 0; r < rows.length; r++) {
+    const rt = rowTexts[r];
+    const left = (W - measureTxt(rt, fs)) / 2;
+    const y = Math.round(cy0 + r * lineH);
+    const base = spans[rows[r][0]].i0;
+    for (const k of rows[r]) {
+      const s = spans[k];
+      const str = text.slice(s.i0, s.i1);
+      if (!str) continue;
+      const pts = samplePts(str, fs);
+      if (!pts.length) continue;
+      /* 每团的起点用**前缀宽度**量，不能让各团自己量 —— 会累积误差、整行越走越偏。
+         ★ 量完必须 round 到整数像素：采样格是整数、绘制时又要 (px+0.5)|0 取整，
+         起点带小数的话，恰好落在 .5 附近的整行方块会被呼吸抖动顶到隔壁像素，
+         笔画上出现一排排横向断线（看着像字被腐蚀了）。 */
+      const x0 = Math.round(left + measureTxt(text.slice(base, s.i0), fs));
+      /* 节奏 = 团内**首字**的 YRC 绝对秒；没有 YRC 才按字数比例分 */
+      let t = (chars && chars[s.i0] && typeof chars[s.i0].t === 'number')
+        ? chars[s.i0].t
+        : line.t + (line.dur || 4) * (s.i0 / Math.max(1, text.length));
+      ptsTotal += pts.length / 2;
+      groups.push({ t, x0, y, w: measureTxt(str, fs), pts });
+    }
+  }
+  if (!groups.length) return null;
+
+  /* 时间必须单调，否则 seek 回来会出现"后面的团先吸过去" */
+  for (let k = 1; k < groups.length; k++) if (groups[k].t < groups[k - 1].t) groups[k].t = groups[k - 1].t;
+
+  /* 最后一团不能拖到换句之后 —— 留出 GLEAD 秒飞过去，换句前必须闭合 */
+  const tMax = endT - 0.55;
+  if (tMax > line.t) {
+    for (const g of groups) if (g.t > tMax) g.t = tMax;
+    for (let k = 1; k < groups.length; k++) if (groups[k].t < groups[k - 1].t) groups[k].t = groups[k - 1].t;
+  }
+  return { groups, ptsTotal, next: 0 };
+}
+
+/* 成字的粒子上限：再多就糊成实心块，颗粒感全没了（其余留在星云里）。
+   2.2 万是为了让常见长度的句子能做到"一个采样点恰好一颗" —— 少一颗就是一个洞。 */
+const TEXT_BUDGET = 22000;
+
+/** 派一团：把离它最近的自由粒子吸过去，落点就是这一团的字形采样点 */
+function claim(L, g) {
+  const pc = g.pts.length / 2;
+  if (!pc) return;
+  const K = Math.max(40, Math.min(
+    Math.round(TEXT_BUDGET * pc / Math.max(1, L.ptsTotal)),
+    pc,
+  ));
+  const gx = g.x0 + g.w / 2, gy = g.y;
+  const free = [];
+  for (let i = 0; i < N; i++) {
+    if (cl[i]) continue;
+    const dx = px[i] - gx, dy = py[i] - gy;
+    fd[i] = dx * dx + dy * dy;
+    free.push(i);
+  }
+  if (!free.length) return;
+
+  /* 只取最近的 K 颗。全量排序 3 万颗、每句 4 次，会有看得见的卡顿；
+     先在半径 R 的圆里找，不够再翻倍 —— 星云密度下 R=200 一般就够了，
+     排序量掉到 K 的量级。 */
+  let R = 200, sel;
+  for (;;) {
+    const r2 = R * R;
+    sel = [];
+    for (let k = 0; k < free.length; k++) if (fd[free[k]] < r2) sel.push(free[k]);
+    if (sel.length >= K || R > 3000) break;
+    R *= 2;
+  }
+  sel.sort((a, b) => fd[a] - fd[b]);
+
+  const n = Math.min(K, sel.length);
+  for (let k = 0; k < n; k++) {
+    const i = sel[k];
+    /* k:pc 一一对应 —— n === pc 时恰好"一个采样点一颗"，方块 3×3 、格距 3px，
+       既不留洞也不重叠。给了随机抖动反而糟糕：±0.35px 取整就会顶偏一格，
+       笔画上到处是 1px 的缺口，整句看起来像噪点。 */
+    const p = (Math.floor(k * pc / n) % pc) * 2;
+    tx[i] = g.x0 + g.pts[p];
+    ty[i] = g.y + g.pts[p + 1];
+    cl[i] = 1;
+  }
+  g.done = true;
+}
+
+/** 自由粒子的目标：铺成一片椭圆星云 */
+function fieldTargets(all) {
+  for (let i = 0; i < N; i++) {
+    if (!all && cl[i]) continue;
+    const a = Math.random() * 6.283;
+    const r = Math.sqrt(Math.random());
+    tx[i] = W * 0.5 + Math.cos(a) * r * W * 0.47;
+    ty[i] = H * 0.5 + Math.sin(a) * r * H * 0.45;
+    cl[i] = 0;
+  }
+}
+fieldTargets(true);
+
+let lines = [];
+let active = -1;
+let hasText = false;
+let lay = null;
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+const hint = document.getElementById('hint');
+let last = performance.now();
+let t0 = 0;
+let lastT = -1;
+let rollAcc = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+
+  /* ================= 节奏 =================
+     GLEAD = 每一团的提前量：够粒子从星云飞进字形，正好在 YRC 首字那一刻锁住。
+     0.5 秒是按弹簧收敛算的：起始 400px 外、增益 12，指数尾巴要走 ~0.5 秒才收进 1px。
+     给 0.42 时唱到那一刻字还糊着，看起来"晚了半拍"。
+     LEAD  = 换句提前量：只比 GLEAD 多 0.03 秒 —— 刚够算好新句布局。
+     两者不能差太多：差 0.13 秒时，旧句已经散开、首团还没出发，屏幕会空一下。 */
+  const GLEAD = 0.5;
+  const LEAD = 0.53;
+  if (lines.length) {
+    if (T < lastT - 0.6) { active = -1; lay = null; }   // 拖进度条才允许回退
+    lastT = T;
+    let idx = -1;
+    for (let i = 0; i < lines.length; i++) if (lines[i].t - LEAD <= T) idx = i; else break;
+    if (active >= 0 && idx < active) idx = active;      // 单调不回退
+    if (idx !== active) {
+      active = idx;
+      const cur = idx >= 0 ? lines[idx] : null;
+      const endT = cur
+        ? (idx + 1 < lines.length ? lines[idx + 1].t : cur.t + (cur.dur || 4))
+        : 0;
+      lay = cur ? layoutLine(cur, endT) : null;
+      /* 旧句整句散回星云，新句的团再一个个把它们抓回来 ——
+         这样"上一句"不会和新句叠在一起糊成一片。 */
+      fieldTargets(true);
+      hasText = !!lay;
+    }
+    /* 逐团吸附：到点前 GLEAD 秒派活。seek 跨过一整段时这里会连续补上，不会漏字 */
+    if (lay) {
+      while (lay.next < lay.groups.length && T >= lay.groups[lay.next].t - GLEAD) {
+        claim(lay, lay.groups[lay.next]);
+        lay.next++;
+      }
+    }
+    hint.style.opacity = lines.length ? (active >= 0 ? '0' : '1') : '0.5';
+  }
+
+  /* 星云也得一直在动：每 0.45 秒给一小撮自由粒子换个去处，别让它们凝住 */
+  rollAcc += dt;
+  if (rollAcc > 0.45) {
+    rollAcc = 0;
+    for (let n = 0; n < 1400; n++) {
+      const i = (Math.random() * N) | 0;
+      if (cl[i]) continue;
+      const a = Math.random() * 6.283, r = Math.sqrt(Math.random());
+      tx[i] = W * 0.5 + Math.cos(a) * r * W * 0.47;
+      ty[i] = H * 0.5 + Math.sin(a) * r * H * 0.45;
+    }
+  }
+
+  /* ---- 弹簧 + 永久扰动，没有静止态 ----
+     成字的粒子：远处全速冲（上限 1800），近处自然减速，0.4 秒内到位；
+     自由粒子：慢悠悠地漂（上限 260），当背景星云，不许抢戏。 */
+  for (let i = 0; i < N; i++) {
+    const dx = tx[i] - px[i], dy = ty[i] - py[i];
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const on = cl[i];
+    const cap = on ? 1800 : 260;
+    const want = Math.min(cap, d * (on ? 12 : 3));
+    const resp = Math.min(1, dt * (on ? 6 : 2.2));
+    vx[i] += ((dx / d) * want - vx[i]) * resp;
+    vy[i] += ((dy / d) * want - vy[i]) * resp;
+    // 永久扰动：让字是"活的"，也保证没有静止态。
+    // 成字的粒子只给 1/4（抖动 ~0.17px，不会被取整顶到隔壁格子），星云的照旧。
+    const wob = on ? 2.5 : 10;
+    vx[i] += Math.sin(t0 * 1.9 + jt[i]) * wob * dt;
+    vy[i] += Math.cos(t0 * 1.5 + jt[i] * 1.7) * wob * dt;
+    px[i] += vx[i] * dt; py[i] += vy[i] * dt;
+  }
+
+  /* ================= 绘制 ================= */
+  /* ① 淡出：整屏一次位运算。每个通道减半 —— 这一下同时就是**拖尾**：
+     成字的粒子每秒飞 1800px（帧间 30px），半衰后能留 4~5 帧残影，
+     形变那股流就看得见了；静止时残影正好压在颗粒下面，不影响清晰度。 */
+  for (let i = 0; i < lim; i++) u32[i] = 0xff000000 | ((u32[i] >>> 1) & 0x7f7f7f7f);
+
+  /* ② 粒子：直接写像素。成字的 3×3（采样步长也是 3，刚好铺满，靠每颗亮度不同抖出沙的质感），
+     星云的 2×2 且暗 —— 背景有颗粒感，又不跟字抢。
+     两趟分开写：星云先铺，字后盖，否则飘到字上的尘埃会把亮像素抠成暗点。 */
+  const CW = cv.width, CH = cv.height;
+  for (let i = 0; i < N; i++) {
+    if (cl[i]) continue;
+    const X = (px[i] + 0.5) | 0, Y = (py[i] + 0.5) | 0;
+    if (X < 1 || X >= CW - 1 || Y < 1 || Y >= CH - 1) continue;
+    const o = Y * CW + X, c = DC[i & 3];
+    u32[o] = c; u32[o + 1] = c; u32[o + CW] = c; u32[o + CW + 1] = c;
+  }
+  for (let i = 0; i < N; i++) {
+    if (!cl[i]) continue;
+    /* +0.5 再取整 = 四舍五入到最近像素。采样点都在整数像素上，
+       这样 ±0.17px 的呼吸抖动不会把方块顶到隔壁格子（直接 |0 会一半一半地跳）。 */
+    const X = (px[i] + 0.5) | 0, Y = (py[i] + 0.5) | 0;
+    if (X < 1 || X >= CW - 1 || Y < 1 || Y >= CH - 1) continue;
+    const o = Y * CW + X, c = TC[i & 3];
+    u32[o - 1] = c; u32[o] = c; u32[o + 1] = c;
+    u32[o + CW - 1] = c; u32[o + CW] = c; u32[o + CW + 1] = c;
+    u32[o + 2 * CW - 1] = c; u32[o + 2 * CW] = c; u32[o + 2 * CW + 1] = c;
+  }
+  ctx.putImageData(img, 0, 0);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+
+/* 空格暂停/播放。焦点在 iframe 里时父页面收不到键盘事件，
+   所以要主动转发过去（和 F5 是同一个道理）。 */
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+
+addEventListener('resize', () => { resize(); fieldTargets(true); });
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    active = -1; lastT = -1; lay = null; hasText = false;
+    if (p.accent) { accent = p.accent; palette(); }
+    fieldTargets(true);                // 没有歌词时也在互相重组，不是静止的圆
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：只给一点点微光。
+       原来给到 120px/s，而且方向是逐颗随机的 —— 每个鼓点整群粒子乱窜，
+       字一直在抖，根本看不清。而且那个速度远超拖尾阈值，
+       于是每一拍所有粒子都拖出尾迹，整句直接糊掉。 */
+    const k = 12 * (0.4 + (d.payload.level || 0));
+    for (let i = 0; i < N; i++) {
+      const f = cl[i] ? 0.55 : 1.5;
+      vx[i] += Math.sin(jt[i] + t0) * k * f;
+      vy[i] += Math.cos(jt[i] + t0) * k * f;
+    }
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+window.__stage = () => ({
+  lines: lines.length, active, hasText, accent, t: +now().toFixed(2),
+  dict: !!DICT, rows: lay ? lay.groups.length : 0, next: lay ? lay.next : 0,
+  onText: cl.reduce((a, b) => a + b, 0),
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,1327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>傅里叶绘图</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060c;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,205,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   047 · 傅里叶绘图 —— 字就是它自己的傅里叶级数
+   ---------------------------------------------------------------------------
+   和已有形态的区别：041 万花尺也是"一支笔把字描出来"，但它的笔滚的是**内摆线**，
+   下一段走哪个齿比要靠 288 个候选打分搜索（字是"找"出来的，笔画是蹭亮的高光）。
+   这里没有任何搜索、没有目标点、没有距离场：
+   **字形的几何本身就是那条曲线的系数**。屏幕上的每一支笔都在解同一个方程
+     z(t) = Σ_{k=-K..K} c_k · e^{i2πkt}
+   把 K 截断，剩下的圆就是屏幕上看得见的那串相量环。
+
+   机制：
+     ① 字形光栅 → 格子占据图 → 沿"实心格/空格"的边界抽出一圈圈闭合轮廓
+        （每个笔画是一个环；字的内部孔洞自然成为反向环）。
+     ② 每个环等弧长重采样成 M 点，做离散傅里叶变换，得到 2K+1 个复系数 c_k。
+        把 c_k 重新叠回去、按 M 个参数点求和，得到的就是那个环本身
+        （截断 = 抹掉拐角的高频抖动，所以笔画端头是圆的）。
+     ③ 每个环配一支笔。相位按环的 x 排序错开 → 整行字从左往右写出来。
+        笔走过的地方留下墨；笔绕完一圈，这个笔画**实心落下去**
+        （Path2D 累积 + evenodd，孔洞自动挖掉）。写完后笔不停，
+        继续绕自己的轮廓转 —— 字上始终跑着一层会绕圈的光。
+     ④ 参考页的"圆环"保留并强化：屏幕上一直画着**幅值最大那个环**的相量链
+        （按 |c_k| 递减叠圆 + 辐条），半径一圈圈缩小，笔尖正好落在字的笔画上。
+        右下角同步画出它的谐波幅值谱。
+     ⑤ 背景那层暗点阵是**输入数据**：字形采样点按等间隔重抽样铺成的底稿
+        （`(Math.floor(k*pc/K) % pc) * 2`，交接说明第四节）。级数负责把它画实。
+     ⑥ 换句：所有笔释放 —— 火星向外飞散、消散；上一句的轮廓整体淡出。
+
+   为什么快（坑⑨⑩⑪都躲开了）：
+     · 每帧的墨只有 3 条 Path2D：已完成环（增量累积，不重建）、活跃弧（合批）、
+       热弧（笔尖那一段）。全场一共 3~5 次 stroke，不是几千次。
+     · 光斑、底稿点阵、背景（径向渐变 + 点阵 + 暗角）全是**预渲染位图**，
+       每帧只有 drawImage；帧内没有一次 createRadialGradient、没有一次拼 rgba 字符串。
+     · 字形→轮廓→DFT 每句只做一次，并按句文本缓存（重复句零成本）。
+     · 笔尖位置直接取重建点数组的下标 —— 每帧没有逐笔的三角函数求和。
+
+    精修记录：① **接入 YRC**——每个笔画环记下自己属于第几个字（看环心落进哪个字框），
+       该环的书写窗口就是 [chars[k].t, chars[k+1].t]；同一字里的几个环再按左边界错开
+       一点，于是"笔走到哪里 = 唱到哪个字"。无 chars / 长度不符时按 line.t + dur*k/n
+       均分回退（已单调钳位），绝不报错。
+     ② 长句先折 1~3 行再定字号：41 字从"单行 28px、笔画糊成一条横线"变成 3 行约 90px，
+       字形与右下角的谐波谱都看得清；还没轮到的笔画留一层淡底稿，整句始终完整可见。
+     ③ 换句：上一句轮廓整块淡出、火星释放；踩拍仍是全场相干（字形整体微涨 + 相量链变亮）。
+     分词：不接 —— 笔是按"环"分配的，环又按"字"归组，词边界在这里是更粗的一层，
+     加进来只会让同一句的书写节奏变糊。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const TAU = Math.PI * 2;
+
+let W = 0, H = 0, DPR = 1;
+
+/* ---------------- 调色（封面主色 → 全部颜色只在这里算一次） ---------------- */
+let ACC = [118, 204, 255];
+let C_DIM = '', C_MID = '', C_HOT = '', C_FILL = '', C_GHOST = '', C_READ = '', C_CHAIN = '', C_GLOW = '', C_RING = '', C_INK1 = '', C_INK2 = '', C_TRAIL = '', C_WET = '', C_TRAIL_GLOW = '', C_PEND = '';
+let SPR_TIP = null, SPR_DUST = null;
+
+const mixc = (c, t) => [c[0] + (255 - c[0]) * t, c[1] + (255 - c[1]) * t, c[2] + (255 - c[2]) * t];
+const rgba = (c, a) => 'rgba(' + (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0) + ',' + a + ')';
+
+function makeSprite(sz, stops) {
+  const c = document.createElement('canvas');
+  c.width = c.height = sz;
+  const g = c.getContext('2d');
+  const r = sz / 2;
+  const rg = g.createRadialGradient(r, r, 0, r, r, r);
+  for (let i = 0; i < stops.length; i++) rg.addColorStop(stops[i][0], stops[i][1]);
+  g.fillStyle = rg;
+  g.fillRect(0, 0, sz, sz);
+  return c;
+}
+
+function setAccent(a) {
+  if (a && a.length >= 3 && (a[0] | 0) + (a[1] | 0) + (a[2] | 0) > 60) ACC = [a[0] | 0, a[1] | 0, a[2] | 0];
+  const base = ACC;
+  const mid = mixc(base, 0.34);
+  const hot = mixc(base, 0.80);
+  C_DIM = rgba(mixc(base, 0.08), 0.50);
+  C_MID = rgba(mid, 0.74);
+  C_HOT = rgba(mixc(base, 0.66), 0.95);
+  C_FILL = rgba(base, 0.20);
+  C_GLOW = rgba(base, 0.08);
+  C_GHOST = rgba(mixc(base, 0.30), 0.045);
+  C_READ = rgba(mixc(base, 0.55), 0.34);
+  C_CHAIN = rgba(mixc(base, 0.48), 0.32);
+  C_RING = rgba(mixc(base, 0.35), 0.11);
+  C_INK1 = rgba(base, 0.085);
+  C_INK2 = rgba(base, 0.155);
+  C_WET = rgba(mixc(base, 0.28), 0.62);
+  C_PEND = rgba(mixc(base, 0.40), 0.34);
+  C_TRAIL = rgba(mixc(base, 0.55), 0.62);
+  C_TRAIL_GLOW = rgba(base, 0.10);
+  SPR_TIP = makeSprite(64, [
+    [0, rgba([255, 255, 255], 0.95)],
+    [0.13, rgba(hot, 0.52)],
+    [0.40, rgba(base, 0.15)],
+    [1, rgba(base, 0)]
+  ]);
+  SPR_DUST = makeSprite(32, [
+    [0, rgba(hot, 0.92)],
+    [0.34, rgba(base, 0.34)],
+    [1, rgba(base, 0)]
+  ]);
+}
+
+/* ---------------- 背景：一次烘一张，每帧一次 drawImage ---------------- */
+let BGCV = null;
+function buildBg() {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * DPR));
+  c.height = Math.max(1, Math.round(H * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const rg = g.createRadialGradient(W * 0.5, H * 0.46, 0, W * 0.5, H * 0.46, Math.max(W, H) * 0.78);
+  rg.addColorStop(0, '#080d18');
+  rg.addColorStop(0.55, '#05070e');
+  rg.addColorStop(1, '#03040a');
+  g.fillStyle = rg;
+  g.fillRect(0, 0, W, H);
+
+  /* 中心的一点底光，让字落下去的地方不是纯黑 */
+  const cg = g.createRadialGradient(W * 0.5, H * 0.47, 0, W * 0.5, H * 0.47, Math.min(W * 0.52, H * 0.92));
+  cg.addColorStop(0, rgba(ACC, 0.055));
+  cg.addColorStop(1, rgba(ACC, 0));
+  g.fillStyle = cg;
+  g.fillRect(0, 0, W, H);
+
+  /* 点阵：坐标纸 */
+  g.fillStyle = rgba(mixc(ACC, 0.45), 0.105);
+  const sp = 30;
+  for (let j = 0, y = sp * 0.5; y < H; y += sp, j++) {
+    for (let i = 0, x = sp * 0.5; x < W; x += sp, i++) {
+      const big = (i % 5 === 0 && j % 5 === 0);
+      g.fillRect(x, y, big ? 2 : 1, big ? 2 : 1);
+    }
+  }
+
+  /* 暗角 */
+  const vg = g.createRadialGradient(W * 0.5, H * 0.5, Math.min(W, H) * 0.34, W * 0.5, H * 0.5, Math.max(W, H) * 0.74);
+  vg.addColorStop(0, 'rgba(2,4,10,0)');
+  vg.addColorStop(1, 'rgba(2,4,10,0.88)');
+  g.fillStyle = vg;
+  g.fillRect(0, 0, W, H);
+
+  BGCV = c;
+}
+
+/* ---- 每句一张"纸"：背景 + 这一句的输入点阵，合成好之后每帧只要一次 drawImage ----
+   （点阵是缩放后带 alpha 的位图，逐帧画它实测占掉整帧的 1/4；烘进纸里就没了） */
+let PAPER = null, PENDING = null;
+
+/* ---- 写完的墨也烘一张：只有"多写完一个环"才重画，每帧一次 drawImage ---- */
+let inkCv = null, inkG = null, inkDoneN = -1, inkAt = 0;
+function buildInk() {
+  const w = Math.max(2, Math.round(W * DPR)), h = Math.max(2, Math.round(H * DPR));
+  if (!inkCv) inkCv = document.createElement('canvas');
+  inkCv.width = w; inkCv.height = h;
+  inkG = inkCv.getContext('2d');
+  inkDoneN = -1;
+}
+
+function makePaper(geo) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * DPR));
+  c.height = Math.max(1, Math.round(H * DPR));
+  const g = c.getContext('2d');
+  g.globalCompositeOperation = 'source-over';
+  g.globalAlpha = 1;
+  g.drawImage(BGCV, 0, 0);
+  if (geo && geo.ghost) {
+    g.setTransform(DPR, 0, 0, DPR, 0, 0);
+    g.translate(W / 2, H * 0.47);
+    g.scale(geo.gs, geo.gs);
+    g.imageSmoothingEnabled = false;
+    g.drawImage(geo.ghost, -geo.gw / 2, -geo.gh / 2, geo.gw, geo.gh);
+    g.imageSmoothingEnabled = true;
+  }
+  return c;
+}
+
+/* ============================================================================
+   几何：字形 → 格子占据 → 闭合轮廓 → 等弧长重采样 → DFT
+   ========================================================================== */
+const offc = document.createElement('canvas');
+const octx = offc.getContext('2d', { willReadFrequently: true });
+
+/* 字形光栅（同时给出按扫描顺序的点云，底稿要用）
+   **长句必须先折行再定字号**：41 字挤成一行时字号只有 28px 上下，
+   格子边长和笔画一样粗，抽出来的轮廓会糊成一条横线（第一批就是这样）。
+   这里按 1~3 行铺开、字号实测能到 90px，DFT 才有东西可描。
+   同时记下每个字的字框（boxes），YRC 靠它把"环"分配到"字"。 */
+const GFNT = (sz) => '800 ' + sz.toFixed(1) + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+function wrapGlyph(s, fs, availW) {
+  octx.font = GFNT(fs);
+  if (!s) return [];
+  const n = s.length;
+  const total = octx.measureText(s).width;
+  const rows = Math.max(1, Math.min(3, Math.ceil(total / Math.max(1, availW))));
+  if (rows === 1) return [s];
+  /* 中文没有空格：按字数**均分**，否则贪心折行会把最后一行只剩两三个字 */
+  const per = Math.ceil(n / rows);
+  const out = [];
+  for (let i = 0; i < n; i += per) out.push(s.slice(i, i + per));
+  return out;
+}
+
+function glyphMask(text) {
+  const F = 128;
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  const maxW = Math.min(W * 0.86, 1300);
+  const maxH = Math.min(H * 0.56, 470);
+  octx.font = GFNT(F);
+  const w100 = Math.max(1, octx.measureText(s || ' ').width);
+  /* 枚举 1~3 行，取宽度与高度都放得下的最大字号。
+     上限 72px 是性能与可读性的折中：字形是"路径填+描"，面积越大软光栅越慢。 */
+  let fs = 20;
+  for (let nl = 1; nl <= 3; nl++) {
+    const a = maxW * nl / (w100 / F);
+    const b = maxH / (nl * 1.26);
+    const f = Math.min(a, b, 72);
+    if (f > fs) fs = f;
+  }
+  let rows = wrapGlyph(s, fs, maxW);
+  let guard = 0;
+  while ((rows.length > 3 || !rows.length) && fs > 12 && guard++ < 40) { fs *= 0.92; rows = wrapGlyph(s, fs, maxW); }
+  if (!rows.length) rows = [s || ' '];
+
+  const lh = fs * 1.26;
+  octx.font = GFNT(fs);
+  let blockW = 0;
+  for (const r of rows) blockW = Math.max(blockW, octx.measureText(r).width);
+  const blockH = rows.length * lh;
+  const w = Math.max(8, Math.ceil(blockW) + 12);
+  const h = Math.max(8, Math.ceil(blockH) + 12);
+  offc.width = w; offc.height = h;
+  octx.clearRect(0, 0, w, h);
+  octx.font = GFNT(fs);
+  octx.textAlign = 'center';
+  octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  const y0 = (h - blockH) / 2;
+  const boxes = [];                 // 每个字：{ci, x0, x1, xc, yc}（画布坐标）
+  let ci = 0;
+  for (let ri = 0; ri < rows.length; ri++) {
+    const r = rows[ri];
+    const rw = octx.measureText(r).width;
+    let x = (w - rw) / 2;
+    const yc = y0 + lh * (ri + 0.5);
+    for (const ch of r) {
+      const cw = octx.measureText(ch).width;
+      octx.fillText(ch, x + cw / 2, yc);
+      boxes.push({ ci: ci++, x0: x, x1: x + cw, xc: x + cw / 2, yc });
+      x += cw;
+    }
+  }
+  const data = octx.getImageData(0, 0, w, h).data;
+  /* 点云（和交接说明一致的扫描顺序，step 2） */
+  const pts = [];
+  for (let y = 0; y < h; y += 2)
+    for (let x = 0; x < w; x += 2)
+      if (data[(y * w + x) * 4 + 3] > 128) pts.push(x - w / 2, y - h / 2);
+  return { data, w, h, fs, pts, boxes, n: ci };
+}
+
+/* 沿实心格/空格的边界走一圈：每条边都有方向（实心在左手边），
+   所以所有边天然首尾相连成闭合环；孔洞自动是反向环。 */
+function traceContours(filled, cw, ch) {
+  const VW = cw + 1;
+  const nV = VW * (ch + 1);
+  const head = new Int32Array(nV).fill(-1);
+  const eFrom = [], eTo = [], eDir = [], eNext = [];
+  const F = (i, j) => (i >= 0 && i < cw && j >= 0 && j < ch) ? filled[j * cw + i] : 0;
+  const push = (fx, fy, tx, ty, dir) => {
+    const e = eFrom.length;
+    const v = fy * VW + fx;
+    eFrom.push(v); eTo.push(ty * VW + tx); eDir.push(dir); eNext.push(head[v]); head[v] = e;
+  };
+  for (let j = 0; j < ch; j++) {
+    for (let i = 0; i < cw; i++) {
+      if (!filled[j * cw + i]) continue;
+      if (!F(i, j - 1)) push(i, j, i + 1, j, 0);
+      if (!F(i + 1, j)) push(i + 1, j, i + 1, j + 1, 1);
+      if (!F(i, j + 1)) push(i + 1, j + 1, i, j + 1, 2);
+      if (!F(i - 1, j)) push(i, j + 1, i, j, 3);
+    }
+  }
+  const nE = eFrom.length;
+  const used = new Uint8Array(nE);
+  const used2 = new Uint8Array(nE);
+  const pick = (v, indir) => {
+    for (let k = 0; k < 4; k++) {
+      const d = k === 0 ? ((indir + 1) & 3) : (k === 1 ? indir : (k === 2 ? ((indir + 3) & 3) : ((indir + 2) & 3)));
+      for (let e = head[v]; e !== -1; e = eNext[e]) if (!used2[e] && eDir[e] === d) return e;
+    }
+    return -1;
+  };
+  const polys = [];
+  for (let e0 = 0; e0 < nE; e0++) {
+    if (used[e0]) continue;
+    const startV = eFrom[e0];
+    const path = [];
+    let cur = e0;
+    let guard = 0;
+    while (cur >= 0 && !used[cur] && guard++ < 24000) {
+      used[cur] = 1; used2[cur] = 1;
+      path.push(eFrom[cur]);
+      const v = eTo[cur];
+      if (v === startV) break;
+      cur = pick(v, eDir[cur]);
+    }
+    if (path.length < 3) continue;
+    /* 顶点 → 细胞坐标 */
+    const n = path.length;
+    const xs = new Float32Array(n), ys = new Float32Array(n);
+    let perim = 0, x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (let i = 0; i < n; i++) {
+      const v = path[i];
+      const vx = v % VW, vy = (v - vx) / VW;
+      xs[i] = vx; ys[i] = vy;
+      if (vx < x0) x0 = vx; if (vx > x1) x1 = vx;
+      if (vy < y0) y0 = vy; if (vy > y1) y1 = vy;
+      const j2 = (i + 1) % n;
+      perim += Math.abs(xs[j2] - vx) + Math.abs(ys[j2] - vy);
+    }
+    polys.push({ xs, ys, n, perim, bw: x1 - x0, bh: y1 - y0 });
+  }
+  return polys;
+}
+
+/* 闭合折线按弧长等间隔重采样 */
+function resampleLoop(p, M) {
+  const n = p.n, xs = p.xs, ys = p.ys;
+  const seg = new Float32Array(n);
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    const d = Math.hypot(xs[j] - xs[i], ys[j] - ys[i]);
+    seg[i] = d; total += d;
+  }
+  const out = new Float64Array(M * 2);
+  if (total < 1e-6) return out;
+  const step = total / M;
+  let i = 0, acc = 0;
+  for (let k = 0; k < M; k++) {
+    const target = k * step;
+    while (i < n - 1 && acc + seg[i] < target) { acc += seg[i]; i++; }
+    const j = (i + 1) % n;
+    const t = seg[i] > 1e-9 ? Math.min(1, Math.max(0, (target - acc) / seg[i])) : 0;
+    out[k * 2] = xs[i] + (xs[j] - xs[i]) * t;
+    out[k * 2 + 1] = ys[i] + (ys[j] - ys[i]) * t;
+  }
+  return out;
+}
+
+/* 单位根表缓存（M 只有十几个取值，建一次就好） */
+const TRIG = new Map();
+function trig(M) {
+  let t = TRIG.get(M);
+  if (!t) {
+    const cs = new Float64Array(M), sn = new Float64Array(M);
+    for (let i = 0; i < M; i++) { const a = TAU * i / M; cs[i] = Math.cos(a); sn[i] = Math.sin(a); }
+    t = { cs, sn };
+    TRIG.set(M, t);
+  }
+  return t;
+}
+
+/* c_k = (1/M) Σ z_n e^{-i2πkn/M}，取 k = -K..K */
+function dft(pts, M, K) {
+  const T = trig(M), cs = T.cs, sn = T.sn;
+  const R = K * 2 + 1;
+  const co = new Float64Array(R * 2);
+  for (let ki = 0; ki < R; ki++) {
+    const km = (((ki - K) % M) + M) % M;
+    let re = 0, im = 0, idx = 0;
+    for (let n = 0; n < M; n++) {
+      const c = cs[idx], s = -sn[idx];
+      const x = pts[n * 2], y = pts[n * 2 + 1];
+      re += x * c - y * s;
+      im += x * s + y * c;
+      idx += km; if (idx >= M) idx -= M;
+    }
+    co[ki * 2] = re / M;
+    co[ki * 2 + 1] = im / M;
+  }
+  return co;
+}
+
+/* z(t) = Σ c_k e^{+i2πkt}，在 t = r/M 上求值 → 就是那个环 */
+function synth(co, M, K) {
+  const T = trig(M), cs = T.cs, sn = T.sn;
+  const R = K * 2 + 1;
+  const out = new Float64Array(M * 2);
+  for (let r = 0; r < M; r++) {
+    let x = 0, y = 0;
+    for (let ki = 0; ki < R; ki++) {
+      const km = (((ki - K) % M) + M) % M;
+      const idx = (km * r) % M;
+      const c = cs[idx], s = sn[idx];
+      const a = co[ki * 2], b = co[ki * 2 + 1];
+      x += a * c - b * s;
+      y += a * s + b * c;
+    }
+    out[r * 2] = x; out[r * 2 + 1] = y;
+  }
+  return out;
+}
+
+/* 底稿：字形采样点的等间隔重抽样（交接说明第四节的那个下标式子） */
+function buildGhost(G) {
+  const gw = Math.max(2, G.w), gh = Math.max(2, G.h);
+  const c = document.createElement('canvas');
+  c.width = gw; c.height = gh;
+  const g = c.getContext('2d');
+  g.setTransform(1, 0, 0, 1, G.w / 2, G.h / 2);
+  const pc = Math.floor(G.pts.length / 2);
+  if (!pc) return { cv: c, w: G.w, h: G.h };
+  const K = Math.min(pc, 2600);
+  const p = new Path2D();
+  for (let k = 0; k < K; k++) {
+    const q = (Math.floor(k * pc / K) % pc) * 2;
+    p.rect(G.pts[q] - 0.55, G.pts[q + 1] - 0.55, 1.1, 1.1);
+  }
+  g.fillStyle = C_GHOST;
+  g.fill(p);
+  return { cv: c, w: G.w, h: G.h };
+}
+
+const LOOP_CAP = 240;
+const MIN_PERIM = 3.2;
+
+function buildLine(text) {
+  const bt = performance.now();
+  const G = glyphMask(text || '');
+  const w = G.w, h = G.h, data = G.data;
+  const CELL = Math.max(2, Math.min(3, Math.round(G.fs / 56)));
+  const cw = Math.ceil(w / CELL), ch = Math.ceil(h / CELL);
+  const cov = new Uint16Array(cw * ch);
+  for (let y = 0; y < h; y++) {
+    const cy = (y / CELL) | 0, row = cy * cw, base = y * w * 4;
+    for (let x = 0; x < w; x++) if (data[base + x * 4 + 3] > 120) cov[row + ((x / CELL) | 0)]++;
+  }
+  const need = CELL * CELL * 0.5;
+  const filled = new Uint8Array(cw * ch);
+  for (let i = 0; i < cov.length; i++) if (cov[i] >= need) filled[i] = 1;
+
+  let raw = traceContours(filled, cw, ch);
+  raw = raw.filter((p) => p.perim >= MIN_PERIM && (p.bw > 1 || p.bh > 1));
+  raw.sort((a, b) => b.perim - a.perim);
+  if (raw.length > LOOP_CAP) raw = raw.slice(0, LOOP_CAP);
+
+  const loops = [];
+  for (let li = 0; li < raw.length; li++) {
+    const rp = raw[li];
+    const M = Math.max(18, Math.min(56, Math.round(rp.perim * 0.5)));
+    const cellPts = resampleLoop(rp, M);
+    const px = new Float64Array(M * 2);
+    let x0 = 1e9;
+    for (let i = 0; i < M; i++) {
+      const x = cellPts[i * 2] * CELL - w / 2;
+      const y = cellPts[i * 2 + 1] * CELL - h / 2;
+      px[i * 2] = x; px[i * 2 + 1] = y;
+      if (x < x0) x0 = x;
+    }
+    const K = Math.max(4, Math.min(14, Math.round(M / 3.4)));
+    const co = dft(px, M, K);
+    const rec = synth(co, M, K);
+    /* 笔落点转到环的最左上角 */
+    let bi = 0, bs = 1e9;
+    for (let i = 0; i < M; i++) {
+      const s = rec[i * 2] + rec[i * 2 + 1] * 0.42;
+      if (s < bs) { bs = s; bi = i; }
+    }
+    const pts = new Float64Array(M * 2);
+    for (let i = 0; i < M; i++) {
+      const j = (i + bi) % M;
+      pts[i * 2] = rec[j * 2]; pts[i * 2 + 1] = rec[j * 2 + 1];
+    }
+    const path = new Path2D();
+    path.moveTo(pts[0], pts[1]);
+    for (let i = 1; i < M; i++) path.lineTo(pts[i * 2], pts[i * 2 + 1]);
+    path.closePath();
+    /* 相量链要用：按幅值降序的谐波下标 */
+    const rank = [];
+    for (let ki = 0; ki < K * 2 + 1; ki++) {
+      if (ki === K) continue;
+      const m = Math.hypot(co[ki * 2], co[ki * 2 + 1]);
+      if (m > 0.35) rank.push([m, ki]);
+    }
+    rank.sort((a, b) => b[0] - a[0]);
+    const top = rank.slice(0, 7).map((r) => r[1]);
+    /* YRC：环心落进哪个字的字框，这个环就属于那个字 */
+    let mxp = 0, myp = 0;
+    for (let i = 0; i < M; i++) { mxp += px[i * 2]; myp += px[i * 2 + 1]; }
+    mxp = mxp / M + w / 2; myp = myp / M + h / 2;
+    let ciBest = 0, dB = 1e18;
+    for (let b = 0; b < G.boxes.length; b++) {
+      const bx = G.boxes[b];
+      const dx = bx.xc - mxp, dy = bx.yc - myp;
+      const d = dx * dx * 0.55 + dy * dy;
+      if (d < dB) { dB = d; ciBest = bx.ci; }
+    }
+    loops.push({
+      M, K, co, pts, path, top, x0, perim: rp.perim, ci: ciBest, sub: 0,
+      mag1: Math.hypot(co[(K + 1) * 2], co[(K + 1) * 2 + 1])
+    });
+  }
+
+  /* 书写顺序 = 字序（YRC 的时间轴），同一字里再从左到右：
+     于是"笔走到哪里"就是"唱到哪个字"，而不是跟着一个匀速进度条走 */
+  loops.sort((a, b) => (a.ci - b.ci) || (a.x0 - b.x0));
+  const n = loops.length;
+  for (let i = 0; i < n;) {
+    let j = i;
+    while (j < n && loops[j].ci === loops[i].ci) j++;
+    const cnt = j - i;
+    for (let k = 0; k < cnt; k++) loops[i + k].sub = cnt > 1 ? (k / cnt) * 0.55 : 0;
+    i = j;
+  }
+
+  /* 主角环：|c_1| 最大的那个（相量链最显眼） */
+  let hero = 0, hm = -1;
+  for (let i = 0; i < n; i++) if (loops[i].mag1 > hm) { hm = loops[i].mag1; hero = i; }
+
+  const ghost = buildGhost(G);
+  const gs = Math.max(0.5, Math.min(1.55, Math.min(W * 0.84 / w, H * 0.62 / h)));
+
+  return {
+    text, loops, hero, gs,
+    gw: ghost.w, gh: ghost.h, ghost: ghost.cv,
+    w, h, n, charN: G.n, gfs: +G.fs.toFixed(1),
+    buildMs: +(performance.now() - bt).toFixed(1)
+  };
+}
+/* ---------------- 句子缓存（重复句零成本） ---------------- */
+const cache = new Map();
+function getLine(text) {
+  const key = text + '@' + W + 'x' + H;
+  let L = cache.get(key);
+  if (!L) {
+    L = buildLine(text);
+    cache.set(key, L);
+    if (cache.size > 10) { const k = cache.keys().next().value; cache.delete(k); }
+  }
+  return L;
+}
+
+/* ============================================================================
+   粒子（笔尖甩出来的火星；换句时整体释放）
+   ========================================================================== */
+const NP = 420;
+const PX = new Float32Array(NP), PY = new Float32Array(NP);
+const PVX = new Float32Array(NP), PVY = new Float32Array(NP);
+const PL = new Float32Array(NP), PT = new Float32Array(NP), PS = new Float32Array(NP);
+const PA = new Uint8Array(NP);
+let pHead = 0, pAlive = 0;
+
+function emit(x, y, vx, vy, ttl, sz) {
+  const i = pHead;
+  pHead = (pHead + 1) % NP;
+  PX[i] = x; PY[i] = y; PVX[i] = vx; PVY[i] = vy;
+  PL[i] = ttl; PT[i] = ttl; PS[i] = sz; PA[i] = 1;
+}
+
+function stepParts(dt) {
+  const dr = Math.pow(0.10, dt);
+  let n = 0;
+  for (let i = 0; i < NP; i++) {
+    if (!PA[i]) continue;
+    PL[i] -= dt;
+    if (PL[i] <= 0) { PA[i] = 0; continue; }
+    PX[i] += PVX[i] * dt;
+    PY[i] += PVY[i] * dt;
+    PVX[i] *= dr; PVY[i] *= dr;
+    n++;
+  }
+  pAlive = n;
+}
+
+function releaseParts(cx, cy) {
+  for (let i = 0; i < NP; i++) {
+    if (!PA[i]) continue;
+    const dx = PX[i] - cx, dy = PY[i] - cy;
+    const l = Math.sqrt(dx * dx + dy * dy) + 1e-3;
+    PVX[i] += (dx / l) * 210;
+    PVY[i] += (dy / l) * 210;
+    if (PL[i] > 0.85) PL[i] = 0.85;
+  }
+}
+
+/* ============================================================================
+   节奏：1-10 的教训固化在这里
+   ========================================================================== */
+let lines = [];
+let cur = null, prev = null;
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let curT = 0, curDur = 3.2, writeT = 2.6;
+let beatP = 0, spawnAcc = 0;
+
+/* 逐字时刻：chars 与正文逐字对齐（长度相等 + 时间可解析）才采信，并做单调钳位；
+   否则 line.t + dur*k/n 均分回退 —— 缺 chars 绝不能报错。 */
+function charTimes(ln, n) {
+  const out = new Float32Array(n);
+  const txt = ln ? (ln.text || '') : '';
+  const chs = ln ? ln.chars : null;
+  const base = ln ? ln.t : 0;
+  const dur = ln ? (ln.dur || 3.2) : 3.2;
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* 一个环此刻写到几成：它的时间窗就是"所属那个字"的时间窗 */
+let ctCur = null, stepCur = 0.22;
+function phaseOf(lp) {
+  const ct = ctCur;
+  if (!ct || !ct.length) return 0;
+  const n = ct.length;
+  const k = lp.ci < n ? lp.ci : n - 1;
+  const st0 = ct[k];
+  const st1 = (k + 1 < n) ? ct[k + 1] : st0 + stepCur;
+  const span = Math.max(0.15, st1 - st0);
+  const off = lp.sub * span * 0.62;
+  const dur = Math.max(0.15, span * 0.95 - off);
+  return (now() - st0 - off) / dur;
+}
+
+function activate(i, T) {
+  const ln = lines[i];
+  if (!ln) return;
+  /* 上一句整块交给淡出层（轮廓一次性合批） */
+  if (cur) {
+    const p = new Path2D();
+    for (let k = 0; k < cur.geo.loops.length; k++) p.addPath(cur.geo.loops[k].path);
+    prev = { geo: cur.geo, path: p, t: 0.46, life: 0.46 };
+  }
+  const geo = getLine(ln.text || '');
+  /* 纸（背景 + 这一句的输入点阵）在酝酿阶段就合成好了，换句只剩交换引用 */
+  PAPER = (PENDING && PENDING.geo === geo) ? PENDING.cv : makePaper(geo);
+  if (PENDING && PENDING.geo !== geo && PENDING.cv) { /* 释放旧的那张 */ }
+  PENDING = null;
+  const ct = charTimes(ln, geo.charN || 0);
+  ctCur = ct.t;
+  stepCur = ct.t.length > 1 ? Math.max(0.12, (ct.t[ct.t.length - 1] - ct.t[0]) / (ct.t.length - 1)) : 0.22;
+  cur = {
+    geo,
+    ct: ct.t,
+    yrc: ct.yrc,
+    startT: ln.t,
+    writeT: Math.max(1.9, Math.min(5.2, (ln.dur || 3.2) * 0.75)),
+    donePath: new Path2D(),
+    startedPath: new Path2D(),
+    bandLow: new Path2D(),
+    bandMid: new Path2D(),
+    doneN: 0,
+    startedN: 0,
+    bandLowN: 0,
+    bandMidN: 0,
+    done: new Uint8Array(geo.n),
+    on: new Uint8Array(geo.n),
+    band: new Uint8Array(geo.n)
+  };
+  curT = ln.t; curDur = ln.dur || 3.2; writeT = cur.writeT;
+  inkDoneN = -1;                    /* 换句必须重烘墨层，否则会残留上一句的笔画 */
+  /* 换句必须释放粒子（坑③：池子绝不能被上一句占着） */
+  releaseParts(W / 2, H * 0.47);
+  hint.style.opacity = '0';
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    cur = null; prev = null; ctCur = null; inkDoneN = -1;
+    for (let i = 0; i < NP; i++) PA[i] = 0;
+    pAlive = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) activate(ci, T);
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      const gx = getLine(lines[nx].text || '');   /* 提前把轮廓 + DFT 算完（换句时零等待） */
+      if (!PENDING || PENDING.geo !== gx) PENDING = { geo: gx, cv: makePaper(gx) };
+    }
+  }
+}
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    cur = null; prev = null; ctCur = null; inkDoneN = -1;
+    for (let i = 0; i < NP; i++) PA[i] = 0;
+    pAlive = 0;
+    setAccent(p.accent);
+    buildBg();
+    PENDING = null;
+    PAPER = makePaper(null);
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍必须相干：全场的字一起涨一点、相量链一起亮一点，不逐颗乱踢 */
+    beatP = Math.min(1.25, beatP + 0.30 + 0.55 * (d.payload.level || 0));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ============================================================================
+   尺寸 / 空闲时的示例曲线
+   ========================================================================== */
+let IDLE = null;
+function buildIdle() {
+  const M = 120, K = 10;
+  const R = Math.min(W, H) * 0.24;
+  const px = new Float64Array(M * 2);
+  for (let i = 0; i < M; i++) {
+    const a = TAU * i / M;
+    px[i * 2] = R * (0.92 * Math.cos(3 * a) + 0.22 * Math.cos(5 * a + 1.1));
+    px[i * 2 + 1] = R * (0.66 * Math.sin(2 * a) - 0.20 * Math.sin(7 * a));
+  }
+  const co = dft(px, M, K);
+  const rec = synth(co, M, K);
+  const path = new Path2D();
+  path.moveTo(rec[0], rec[1]);
+  for (let i = 1; i < M; i++) path.lineTo(rec[i * 2], rec[i * 2 + 1]);
+  path.closePath();
+  const rank = [];
+  for (let ki = 0; ki < K * 2 + 1; ki++) {
+    if (ki === K) continue;
+    const m = Math.hypot(co[ki * 2], co[ki * 2 + 1]);
+    if (m > 0.35) rank.push([m, ki]);
+  }
+  rank.sort((a, b) => b[0] - a[0]);
+  IDLE = { M, K, co, pts: rec, path, top: rank.slice(0, 7).map((r) => r[1]), s: 0, w: 1 };
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(320, window.innerWidth);
+  H = Math.max(240, window.innerHeight);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cache.clear();
+  TRIG.clear();
+  buildBg();
+  buildIdle();
+  buildInk();
+  prev = null;
+  PENDING = null;
+  /* 当前句按新尺寸重建（时间轴不动，写到哪里还是哪里） */
+  if (cur && lines[curIdx]) {
+    const st = cur.startT, wt = cur.writeT;
+    const geo = getLine(lines[curIdx].text || '');
+    const ct2 = charTimes(lines[curIdx], geo.charN || 0);
+    ctCur = ct2.t;
+    stepCur = ct2.t.length > 1 ? Math.max(0.12, (ct2.t[ct2.t.length - 1] - ct2.t[0]) / (ct2.t.length - 1)) : 0.22;
+    cur = {
+      geo, ct: ct2.t, yrc: ct2.yrc, startT: st, writeT: wt,
+      donePath: new Path2D(), startedPath: new Path2D(),
+      bandLow: new Path2D(), bandMid: new Path2D(),
+      doneN: 0, startedN: 0, bandLowN: 0, bandMidN: 0,
+      done: new Uint8Array(geo.n), on: new Uint8Array(geo.n), band: new Uint8Array(geo.n)
+    };
+    PAPER = makePaper(geo);
+  } else {
+    ctCur = null;
+    PAPER = makePaper(null);
+  }
+}
+setAccent(null);
+resize();
+addEventListener('resize', resize);
+
+/* ============================================================================
+   绘制
+   ========================================================================== */
+const TIPS = new Float32Array(160 * 2);
+let nTips = 0;
+const PF = { loop: 0, rings: 0, pend: 0, skel: 0, band: 0, done: 0, wet: 0, hot: 0, tips: 0, hud: 0 };
+const pn = () => performance.now();
+const D = (window.__dbg = window.__dbg || {});
+
+/* 把一段参数区间 [a0,a1]（单位：圈，可以 >1 自动回绕）加进路径 */
+function addArc(p, L, a0, a1) {
+  const M = L.M, pts = L.pts;
+  let i0 = Math.round(a0 * M), i1 = Math.round(a1 * M);
+  if (i1 - i0 < 1) return 0;
+  let first = true, cnt = 0;
+  for (let i = i0; i <= i1; i++) {
+    const j = ((i % M) + M) % M;
+    const x = pts[j * 2], y = pts[j * 2 + 1];
+    if (first) { p.moveTo(x, y); first = false; } else p.lineTo(x, y);
+    cnt++;
+  }
+  return cnt;
+}
+
+function drawChain(L, turn, lw) {  const top = L.top;
+  if (!top || !top.length) return;
+  let cx0 = L.co[L.K * 2], cy0 = L.co[L.K * 2 + 1];
+  const ring = new Path2D(), spoke = new Path2D();
+  const nodes = [];
+  for (let q = 0; q < top.length; q++) {
+    const ki = top[q], k = ki - L.K;
+    const a = L.co[ki * 2], b = L.co[ki * 2 + 1];
+    const ang = TAU * k * turn;
+    const c = Math.cos(ang), s = Math.sin(ang);
+    const r = Math.hypot(a, b);
+    const nx = cx0 + a * c - b * s, ny = cy0 + a * s + b * c;
+    if (r > 0.5) { ring.moveTo(cx0 + r, cy0); ring.arc(cx0, cy0, r, 0, TAU); }
+    spoke.moveTo(cx0, cy0); spoke.lineTo(nx, ny);
+    nodes.push(cx0, cy0);
+    cx0 = nx; cy0 = ny;
+  }
+  nodes.push(cx0, cy0);
+  ctx.strokeStyle = C_CHAIN;
+  ctx.lineWidth = lw * 0.9;
+  ctx.stroke(ring);
+  ctx.lineWidth = lw * 0.8;
+  ctx.stroke(spoke);
+  ctx.fillStyle = C_DIM;
+  for (let i = 0; i < nodes.length; i += 2) ctx.fillRect(nodes[i] - 0.9, nodes[i + 1] - 0.9, 1.8, 1.8);
+}
+
+function drawCur(dt, T) {
+  const geo = cur.geo;
+  const s = geo.gs * (1 + 0.016 * beatP);
+  const CX = W / 2, CY = H * 0.47;
+  const p = (T - cur.startT) / cur.writeT;
+  const loops = geo.loops;
+  const n = loops.length;
+
+  ctx.save();
+  ctx.translate(CX, CY);
+  ctx.scale(s, s);
+  const lw = 1.25 / s;
+
+  /* 输入数据（字形采样点底稿）已经烘进纸里了，这里不再逐帧画 */
+
+  /* 墨分四档，全部按用途合批：
+       ① 相量环 ② 结构线（笔碰到的环） ③ 低/中两档实心（按进度累积，Path2D 增量累积不重建）
+       ④ 写完的实心+宽晕+亮芯 ⑤ 笔尖拖尾。整屏一共 6~8 次绘制调用（坑⑨⑩）。 */
+  const wet = new Path2D(), aHot = new Path2D(), aHead = new Path2D();
+  const rings = new Path2D(), spokes = new Path2D(), pending = new Path2D();
+  let inkPts = 0, hasWet = false, hasHot = false, hasPend = false;
+  nTips = 0;
+  const _t0 = pn();
+  for (let i = 0; i < n; i++) {
+    const lp = loops[i];
+    /* 这一笔写到哪里：时间窗取自"它所属那个字"的 YRC 时刻（缺 chars 时是均分时刻） */
+    const th = phaseOf(lp);
+    /* 还没轮到的笔画：留一层极淡的"底稿"，整句在任何时刻都是完整的（可读性要求） */
+    if (th <= 0) { pending.addPath(lp.path); hasPend = true; continue; }
+    /* 笔一落到这个环上，整条轮廓就先以"结构线"的方式出现 ——
+       字是一列一列被点亮的结构，而不是一堆乱窜的碎片（可读性的关键） */
+    if (!cur.on[i]) {
+      cur.on[i] = 1;
+      cur.startedPath.addPath(lp.path);
+      cur.startedN++;
+    }
+    if (th >= 1 && !cur.done[i]) {
+      cur.done[i] = 1;
+      cur.donePath.addPath(lp.path);
+      cur.doneN++;
+    } else if (th < 1 && th >= 0.45 && cur.band[i] < 2) {
+      cur.band[i] = 2;
+      cur.bandMid.addPath(lp.path);
+      cur.bandMidN++;
+    } else if (th < 0.45 && !cur.band[i]) {
+      cur.band[i] = 1;
+      cur.bandLow.addPath(lp.path);
+      cur.bandLowN++;
+    }
+    const u = th < 1 ? th : th - Math.floor(th);
+    if (th < 1) {
+      const c = addArc(wet, lp, 0, th);
+      if (c) { hasWet = true; inkPts += c; }
+      const h0 = Math.max(0, th - 0.17);
+      if (th - h0 > 0.004) {
+        addArc(aHot, lp, h0, th);
+        addArc(aHead, lp, Math.max(0, th - 0.05), th);
+        hasHot = true;
+      }
+    } else {
+      /* 写完以后笔不停，继续绕自己的轮廓转 → 字上跑着一层会绕圈的光 */
+      addArc(aHot, lp, u - 0.17, u);      /* 下标回绕，接缝天然连续 */
+      addArc(aHead, lp, u - 0.05, u);
+      hasHot = true;
+    }
+    /* 这支笔的相量链（前 2 个谐波）：能看见它确实在绕圆 */
+    if (lp.top.length && lp.perim >= 15) {
+      let ccx = lp.co[lp.K * 2], ccy = lp.co[lp.K * 2 + 1];
+      const q = lp.top;
+      for (let hh = 0; hh < q.length && hh < 2; hh++) {
+        const ki = q[hh], k = ki - lp.K;
+        const a = lp.co[ki * 2], b = lp.co[ki * 2 + 1];
+        const ang = TAU * k * u, c2 = Math.cos(ang), s2 = Math.sin(ang);
+        const r = Math.hypot(a, b);
+        const nx = ccx + a * c2 - b * s2, ny = ccy + a * s2 + b * c2;
+        if (r > 1.7) { rings.moveTo(ccx + r, ccy); rings.arc(ccx, ccy, r, 0, TAU); }
+        spokes.moveTo(ccx, ccy); spokes.lineTo(nx, ny);
+        ccx = nx; ccy = ny;
+      }
+    }
+    if (nTips < 158 && lp.perim >= 6) {
+      const ii = Math.round(u * lp.M);
+      const j = ((ii % lp.M) + lp.M) % lp.M;
+      TIPS[nTips * 2] = lp.pts[j * 2];
+      TIPS[nTips * 2 + 1] = lp.pts[j * 2 + 1];
+      nTips++;
+    }
+  }
+
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  let _tk = pn();
+  PF.loop = _tk - _t0;
+
+  /* ① 相量环：每个笔尖外圈那个正在转的圆 */
+  if (nTips) {
+    if (D.noRings !== 1) {
+      ctx.strokeStyle = C_RING;
+      ctx.lineWidth = lw * 0.75;
+      ctx.stroke(rings);
+      ctx.stroke(spokes);
+    }
+  }
+  PF.rings = pn() - _tk; _tk = pn();
+
+  /* ①' 还没轮到的笔画：一层很淡的底稿，保证整句在这些时刻也是"完整可见"的 */
+  if (hasPend && D.noPend !== 1) {
+    ctx.strokeStyle = C_PEND;
+    ctx.lineWidth = lw * 0.8;
+    ctx.stroke(pending);
+  }
+  PF.pend = pn() - _tk; _tk = pn();
+
+  /* ② 结构线：笔已经碰到的环，先淡淡地立在那里（全都写完之后它就多余了） */
+  if (cur.startedN > cur.doneN && D.noSkel !== 1) {
+    ctx.strokeStyle = C_DIM;
+    ctx.lineWidth = lw * 0.85;
+    ctx.stroke(cur.startedPath);
+  }
+  PF.skel = pn() - _tk; _tk = pn();
+
+  /* ③ 墨在积：两档实心（笔走到一半就有一半的墨）。
+        全部写完后这两层已经被 ④ 完全盖住，跳过 —— 否则每帧要多刷两遍整块字形 */
+  if (cur.doneN < n && D.noBand !== 1) {
+    if (cur.bandLowN) { ctx.fillStyle = C_INK1; ctx.fill(cur.bandLow, 'nonzero'); }
+    if (cur.bandMidN) { ctx.fillStyle = C_INK2; ctx.fill(cur.bandMid, 'nonzero'); }
+  }
+  PF.band = pn() - _tk; _tk = pn();
+
+  /* ④ 写完的笔画：落成实心 + 宽晕 + 亮芯。
+     **烘焙**：只有"又写完一个环"时才重画这张离屏画布，每帧只 drawImage 一次。
+     逐帧重填这几千个点，41 字整句写完后实测只剩 16fps（瓶颈在软光栅，不在 JS）。 */
+  if (cur.doneN) {
+    /* 烘焙本身是一次全屏重画（~17ms），所以最多 20Hz 烘一次：慢一拍肉眼看不出，
+       但不会每写完一个环就掉一帧 */
+    if (cur.doneN !== inkDoneN && (inkDoneN < 0 || pn() - inkAt > 45)) {
+      inkAt = pn();
+      const BK = geo.gs;
+      const g = inkG;
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.clearRect(0, 0, inkCv.width, inkCv.height);
+      g.setTransform(DPR, 0, 0, DPR, 0, 0);
+      g.translate(CX, CY);
+      g.scale(BK, BK);
+      g.globalCompositeOperation = 'lighter';
+      g.lineJoin = 'round'; g.lineCap = 'round';
+      const lwB = 1.25 / BK;
+      if (D.noFill !== 1) { g.fillStyle = C_FILL; g.fill(cur.donePath, 'evenodd'); }
+      if (D.noGlow !== 1) {
+        g.strokeStyle = C_GLOW;
+        g.lineWidth = lwB * 3.2;
+        g.stroke(cur.donePath);
+      }
+      if (D.noCore !== 1) {
+        g.strokeStyle = C_MID;
+        g.lineWidth = lwB;
+        g.stroke(cur.donePath);
+      }
+      inkDoneN = cur.doneN;
+    }
+    /* 踩拍的微缩放用 drawImage 的比例补，不重烘 */
+    const k = s / geo.gs;
+    ctx.save();
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    if (Math.abs(k - 1) > 0.0012) {
+      ctx.translate(CX, CY); ctx.scale(k, k); ctx.translate(-CX, -CY);
+    }
+    ctx.drawImage(inkCv, 0, 0, W, H);
+    ctx.restore();
+  }
+  PF.done = pn() - _tk; _tk = pn();
+
+  /* ⑤ 笔正在勾的这条边（"湿墨"）+ 笔尖拖尾 */
+  if (hasWet) {
+    ctx.strokeStyle = C_WET;
+    ctx.lineWidth = lw * 1.15;
+    ctx.stroke(wet);
+  }
+  if (hasHot && D.noHot !== 1) {
+    ctx.strokeStyle = C_TRAIL_GLOW;
+    ctx.lineWidth = lw * 3.4;
+    ctx.stroke(aHot);
+    ctx.strokeStyle = C_TRAIL;
+    ctx.lineWidth = lw * 1.7;
+    ctx.stroke(aHot);
+    ctx.strokeStyle = C_HOT;
+    ctx.lineWidth = lw * 2.2;
+    ctx.stroke(aHead);
+    ctx.lineWidth = lw * 0.9;
+    ctx.stroke(aHead);
+  }
+  PF.wet = pn() - _tk;
+
+  /* 相量链：幅值最大的那个环 */
+  const hero = loops[geo.hero];
+  if (hero) {
+    const hth = phaseOf(hero);
+    if (hth > 0) {
+      const u = hth < 1 ? hth : hth - Math.floor(hth);
+      drawChain(hero, u, lw);
+    }
+  }
+  ctx.restore();
+
+  /* 笔尖光斑（屏幕坐标画，位图不会被缩放糊掉） */
+  ctx.globalCompositeOperation = 'lighter';
+  const beat = 1 + 0.5 * beatP;
+  let _tj = pn();
+  if (D.noTips !== 1) {
+    for (let i = 0; i < nTips; i++) {
+      const sx = CX + TIPS[i * 2] * s, sy = CY + TIPS[i * 2 + 1] * s;
+      const r = (9.5 + 3 * (i % 3)) * beat;
+      ctx.globalAlpha = 0.52 + 0.20 * beatP;
+      ctx.drawImage(SPR_TIP, sx - r, sy - r, r * 2, r * 2);
+    }
+  }
+  ctx.globalAlpha = 1;
+  PF.tips = pn() - _tj;
+
+  /* 笔尖掉火星（脉动的，跟着拍子走 → 相干） */
+  if (nTips && pAlive < NP - 80) {
+    spawnAcc += (18 + 46 * beatP) * dt;
+    let ns = spawnAcc | 0;
+    spawnAcc -= ns;
+    if (ns > 10) ns = 10;
+    for (let i = 0; i < ns; i++) {
+      const t = (Math.random() * nTips) | 0;
+      const sx = CX + TIPS[t * 2] * s, sy = CY + TIPS[t * 2 + 1] * s;
+      emit(sx + (Math.random() - 0.5) * 6, sy + (Math.random() - 0.5) * 6,
+        (Math.random() - 0.5) * 46, (Math.random() - 0.5) * 46 - 12,
+        0.55 + Math.random() * 0.7, 3 + Math.random() * 4);
+    }
+  }
+  return { inkPts, p };
+}
+
+function drawIdle() {
+  const L = IDLE;
+  if (!L) return;
+  const CX = W / 2, CY = H * 0.47;
+  const s = 1;
+  const turn = (t0 * 0.19) % 1;
+  ctx.save();
+  ctx.translate(CX, CY);
+  ctx.scale(s, s);
+  const lw = 1.25 / s;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.globalAlpha = 0.55;
+  ctx.strokeStyle = C_DIM;
+  ctx.lineWidth = lw;
+  ctx.stroke(L.path);
+  const arc = new Path2D(), hot = new Path2D();
+  addArc(arc, L, 0, turn);
+  addArc(hot, L, turn - 0.05, turn);
+  ctx.strokeStyle = C_MID;
+  ctx.stroke(arc);
+  ctx.strokeStyle = C_HOT;
+  ctx.lineWidth = lw * 2;
+  ctx.stroke(hot);
+  drawChain(L, turn, lw);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+  const i = Math.round(turn * L.M) % L.M;
+  const sx = CX + L.pts[i * 2], sy = CY + L.pts[i * 2 + 1];
+  const r = 16 * (1 + 0.35 * beatP);
+  ctx.drawImage(SPR_TIP, sx - r, sy - r, r * 2, r * 2);
+}
+
+function drawPrev(dt) {
+  if (!prev) return;
+  prev.t -= dt;
+  if (prev.t <= 0) { prev = null; return; }
+  const k = prev.t / prev.life;
+  const s = prev.geo.gs;
+  ctx.save();
+  ctx.translate(W / 2, H * 0.47);
+  ctx.scale(s, s);
+  const lw = 1.4 / s;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = k * 0.5;
+  ctx.strokeStyle = C_MID;
+  ctx.lineWidth = lw;
+  ctx.stroke(prev.path);
+  ctx.globalAlpha = k * 0.35;
+  ctx.fillStyle = C_FILL;
+  ctx.fill(prev.path, 'evenodd');
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function drawParts() {
+  if (!pAlive || D.noParts === 1) return;
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < NP; i++) {
+    if (!PA[i]) continue;
+    const x = PX[i], y = PY[i];
+    if (x < -40 || x > W + 40 || y < -40 || y > H + 40) continue;
+    const u = PL[i] / PT[i];
+    ctx.globalAlpha = 0.62 * u * u;
+    const r = PS[i] * (0.45 + 0.55 * u) + 1.2;
+    ctx.drawImage(SPR_DUST, x - r, y - r, r * 2, r * 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHud() {
+  if (D.noHud === 1) return;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = '500 10px ui-monospace,Consolas,monospace';
+  ctx.letterSpacing = '1.5px';
+  ctx.fillStyle = C_READ;
+  ctx.fillText('FOURIER SYNTHESIS · 047', 20, H - 30);
+  if (cur) {
+    const geo = cur.geo;
+    const hero = geo.loops[geo.hero];
+    const txt = 'CONTOURS ' + geo.n + '   HARMONICS ' + (hero ? hero.K : 0) +
+      ' / ' + (hero ? hero.top.length : 0) + ' CIRCLES';
+    ctx.fillText(txt, 20, H - 15);
+
+    /* 右下角：主角环的谐波幅值谱 */
+    if (hero) {
+      const bx = W - 20, by = H - 17, bw = 3, gap = 4.5;
+      const R = hero.K * 2 + 1;
+      let maxA = 1e-6;
+      const amps = new Float32Array(R);
+      for (let ki = 0; ki < R; ki++) {
+        amps[ki] = Math.hypot(hero.co[ki * 2], hero.co[ki * 2 + 1]);
+        if (amps[ki] > maxA) maxA = amps[ki];
+      }
+      const path = new Path2D();
+      for (let ki = 0; ki < R; ki++) {
+        const h = 1 + 26 * Math.sqrt(amps[ki] / maxA);
+        const x = bx - (R - 1 - ki) * (bw + gap);
+        if (x < 20) continue;
+        path.rect(x, by - h, bw, h);
+      }
+      ctx.fillStyle = C_CHAIN;
+      ctx.fill(path);
+      ctx.fillStyle = C_DIM;
+      ctx.fillRect(bx - (R - 1) * (bw + gap) - 6, by - 1, (R - 1) * (bw + gap) + 3, 1);
+    }
+  }
+  ctx.letterSpacing = '0px';
+}
+
+/* ---------------- 主循环 ---------------- */
+let lastMs = performance.now();
+let t0 = 0;
+let fpsE = 60;
+let inkPts = 0, phaseP = 0;
+
+function frame(nowMs) {
+  const raw = (nowMs - lastMs) / 1000;
+  lastMs = nowMs;
+  const dt = Math.min(0.05, raw > 0 ? raw : 0.016);
+  t0 += dt;
+  if (raw > 0.0005) fpsE = fpsE * 0.92 + Math.min(240, 1 / raw) * 0.08;
+
+  const T = now();
+  timing(T);
+  beatP *= Math.exp(-dt * 3.0);
+  if (!playing) t0 += 0;                     /* 暂停时 t0 仍然走，画面不至于定死 */
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  if (D.flatBg === 1) { ctx.fillStyle = '#05070e'; ctx.fillRect(0, 0, W, H); }
+  else ctx.drawImage(PAPER, 0, 0, W, H);
+
+  drawPrev(dt);
+
+  if (cur && cur.geo && cur.geo.n && D.noGlyph !== 1) {
+    const r = drawCur(dt, T);
+    inkPts = r.inkPts; phaseP = r.p;
+  } else {
+    drawIdle();
+    inkPts = 0; phaseP = 0;
+  }
+
+  stepParts(dt);
+  drawParts();
+  const _th = pn();
+  drawHud();
+  PF.hud = pn() - _th;
+
+  if (beatP > 0.02) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = rgba(mixc(ACC, 0.3), 0.022 * beatP);
+    ctx.fillRect(0, 0, W, H);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  if (D.flush === 1) {
+    const _tf = pn();
+    ctx.getImageData(0, 0, 1, 1);
+    PF.flush = pn() - _tf;
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---------------- 调试钩子 ---------------- */
+window.__stage = () => ({
+  lines: lines.length,
+  curIdx: curIdx,
+  brewIdx: brewIdx,
+  T: +now().toFixed(2),
+  fps: +fpsE.toFixed(1),
+  playing: playing,
+  loops: cur ? cur.geo.n : 0,
+  hero: cur ? cur.geo.loops[cur.geo.hero] && cur.geo.loops[cur.geo.hero].K : 0,
+  M: cur ? cur.geo.loops.reduce((a, l) => a + l.M, 0) : 0,
+  done: cur ? cur.doneN : 0,
+  inkPts: inkPts,
+  yrc: !!(cur && cur.yrc),
+  yrcLen: cur && cur.geo ? cur.geo.charN : 0,
+  gfs: cur && cur.geo ? cur.geo.gfs : 0,
+  phase: +phaseP.toFixed(3),
+  tips: nTips,
+  parts: pAlive,
+  gs: cur ? +cur.geo.gs.toFixed(2) : 0,
+  buildMs: cur ? cur.geo.buildMs : 0,
+  pf: {
+    loop: +PF.loop.toFixed(2), rings: +PF.rings.toFixed(2), skel: +PF.skel.toFixed(2),
+    band: +PF.band.toFixed(2), done: +PF.done.toFixed(2), wet: +PF.wet.toFixed(2),
+    tips: +PF.tips.toFixed(2), hud: +PF.hud.toFixed(2), flush: +(PF.flush || 0).toFixed(2)
+  },
+  W: W, H: H
+});
+</script>
+</body>
+</html>

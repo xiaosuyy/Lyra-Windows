@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>球池</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070d;overflow:hidden}
+  body{background:radial-gradient(120% 100% at 50% 44%,#0b111c,#05070d 74%)}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(112% 94% at 50% 48%,transparent 42%,rgba(2,6,10,.58) 82%,rgba(1,4,7,.94))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,200,240,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   064 · 球池 —— 小球从池底弹进字形凹槽，唱完被搅动浮起再落下
+   ---------------------------------------------------------------------------
+   字用的是"槽"：整句先被刻进池底（一层半透明的凹槽面，永远可读），
+   唱到第 k 字，属于那一字的球从画面下沿的球池里被抛上来，
+   沿抛物线落进笔画采样点，落定时"咔"地闪一下（弹一下再定住）。
+
+   时间怎么演：每颗球带着两个位置 —— 池底的槽位（tx,ty）和笔画里的窝（hx,hy）。
+   没唱到 = 待在池底，只有浅浅的起伏；chars[k].t 到 = 这一字的球同时起飞，
+   弧顶在字上方 40~110px，落点就是笔画点，落地时刻精确等于 chars[k].t。
+   句尾（或换句的瞬间）整池被"搅动"：所有球向上抛 110~350px 的弧，再落回池底，
+   下一句再从池底一颗颗升上去 —— 浮起、散开、落下、重排，一个完整循环。
+
+   可读性：球不是撒点，是按每个字的墨量**均摊**到该字的笔画上（等间隔取样），
+   所以每个字的球一样密；底下再垫一层凹槽面，长句折 3 行也不会断。
+   41 字的长句 fs≈88、每字 ~26 颗 r≈6.6 的球，珠子拼字 + 槽面兜底。
+
+   和 001-010 的区别：那些是"粒子被吸到采样点"，这里球有**两个驻留地**
+   （池底 / 凹槽），起飞是抛物线而不是弹簧吸引，落地有撞击回弹。
+   和 004（沙）的区别：沙是从上往下堆、堆完塌；球是从下往上抛、抛完被搅回去。
+   和 061-063 的区别：布/链/丝带都是线本身在动，这里是离散的珠子在搬。
+
+   YRC：第 k 字的球在 chars[k].t 落地（提前 0.26~0.40 秒起飞，弧线正好压在字时刻）；
+   缺 chars / 长度不符按 t + dur*k/n 均分。__stage 带 yrc。
+   分词：不使用。球是一窝一窝抛上去的，起跳已经按字成团；按词合并会让
+   "一窝球升起"变成几窝球同时抢位，弧线全撞在一起，反而不像球池。
+   性能：球数 460~1180（按字数），每帧 3 次合批 drawImage（池底/亮/刚落地），
+   无球-球碰撞（球池的"挤"靠固定槽位表达），1440×810 无头稳在 60。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+const TAU = 6.283185307;
+
+let W = 0, H = 0, DPR = 1, t0 = 0;
+
+/* ---------------- accent 派生色 ---------------- */
+let accent = [120, 200, 255];
+const AC = { r: 120, g: 200, b: 255, hr: 0, hg: 0, hb: 0, mr: 0, mg: 0, mb: 0, dr: 0, dg: 0, db: 0 };
+const C = { glow: '', tint: '', plate: '', plateLit: '', spec: '' };
+const mix = (a, b, k) => Math.round(a + (b - a) * k);
+function derive() {
+  const r = accent[0] | 0, g = accent[1] | 0, b = accent[2] | 0;
+  AC.r = r; AC.g = g; AC.b = b;
+  AC.hr = mix(r, 255, .56); AC.hg = mix(g, 255, .56); AC.hb = mix(b, 255, .54);
+  AC.mr = mix(r, 255, .30); AC.mg = mix(g, 255, .30); AC.mb = mix(b, 255, .28);
+  AC.dr = Math.round(r * .52); AC.dg = Math.round(g * .54); AC.db = Math.round(b * .64);
+  C.glow = 'rgba(' + r + ',' + g + ',' + b + ',';
+  C.tint = 'rgba(' + r + ',' + g + ',' + b + ',';
+  C.plate = 'rgba(' + mix(r, 206, .30) + ',' + mix(g, 220, .30) + ',' + mix(b, 246, .26) + ',';
+  C.plateLit = 'rgba(' + mix(r, 255, .62) + ',' + mix(g, 255, .62) + ',' + mix(b, 255, .56) + ',';
+  C.spec = 'rgba(255,255,255,';
+}
+
+/* ---------------- 离屏位图（取墨用） ---------------- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+/* ---------------- 布局：折行 + 自适应字号（同 061/062 的排版层） ---------------- */
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+function makeLayout(text) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.86, 1360);
+  const maxH = H * 0.58;
+  octx.font = fontOf(120);
+  let widest = 1;
+  for (let i = 0; i < nr; i++) widest = Math.max(widest, octx.measureText(rows[i]).width);
+  let fs = Math.min(120 * maxW / widest, maxH / (nr * 1.20), 150);
+  fs = Math.max(20, Math.floor(fs));
+  octx.font = fontOf(fs);
+  let wMax = 1;
+  for (let i = 0; i < nr; i++) wMax = Math.max(wMax, octx.measureText(rows[i]).width);
+  if (wMax > maxW) { fs = Math.max(18, Math.floor(fs * maxW / wMax)); octx.font = fontOf(fs); }
+  const font = fontOf(fs);
+  const LH = fs * 1.20;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      x += w; gi++;
+    }
+    if (x - wsum < bx0) bx0 = x - wsum;
+    if (x > bx1) bx1 = x;
+    rowsOut.push({ y: y, g: gr, w: wsum });
+    if (y - fs * 0.68 < by0) by0 = y - fs * 0.68;
+    if (y + fs * 0.68 > by1) by1 = y + fs * 0.68;
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length, font: font, bx0: bx0, bx1: bx1, by0: by0, by1: by1 };
+}
+
+/* ---------------- 每个字的墨点（步长 2，等间隔取；带"属于第几个字"） ----------------
+   一张大位图一次 getImageData，比 41 次逐字读回便宜得多；
+   点按行归属再按列的二分查字，和采样点同一套归属逻辑。 */
+const inkTotal = { n: 0 };
+function inkSampling(L) {
+  const n = L.glyphs.length;
+  const pad = 6;
+  const bx = Math.floor(L.bx0) - pad, by = Math.floor(L.by0) - pad;
+  const bw = Math.max(4, Math.ceil(L.bx1 - L.bx0) + pad * 2);
+  const bh = Math.max(4, Math.ceil(L.by1 - L.by0) + pad * 2);
+  if (off.width !== bw || off.height !== bh) { off.width = bw; off.height = bh; }
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, bw, bh);
+  octx.font = L.font; octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  for (let i = 0; i < n; i++) octx.fillText(L.glyphs[i].ch, L.glyphs[i].x - bx, L.glyphs[i].y - by);
+  const d = octx.getImageData(0, 0, bw, bh).data;
+  const lists = [];
+  for (let i = 0; i < n; i++) lists.push([]);
+  const rows = L.rows, S = 2;
+  let tot = 0;
+  for (let y = 0; y < bh; y += S) {
+    const ay = y + by;
+    let best = 0, bd = 1e9;
+    for (let k = 0; k < rows.length; k++) { const dd = Math.abs(rows[k].y - ay); if (dd < bd) { bd = dd; best = k; } }
+    const g = rows[best].g;
+    if (!g.length) continue;
+    const rowOff = y * bw;
+    for (let x = 0; x < bw; x += S) {
+      if (d[(rowOff + x) * 4 + 3] <= 128) continue;
+      const ax = x + bx;
+      let kk;
+      if (ax <= g[0].x0) kk = 0;
+      else if (ax >= g[g.length - 1].x1) kk = g.length - 1;
+      else {
+        let lo = 0, hi = g.length - 1;
+        while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < ax) lo = m + 1; else hi = m; }
+        kk = lo;
+      }
+      const arr = lists[g[kk].i];
+      arr.push(ax, ay); tot++;
+    }
+  }
+  inkTotal.n = tot;
+  return lists;
+}
+
+/* ---------------- 逐字时刻 ---------------- */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+/* ---------------- 凹槽面（池底刻的字；整句永远可读靠它） ----------------
+   半分辨率、只覆盖字形包围盒，不整屏混合。刻痕 = 横向细纹 + 上沿高光，
+   于是还没唱的部分是"槽"，唱过的是被珠子填满、也顺手擦亮的槽。 */
+let plate = null, plateX = 0, plateY = 0, plateW = 1, plateH = 1, plateA = 0;
+const PLATE_S = 0.55;
+function bakePlate(L) {
+  if (!L) { plate = null; plateA = 0; return; }
+  if (!plate) plate = document.createElement('canvas');
+  const pad = 26;
+  plateX = Math.floor(L.bx0 - pad); plateY = Math.floor(L.by0 - pad);
+  plateW = Math.max(8, Math.ceil(L.bx1 - L.bx0 + pad * 2));
+  plateH = Math.max(8, Math.ceil(L.by1 - L.by0 + pad * 2));
+  plate.width = Math.round(plateW * PLATE_S); plate.height = Math.round(plateH * PLATE_S);
+  const g = plate.getContext('2d');
+  g.setTransform(PLATE_S, 0, 0, PLATE_S, 0, 0);
+  g.clearRect(0, 0, plateW, plateH);
+  g.font = L.font; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = C.plate + '0.34)';
+  for (let i = 0; i < L.glyphs.length; i++) g.fillText(L.glyphs[i].ch, L.glyphs[i].x - plateX, L.glyphs[i].y - plateY);
+  /* 刻痕：只在字形上（source-atop），横向细纹 */
+  g.globalCompositeOperation = 'source-atop';
+  g.lineWidth = 1; g.strokeStyle = 'rgba(0,0,0,0.30)';
+  const p = new Path2D();
+  for (let y = 0; y < plateH; y += 4) { p.moveTo(0, y); p.lineTo(plateW, y); }
+  g.stroke(p);
+  /* 上沿高光：整句往上错 1.1px 再打一层亮，槽就有了厚度 */
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = C.plateLit + '0.20)';
+  for (let i = 0; i < L.glyphs.length; i++) g.fillText(L.glyphs[i].ch, L.glyphs[i].x - plateX, L.glyphs[i].y - plateY - 1.1);
+  g.globalCompositeOperation = 'source-over';
+  plateA = 0;
+}
+function lightPlate(k) {
+  if (!plate || !curLay) return;
+  const gl = curLay.glyphs[k];
+  if (!gl) return;
+  const g = plate.getContext('2d');
+  g.setTransform(PLATE_S, 0, 0, PLATE_S, 0, 0);
+  g.font = curLay.font; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = C.plateLit + '0.20)';
+  g.fillText(gl.ch, gl.x - plateX, gl.y - plateY);
+  g.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------- 球 ---------------- */
+const CAP = 1300;
+let N = 0, BALL_R = 5, prevN = 0;
+const B = {
+  x: new Float32Array(CAP), y: new Float32Array(CAP),
+  x0: new Float32Array(CAP), y0: new Float32Array(CAP),
+  gx: new Float32Array(CAP), gy: new Float32Array(CAP),
+  hx: new Float32Array(CAP), hy: new Float32Array(CAP),
+  tx: new Float32Array(CAP), ty: new Float32Array(CAP),
+  t0f: new Float32Array(CAP), d: new Float32Array(CAP), hmp: new Float32Array(CAP),
+  st: new Uint8Array(CAP), glow: new Float32Array(CAP),
+  act: new Float32Array(CAP), launch: new Float32Array(CAP)
+};
+const pX = new Float32Array(CAP), pY = new Float32Array(CAP);
+let pinT = Infinity, stirred = false, nRest = 0, nAir = 0, beatP = 0;
+let sprLit = null, sprDim = null, sprHot = null;
+
+const hsh = (i) => {
+  let x = (i * 2654435761) >>> 0;
+  x ^= x >>> 15; x = Math.imul(x, 2246822519) >>> 0;
+  x ^= x >>> 13; return (x >>> 8) / 16777216;
+};
+
+function rise(i, gx, gy, dur, hmp, t0f) {
+  B.x0[i] = B.x[i]; B.y0[i] = B.y[i];
+  B.gx[i] = gx; B.gy[i] = gy;
+  B.d[i] = dur; B.hmp[i] = hmp; B.t0f[i] = t0f; B.st[i] = 1;
+}
+function fall(i, gx, gy, dur, hmp, t0f) {
+  B.x0[i] = B.x[i]; B.y0[i] = B.y[i];
+  B.gx[i] = gx; B.gy[i] = gy;
+  B.d[i] = dur; B.hmp[i] = hmp; B.t0f[i] = t0f; B.st[i] = 3;
+}
+
+function stir(T) {
+  for (let i = 0; i < N; i++) {
+    B.launch[i] = Infinity; B.act[i] = Infinity;
+    if (B.st[i] === 0) continue;
+    fall(i, B.tx[i], B.ty[i], 0.42 + hsh(i * 23 + 5) * 0.30, 110 + hsh(i * 29 + 7) * 250, T + hsh(i * 31 + 3) * 0.10);
+  }
+  stirred = true;
+}
+
+function buildBalls(L, ct, T) {
+  /* 换句 = 整池搅动：先把旧位置存下来，新球从旧位置抛出去 */
+  for (let i = 0; i < N; i++) { pX[i] = B.x[i]; pY[i] = B.y[i]; }
+  prevN = N;
+  const lists = inkSampling(L);
+  const nch = L.glyphs.length;
+  let total = 0;
+  for (let i = 0; i < nch; i++) total += lists[i].length / 2;
+  if (!total) { N = 0; pinT = Infinity; return; }
+  BALL_R = Math.max(2.6, Math.min(7.4, L.fs * 0.078));
+  const want = Math.max(480, Math.min(1250, nch * 36));
+  const cnt = new Int32Array(nch);
+  let sum = 0;
+  for (let i = 0; i < nch; i++) {
+    const c = Math.round(want * (lists[i].length / 2) / total);
+    cnt[i] = Math.max(3, c); sum += cnt[i];
+  }
+  N = Math.min(CAP, sum);
+  pinT = -Infinity;
+  let j = 0;
+  for (let c = 0; c < nch && j < N; c++) {
+    const P = lists[c], pc = P.length / 2, gl = L.glyphs[c], n = cnt[c];
+    for (let k = 0; k < n && j < N; k++, j++) {
+      const idx = Math.min(pc - 1, Math.floor(k * pc / n)) * 2;
+      const hx = P[idx] + (hsh(j * 3 + 1) - .5) * BALL_R * 0.62;
+      const hy = P[idx + 1] + (hsh(j * 3 + 2) - .5) * BALL_R * 0.62;
+      B.hx[j] = hx; B.hy[j] = hy;
+      const tx = Math.max(10, Math.min(W - 10, gl.x + (hsh(j * 5 + 3) - .5) * gl.w * 1.9));
+      const ty = H - 96 + hsh(j * 5 + 4) * 100;
+      B.tx[j] = tx; B.ty[j] = ty;
+      const a = (ct && c < ct.length) ? ct[c] : Infinity;
+      B.act[j] = a;
+      const dur = 0.26 + hsh(j * 7 + 5) * 0.14;
+      B.launch[j] = a - dur;
+      B.glow[j] = 0;
+      if (a > pinT) pinT = a;
+      const carry = prevN > 0 && j < prevN;
+      if (a <= T - 0.04) {                       /* 已经唱过的：直接待在窝里 */
+        B.x[j] = hx; B.y[j] = hy; B.gx[j] = hx; B.gy[j] = hy; B.st[j] = 2;
+      } else if (carry) {
+        B.x[j] = pX[j]; B.y[j] = pY[j];
+        if (a - T > 0.9) {                       /* 还早：先被搅回池底 */
+          fall(j, tx, ty, 0.40 + hsh(j * 9 + 6) * 0.20, 100 + hsh(j * 11 + 7) * 250, T + hsh(j * 13 + 8) * 0.07);
+        } else {                                  /* 快到了：直接从旧位置抛进新窝 */
+          const dd = Math.min(0.60, Math.max(0.24, a - T - 0.04));
+          rise(j, hx, hy, dd, 60 + hsh(j * 15 + 2) * 150, T + 0.01);
+        }
+      } else {                                    /* 全新一句：先在池底等着 */
+        B.x[j] = tx; B.y[j] = ty; B.gx[j] = tx; B.gy[j] = ty; B.st[j] = 0;
+      }
+    }
+  }
+  stirred = false;
+  bakeSprites();
+}
+
+/* ---------------- 球的贴图（预渲染，绝不逐帧建渐变，坑⑪） ---------------- */
+function ballSprite(kind) {
+  const rr = kind === 'hot' ? BALL_R * 1.02 : (kind === 'dim' ? BALL_R * 0.88 : BALL_R);
+  const half = rr * 1.45;
+  const S = 2;
+  const size = Math.max(6, Math.ceil(half * 2 * S));
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const g = c.getContext('2d');
+  g.setTransform(S, 0, 0, S, 0, 0);
+  g.translate(half, half);
+  const RGB = (r, gg, b) => 'rgb(' + r + ',' + gg + ',' + b + ')';
+  const RGBA = (r, gg, b, a) => 'rgba(' + r + ',' + gg + ',' + b + ',' + a + ')';
+  let hi, md, lo;
+  if (kind === 'dim') {
+    hi = [mix(AC.r, 255, .20), mix(AC.g, 255, .22), mix(AC.b, 255, .26)];
+    md = [AC.dr, AC.dg, AC.db];
+    lo = [Math.round(AC.dr * .52), Math.round(AC.dg * .52), Math.round(AC.db * .62)];
+  } else {
+    hi = [AC.hr, AC.hg, AC.hb];
+    md = [AC.mr, AC.mg, AC.mb];
+    lo = [AC.dr, AC.dg, AC.db];
+  }
+  /* 外晕：亮球带一层，刚落地的最亮（球池的"打光"） */
+  if (kind !== 'dim') {
+    const halo = g.createRadialGradient(0, 0, rr * 0.72, 0, 0, half);
+    halo.addColorStop(0, RGBA(AC.r, AC.g, AC.b, kind === 'hot' ? .40 : .20));
+    halo.addColorStop(0.6, RGBA(AC.r, AC.g, AC.b, 0.045));
+    halo.addColorStop(1, RGBA(AC.r, AC.g, AC.b, 0));
+    g.fillStyle = halo;
+    g.beginPath(); g.arc(0, 0, half, 0, TAU); g.fill();
+  }
+  /* 球体：受光点在左上，边缘压暗 —— 一颗球要能看出"圆" */
+  const body = g.createRadialGradient(-rr * 0.26, -rr * 0.30, rr * 0.04, 0, 0, rr * 1.02);
+  body.addColorStop(0, RGB(hi[0], hi[1], hi[2]));
+  body.addColorStop(0.40, RGB(md[0], md[1], md[2]));
+  body.addColorStop(0.80, RGB(lo[0], lo[1], lo[2]));
+  body.addColorStop(1, RGB(Math.round(lo[0] * .62), Math.round(lo[1] * .62), Math.round(lo[2] * .70)));
+  g.fillStyle = body;
+  g.beginPath(); g.arc(0, 0, rr, 0, TAU); g.fill();
+  /* 底部一圈反光（球池里的球是亮的，不是剪影） */
+  g.strokeStyle = RGBA(hi[0], hi[1], hi[2], kind === 'dim' ? 0.16 : 0.26);
+  g.lineWidth = rr * 0.10;
+  g.beginPath(); g.arc(0, 0, rr * 0.90, 0.62, 2.36); g.stroke();
+  /* 高光点 */
+  g.fillStyle = RGBA(255, 255, 255, kind === 'dim' ? 0.28 : 0.55);
+  g.beginPath(); g.arc(-rr * 0.30, -rr * 0.34, rr * 0.22, 0, TAU); g.fill();
+  return { cv: c, half: half };
+}
+function bakeSprites() { sprLit = ballSprite('lit'); sprHot = ballSprite('hot'); sprDim = ballSprite('dim'); }
+
+/* ---------------- 物理：抛物线飞行 + 落定 ---------------- */
+function stepBalls(dt, T) {
+  let rest = 0, air = 0;
+  const jig = 1.25 + beatP * 2.2;
+  for (let i = 0; i < N; i++) {
+    const st = B.st[i];
+    if (st === 0) {
+      if (T >= B.launch[i]) {
+        const d = 0.26 + hsh(i * 17 + 9) * 0.14;
+        rise(i, B.hx[i], B.hy[i], d, 34 + hsh(i * 19 + 3) * 86, Math.min(T, B.act[i] - d));
+      }
+      B.x[i] = B.tx[i] + Math.sin(t0 * 1.15 + i * 1.7) * jig;
+      B.y[i] = B.ty[i] + Math.cos(t0 * 0.93 + i * 0.71) * jig * 0.8;
+      rest++;
+    } else if (st === 1 || st === 3) {
+      const e = (T - B.t0f[i]) / B.d[i];
+      if (e >= 1) {
+        B.x[i] = B.gx[i]; B.y[i] = B.gy[i];
+        if (st === 3) {
+          B.st[i] = 0;
+          if (T >= B.launch[i] - 0.02) {          /* 搅动后正好轮到它：直接落窝 */
+            B.st[i] = 2; B.x[i] = B.hx[i]; B.y[i] = B.hy[i]; B.glow[i] = 0.7;
+          }
+        } else { B.st[i] = 2; B.glow[i] = 1; }
+        rest++;
+      } else if (e > 0) {
+        B.x[i] = B.x0[i] + (B.gx[i] - B.x0[i]) * e;
+        B.y[i] = B.y0[i] + (B.gy[i] - B.y0[i]) * e - B.hmp[i] * 4 * e * (1 - e);
+        air++;
+      }
+    } else {
+      B.x[i] = B.hx[i] + Math.sin(t0 * 1.7 + i * 2.3) * 0.34;
+      B.y[i] = B.hy[i] + Math.cos(t0 * 1.5 + i * 1.1) * 0.30;
+      rest++;
+    }
+    B.glow[i] *= Math.exp(-dt * 5.0);
+  }
+  nRest = rest; nAir = air;
+}
+
+/* ---------------- 背景（静态，1:1 blit） ---------------- */
+let bgCv = null;
+function bakeBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  bgCv.width = Math.max(8, cv.width); bgCv.height = Math.max(8, cv.height);
+  const g = bgCv.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const lg = g.createLinearGradient(0, 0, 0, H);
+  lg.addColorStop(0, '#070c15'); lg.addColorStop(0.5, '#05070e'); lg.addColorStop(1, '#03050a');
+  g.fillStyle = lg; g.fillRect(0, 0, W, H);
+  const rg = g.createRadialGradient(W * 0.5, H * 0.44, 0, W * 0.5, H * 0.44, Math.max(W, H) * 0.64);
+  rg.addColorStop(0, C.tint + '0.105)');
+  rg.addColorStop(0.5, C.tint + '0.030)');
+  rg.addColorStop(1, C.tint + '0)');
+  g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  /* 池底地砖：极稀的暗点，给纵深 */
+  for (let i = 0; i < 220; i++) {
+    const x = hsh(i * 7 + 1) * W, y = hsh(i * 7 + 2) * H;
+    g.fillStyle = C.tint + (0.020 + hsh(i * 7 + 3) * 0.030) + ')';
+    g.fillRect(x, y, 1.4, 1.4);
+  }
+  /* 球池边沿：一条很淡的弧 + 底部的辉光带 */
+  const rim = g.createLinearGradient(0, H - 140, 0, H);
+  rim.addColorStop(0, C.tint + '0)');
+  rim.addColorStop(1, C.tint + '0.085)');
+  g.fillStyle = rim; g.fillRect(0, H - 140, W, 140);
+  g.strokeStyle = C.tint + '0.14)'; g.lineWidth = 1.1;
+  g.beginPath(); g.ellipse(W / 2, H + 54, W * 0.70, 84, 0, Math.PI * 1.03, Math.PI * 1.97); g.stroke();
+}
+
+/* ---------------- 时间 / 节奏 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许清场
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+let curLay = null, curCT = null, curYrc = false, lit = 0;
+let pend = null, pendIdx = -1;
+
+function brewLine(i) {
+  const L = lines[i];
+  pend = L && L.text ? { lay: makeLayout(L.text) } : null;
+  pendIdx = i;
+}
+function applyLine(lay) {
+  curLay = lay;
+  if (!lay) { curCT = null; curYrc = false; N = 0; plate = null; prevN = 0; return; }
+  const tm = charTimes(lines[curIdx], lay.glyphs.length);
+  curCT = tm.t; curYrc = tm.ok; lit = 0;
+  bakePlate(lay);
+  buildBalls(lay, curCT, now());
+  const T = now();
+  while (lit < curCT.length && T >= curCT[lit]) { lightPlate(lit); lit++; }
+}
+function startLine(i) {
+  if (pendIdx !== i) brewLine(i);
+  const b = pend; pend = null; pendIdx = -1;
+  applyLine(b ? b.lay : null);
+}
+function relayout() {
+  if (curIdx >= 0 && lines[curIdx] && lines[curIdx].text) {
+    applyLine(makeLayout(lines[curIdx].text));
+  } else { curLay = null; N = 0; plate = null; prevN = 0; }
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pend = null; pendIdx = -1;
+    curLay = null; curCT = null; lit = 0; N = 0; plate = null; prevN = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci); else { N = 0; plate = null; prevN = 0; }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine(nx); }
+  }
+  if (curCT) while (lit < curCT.length && T >= curCT[lit]) { lightPlate(lit); lit++; }
+  /* 句尾没接下一句时，让整池浮起来再落回去 */
+  if (curCT && !stirred && pinT > -1e8 && T > pinT + 0.95) stir(T);
+}
+
+/* ---------------- 镜头 ---------------- */
+let panX = 0, panY = 0;
+function camera(dt) {
+  let tx = 0, ty = 0;
+  if (curLay && curLay.glyphs.length) {
+    const g = curLay.glyphs[Math.min(curLay.glyphs.length - 1, Math.max(0, lit - 1))];
+    if (g) { tx = (g.x - W / 2) * 0.10; ty = (g.y - H / 2) * 0.065; }
+  }
+  tx += Math.sin(t0 * 0.037) * W * 0.008 + Math.sin(t0 * 0.014) * W * 0.004;
+  ty += Math.cos(t0 * 0.029) * H * 0.008;
+  const k = Math.min(1, dt * 2.4);
+  panX += (tx - panX) * k; panY += (ty - panY) * k;
+}
+
+/* ---------------- 绘制 ---------------- */
+let last = performance.now();
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+  else { ctx.fillStyle = '#05070d'; ctx.fillRect(0, 0, W, H); }
+  if (!N || !curLay) return;
+
+  const zoom = 1.008 + 0.015 * Math.sin(t0 * 0.045) + 0.012 * beatP;
+  ctx.save();
+  ctx.translate(W * 0.5 + panX, H * 0.5 + panY);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W * 0.5, -H * 0.5);
+
+  /* 凹槽面 */
+  if (plate) {
+    plateA = Math.min(1, plateA + 0.07);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = (0.92 + 0.10 * beatP) * plateA;
+    ctx.drawImage(plate, plateX, plateY, plateW, plateH);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 池底的球（暗）：source-over，不上加法，免得底部抢脸 */
+  ctx.globalCompositeOperation = 'source-over';
+  if (sprDim) {
+    const hf = sprDim.half, d = hf * 2;
+    ctx.globalAlpha = 0.68;
+    for (let i = 0; i < N; i++) if (B.st[i] === 0) ctx.drawImage(sprDim.cv, B.x[i] - hf, B.y[i] - hf, d, d);
+  }
+  /* 已经落进笔画的球：实心珠子（source-over 才有球感，加法会糊成一团） */
+  ctx.globalAlpha = 1;
+  if (sprLit) {
+    const hf = sprLit.half, d = hf * 2;
+    for (let i = 0; i < N; i++) if (B.st[i] !== 0 && B.glow[i] <= 0.45) ctx.drawImage(sprLit.cv, B.x[i] - hf, B.y[i] - hf, d, d);
+  }
+  /* 刚落地的那一下：加法光晕，只给 glow 高的少数球 */
+  ctx.globalCompositeOperation = 'lighter';
+  if (sprHot) {
+    const hf = sprHot.half, d = hf * 2;
+    for (let i = 0; i < N; i++) if (B.st[i] !== 0 && B.glow[i] > 0.45) ctx.drawImage(sprHot.cv, B.x[i] - hf, B.y[i] - hf, d, d);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
+
+  /* beat：整场相干地亮一下（不逐球乱踢，坑⑬） */
+  if (beatP > 0.01) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = C.glow + (0.030 * beatP).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  beatP *= Math.exp(-dt * 2.6);
+  camera(dt);
+  stepBalls(dt, T);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  derive(); bakeBg();
+  if (lines.length) relayout(); else { N = 0; plate = null; prevN = 0; }
+}
+addEventListener('resize', resize);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; pend = null; pendIdx = -1;
+    curLay = null; curCT = null; curYrc = false; lit = 0;
+    N = 0; prevN = 0; plate = null; pinT = Infinity; stirred = false;
+    if (p.accent) accent = p.accent;
+    derive(); bakeBg();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整池相干地一颤（池底的球一起起伏）+ 整体亮一下 */
+    beatP = Math.min(1.4, beatP + 0.38 + (d.payload.level || 0) * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+resize();
+requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx, yrc: !!curYrc,
+  lit: lit, chars: curCT ? curCT.length : 0, rows: curLay ? curLay.nr : 0,
+  fs: curLay ? +curLay.fs.toFixed(1) : 0,
+  balls: N, rest: nRest, air: nAir, r: +BALL_R.toFixed(2),
+  pool: (function () { let c = 0; for (let i = 0; i < N; i++) if (B.st[i] === 0) c++; return c; })(),
+  stirred: stirred, ink: inkTotal.n, T: +now().toFixed(2)
+});
+</script>
+</body>
+</html>
+
+

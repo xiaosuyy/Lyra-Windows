@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>噪声山脉</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(255,192,138,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   054 · 噪声山脉 —— 每个字的**高度剖面**被抬成一维山脊上的一座峰
+   ----------------------------------------------------------------------------
+   核心机制：五条山脊线，每条都是一维值噪声 + 多倍频叠加出的高度剖面，
+   一条 Path2D 一次 fill 一次 stroke；天空按 150 秒一轮昼夜循环换色。
+   中间那条（字形山脊）不是纯噪声：**每个字把自己字形的高度剖面写进这一段
+   山脊**——唱到第 k 个字，它脚下那一小段地形就从噪声平滑地抬成那个字的
+   峰（笔画高的地方峰高，空隙处落回谷）。整句唱完，山脊的轮廓就是这句话的
+   心电图：41 个字 = 41 座高度、形状各不相同的峰。字本身亮在山脊上方的天空里。
+
+   和 020（网格地平线）的区别：那是透视网格的无限延伸；这里是分层噪声地形 +
+   横向推轨，而且地形的高度场逐字来自字形。
+
+   分词：不用 —— 生成系统类逐字抬升更自然，一个字一座峰。
+
+   精修记录：
+   ① 逐字时刻统一走 charTimes()（chars 长度与正文相等且可解析才采信，单调钳位，
+      否则 t+dur*k/n 均分回退）；第 k 字的峰在 chars[k].t 抬升，
+      window.__stage().yrc 暴露是否走 YRC。
+   ② 阅读优先：1~3 行、取放得下的最大字号、行内居中，字块垫一层薄暗场（日落亮
+      天空里也读得清），暗描边；未唱到的字保持 0.60 可见度，句尾整句仍在。
+   ③ 动效：相机缓慢横移（山脊与字一起走），beat 一阵过山风 + 整片地形亮一档，
+      峰在开唱瞬间抬升（0.42s 缓动），进场 0.26s 淡入。
+   ④ 性能：五条山脊每帧各一条 Path2D；天空渐变/暗角只在 resize 重建；星点/萤火
+      整批一次 fill。
+   ========================================================================== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hint = document.getElementById('hint');
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+/* ---- 画布 ---- */
+let W = 0, H = 0, DPR = 1;
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+function fit() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(320, innerWidth); H = Math.max(240, innerHeight);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+fit();
+
+/* ================= 排版：1~3 行，逐字绝对坐标 ================= */
+const FAMILY = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif';
+const FONT = (fs) => '800 ' + fs.toFixed(1) + 'px ' + FAMILY;
+const om = document.createElement('canvas').getContext('2d');
+
+function layout(text, availW, availH, maxRows, cy) {
+  const s = text;
+  if (!/\S/.test(s)) return null;
+  const n = s.length;
+  om.font = FONT(100);
+  let best = 0, bestR = 1;
+  for (let r = 1; r <= maxRows; r++) {
+    const per = Math.ceil(n / r);
+    const wPer = om.measureText(s.slice(0, Math.min(n, per))).width / 100 || 0.01;
+    const f = Math.min(availW / wPer, availH / (r * 1.34), 96);
+    if (f > best) { best = f; bestR = r; }
+  }
+  let fs = Math.max(13, best);
+  let ranges = null;
+  for (let guard = 0; guard < 30; guard++) {
+    om.font = FONT(fs);
+    const total = om.measureText(s).width;
+    const cap = Math.max(fs * 2.2, Math.min(availW, total / bestR * 1.04));
+    const rr = [];
+    let start = 0;
+    while (start < n) {
+      let lo = start + 1, hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (om.measureText(s.slice(start, mid)).width <= cap) lo = mid; else hi = mid - 1;
+      }
+      let end = Math.max(start + 1, lo);
+      const sp = s.lastIndexOf(' ', end - 1);
+      if (sp > start + Math.max(2, (end - start) * 0.5)) end = sp;
+      rr.push([start, end]);
+      start = end;
+    }
+    if (rr.length <= maxRows) { ranges = rr; break; }
+    fs *= 0.9;
+    if (fs < 13) { fs = 13; ranges = rr; break; }
+  }
+  if (!ranges) return null;
+  const lh = fs * 1.34;
+  const rows = [];
+  let maxw = 0;
+  om.font = FONT(fs);
+  for (let q = 0; q < ranges.length; q++) {
+    const a = ranges[q][0], b = ranges[q][1];
+    let x = 0;
+    const chars = [];
+    for (let i = a; i < b; i++) {
+      const ch = s[i];
+      const w = om.measureText(ch).width;
+      chars.push({ ch, x, w, k: i });
+      x += w;
+    }
+    if (x > maxw) maxw = x;
+    rows.push({ chars, w: x });
+  }
+  const blockH = rows.length * lh;
+  const y0 = cy - blockH / 2;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const rx = (W - row.w) / 2;
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      c.ax = rx + c.x + c.w / 2;
+      c.ay = y0 + r * lh + lh / 2;
+    }
+  }
+  return { rows, fs, lh, blockW: maxw, blockH, cy };
+}
+
+function charTimes(line, n) {
+  const out = new Float32Array(Math.max(1, n));
+  const chs = line ? line.chars : null;
+  const base = line ? (isFinite(line.t) ? line.t : 0) : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* ================= 一维噪声 ================= */
+function hash1(n) {
+  const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+function vnoise1(x) {
+  const i = Math.floor(x), f = x - i;
+  const u = f * f * (3 - 2 * f);
+  return lerp(hash1(i), hash1(i + 1), u);
+}
+function fbm1(x) {
+  return vnoise1(x) * 0.55 + vnoise1(x * 2.07 + 13.7) * 0.3 + vnoise1(x * 4.13 + 71.1) * 0.15;
+}
+
+/* ---- 五条山脊 ---- */
+const BANDS = [
+  { yBase: 0.42, amp: 0.070, freq: 0.00090, far: 0.58, seed: 41 },
+  { yBase: 0.48, amp: 0.058, freq: 0.00150, far: 0.40, seed: 77 },
+  { yBase: 0.62, amp: 0.052, freq: 0.00220, far: 0.20, seed: 113 },   // 字形山脊
+  { yBase: 0.80, amp: 0.062, freq: 0.00320, far: 0.08, seed: 151 },
+  { yBase: 0.92, amp: 0.048, freq: 0.00490, far: 0.02, seed: 199 }
+];
+const GLYPH_BAND = 2;
+
+/* 每个字的"高度剖面"：8 个采样点，1 = 笔画顶到格子顶部 */
+const SAMP = 8;
+const gcv = document.createElement('canvas');
+const gctx = gcv.getContext('2d', { willReadFrequently: true });
+function charTopProfile(ch, w, h) {
+  const nw = clamp(Math.round(w), 6, 160), nh = clamp(Math.round(h), 6, 160);
+  if (gcv.width !== nw) gcv.width = nw;
+  if (gcv.height !== nh) gcv.height = nh;
+  gctx.setTransform(1, 0, 0, 1, 0, 0);
+  gctx.clearRect(0, 0, nw, nh);
+  gctx.font = '800 ' + (Math.min(nw, nh) * 0.92).toFixed(1) + 'px ' + FAMILY;
+  gctx.textAlign = 'center'; gctx.textBaseline = 'middle';
+  gctx.fillStyle = '#fff';
+  gctx.fillText(ch, nw / 2, nh / 2);
+  const d = gctx.getImageData(0, 0, nw, nh).data;
+  const out = new Float32Array(SAMP);
+  let mn = 1, mx = 0;
+  for (let i = 0; i < SAMP; i++) {
+    const x0 = Math.floor(i / SAMP * nw), x1 = Math.max(x0 + 1, Math.floor((i + 1) / SAMP * nw));
+    let top = -1;
+    for (let x = x0; x < x1 && top < 0; x++) {
+      for (let y = 0; y < nh; y++) {
+        if (d[(y * nw + x) * 4 + 3] > 110) { top = y; break; }
+      }
+    }
+    out[i] = top < 0 ? 0 : 1 - top / nh;      /* 1 = 这一列顶着格子上沿 */
+    if (top >= 0) { if (out[i] < mn) mn = out[i]; if (out[i] > mx) mx = out[i]; }
+  }
+  /* 归一化到 0..1：不归一化的话每个字的剖面都挤在 0.8 附近，峰就全一样高了 */
+  const rg2 = Math.max(0.02, mx - mn);
+  for (let i = 0; i < SAMP; i++) out[i] = clamp((out[i] - mn) / rg2, 0, 1);
+  return out;
+}
+
+let accent = [255, 176, 128];
+let curLyric = null, pend = null;
+let gust = 0, flash = 0, time = 0, dtG = 0.016;
+let camX = 0, camDX = 0;
+let stars = [], flies = [];
+
+/* 一天一循环（约 150 秒） */
+const CYCLE = 150, OFFSET = 0.34;
+const SKY = [
+  { p: 0.0, top: [18, 23, 46], bot: [108, 88, 110], glow: [255, 178, 136] },
+  { p: 0.25, top: [18, 42, 70], bot: [76, 118, 140], glow: [255, 222, 176] },
+  { p: 0.5, top: [36, 22, 52], bot: [172, 86, 78], glow: [255, 138, 92] },
+  { p: 0.75, top: [4, 6, 14], bot: [12, 20, 38], glow: [140, 170, 255] },
+  { p: 1.0, top: [18, 23, 46], bot: [108, 88, 110], glow: [255, 178, 136] }
+];
+function mix(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]; }
+function rgb(c, a) {
+  return 'rgba(' + (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0) + ',' + (a === undefined ? 1 : a) + ')';
+}
+function smooth(t) { return t * t * (3 - 2 * t); }
+function sampleSky(ph) {
+  let i = 0;
+  while (i < SKY.length - 2 && ph > SKY[i + 1].p) i++;
+  const a = SKY[i], b = SKY[i + 1];
+  const t = smooth(clamp((ph - a.p) / (b.p - a.p), 0, 1));
+  return { top: mix(a.top, b.top, t), bot: mix(a.bot, b.bot, t), glow: mix(a.glow, b.glow, t) };
+}
+
+function makeDeco() {
+  stars = []; flies = [];
+  const ns = Math.round((W * H) / 14000);
+  for (let i = 0; i < ns; i++) stars.push({ x: Math.random() * W, y: Math.random() * H * 0.5,
+                                            r: 0.4 + Math.random() * 1.1, p: Math.random() * TAU });
+  for (let i = 0; i < 24; i++) flies.push({ x: Math.random() * W, y: H * (0.70 + Math.random() * 0.24),
+                                            p: Math.random() * TAU, sp: 0.3 + Math.random() * 0.7 });
+}
+makeDeco();
+
+function buildLyric(ln, idx) {
+  const text = (ln && ln.text) || '';
+  const n = text.length;
+  if (!n) return null;
+  const ct = charTimes(ln, n);
+  const lay = layout(text, Math.min(W * 0.90, 1380), Math.min(H * 0.30, 300), 3, H * 0.27);
+  if (!lay) return null;
+  const bumps = [];
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      if (!/\S/.test(c.ch)) continue;
+      bumps.push({
+        ax: c.ax, w: Math.max(c.w, lay.fs * 0.9), t: isFinite(ct.t[c.k]) ? ct.t[c.k] : 0,
+        amp: 0.62 + ((c.ch.charCodeAt(0) * 2654435761) % 997) / 997 * 0.72,
+        top: charTopProfile(c.ch, Math.max(c.w, lay.fs * 0.8), lay.lh * 0.85)
+      });
+    }
+  }
+  return {
+    line: ln, t0: isFinite(ln.t) ? ln.t : 0, dur: ln.dur || 4, text, n, yrc: ct.yrc,
+    ct: ct.t, rows: lay.rows, fs: lay.fs, lh: lay.lh, cy: lay.cy, blockH: lay.blockH,
+    scrim: makeScrim(lay.blockW, lay.blockH),
+    bumps
+  };
+}
+
+function prepare(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  pend = buildLyric(ln, idx);
+}
+function startLine(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  curLyric = (pend && pend.line === ln) ? pend : buildLyric(ln, idx);
+  pend = null;
+  hint.style.opacity = '0';
+}
+function release() { curLyric = null; pend = null; }
+
+/* ================= 节奏 ================= */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; release(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci); else release();
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prepare(nx); }
+  }
+}
+
+/* ================= 山脊高度 ================= */
+function bumpLift(u, x) {
+  /* 逐字峰：字的剖面写进地形，唱到才抬起来 */
+  let best = 9;
+  const L = curLyric;
+  if (!L || !L.bumps.length) return best;
+  for (let i = 0; i < L.bumps.length; i++) {
+    const b = L.bumps[i];
+    const half = b.w * 0.62;
+    if (x < b.ax - half || x > b.ax + half) continue;
+    const u2 = (x - (b.ax - half)) / (half * 2);
+    const q = u2 * (SAMP - 1);
+    const i0 = Math.floor(q), f = q - i0;
+    const prof = lerp(b.top[i0], b.top[Math.min(SAMP - 1, i0 + 1)], f);
+    const g = clamp((u - b.t) / 0.42, 0, 1);
+    const e = g * g * (3 - 2 * g);
+    const env = Math.sin(clamp(u2, 0, 1) * Math.PI);
+    const l = e * (0.55 + 0.45 * env) * (0.040 + 0.070 * prof) * b.amp;
+    if (l < best) best = l;
+  }
+  return best;
+}
+
+function ridgeH(L, u) {
+  const noise = fbm1(u * L.freq * 1000 + L.seed);
+  let y = L.yBase - (noise - 0.5) * 2 * L.amp;
+  if (L === BANDS[GLYPH_BAND]) {
+    const lift = bumpLift(u, u);
+    if (lift < 9) y = Math.min(y, L.yBase - lift);
+  }
+  return y;
+}
+
+function drawSky(sky, night) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, rgb(sky.top));
+  g.addColorStop(0.55, rgb(mix(sky.top, sky.bot, 0.55)));
+  g.addColorStop(1, rgb(sky.bot));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.globalCompositeOperation = 'lighter';
+  if (night > 0.02) {
+    const sp = new Path2D();
+    for (let i = 0; i < stars.length; i++) {
+      const st = stars[i];
+      const r = st.r * (1 + 0.4 * (0.5 + 0.5 * Math.sin(time * 0.8 + st.p)));
+      sp.moveTo(st.x + r, st.y);
+      sp.arc(st.x, st.y, r, 0, TAU);
+    }
+    ctx.fillStyle = 'rgba(215,228,255,' + (night * 0.42).toFixed(3) + ')';
+    ctx.fill(sp);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawBands(sky, night) {
+  const step = 6;
+  for (let li = 0; li < BANDS.length; li++) {
+    const L = BANDS[li];
+    const baseCol = mix([8, 14, 24], sky.bot, L.far);
+    const topCol = mix(baseCol, sky.glow, 0.16 + night * 0.04 + (li === GLYPH_BAND ? flash * 0.14 : 0));
+    const botCol = [baseCol[0] * 0.5, baseCol[1] * 0.52, baseCol[2] * 0.58];
+
+    const p = new Path2D();
+    let started = false;
+    for (let x = 0; x <= W + step; x += step) {
+      const y = ridgeH(L, x - camDX) * H;
+      if (!started) { p.moveTo(x - 0.1, y); started = true; }
+      else p.lineTo(x, y);
+    }
+    p.lineTo(W, H + 2);
+    p.lineTo(0, H + 2);
+    p.closePath();
+
+    /* 纯色填充：每帧 5 个全屏高度的渐变填充是 40fps 的元凶（实测），
+       远山本来就低对比，纯色剪影 + 山脊亮边反而层次更干净 */
+    ctx.fillStyle = rgb([lerp(topCol[0], botCol[0], 0.34), lerp(topCol[1], botCol[1], 0.34),
+                         lerp(topCol[2], botCol[2], 0.34)]);
+    ctx.fill(p);
+    ctx.strokeStyle = rgb(sky.glow, 0.10 + night * 0.06 + (li === GLYPH_BAND ? flash * 0.20 : 0));
+    ctx.lineWidth = li === GLYPH_BAND ? 1.7 : 1.2;
+    ctx.stroke(p);
+
+    if (li === GLYPH_BAND) {
+      const my = H * L.yBase;
+      const mg = ctx.createLinearGradient(0, my - H * 0.16, 0, my + H * 0.16);
+      mg.addColorStop(0, rgb(sky.glow, 0));
+      mg.addColorStop(0.5, rgb(sky.glow, 0.020 + night * 0.014 + flash * 0.04));
+      mg.addColorStop(1, rgb(sky.glow, 0));
+      ctx.fillStyle = mg;
+      ctx.fillRect(0, my - H * 0.16, W, H * 0.32);
+    }
+  }
+
+  if (night > 0.15) {
+    ctx.globalCompositeOperation = 'lighter';
+    const fp = new Path2D();
+    for (let i = 0; i < flies.length; i++) {
+      const f = flies[i];
+      const x = f.x + Math.sin(time * 0.32 + f.p) * 26;
+      const y = f.y + Math.sin(time * f.sp + f.p) * 9;
+      const r = 0.9 + 0.5 * (0.5 + 0.5 * Math.sin(time * 2 + f.p));
+      fp.moveTo(x + r, y);
+      fp.arc(x, y, r, 0, TAU);
+    }
+    ctx.fillStyle = 'rgba(210,245,180,' + (night * 0.38).toFixed(3) + ')';
+    ctx.fill(fp);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+/* ---- 字 ---- */
+function makeScrim(bw, bh) {
+  const pad = 56;
+  const w = bw + pad * 2, h = bh + pad * 2;
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(w * DPR));
+  c.height = Math.max(2, Math.round(h * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const rx = w * 0.5, ry = Math.max(h * 0.38, 1);
+  g.save();
+  g.translate(w / 2, h / 2);
+  g.scale(1, ry / rx);
+  const rg = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+  rg.addColorStop(0, 'rgba(10,8,14,0.42)');
+  rg.addColorStop(0.6, 'rgba(10,8,14,0.30)');
+  rg.addColorStop(1, 'rgba(10,8,14,0)');
+  g.fillStyle = rg;
+  g.beginPath(); g.arc(0, 0, rx, 0, TAU); g.fill();
+  g.restore();
+  return { cv: c, w, h };
+}
+
+let lastFs = -1;
+function drawText(T) {
+  const L = curLyric;
+  if (!L || !L.rows) return;
+  const app = clamp((T - L.t0) / 0.26, 0, 1);
+  const ap = 0.34 + 0.66 * (app * app * (3 - 2 * app));
+  if (L.scrim) {
+    ctx.globalAlpha = 0.95 * ap;
+    ctx.drawImage(L.scrim.cv, 0, 0, L.scrim.cv.width, L.scrim.cv.height,
+                  W / 2 - L.scrim.w / 2, L.cy - L.scrim.h / 2, L.scrim.w, L.scrim.h);
+    ctx.globalAlpha = 1;
+  }
+  let curCh = -1;
+  for (let k = 0; k < L.n; k++) if (T >= L.ct[k]) curCh = k;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  lastFs = -1;
+  for (let r = 0; r < L.rows.length; r++) {
+    const row = L.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      const k = c.k;
+      const lit = T >= L.ct[k];
+      const isCur = k === curCh;
+      const fsz = L.fs * (isCur ? 1.06 : 1);
+      if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+      ctx.globalAlpha = ap;
+      ctx.lineWidth = Math.max(2, fsz * 0.12);
+      ctx.strokeStyle = 'rgba(8,7,12,0.80)';
+      ctx.strokeText(c.ch, c.ax, c.ay);
+      ctx.fillStyle = isCur ? 'rgba(255,252,246,1)'
+        : lit ? 'rgba(255,240,226,0.94)'
+          : 'rgba(208,198,206,0.60)';
+      ctx.fillText(c.ch, c.ax, c.ay);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ---- 消息 ---- */
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent && p.accent.length === 3) accent = p.accent;
+    release();
+    makeDeco();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.5;
+    gust = Math.min(1.6, gust + 0.30 + lv * 0.50);
+    flash = Math.min(1, flash + 0.16 + lv * 0.26);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ---- 主循环 ---- */
+let last = performance.now();
+function frame(nowMs) {
+  dtG = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  time += dtG;
+  gust *= Math.exp(-dtG * 1.7);
+  flash *= Math.exp(-dtG * 2.4);
+  const T = now();
+  timing(T);
+
+  /* 相机缓慢横移（山脊与字一起走），beat 加一点冲劲 */
+  const want = Math.sin(time * 0.115) * 14 + Math.sin(time * 0.047 + 2.1) * 7;
+  camDX = lerp(camDX, want + gust * 10, 1 - Math.exp(-dtG * 2.0));
+  camX = camDX;
+
+  const phase = (time / CYCLE + OFFSET) % 1;
+  const daylight = 0.5 + 0.5 * Math.cos((phase - 0.25) * TAU);
+  const night = 1 - daylight;
+  const sky = sampleSky(phase);
+
+  ctx.globalCompositeOperation = 'source-over';
+  drawSky(sky, night);
+  drawBands(sky, night);
+  ctx.save();
+  ctx.translate(camDX, 0);               /* 字跟着山脊一起被推轨带走 */
+  drawText(T);
+  ctx.restore();
+
+  /* 暗角 */
+  ctx.fillStyle = vgGrad || 'rgba(0,0,0,0)';
+  ctx.fillRect(0, 0, W, H);
+  requestAnimationFrame(frame);
+}
+
+let vgGrad = null;
+function buildGrads() {
+  vgGrad = ctx.createRadialGradient(W * 0.5, H * 0.48, Math.min(W, H) * 0.32,
+                                    W * 0.5, H * 0.48, Math.max(W, H) * 0.86);
+  vgGrad.addColorStop(0, 'rgba(0,0,0,0)');
+  vgGrad.addColorStop(1, 'rgba(2,4,10,0.42)');
+}
+buildGrads();
+
+addEventListener('resize', () => {
+  fit(); buildGrads(); makeDeco();
+  if (curLyric && curLyric.line) curLyric = buildLyric(curLyric.line, curIdx >= 0 ? curIdx : 0);
+});
+requestAnimationFrame(frame);
+
+window.__stage = () => {
+  let lit = 0;
+  if (curLyric) for (let k = 0; k < curLyric.n; k++) if (now() >= curLyric.ct[k]) lit++;
+  return {
+    lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+    yrc: !!(curLyric && curLyric.yrc), n: curLyric ? curLyric.n : 0,
+    fs: curLyric ? +curLyric.fs.toFixed(1) : 0,
+    rows: curLyric ? curLyric.rows.length : 0, lit,
+    bumps: curLyric ? curLyric.bumps.length : 0, cam: +camDX.toFixed(1)
+  };
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,1313 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>507 · 赤金显影</title>
+<style>
+  /* 本地字体（编号前缀素材，零外链）：kurobara 尖角黑体 + 900 黑体补缺字 */
+  @font-face{
+    font-family:"507 D";
+    src:url("assets/507-kurobara.woff2") format("woff2");
+    font-weight:100 900;font-style:normal;font-display:block;
+  }
+  @font-face{
+    font-family:"507 H";
+    src:url("assets/507-han-black.woff2") format("woff2");
+    font-weight:100 900;font-style:normal;font-display:block;
+  }
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  #cv{position:fixed;left:0;top:0;display:block;width:100%;height:100%}
+  #hud{
+    position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none;
+    font-family:"507 D","507 H","Arial Black","Impact","Microsoft YaHei",sans-serif;
+    color:rgba(255,236,226,.46);letter-spacing:.28em;text-transform:uppercase;
+    -webkit-font-smoothing:antialiased;
+  }
+  #hud .tl{position:absolute;left:4.6vw;top:4.8vh}
+  #hud .t1{font-size:clamp(10px,.80vw,14px);opacity:.55;line-height:1.25}
+  #hud .t2{font-size:clamp(8px,.58vw,11px);opacity:.28;margin-top:.8em;letter-spacing:.36em}
+  #hud .br{
+    position:absolute;right:4.6vw;bottom:5vh;font-size:clamp(9px,.62vw,12px);
+    opacity:.26;letter-spacing:.32em;font-variant-numeric:tabular-nums;
+  }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="hud">
+  <div class="tl"><div class="t1" id="hT"></div><div class="t2" id="hA"></div></div>
+  <div class="br" id="hC"></div>
+</div>
+<script>
+(function () {
+  "use strict";
+
+/* ============================================================
+   507 chrome 引擎（WebGL2）
+   ------------------------------------------------------------
+   与参考图同一套原理：
+     字形 → 距离场 → 「圆管/斜面」高度场 → 求法线
+     → 法线查程序化 HDRI → 真实反射
+
+   关键：笔画内部的法线也必须连续变化（笔画当成半圆柱），
+   否则内部是平面，只会亮一圈边，永远不像铬。
+   ============================================================ */
+var CHROME = (function () {
+  "use strict";
+
+  var cv = document.createElement("canvas");
+  var gl = null;
+  var prog = null, vbo = null;
+  var texShape = null;
+  var U = {};
+  var ok = false;
+  var W = 2, H = 2;
+  var lastErr = "";
+
+  var VS = [
+    "#version 300 es",
+    "in vec2 aPos;",
+    "out vec2 vUv;",
+    "void main(){",
+    "  vUv = aPos * 0.5 + 0.5;",
+    "  gl_Position = vec4(aPos, 0.0, 1.0);",
+    "}"
+  ].join("\n");
+
+  var FS = [
+    "#version 300 es",
+    "precision highp float;",
+    "in vec2 vUv;",
+    "out vec4 fragColor;",
+    "",
+    "uniform sampler2D uShape;",
+    "uniform vec2  uRes;",
+    "uniform float uDepth;",
+    "uniform float uBevel;",
+    "uniform float uPhase;",
+    "uniform vec3  uRed;",
+    "uniform float uGain;",
+    "",
+    "const float PI = 3.14159265;",
+    "",
+    "float S(vec2 uv){",
+    "  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;",
+    "  return texture(uShape, uv).r;",
+    "}",
+    "",
+    /* 用环采样估「到边缘的距离」：
+       圆盘内平均覆盖率 e → 若边缘是直线，e 与 d 近似线性
+       返回 0（贴边）.. 1（深处） */
+    "float depthField(vec2 uv, float rad){",
+    "  vec2 px = 1.0 / uRes;",
+    "  float acc = 0.0;",
+    "  float wsum = 0.0;",
+    /* 两圈，内圈权重高 → 更平滑的距离过渡 */
+    "  for (int ring = 0; ring < 2; ring++){",
+    "    float rr = rad * (ring == 0 ? 0.55 : 1.0);",
+    "    float wgt = (ring == 0 ? 1.35 : 0.75);",
+    "    float sum = 0.0;",
+    "    const int N = 12;",
+    "    for (int i = 0; i < N; i++){",
+    "      float a = (float(i) + 0.5) * (2.0 * PI / float(N));",
+    "      sum += S(uv + vec2(cos(a), sin(a)) * px * rr);",
+    "    }",
+    "    acc += (sum / float(N)) * wgt;",
+    "    wsum += wgt;",
+    "  }",
+    "  return clamp(acc / wsum, 0.0, 1.0);",
+    "}",
+    "",
+    /* 程序化环境（摄影棚式）
+       铬字正脸朝观众时，反射的是正前方一大片亮幕 —— 所以 d.y≈0 附近必须亮。
+       之前的公式在中间留了黑带，导致字面大面积发暗。
+       现在的层次：亮棚（主）+ 上下渐变 + 一条地脚亮线 + 少量暗部。 */
+    "vec3 env(vec3 n){",
+    "  vec3 d = normalize(n);",
+    "",
+    /*  正前方的大亮幕：这是一片高频反射区，占字面大部分 */
+    "  float curtain = smoothstep(-0.55, -0.05, d.y) * smoothstep(0.72, 0.10, d.y);",
+    "",
+    /*  顶部天光（更亮一档） */
+    "  float sky = smoothstep(0.30, 0.80, d.y);",
+    "",
+    /*  地平线附近的硬亮线：铬标志性的那道 */
+    "  float horizon = exp(-pow((d.y - 0.10) / 0.040, 2.0));",
+    "",
+    /*  下方地脚反光，相位让它滑动 */
+    "  float slide = uPhase * 2.0 - 1.0;",
+    "  float lowBand = exp(-pow((d.y + 0.42 + slide * 0.30) / 0.16, 2.0));",
+    "",
+    /*  暗缝：只留很窄的一条，制造金属的层次，不要大面积 */
+    "  float darkSeam = exp(-pow((d.y + 0.16) / 0.035, 2.0));",
+    "",
+    /*  侧向补光 */
+    "  float sideGlow = pow(clamp(abs(d.x), 0.0, 1.0), 1.8) * 0.30;",
+    "",
+    "  float lit = curtain * 0.92",
+    "            + sky * 0.85",
+    "            + horizon * 1.60",
+    "            + lowBand * 0.95",
+    "            + sideGlow",
+    "            - darkSeam * 0.62;",
+    "",
+    /*  基体：铬的暗部接近黑，但占比要小 */
+    "  vec3 base   = vec3(0.035, 0.030, 0.028);",
+    "  vec3 shadow = vec3(0.16, 0.125, 0.10);",
+    "  vec3 warm   = vec3(0.88, 0.62, 0.24);",
+    "  vec3 silver = vec3(0.97, 0.95, 0.90);",
+    "  vec3 hot    = vec3(1.00, 0.995, 0.97);",
+    "",
+    "  vec3 col = base;",
+    "  col = mix(col, shadow, clamp(lit * 1.5, 0.0, 1.0));",
+    "  col = mix(col, warm,   smoothstep(0.34, 1.00, lit));",
+    "  col = mix(col, silver, smoothstep(0.92, 1.32, lit));",
+    "  col = mix(col, hot,    smoothstep(1.26, 1.62, lit));",
+    "",
+    /*  对比拉伸：铬的暗部要真的黑下去，亮部才炸得出来 */
+    "  float lum = dot(col, vec3(0.299, 0.587, 0.114));",
+    "  lum = smoothstep(0.12, 0.86, lum);",
+    "  col = mix(col * 0.28, col * 1.32, lum);",
+    "",
+    /*  红色环境：下方染上来（参考图里字的下半部是红的） */
+    "  float redLow = smoothstep(0.10, -0.95, d.y);",
+    "  col += uRed * redLow * redLow * 0.70;",
+    "",
+    /*  极窄镜面尖光 */
+    "  float spec = pow(clamp(d.y - 0.02, 0.0, 1.0), 26.0);",
+    "  col += vec3(1.0, 1.0, 0.99) * spec * 1.45;",
+    "",
+    "  return col;",
+    "}",
+    "",
+    /* 屏幕空间的环境补充：
+       平直面朝观众时反射的是「整个房间」——地平线会横穿表面。
+       只靠法线做不到这点（平面法线恒定 → 只有一个颜色），
+       所以按屏幕高度再叠一层房室结构。这是对真实反射的近似，
+       但正是让字面「不平」的关键。 */
+    "vec3 roomAt(vec2 uv, vec3 base){",
+    "  float y = uv.y;",
+    /*  房间地平线：一条亮带横穿，位置随相位轻微移动 */
+    "  float hz = 0.46 + (uPhase - 0.5) * 0.14;",
+    "  float floorLine = exp(-pow((y - hz) / 0.012, 2.0));",
+    "  float floorGlow = exp(-pow((y - hz) / 0.075, 2.0)) * 0.55;",
+    /*  上方天花板暗区 */
+    "  float ceil = smoothstep(hz, 1.02, y) * 0.55;",
+    /*  下方地板亮区（抛光地面把光反上来） */
+    "  float floorLit = smoothstep(hz, -0.05, y) * 0.42;",
+    "",
+    /*  一条条横向的柔光灯管：棚拍常见 */
+    "  float strips = 0.0;",
+    "  for (int i = 0; i < 3; i++){",
+    "    float sy = hz + 0.18 + float(i) * 0.21;",
+    "    strips += exp(-pow((y - sy) / 0.020, 2.0)) * (0.42 - float(i) * 0.10);",
+    "  }",
+    "",
+    "  vec3 c = base;",
+    "  c = mix(c, vec3(0.02, 0.018, 0.016), ceil * 0.75);",
+    "  c = mix(c, vec3(0.98, 0.94, 0.86), floorGlow * 0.55);",
+    "  c += vec3(1.0, 0.99, 0.95) * floorLine * 0.55;",
+    "  c += vec3(0.90, 0.86, 0.78) * strips;",
+    "  c = mix(c, c * 0.62 + base * 0.38, floorLit * 0.5);",
+    "",
+    /*  红场在下半部的地面反光里（参考图最明显的特征） */
+    "  float redFloor = smoothstep(hz + 0.10, -0.15, y);",
+    "  c += uRed * redFloor * 0.85;",
+    "",
+    "  return c;",
+    "}",
+    "",
+    "void main(){",
+    "  vec2 px = 1.0 / uRes;",
+    "",
+    /* ---------- ⅰ 挤出的侧面 ---------- */
+    /*  挤出方向：正下方。参考图里字是正面朝观众、厚度全在底部。
+       早期用右下斜向，会把字形整体推开，看起来像变胖 + 重影。 */
+    "  vec2 exDir = vec2(0.0, 1.0);",
+    "  float sideAlpha = 0.0;",
+    "  float sideT = 0.0;",
+    "  const int STEPS = 9;",
+    "  for (int i = 0; i < STEPS; i++){",
+    "    float t = (float(i) + 1.0) / float(STEPS);",
+    "    vec2 off = exDir * px * (uDepth * t);",
+    "    float c = S(vUv - off);",
+    "    if (c > sideAlpha){ sideAlpha = c; sideT = t; }",
+    "  }",
+    "",
+    /* ---------- ⅱ 正面 ---------- */
+    "  float cover = S(vUv);",
+    "  float rad = max(2.0, uBevel);",
+    "  float dfield = depthField(vUv, rad);",
+    "",
+    /*  距离场 → 高度：笔画内部当成半圆柱，越靠中间越高 */
+    "  float h = sqrt(clamp(dfield, 0.0, 1.0));",
+    "",
+    /*  法线 = 高度场梯度（用中心差分近似） */
+    "  float dR = depthField(vUv + vec2(px.x * 2.0, 0.0), rad);",
+    "  float dL = depthField(vUv - vec2(px.x * 2.0, 0.0), rad);",
+    "  float dU = depthField(vUv + vec2(0.0, px.y * 2.0), rad);",
+    "  float dD = depthField(vUv - vec2(0.0, px.y * 2.0), rad);",
+    "",
+    "  float gx = sqrt(clamp(dL,0.0,1.0)) - sqrt(clamp(dR,0.0,1.0));",
+    "  float gy = sqrt(clamp(dD,0.0,1.0)) - sqrt(clamp(dU,0.0,1.0));",
+    "",
+    /*  倾斜强度：决定笔画「圆」到什么程度。
+       太小 → 法线几乎都朝前 → 只反射地平线，整片发暗；
+       太大 → 全部斜掉 → 亮带乱窜。2.6 是试出来的平衡点。 */
+    "  float tilt = 2.6;",
+    "  vec3 nFace = normalize(vec3(gx * tilt * (2.0 / max(2.0, uBevel)), gy * tilt * (2.0 / max(2.0, uBevel)), 1.0));",
+    "",
+    /* ---------- ⅲ 合成 ---------- */
+    "  float a = max(cover, sideAlpha);",
+    "  if (a < 0.02) { fragColor = vec4(0.0, 0.0, 0.0, 0.0); return; }",
+    "",
+    /*  侧面用固定法线（朝右下外侧），正面用高度场法线 */
+    "  vec3 nSide = normalize(vec3(0.52, -0.62, 0.58));",
+    "  vec3 n = normalize(mix(nFace, nSide, step(cover, 0.5) * 0.9));",
+    "",
+    "  vec3 col = env(n);",
+    "",
+    /*  再叠加屏幕空间房室反射（让朝观众的平面也有层次） */
+    "  vec3 room = roomAt(vUv, col);",
+    "  float flatness = clamp(n.z, 0.0, 1.0);",
+    "  col = mix(col, room, flatness * 0.42);",
+    "",
+    /*  侧面越深越暗 */
+    "  float isSide = (1.0 - cover) * step(0.02, sideAlpha);",
+    "  col *= mix(1.0, 1.0 - sideT * 0.62, isSide);",
+    "",
+    /*  正面中心略微提亮，让金属有「鼓起来」的感觉 */
+    "  col *= mix(0.92, 1.10, clamp(dfield * 1.4, 0.0, 1.0) * cover);",
+    "",
+    /*  倒角棱线：贴边一圈的硬高光 */
+    "  float rim = smoothstep(0.30, 0.02, dfield) * cover;",
+    "  col += vec3(1.0, 0.98, 0.93) * pow(rim, 1.15) * 0.85;",
+    "",
+    /*  金属表面细颗粒（参考图那种锈蚀感），很轻 */
+    "  float g1 = fract(sin(dot(vUv * uRes, vec2(12.9898, 78.233))) * 43758.5453);",
+    "  float g2 = fract(sin(dot(vUv * uRes * 1.7, vec2(39.346, 11.135))) * 24634.6345);",
+    "  col *= 0.94 + (g1 * 0.6 + g2 * 0.4) * 0.13;",
+    "",
+    "  col *= uGain;",
+    "  fragColor = vec4(clamp(col, 0.0, 1.0), a);",
+    "}"
+  ].join("\n");
+
+  function compile(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      var log = gl.getShaderInfoLog(s);
+      gl.deleteShader(s);
+      throw new Error("shader: " + log);
+    }
+    return s;
+  }
+
+  function init() {
+    if (ok) return true;
+    try {
+      cv.width = 2; cv.height = 2;
+      gl = cv.getContext("webgl2", {
+        alpha: true, antialias: false, premultipliedAlpha: false,
+        preserveDrawingBuffer: true, depth: false, stencil: false
+      });
+      if (!gl) { lastErr = "no webgl2"; return false; }
+
+      var vs = compile(gl.VERTEX_SHADER, VS);
+      var fs = compile(gl.FRAGMENT_SHADER, FS);
+      prog = gl.createProgram();
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.bindAttribLocation(prog, 0, "aPos");
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        throw new Error("link: " + gl.getProgramInfoLog(prog));
+      }
+      gl.deleteShader(vs); gl.deleteShader(fs);
+
+      vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+      U.shape = gl.getUniformLocation(prog, "uShape");
+      U.res = gl.getUniformLocation(prog, "uRes");
+      U.depth = gl.getUniformLocation(prog, "uDepth");
+      U.bevel = gl.getUniformLocation(prog, "uBevel");
+      U.phase = gl.getUniformLocation(prog, "uPhase");
+      U.red = gl.getUniformLocation(prog, "uRed");
+      U.gain = gl.getUniformLocation(prog, "uGain");
+
+      texShape = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texShape);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+      ok = true;
+      return true;
+    } catch (e) {
+      ok = false;
+      gl = null;
+      lastErr = String((e && e.message) || e);
+      return false;
+    }
+  }
+
+  function uploadShape(canvas2d, w, h) {
+    if (!ok || !gl) return false;
+    W = Math.max(1, Math.round(w));
+    H = Math.max(1, Math.round(h));
+    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+
+    gl.bindTexture(gl.TEXTURE_2D, texShape);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas2d);
+    return true;
+  }
+
+  /* 直接画到画布默认 framebuffer（画进 FBO 的话 canvas 永远是空的） */
+  function render(opts) {
+    if (!ok || !gl) return null;
+    var phase = opts.phase || 0;
+    var depth = opts.depth || 20;
+    var bevel = opts.bevel || 5;
+    var red = opts.red || [0.75, 0.06, 0.05];
+    var gain = opts.gain == null ? 1 : opts.gain;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texShape);
+    gl.uniform1i(U.shape, 0);
+
+    gl.uniform2f(U.res, W, H);
+    gl.uniform1f(U.depth, depth);
+    gl.uniform1f(U.bevel, bevel);
+    gl.uniform1f(U.phase, phase);
+    gl.uniform3f(U.red, red[0], red[1], red[2]);
+    gl.uniform1f(U.gain, gain);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.finish();
+    return cv;
+  }
+
+  return {
+    get available() { return ok; },
+    get error() { return lastErr; },
+    init: init,
+    upload: uploadShape,
+    render: render,
+    canvas: function () { return cv; }
+  };
+})();
+
+
+  /* =========================================================
+     507 · 赤金显影
+     ---------------------------------------------------------
+     同一句歌词有且只有两个完整状态，鼓点一到硬切 + 短促交叉：
+
+     ① 未渲染态
+        底：专辑封面主色做的平滑渐变（无任何纹理 / 噪点 / 颗粒）
+        字：纯黑平涂，无描边、无高光
+
+     ② 渲染态（鼓点触发）
+        底：纯黑
+        字：同比例挤出的 3D 立体金字
+            —— 侧面（沿挤出方向由亮到暗）+ 正面（抛光金反射带）
+            —— 左上受光棱、右下暗棱
+
+     镜头：手持 —— 慢速推拉（前移后移）+ 低频漂移 + 微旋转，
+            每拍再猛地推近一次，带一点滚动快门错位。
+
+     几何全部在 bake 时一次性算好，每帧只做贴图。
+     ========================================================= */
+
+  /* ---------------- 0) 自检口：最外层、无条件 ---------------- */
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "", song: null, duration: 0 };
+  var RM = false;
+  try { RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) { }
+
+  window.__stage = function () {
+    var i = S.idx;
+    var ln = (i >= 0 && i < S.lines.length) ? S.lines[i] : null;
+    return {
+      lines: S.lines.length,
+      idx: i,
+      t: isFinite(S.t) ? S.t : 0,
+      playing: !!S.playing,
+      frames: S.frames,
+      js: Math.round(S.js * 100) / 100,
+      err: S.err || "",
+      text: ln ? String(ln.text == null ? "" : ln.text) : "",
+      gl: false,
+      rm: RM
+    };
+  };
+
+  /* ---------------- 1) ready：第一个 rAF 无条件发，只发一次 ------------- */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (e) { console.error(e); }
+  }
+  requestAnimationFrame(sendReady);
+  setTimeout(sendReady, 800);
+
+  /* ---------------- 2) 小工具 ---------------- */
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function num(v, d) { var n = Number(v); return isFinite(n) ? n : d; }
+  function mk(w, h, scale) {
+    var c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(w * scale));
+    c.height = Math.max(1, Math.round(h * scale));
+    return c;
+  }
+  function c2d(c, scale) {
+    var g = c.getContext("2d");
+    if (scale) g.setTransform(scale, 0, 0, scale, 0, 0);
+    return g;
+  }
+  function C(rgb, a) {
+    var r = Math.round(clamp(rgb[0], 0, 255)), g = Math.round(clamp(rgb[1], 0, 255)), b = Math.round(clamp(rgb[2], 0, 255));
+    return a == null ? "rgb(" + r + "," + g + "," + b + ")" : "rgba(" + r + "," + g + "," + b + "," + a + ")";
+  }
+  function addStop(grad, at, col) {                     // §7.1 每条都包 try
+    try { grad.addColorStop(clamp(at, 0, 1), col); } catch (e) { }
+  }
+  function rgb2hsl(c) {
+    var r = clamp(c[0], 0, 255) / 255, g = clamp(c[1], 0, 255) / 255, b = clamp(c[2], 0, 255) / 255;
+    var mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+    var h = 0, s = 0, l = (mx + mn) / 2;
+    if (d > 1e-6) {
+      s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+      if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0));
+      else if (mx === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h *= 60;
+    }
+    return { h: h, s: s, l: l };
+  }
+  function hsl2rgb(h, s, l) {
+    h = ((h % 360) + 360) % 360; s = clamp(s, 0, 1); l = clamp(l, 0, 1);
+    var cc = (1 - Math.abs(2 * l - 1)) * s, x = cc * (1 - Math.abs((h / 60) % 2 - 1)), m = l - cc / 2;
+    var r = 0, g = 0, b = 0;
+    if (h < 60) { r = cc; g = x; }
+    else if (h < 120) { r = x; g = cc; }
+    else if (h < 180) { g = cc; b = x; }
+    else if (h < 240) { g = x; b = cc; }
+    else if (h < 300) { r = x; b = cc; }
+    else { r = cc; b = x; }
+    return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+  }
+  function rnd(seed) {
+    var x = Math.sin(seed * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  /* ---------------- 3) 画布 ---------------- */
+  var cv = document.getElementById("cv");
+  var ctx = cv.getContext("2d", { alpha: false });
+  var W = 1440, H = 900, DPR = 1, LQ = 2;
+
+  function resize() {
+    W = innerWidth || 1440; H = innerHeight || 900;
+    if (!isFinite(W) || W <= 0) W = 1440;
+    if (!isFinite(H) || H <= 0) H = 900;
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    cv.style.width = W + "px"; cv.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    /* 字层超采样：3D 的棱和反射带要撑得住镜头推近 */
+    LQ = clamp(Math.max(2, DPR), 1, 2.5);
+    bgDirty = true; layerDirty = true;
+  }
+
+  /* ---------------- 4) 调色 ---------------- */
+  var ACC = [190, 26, 22];
+  var FIELD = null;
+
+  /* 抛光金：从上到下若干反射带（暗 → 亮 → 暗 → 亮 → 暗），chrome 那种 */
+  var FACE = [
+    [58, 28, 6],      // 0.00 上缘暗
+    [146, 88, 24],    // 0.10
+    [224, 160, 62],   // 0.22
+    [255, 240, 196],  // 0.30 上反射带（地平线）
+    [246, 204, 120],  // 0.36
+    [178, 112, 34],   // 0.48
+    [96, 50, 12],     // 0.58 腰部暗
+    [150, 92, 30],    // 0.66
+    [238, 180, 88],   // 0.74
+    [255, 246, 208],  // 0.82 下反射带
+    [216, 152, 66],   // 0.88
+    [72, 34, 8]       // 1.00 下缘暗
+  ];
+
+  function buildPalette() {
+    var hsl = rgb2hsl(ACC);
+    var h = hsl.h, s = hsl.s;
+    if (!(s > 0.10)) { h = 357; s = 1; }                 // 中性/黑白封面 → 回落
+    s = clamp(Math.max(0.80, s * 1.02), 0, 1);
+
+    FIELD = {
+      h: h, s: s,
+      hi: hsl2rgb(h, s * 0.98, 0.36),                    // 渐变亮部
+      mid: hsl2rgb(h, s, 0.255),                         // 渐变中部
+      lo: hsl2rgb(h, s * 0.96, 0.085)                    // 渐变暗部
+    };
+  }
+  buildPalette();
+
+  function applyAccent(a) {
+    var ok = false, v = [0, 0, 0];
+    if (Array.isArray(a) && a.length >= 3) {
+      var r = Number(a[0]), g = Number(a[1]), b = Number(a[2]);
+      if (isFinite(r) && isFinite(g) && isFinite(b)) {
+        v = [clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255)];
+        if (v[0] + v[1] + v[2] > 24) ok = true;          // [0,0,0] 或近黑 → 回落
+      }
+    }
+    ACC = ok ? v : [190, 26, 22];
+    buildPalette();
+    bgDirty = true; layerDirty = true;
+  }
+
+  /* ---------------- 5) 未渲染态背景：封面主色的平滑渐变（无纹理） -------- */
+  var bg = null, bgW = 0, bgH = 0, bgDirty = true;
+
+  function bakeBG() {
+    bgDirty = false;
+    var pad = Math.round(Math.max(W, H) * 0.14);
+    bgW = W + pad * 2; bgH = H + pad * 2;
+    var scale = clamp(DPR, 1, 1.5);
+    bg = mk(bgW, bgH, scale);
+    var g = c2d(bg, scale);
+
+    /* 对角线性渐变（整幅干净过渡） */
+    var lg = g.createLinearGradient(0, bgH, bgW, 0);
+    addStop(lg, 0, C(FIELD.lo));
+    addStop(lg, 0.42, C(FIELD.mid));
+    addStop(lg, 0.72, C(FIELD.hi));
+    addStop(lg, 1, C(FIELD.mid));
+    g.fillStyle = lg; g.fillRect(0, 0, bgW, bgH);
+
+    /* 中间一团柔和的提亮，让黑字压得住（也是渐变的一部分，不是纹理） */
+    var rg = g.createRadialGradient(bgW * 0.5, bgH * 0.52, 0, bgW * 0.5, bgH * 0.52, Math.max(bgW, bgH) * 0.62);
+    addStop(rg, 0, C(FIELD.hi, 0.55));
+    addStop(rg, 0.55, C(FIELD.mid, 0.18));
+    addStop(rg, 1, C(FIELD.lo, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, bgW, bgH);
+
+    /* 四周压暗（渐变收边，不是暗角纹理） */
+    var vg = g.createRadialGradient(bgW * 0.5, bgH * 0.5, Math.min(bgW, bgH) * 0.30,
+      bgW * 0.5, bgH * 0.5, Math.max(bgW, bgH) * 0.92);
+    addStop(vg, 0, C(FIELD.lo, 0));
+    addStop(vg, 0.62, C(FIELD.lo, 0.20));
+    addStop(vg, 1, C(FIELD.lo, 0.72));
+    g.fillStyle = vg; g.fillRect(0, 0, bgW, bgH);
+  }
+
+  /* ---------------- 6) 字体 ---------------- */
+  var FONT_D = '"507 D","Arial Black","Impact","Haettenschweiler",sans-serif';
+  var FONT_H = '"507 H","Noto Sans SC","Source Han Sans SC","Microsoft YaHei","PingFang SC",sans-serif';
+  var FONT_STACK = FONT_D + "," + FONT_H;
+  var fontReady = false;
+
+  function fstr(px) { return "900 " + (Math.round(px * 100) / 100) + "px " + FONT_STACK; }
+
+  (function loadFonts() {
+    var done = false;
+    function fin() { if (done) return; done = true; fontReady = true; layerDirty = true; }
+    try {
+      if (document.fonts && document.fonts.load) {
+        Promise.all([
+          document.fonts.load('900 100px "507 D"', "DIZZY0123 灯把影子拉得很长"),
+          document.fonts.load('900 100px "507 H"', "雨落城市回声 爱说时过还远")
+        ]).then(fin, fin);
+        setTimeout(fin, 1600);
+      } else fin();
+    } catch (e) { fin(); }
+  })();
+
+  /* ---------------- 7) 排版 ---------------- */
+  var meas = mk(8, 8, 1), mctx = c2d(meas);
+  var TRACK = -0.026;
+
+  function measureRow(chars, fs) {
+    mctx.font = fstr(fs);
+    var adv = [], sum = 0, i;
+    for (i = 0; i < chars.length; i++) {
+      var a = mctx.measureText(chars[i]).width || fs * 0.5;
+      adv.push(a); sum += a;
+    }
+    sum += TRACK * fs * Math.max(0, chars.length);
+    return { adv: adv, w: sum };
+  }
+
+  function layout(chars, availW, baseFs, minFs, perRow) {
+    var fs = baseFs, m = null, rows = null, i, it, k;
+
+    var forceRows = 1;
+    if (perRow && chars.length > perRow) forceRows = Math.min(3, Math.ceil(chars.length / perRow));
+
+    if (forceRows === 1) {
+      for (it = 0; it < 18; it++) {
+        m = measureRow(chars, fs);
+        if (m.w <= availW) return { rows: [{ chars: chars, adv: m.adv, w: m.w }], fs: fs };
+        if (fs <= minFs) break;
+        fs = Math.max(minFs, fs * (availW / m.w) * 0.985);
+      }
+    }
+
+    for (var nr = Math.max(2, forceRows); nr <= 3 && !rows; nr++) {
+      var n = chars.length;
+      if (n < nr * 2) break;
+      var best = null, cuts = [];
+      (function rec(start, left, acc) {
+        if (left === 1) { cuts.push(acc.concat([n])); return; }
+        for (var q = start + 1; q <= n - (left - 1); q++) rec(q, left - 1, acc.concat([q]));
+      })(0, nr, []);
+      for (i = 0; i < cuts.length; i++) {
+        var cs = cuts[i], prev = 0, mx = 0, set = [], bad = false;
+        for (k = 0; k < cs.length; k++) {
+          var part = chars.slice(prev, cs[k]);
+          if (!part.length) { bad = true; break; }
+          var mm = measureRow(part, 1);
+          if (mm.w > mx) mx = mm.w;
+          set.push(part);
+          prev = cs[k];
+        }
+        if (!bad && (!best || mx < best.mx)) best = { mx: mx, set: set };
+      }
+      if (!best) continue;
+      var f2 = baseFs;
+      for (it = 0; it < 18; it++) {
+        if (best.mx * f2 <= availW) break;
+        if (f2 <= minFs) break;
+        f2 = Math.max(minFs, f2 * (availW / (best.mx * f2)) * 0.985);
+      }
+      if (best.mx * f2 <= availW || f2 <= minFs) {
+        rows = best.set.map(function (r) {
+          var mm2 = measureRow(r, f2);
+          return { chars: r, adv: mm2.adv, w: mm2.w };
+        });
+        fs = f2;
+      }
+    }
+    if (!rows) {
+      var cut = chars.slice(0, 12);
+      var m2 = measureRow(cut, minFs);
+      rows = [{ chars: cut, adv: m2.adv, w: m2.w }];
+      fs = minFs;
+    }
+    return { rows: rows, fs: fs };
+  }
+
+  /* ---------------- 8) 单句烘焙 ---------------- */
+  var L = null;
+  var prevL = null, prevA = 0;
+  var layerDirty = true;
+  var curIdx = -2;
+
+  /* 挤出方向（下 + 微右）与受光方向（左上） */
+  var EX = 0.30, EY = 1.0;
+  (function normEx() { var d = Math.sqrt(EX * EX + EY * EY); EX /= d; EY /= d; })();
+
+  function bakeLayer(text, isTitle, lineIdx) {
+    var chars = Array.from(String(text || "").replace(/^[\s\u3000]+|[\s\u3000]+$/g, ""));
+    if (!chars.length) return null;
+
+    var portrait = H > W;
+    var availW = W * (portrait ? 0.84 : (W / H > 1.9 ? 0.80 : 0.82));
+    var baseFs = isTitle
+      ? Math.min(H * 0.185, W * 0.14)
+      : (portrait ? Math.min(W * 0.135, H * 0.10) : Math.min(H * 0.215, W * 0.145));
+    var minFs = Math.max(20, baseFs * 0.38);
+
+    var lay = layout(chars, availW, baseFs, minFs, portrait ? 8 : 0);
+    var fs = lay.fs, rows = lay.rows;
+
+    /* 3D 挤出厚度：跟字号同比例 */
+    var depth = Math.max(7, fs * 0.165);
+    var rimW = Math.max(1.5, fs * 0.016);
+
+    var rowH = fs * 1.42;          /* 行距要容得下上一行的 3D 挤出，否则会顶到下一行 */
+    var lineW = 0;
+    for (var r = 0; r < rows.length; r++) if (rows[r].w > lineW) lineW = rows[r].w;
+
+    /* 四周都要给挤出让位：挤出方向是右下，所以右和下留 depth，
+       上留 depth*0.2（斜向挤出的字顶也会被抬一点），左留棱宽 */
+    var padL = fs * 0.26 + rimW * 2;
+    var padR = fs * 0.26 + depth * 1.15 + rimW * 2;
+    var padT = fs * 0.34 + depth * 0.25 + rimW * 2;
+    var padB = fs * 0.40 + depth * 1.30;
+    var w = lineW + padL + padR;
+    var h = rowH * (rows.length - 1) + fs * 1.24 + padT + padB;
+
+    var dpr = LQ;
+    var shape = mk(w, h, dpr), sg = c2d(shape, dpr);
+
+    sg.textBaseline = "alphabetic";
+    sg.textAlign = "left";
+    sg.font = fstr(fs);
+    sg.fillStyle = "#fff";
+
+    for (r = 0; r < rows.length; r++) {
+      var row = rows[r];
+      var baseline = padT + fs * 0.84 + r * rowH;
+      var x = padL + (lineW - row.w) / 2;
+      for (var k = 0; k < row.chars.length; k++) {
+        var ch = row.chars[k];
+        var adv = row.adv[k];
+        var seed = r * 97 + k * 13 + (isTitle ? 0 : lineIdx * 7);
+        /* 字标那种"手贴上去"的微错位：确定性，不抖 */
+        var jx = (rnd(seed) - 0.5) * fs * 0.028;
+        var jy = (rnd(seed + 4.1) - 0.5) * fs * 0.024;
+        var rot = (rnd(seed + 9.7) - 0.5) * (isTitle ? 0.045 : 0.034);
+        var sc = 1 + (rnd(seed + 2.3) - 0.5) * 0.028;
+
+        sg.save();
+        sg.translate(x + adv / 2 + jx, baseline + jy);
+        sg.rotate(rot);
+        sg.scale(sc, sc);
+        var glyph = ch === " " ? "\u00A0" : ch;
+        sg.fillText(glyph, -adv / 2, 0);
+        /* 同色描边压粗一档，也把两种字体的笔画粗细拉齐 */
+        sg.lineWidth = Math.max(1, fs * 0.022);
+        sg.lineJoin = "miter";
+        sg.miterLimit = 2;
+        sg.strokeStyle = "#fff";
+        sg.strokeText(glyph, -adv / 2, 0);
+        sg.restore();
+
+        x += adv + fs * TRACK;
+      }
+    }
+
+    /* 每行竖向范围（给正面反射带用） */
+    var bands = [];
+    for (r = 0; r < rows.length; r++) {
+      var ty = padT + fs * 0.84 + r * rowH;
+      bands.push({ y0: Math.max(0, ty - fs * 0.94), y1: Math.min(h, ty + fs * 0.20) });
+    }
+
+    var flat = bakeFlat(shape, w, h, dpr);
+
+    /* WebGL chrome 引擎渲染立体字（真反射）；失败则回退旧的 2D 版本 */
+    var solid = bakeGL(shape, w, h, dpr, depth) || bakeSolid(shape, w, h, dpr, bands, depth, rimW);
+
+    return {
+      w: w, h: h, dpr: dpr, fs: fs, text: String(text || ""),
+      isTitle: !!isTitle, lineIdx: lineIdx,
+      flat: flat,       /* 未渲染：纯黑平涂 */
+      solid: solid,     /* 渲染：3D 立体金（三个相位，反光带会滑动） */
+      born: performance.now()
+    };
+  }
+
+  /* 渲染（WebGL）：字形 → chrome 引擎 → 三个相位的立体字。
+     原理与参考图一致：距离场 → 半球法线 → 查环境 → 真实反射。 */
+  function bakeGL(shape, w, h, dpr, depth) {
+    try {
+      if (!CHROME.available && !CHROME.init()) return null;
+      if (!CHROME.upload(shape, Math.round(w * dpr), Math.round(h * dpr))) return null;
+
+      var out = [];
+      var phases = [0.18, 0.50, 0.82];
+      var red = [ACC[0] / 255 * 0.95, ACC[1] / 255 * 0.95, ACC[2] / 255 * 0.95];
+      for (var p = 0; p < 3; p++) {
+        var cvGL = CHROME.render({
+          phase: phases[p],
+          depth: Math.max(10, depth * dpr * 0.85),
+          bevel: Math.max(3, w * dpr * 0.006),
+          red: red,
+          gain: 1.0
+        });
+        if (!cvGL) return null;
+        var c = mk(w, h, 1);
+        var g = c.getContext("2d");
+        g.drawImage(cvGL, 0, 0, Math.round(w * dpr), Math.round(h * dpr), 0, 0, w, h);
+        out.push(c);
+      }
+      return out;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /* 未渲染：纯黑，无描边无高光 */
+  function bakeFlat(shape, w, h, dpr) {
+    var c = mk(w, h, dpr), g = c2d(c, dpr);
+    g.drawImage(shape, 0, 0, w, h);
+    g.globalCompositeOperation = "source-in";
+    g.fillStyle = "#000";
+    g.fillRect(0, 0, w, h);
+    return c;
+  }
+
+  /* 渲染：沿 (EX,EY) 挤出 depth 像素 → 侧面 → 正面反射 → 两条棱 */
+  function bakeSolid(shape, w, h, dpr, bands, depth, rimW) {
+    /* ① 挤出体的轮廓 = 剪影按 1px 步进累加（只算一次） */
+    var steps = Math.max(12, Math.round(depth));
+    var body = mk(w, h, dpr), bg2 = c2d(body, dpr);
+    for (var i = steps; i >= 0; i--) {
+      var f = i / steps;
+      bg2.drawImage(shape, EX * depth * f, EY * depth * f, w, h);
+    }
+
+    /* ② 两条棱的剪影：剪影 减 偏移后的剪影
+          rimL 左上受光棱（亮）；rimD 右下转折棱（暗） */
+    var rimL = makeRim(shape, w, h, dpr, rimW, rimW);
+    var rimD = makeRim(shape, w, h, dpr, -rimW, -rimW);
+
+    /* ③ 三个相位：正面反射带横向滑动 */
+    var phases = [0.16, 0.50, 0.84];
+    var out = [];
+    for (var p = 0; p < 3; p++) {
+      out.push(composeSolid(shape, body, rimL, rimD, w, h, dpr, bands, depth, phases[p]));
+    }
+    return out;
+  }
+
+  function makeRim(shape, w, h, dpr, ox, oy) {
+    var c = mk(w, h, dpr), g = c2d(c, dpr);
+    g.drawImage(shape, 0, 0, w, h);
+    g.globalCompositeOperation = "destination-out";
+    g.drawImage(shape, ox, oy, w, h);
+    g.globalCompositeOperation = "source-over";
+    return c;
+  }
+
+  function composeSolid(shape, body, rimL, rimD, w, h, dpr, bands, depth, phase) {
+    var c = mk(w, h, dpr), g = c2d(c, dpr);
+
+    /* --- 侧面：沿挤出方向由亮到暗（金属侧面也有反射，不能压成死黑） --- */
+    var side = mk(w, h, dpr), sg = c2d(side, dpr);
+    sg.drawImage(body, 0, 0, w, h);
+    sg.globalCompositeOperation = "source-in";
+    var gs = sg.createLinearGradient(0, 0, EX * depth, EY * depth);
+    addStop(gs, 0.00, C([232, 178, 92]));      // 紧贴正面的一圈亮边
+    addStop(gs, 0.18, C([186, 124, 44]));
+    addStop(gs, 0.42, C([120, 70, 20]));
+    addStop(gs, 0.70, C([66, 34, 8]));
+    addStop(gs, 1.00, C([30, 14, 3]));
+    sg.fillStyle = gs;
+    sg.fillRect(0, 0, w, h);
+    g.drawImage(side, 0, 0, w, h);
+
+    /* --- 正面：每行一条独立反射带（抛光金） --- */
+    var face = mk(w, h, dpr), fg2 = c2d(face, dpr);
+
+    /* 先把反射带画满，再一次性套上字形
+       注意：source-in 每填一次都会清空之外区域，不能边填边套 */
+    for (var r = 0; r < bands.length; r++) {
+      var y0 = bands[r].y0, y1 = bands[r].y1, hh = Math.max(1, y1 - y0);
+      var gf = fg2.createLinearGradient(0, y0, 0, y1);
+      addStop(gf, 0.00, C(FACE[0]));
+      addStop(gf, 0.10, C(FACE[1]));
+      addStop(gf, 0.22, C(FACE[2]));
+      addStop(gf, 0.30, C(FACE[3]));
+      addStop(gf, 0.36, C(FACE[4]));
+      addStop(gf, 0.48, C(FACE[5]));
+      addStop(gf, 0.58, C(FACE[6]));
+      addStop(gf, 0.66, C(FACE[7]));
+      addStop(gf, 0.74, C(FACE[8]));
+      addStop(gf, 0.82, C(FACE[9]));
+      addStop(gf, 0.88, C(FACE[10]));
+      addStop(gf, 1.00, C(FACE[11]));
+      fg2.fillStyle = gf;
+      fg2.fillRect(0, y0, w, hh);
+    }
+
+    /* --- 斜向扫光：三个相位，闪的时候这道高光在字面上滑过去 --- */
+    var sx = w * (phase * 1.20 - 0.10), bandW = w * 0.075;
+    var gl = fg2.createLinearGradient(sx - bandW, 0, sx + bandW, h * 0.75);
+    addStop(gl, 0, C([255, 248, 224], 0));
+    addStop(gl, 0.34, C([255, 244, 212], 0.16));
+    addStop(gl, 0.46, C([255, 255, 250], 0.62));
+    addStop(gl, 0.56, C([255, 244, 210], 0.22));
+    addStop(gl, 0.74, C([255, 234, 188], 0.07));
+    addStop(gl, 1, C([255, 248, 224], 0));
+    fg2.fillStyle = gl;
+    fg2.fillRect(0, 0, w, h);
+
+    /* 套字形 */
+    fg2.globalCompositeOperation = "destination-in";
+    fg2.drawImage(shape, 0, 0, w, h);
+    fg2.globalCompositeOperation = "source-over";
+
+    /* 横向拉丝：抛光金属的细微走向（很轻，只打破纯色） */
+    var seed = 17 + phase * 31;
+    for (var s2 = 0; s2 < 70; s2++) {
+      var ly = rnd(seed + s2 * 2.3) * h;
+      var lx = rnd(seed + s2 * 3.1) * w;
+      var ll = w * (0.04 + rnd(seed + s2 * 4.9) * 0.30);
+      var light = rnd(seed + s2 * 7.9) > 0.46;
+      fg2.save();
+      fg2.globalCompositeOperation = "source-atop";
+      fg2.strokeStyle = light
+        ? C([255, 246, 218], 0.04 + rnd(seed + s2 * 8.7) * 0.16)
+        : C([40, 18, 5], 0.05 + rnd(seed + s2 * 9.3) * 0.18);
+      fg2.lineWidth = 0.5 + rnd(seed + s2 * 6.1) * 1.6;
+      fg2.beginPath();
+      fg2.moveTo(lx, ly);
+      fg2.lineTo(lx + ll, ly + (rnd(seed + s2 * 5.7) - 0.5) * 2);
+      fg2.stroke();
+      fg2.restore();
+    }
+
+    g.drawImage(face, 0, 0, w, h);
+
+    /* --- 棱 ---
+       左上：一亮线（金属被打亮的第一条棱），用金色而不是白，避免出白描边
+       右下：一道暗线，把转折压下去（画在字内，用 source-atop 只作用在已有像素上） */
+    g.save();
+    g.globalCompositeOperation = "source-atop";
+    g.globalAlpha = 0.55;
+    var rimLc = mk(w, h, dpr), rlg = c2d(rimLc, dpr);
+    rlg.drawImage(rimL, 0, 0, w, h);
+    rlg.globalCompositeOperation = "source-in";
+    rlg.fillStyle = C([255, 248, 226]);
+    rlg.fillRect(0, 0, w, h);
+    g.drawImage(rimLc, 0, 0, w, h);
+    g.restore();
+
+    g.save();
+    g.globalCompositeOperation = "source-atop";
+    g.globalAlpha = 0.45;
+    var rimDc = mk(w, h, dpr), rdg = c2d(rimDc, dpr);
+    rdg.drawImage(rimD, 0, 0, w, h);
+    rdg.globalCompositeOperation = "source-in";
+    rdg.fillStyle = C([24, 10, 2]);
+    rdg.fillRect(0, 0, w, h);
+    g.drawImage(rimDc, 0, 0, w, h);
+    g.restore();
+
+    return c;
+  }
+
+  /* ---------------- 9) 镜头（手持 + 前移后移） ---------------- */
+  var cam = { x: 0, y: 0, rot: 0, zoom: 1, punch: 0, shear: 0, jitX: 0, jitY: 0 };
+  var punchV = 0;
+
+  function camStep(now, dt) {
+    var t = now * 0.001;
+    var k = RM ? 0.20 : 1;
+
+    /* 推近 / 拉远：约 15 秒一个来回 */
+    var dolly = Math.sin(t * 0.42 + 0.6);
+    var dolly2 = Math.sin(t * 0.157 + 1.9);
+
+    /* 手持：几个不同频率叠在一起，避免机械感 */
+    var shakeX = (Math.sin(t * 0.43) * 0.68 + Math.sin(t * 1.31 + 2.1) * 0.30 + Math.sin(t * 3.7 + 0.7) * 0.10);
+    var shakeY = (Math.sin(t * 0.37 + 1.3) * 0.60 + Math.sin(t * 1.07 + 0.4) * 0.28 + Math.sin(t * 4.3 + 1.9) * 0.09);
+    var shakeR = (Math.sin(t * 0.29 + 2.7) * 0.7 + Math.sin(t * 0.83 + 1.1) * 0.3);
+
+    var amp = Math.min(W, H) * 0.011 * k;
+    cam.x = shakeX * amp;
+    cam.y = shakeY * amp * 0.9;
+    cam.rot = shakeR * 0.26 * k * Math.PI / 180;
+    cam.zoom = 1.078 + dolly * 0.058 * k + dolly2 * 0.020 * k;
+
+    cam.punch *= Math.exp(-dt * 6.2);
+    cam.zoom += cam.punch;
+    cam.shear = cam.punch * (RM ? 0.10 : 0.55);
+
+    cam.jitX = cam.punch * Math.min(W, H) * 0.05 * (RM ? 0 : 1);
+    cam.jitY = cam.punch * Math.min(W, H) * 0.010 * (RM ? 0 : 1);
+  }
+
+  function camApply(g, depth) {
+    var d = depth == null ? 1 : depth;
+    g.translate(W / 2 + cam.x * d + cam.jitX * d, H / 2 + cam.y * d + cam.jitY * d);
+    g.rotate(cam.rot * d);
+    var z = 1 + (cam.zoom - 1) * d;
+    g.scale(z, z);
+    if (cam.shear) g.transform(1, 0, cam.shear * d, 1, 0, 0);
+    g.translate(-W / 2, -H / 2);
+  }
+
+  /* ---------------- 10) 鼓点 → 显影 ---------------- */
+  var flash = { t0: -1e9, dur: 100, lvl: 0 };
+  var lastBeatAt = -1e9, lastBpm = 0;
+
+  function flashFactor(now) {
+    var age = now - flash.t0;
+    if (age < 0 || age > flash.dur) return 0;
+    var x = age / flash.dur;
+    /* 顶住 → 掉一下 → 再顶一下 → 平滑沉回（灯管接触不良那种双闪） */
+    var f;
+    if (x < 0.26) f = 1;
+    else if (x < 0.36) { var a = (x - 0.26) / 0.10; f = 1 - 0.64 * a; }
+    else if (x < 0.48) { var b = (x - 0.36) / 0.12; f = 0.36 + 0.56 * b; }
+    else { var q = (x - 0.48) / 0.52; f = 0.92 * (1 - q * q * (3 - 2 * q)); }
+    return f * (0.62 + 0.38 * flash.lvl);
+  }
+
+  function onBeat(index, level) {
+    var lv = clamp(num(level, 0.5), 0, 1);
+    if (!S.playing) return;
+    lastBeatAt = performance.now();
+    if (lv < 0.15) return;
+    flash.t0 = performance.now();
+    flash.lvl = lv;
+    var dur = 150 + 170 * lv;
+    if (lastBpm > 45 && lastBpm < 220) {
+      var per = 60000 / lastBpm;
+      dur = clamp(per * (0.40 + 0.24 * lv), 180, 430);
+    }
+    flash.dur = dur;
+    punchV += 0.006 + 0.024 * lv + (index === 0 ? 0.014 : 0);
+    if (punchV > 0.075) punchV = 0.075;
+  }
+
+  /* ---------------- 11) 主循环 ---------------- */
+  var lastNow = performance.now();
+  var errAt = 0;
+  function reportErr(e) {
+    var n = performance.now();
+    if (n - errAt > 1000) {
+      errAt = n;
+      try { console.error(e); } catch (q) { }
+      try { parent.postMessage({ __c100: 1, type: "error", payload: { msg: String((e && e.message) || e) } }, "*"); } catch (q2) { }
+    }
+  }
+
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    while (lo <= hi) {
+      var m = (lo + hi) >> 1;
+      if (a[m].t <= t + 0.02) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return best;
+  }
+
+  function bakeNow() {
+    layerDirty = false;
+    if (!fontReady) return;
+    var i = S.idx;
+    var text = "", isTitle = false;
+    if (i >= 0 && i < S.lines.length) {
+      text = S.lines[i].text || "";
+      if (!text) {
+        text = (S.song && S.song.name) ? String(S.song.name) : "";
+        isTitle = true;
+      }
+    } else {
+      text = (S.song && S.song.name) ? String(S.song.name) : "";
+      isTitle = true;
+    }
+    L = text ? bakeLayer(text, isTitle, isTitle ? -1 : i) : null;
+  }
+
+  function onLineChange() {
+    prevL = L; prevA = prevL ? 1 : 0;
+    L = null;
+    bakeNow();
+  }
+
+  function fmtTime(sec) {
+    sec = Math.max(0, num(sec, 0));
+    var m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+    return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  var hudT = document.getElementById("hT"), hudA = document.getElementById("hA"), hudC = document.getElementById("hC");
+  var hudTxt = null, hudArt = null, hudClk = null;
+
+  function draw(now, dt) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    camStep(now, dt);
+    var ff = flashFactor(now);
+    /* 两种状态硬切频闪（不做半透明混色，否则红底和金字会糊成一片）：
+       ff > 0.5 就是「渲染态」，否则「未渲染态」 */
+    var on = ff > 0.5;
+    var phase = Math.floor(now / 96) % 3;
+
+    /* ---- 底 ---- */
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    if (bgDirty) bakeBG();
+
+    /* 渲染态：纯黑，什么都不画。未渲染态：封面主色渐变 */
+    if (!on && bg) {
+      ctx.save();
+      camApply(ctx, 0.42);
+      var pad = (bgW - W) / 2;
+      ctx.drawImage(bg, -pad, -pad, bgW, bgH);
+      ctx.restore();
+    }
+
+    /* ---- 上一句：只淡出，不缩放 ----
+       缩放会把黑字在渐变底上叠成一团影子，看着像字发虚。
+       未渲染底是亮渐变，黑字残影特别显眼，所以这里要干净。 */
+    if (prevL && prevA > 0 && !on) {
+      ctx.save();
+      camApply(ctx, 1);
+      ctx.globalAlpha = prevA * prevA * 0.85;
+      var pcx = W / 2, pcy = H * (H > W ? 0.60 : 0.545);
+      if (prevL.flat) ctx.drawImage(prevL.flat, pcx - prevL.w / 2, pcy - prevL.h / 2, prevL.w, prevL.h);
+      ctx.restore();
+      prevA -= dt * 5.2;
+      if (prevA <= 0) { prevA = 0; prevL = null; }
+    }
+
+    /* ---- 当前句 ---- */
+    if (L) {
+      var inT = clamp((now - L.born) / 170, 0, 1);
+      ctx.save();
+      camApply(ctx, 1);
+      ctx.globalAlpha = inT;
+
+      var lcx = W / 2, lcy = H * (H > W ? 0.60 : 0.545);
+      var sc = 1.030 - 0.030 * inT;
+      ctx.translate(lcx, lcy);
+      ctx.scale(sc, sc);
+      ctx.translate(-lcx, -lcy);
+      var x0 = lcx - L.w / 2, y0 = lcy - L.h / 2;
+
+      /* 未渲染态：纯黑平面字 */
+      if (!on) {
+        ctx.drawImage(L.flat, x0, y0, L.w, L.h);
+      } else {
+        /* 渲染态：3D 立体金字 */
+        ctx.drawImage(L.solid[phase], x0, y0, L.w, L.h);
+      }
+
+      ctx.restore();
+    }
+
+    /* ---- HUD ---- */
+    var tn = (S.song && S.song.name) ? String(S.song.name) : "";
+    var ar = "";
+    if (S.song) {
+      if (Array.isArray(S.song.artists)) ar = S.song.artists.filter(Boolean).join(" / ");
+      else if (S.song.artists) ar = String(S.song.artists);
+    }
+    if (tn !== hudTxt) { hudTxt = tn; hudT.textContent = tn; }
+    if (ar !== hudArt) { hudArt = ar; hudA.textContent = ar; }
+    var dur = S.duration > 0 ? S.duration : 0;
+    var clk = fmtTime(S.t) + (dur ? " / " + fmtTime(dur) : "");
+    if (clk !== hudClk) { hudClk = clk; hudC.textContent = clk; }
+  }
+
+  function frame(now) {
+    var js0 = performance.now();
+    try {
+      var dt = Math.min(0.06, (now - lastNow) / 1000);
+      lastNow = now;
+
+      if (S.playing) S.t += dt;
+
+      /* 兜底呼吸：长期没有 beat 消息时按 bpm 自己给一点脉动 */
+      if (S.playing && !RM && lastBpm > 40) {
+        var per = 60000 / lastBpm;
+        if (now - lastBeatAt > 1500 && now - flash.t0 > per) {
+          flash.t0 = now; flash.dur = 90; flash.lvl = 0.24;
+          punchV += 0.004;
+        }
+      }
+
+      if (layerDirty && fontReady) bakeNow();
+
+      var i = idxAt(S.t);
+      if (i !== curIdx) { curIdx = i; S.idx = i; onLineChange(); }
+
+      cam.punch += punchV; punchV = 0;
+      if (cam.punch > 0.085) cam.punch = 0.085;
+
+      draw(now, dt);
+      S.frames++;
+    } catch (e) {
+      S.err = String((e && e.message) || e);
+      reportErr(e);
+    }
+    S.js = performance.now() - js0;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  /* ---------------- 12) 消息 ---------------- */
+  addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === "init") {
+        S.song = p.song || null;
+        S.duration = num(p.duration, 0);
+        applyAccent(p.accent);
+
+        S.lines = (Array.isArray(p.lines) ? p.lines : [])
+          .filter(function (l) { return l && typeof l === "object"; })
+          .map(function (l) {
+            return {
+              t: isFinite(Number(l.t)) ? Number(l.t) : 0,
+              dur: isFinite(Number(l.dur)) ? Number(l.dur) : 0,
+              text: (l.text == null ? "" : String(l.text)),
+              chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null
+            };
+          })
+          .sort(function (a, b) { return a.t - b.t; });
+
+        S.playing = (typeof p.playing === "boolean") ? p.playing : true;
+        curIdx = -2; L = null; prevL = null; prevA = 0; layerDirty = true;
+        hudTxt = hudArt = hudClk = null;
+      } else if (d.type === "tick") {
+        var t = Number(p.time);
+        if (isFinite(t)) S.t = t;                       // §5.3 无条件采纳
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      } else if (d.type === "beat") {
+        onBeat(p.index, p.level);
+      } else if (d.type === "live") {
+        var b = num(p.bpm, 0);
+        if (b > 40 && b < 260) lastBpm = b;
+      }
+    } catch (e) {
+      S.err = String((e && e.message) || e);
+      reportErr(e);
+    }
+  });
+
+  /* ---------------- 13) 交互转发 ---------------- */
+  var actAt = 0;
+  addEventListener("mousemove", function () {
+    var n = performance.now();
+    if (n - actAt < 120) return;
+    actAt = n;
+    try { parent.postMessage({ __c100: 1, type: "activity" }, "*"); } catch (e) { }
+  }, { passive: true });
+
+  addEventListener("keydown", function (e) {
+    if (e.code === "Space" || e.key === " ") {
+      try { e.preventDefault(); } catch (q) { }
+      try { parent.postMessage({ __c100: 1, type: "key", payload: { key: "Space" } }, "*"); } catch (q2) { }
+    }
+  });
+
+  addEventListener("resize", resize);
+  resize();
+
+  if (document.fonts && document.fonts.addEventListener) {
+    try { document.fonts.addEventListener("loadingdone", function () { layerDirty = true; }); } catch (e) { }
+  }
+})();
+</script>
+</body>
+</html>

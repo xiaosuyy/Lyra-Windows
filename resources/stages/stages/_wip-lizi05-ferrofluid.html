@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>铁磁尖刺</title>
+<style>
+  html,body{margin:0;height:100%;background:#040406;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(124% 100% at 50% 46%,transparent 52%,rgba(3,4,8,.34) 82%,rgba(1,1,3,.86))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(190,210,240,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   lyra05 · 铁磁尖刺（ferrofluid）—— 磁铁在液面上游走，液面被磁场拉出一片
+   **Rosensweig 尖刺阵列**；每根尖刺的**顶端**钉在歌词字形采样点上，
+   唱到哪个字，那一片尖刺才真正立起来 —— 于是"尖刺顶端的包络"就是这一句的字。
+   ---------------------------------------------------------------------------
+   和 lyra01「泼墨砸墙」的区别（机制、观感、配色全不同）：
+     · 01 是**位移**：墨团从画外飞进来、砸中、黏住、累积变深、被风扫走。
+     · 05 是**零位移的形变**：粒子一直待在原地，动的是"针长"——
+       弹簧把每根针从 1.5px 弹到 30px（会过冲），磁铁靠近时被拉长并**朝磁铁偏折**。
+       没有任何东西从画外飞进来，画面是"液面在呼吸 + 表面长出刺"。
+     · 配色：银蓝金属 + 磁性品红（01 是墨黑 + 封面蓝紫）。
+
+   物理模型（这是"好看"的关键，不是装饰）：
+     · **Rosensweig 晶格**：真实铁磁流体在磁场里会长成离散的锥形簇，而不是均匀梳子。
+       所以针长按 8.5px 的方格做 tuft 调制 —— 格心最长、格边几乎为 0（留出空隙），
+       蜂窝状的空隙一眼就是"尖刺阵列"，而不是"钟乳石"。
+     · 磁铁邻近度：d < 210px 内针长 ×1.7、并向磁铁偏折最多 26px；针尖同时变成品红。
+       磁铁跟着"正在唱的那个字"跑 —— 因果清楚：唱到哪、哪里被磁化。
+     · 未唱到的字只留 0.10 的"液面残丘"，唱到才弹起来。
+
+   AE 手法：**滑动变焦 Dolly Zoom**（主手法：z 弹簧变焦的同时 pz 把液面/背景的
+   纵深反向拉，字的大小在变而液面纵深反向补偿 —— 希区柯克变焦）／
+   冲击帧顿帧 44~76ms ／ 冲击白闪 ／ 定向震动（沿磁力线方向，不是随机抖）／
+   弹簧变焦 vz += (tz-z)*k - vz*c（欠阻尼，会回弹）／多层级视差（背景 1.6、
+   液面 0.55、字 0）／镜头锁定（跟随正在唱的字）／微滚转／
+   次级动作（磁铁经过时液面针丛被带弯、溅起铁磁液珠、压出椭圆涟漪）
+
+   性能（实测数字见文件末尾注释）：
+     · 所有 rect 用**整数坐标**（浮点坐标在软件光栅下明显更贵）
+     · 每帧 fillStyle 只设 5 次、beginPath 5 次：液面 1 + 针身 1 + 针尖 1 + 品红 1 + 液珠 1
+     · 背景 1 张同尺寸预烘贴图直接 blit（不 fillRect 打底，省 0.7ms）
+     · getImageData / 渐变 / shadowBlur 全在 prep / resize 里，frame() 里一个都没有
+     · sampleGlyph（6~23ms）+ 光晕烘焙提前 1.5s 在空闲帧做，换句只切指针
+   ========================================================================== */
+
+/* ============================ 0 · 画布 ============================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const vig = document.getElementById('vig');
+const offCv = document.createElement('canvas');
+const octx = offCv.getContext('2d', { willReadFrequently: true });
+/* 这几个必须声明在 resize() 之前 —— resize 立刻会被调用一次，
+   在 let 之前用到就是 "Cannot access before initialization"（最常见的第一个 bug） */
+let W = 0, H = 0, DPR = 1;
+let bgCv = null;                 // 背景 + 液面（预烘，每帧只 blit）
+let halo = null;                 // 字的光晕层（预烘，垫在粒子下面）
+let L = null, curIdx = -1;
+let blockGx = 0, blockGy = 0, surfaceY = 0;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBg();
+  seedPool();                    // 液面针丛按新画幅重铺（几百次循环，可忽略）
+  if (L && curIdx >= 0) layoutLine(curIdx);
+}
+addEventListener('resize', resize);
+
+/* ============================ 1 · 时钟 ============================ */
+let lines = [];
+let accent = [180, 170, 255];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ============================ 2 · 分词（词典法 + 双向最大匹配） ============================ */
+let DICT = null;
+fetch('/segdict.bin').then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); }).catch(() => {});
+const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+function isWord(s, i, Ln) {
+  if (!DICT) return false;
+  const h = fnv(s.substr(i, Ln));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) { const m = (lo + hi) >> 1, v = DICT[m]; if (v === h) return true; if (v < h) lo = m + 1; else hi = m - 1; }
+  return false;
+}
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, text.length - i); Ln >= 2; Ln--) if (isWord(text, i, Ln)) { hit = Ln; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, j); Ln >= 2; Ln--) if (isWord(text, j - Ln, Ln)) { hit = Ln; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+function isLatin(text) {
+  let la = 0, cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++;
+    else if (c >= '\u4e00' && c <= '\u9fff') cjk++;
+  }
+  return la > cjk;
+}
+function latinSpans(text) {
+  const out = []; let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i; while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j }); i = j;
+  }
+  return out;
+}
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+const countChars = (s) => { let n = 0; for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++; return n; };
+function groupByWords(text) {
+  const words = segWords(text), out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos; pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; } else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+function groupByRule(text) {
+  const out = []; let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const s = PUNCT.test(text[i]) || SPACE.test(text[i]);
+    if (!s) chars++;
+    if (s && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!s && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+const spansForLine = (t) => (isLatin(t) ? latinSpans(t) : (DICT ? groupByWords(t) : groupByRule(t)));
+
+/* ============================ 3 · 字形采样（自动折行 + 逐字归属） ============================ */
+const FONT = (px, wt) => `${wt || 800} ${px}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+function wrapText(text, fs, maxW, wt) {
+  octx.font = FONT(fs, wt);
+  const rows = [];
+  let start = 0, w = 0;
+  for (let i = 0; i < text.length; i++) {
+    const cw = octx.measureText(text[i]).width;
+    if (!cw) continue;
+    if (w + cw > maxW && i > start) { rows.push({ i0: start, i1: i, w }); start = i; w = 0; }
+    w += cw;
+  }
+  rows.push({ i0: start, i1: text.length, w });
+  for (const r of rows) while (r.i1 - r.i0 > 1 && SPACE.test(text[r.i0])) r.i0++;
+  return rows;
+}
+function sampleGlyph(text, opt) {
+  opt = opt || {};
+  const wt = opt.weight || 800;
+  let fs = opt.fs || 88;
+  const maxW = opt.maxW || Math.min(W * 0.74, 1180);
+  const maxH = opt.maxH || H * 0.52;
+  let rows = wrapText(text, fs, maxW, wt);
+  /* 行距：这个形态的针是**朝下伸**的，所以折行时必须比常规行高大一截，
+     否则上一行的针身正好扎在下一行的字上（读图看成重影，lyra05 第一版就是这么废的）。 */
+  let lh = fs * (rows.length > 1 ? 1.62 : 1.14);
+  if (rows.length * lh > maxH) {
+    fs *= maxH / (rows.length * lh);
+    rows = wrapText(text, fs, maxW, wt);
+    lh = fs * (rows.length > 1 ? 1.62 : 1.14);
+  }
+  octx.font = FONT(fs, wt);
+  const widest = Math.max(1, ...rows.map((r) => octx.measureText(text.slice(r.i0, r.i1)).width));
+  const padW = Math.ceil(widest) + 20, padH = Math.ceil(lh * rows.length) + 10;
+  offCv.width = padW; offCv.height = padH;
+  octx.font = FONT(fs, wt);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.clearRect(0, 0, padW, padH);
+
+  const n = text.length;
+  const charCx = new Float32Array(n), charCy = new Float32Array(n);
+  const rowMaps = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const str = text.slice(row.i0, row.i1);
+    const cy = padH / 2 + (r - (rows.length - 1) / 2) * lh;
+    octx.fillText(str, padW / 2, cy);
+    const x0 = (padW - row.w) / 2;
+    const map = new Int16Array(padW).fill(-1);
+    let acc = 0;
+    for (let i = row.i0; i < row.i1; i++) {
+      const cw = octx.measureText(text[i]).width;
+      charCx[i] = x0 + acc + cw / 2 - padW / 2;
+      charCy[i] = cy - padH / 2;
+      const a0 = Math.max(0, Math.floor(x0 + acc)), a1 = Math.min(padW, Math.ceil(x0 + acc + cw));
+      for (let x = a0; x < a1; x++) map[x] = i;
+      acc += cw;
+    }
+    rowMaps.push({ y0: cy - lh / 2, y1: cy + lh / 2, map });
+  }
+  const d = octx.getImageData(0, 0, padW, padH).data;
+  const pxA = [], pyA = [], ownA = [], rowA = [];
+  const step = opt.step || 2;          // 步长 ≤ 颗粒直径，否则笔画是点阵不是实心
+  for (let y = 0; y < padH; y += step) {
+    let rm = null, ri = 0;
+    for (let r = 0; r < rowMaps.length; r++) { const m = rowMaps[r]; if (y >= m.y0 && y < m.y1) { rm = m; ri = r; break; } }
+    if (!rm) continue;
+    for (let x = 0; x < padW; x += step) {
+      if (d[(y * padW + x) * 4 + 3] <= 128) continue;
+      const c = rm.map[x];
+      if (c < 0) continue;
+      pxA.push(x - padW / 2); pyA.push(y - padH / 2); ownA.push(c); rowA.push(ri);
+    }
+  }
+  return {
+    px: Float32Array.from(pxA), py: Float32Array.from(pyA), own: Int16Array.from(ownA),
+    row: Int16Array.from(rowA),
+    pc: pxA.length, n, charCx, charCy, fs, w: widest, h: lh * rows.length, rows: rows.length,
+    lh, padW, padH, step,
+  };
+}
+
+/** 让采样点数和粒子数**匹配**：K << pc 时等间隔取样会沿扫描线抽稀，
+    字会退化成一片横虚线（实测最常见的"字不成形"原因）。
+    先按 step=2 采一遍估面积，再按 sqrt 关系反推步长重采，使 pc ≈ target*1.12。 */
+function sampleFit(text, opt, target) {
+  let g = sampleGlyph(text, Object.assign({}, opt, { step: 2 }));
+  if (!g.pc) return g;
+  const s2 = 2 * Math.sqrt(g.pc / (target * 1.12));
+  const st = Math.max(2, Math.min(9, Math.round(s2 * 2) / 2));
+  if (st > 2.25) {
+    const g2 = sampleGlyph(text, Object.assign({}, opt, { step: st }));
+    if (g2.pc) g = g2;
+  }
+  return g;
+}
+
+/* ============================ 4 · 句索引（单调 + 显示/酝酿分离） ============================ */
+let brewIdx = -1, lastT = -1;
+const LEAD = 1.5;
+const hintShow = (s, o) => { hint.textContent = s; hint.style.opacity = o; };
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const easeOut5 = (p) => 1 - Math.pow(1 - p, 5);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* ============================ 5 · 相机（弹簧变焦 + Dolly Zoom） ============================ */
+/* pz = 纵深拉伸系数。字层用 1.0（不动），液面层 1+0.55*pz，背景 1+1.6*pz。
+   z 与 pz 反向走：字在变大，而液面/背景的透视纵深反向补偿 —— 这才是 dolly zoom。 */
+const cam = {
+  x: 0, y: 0, z: 1, tz: 1, vz: 0, tx: 0, ty: 0,
+  pz: 0, tpz: 0, vpz: 0, sh: 0, dirx: 0, diry: 0, shx: 0, shy: 0,
+  rot: 0, vrot: 0,
+};
+function camShake(dx, dy, amp) {
+  const l = Math.hypot(dx, dy) || 1;
+  cam.dirx = dx / l; cam.diry = dy / l;
+  cam.sh = Math.min(26, Math.max(cam.sh, amp));
+}
+function camUpdate(dt) {
+  const ke = 1 - Math.pow(0.0014, dt);
+  cam.x += (cam.tx - cam.x) * ke * 0.9;
+  cam.y += (cam.ty - cam.y) * ke * 0.9;
+  /* 弹簧变焦：欠阻尼（ζ≈0.47）会冲过头再回来 —— 回弹才像镜头 */
+  cam.vz += ((cam.tz - cam.z) * 190 - cam.vz * 13.0) * dt;
+  cam.z += cam.vz * dt;
+  if (cam.z < 0.66) { cam.z = 0.66; if (cam.vz < 0) cam.vz = 0; }
+  if (cam.z > 1.62) { cam.z = 1.62; if (cam.vz > 0) cam.vz = 0; }
+  cam.vpz += ((cam.tpz - cam.pz) * 120 - cam.vpz * 12) * dt;
+  cam.pz += cam.vpz * dt;
+  cam.vrot += (-cam.rot * 240 - cam.vrot * 22) * dt;
+  cam.rot += cam.vrot * dt;
+  cam.sh *= Math.pow(0.00003, dt);
+  /* 定向震动：两个不同频率的正弦叠在同一根轴上 —— 有方向，但不是规则抖动 */
+  const wob = Math.sin(T0 * 71.3) * 0.62 + Math.sin(T0 * 43.9 + 1.7) * 0.38;
+  cam.shx = cam.dirx * cam.sh * wob;
+  cam.shy = cam.diry * cam.sh * wob;
+}
+const layerS = (dk) => cam.z * (1 + dk * cam.pz);
+
+/* ============================ 6 · 顿帧 / 白闪 ============================ */
+const AE = { freeze: 0, flash: 0 };
+const hitStop = (s) => { AE.freeze = Math.max(AE.freeze, s); };
+const flash = (v) => { AE.flash = Math.max(AE.flash, v); };
+
+/* ============================ 7 · 粒子池 ============================ */
+/* 每颗粒子 = 一根尖刺：针尖 (pgx,pgy) 钉在字形采样点上；ph 是当前针长（弹簧）；
+   plean 是本帧朝磁铁的偏折。针尖那一层连起来就是字，针身朝下伸进液面。 */
+const N = 4600;                        // 主针（组成字）
+const PN = 460;                        // 液面针丛（氛围层，不参与字形）
+const pgx = new Float32Array(N), pgy = new Float32Array(N);
+const plen = new Float32Array(N);      // 这根针的基础长度（含 tuft 调制，布局时算好）
+const plim = new Float32Array(N);      // 针身长度的上限（不能穿到下一行去）
+const plane = new Float32Array(N);     // 静态倾斜（针不是完美垂直，有点歪才像流体）
+const ph = new Float32Array(N);        // 当前针长
+const phv = new Float32Array(N);       // 针长速度（弹簧）
+const pci = new Int16Array(N);         // 属于哪个字
+const psi = new Uint8Array(N);         // 属于哪个词团
+const pj = new Float32Array(N);        // 每颗的相位
+const ptuft = new Float32Array(N);     // 0..1 tuft 强度（格心=1，格边=0），决定画不画针身
+/* 本帧投影结果（避开每帧重复算） */
+const psx = new Float32Array(N), psy = new Float32Array(N);
+const pln = new Float32Array(N), plean = new Float32Array(N);
+const psz = new Uint8Array(N);         // 针尖尺寸 px（0 = 不画）
+const phot = new Uint8Array(N);        // 1 = 磁化到极限（单独一趟品红）
+const pdim = new Uint8Array(N);        // 1 = 还没唱到（用冷银灰那档）
+
+/* 液面针丛（世界坐标固定，不随句改变） */
+const qx = new Float32Array(PN), qy = new Float32Array(PN);
+const ql = new Float32Array(PN), qj = new Float32Array(PN);
+for (let i = 0; i < PN; i++) { qj[i] = rnd(0, 6.283); ql[i] = rnd(3, 13); }
+
+let charChars = null;
+let charGlow = new Float32Array(0);
+let spanFired = new Uint8Array(0);
+
+let drops = [], ripples = [];
+
+/* 每帧引用的颜色串（绝不逐颗拼接） */
+let C_POOL = 'rgba(96,124,166,0.24)';
+let C_SHAFT = 'rgba(120,152,196,0.38)';
+let C_TIP = 'rgba(232,244,255,0.90)';
+let C_TIP_DIM = 'rgba(96,120,158,0.30)';
+let C_HOT = 'rgba(255,96,200,0.92)';
+let C_DROP = 'rgba(246,252,255,0.85)';
+
+let magSpr = null, haloDim = 0;
+const mix = (a, b, t) => Math.round(a + (b - a) * t);
+function rebuildPalette() {
+  const ar = accent[0], ag = accent[1], ab = accent[2];
+  /* 银蓝金属打底，掺 26% 封面主色 —— 跟着歌走但不会糊成一片蓝紫 */
+  const sr = mix(122, ar, 0.26), sg = mix(154, ag, 0.26), sb = mix(194, ab, 0.26);
+  C_POOL = `rgba(${mix(sr, 70, 0.35)},${mix(sg, 92, 0.35)},${mix(sb, 128, 0.35)},0.26)`;
+  C_SHAFT = `rgba(${sr},${sg},${sb},0.40)`;
+  C_TIP = 'rgba(236,246,255,0.92)';
+  /* 未唱到的针尖：冷银灰、很暗 —— 它是"液面上还没立起来的残余尖丘"，
+     不能是亮点，否则整句还没唱的字就是一片噪点（第一版读图就是这个毛病）。 */
+  C_TIP_DIM = `rgba(${mix(sr, 74, 0.42)},${mix(sg, 96, 0.42)},${mix(sb, 134, 0.42)},0.34)`;
+  C_HOT = 'rgba(255,96,200,0.92)';        // 磁性品红：只有被磁铁拉到极限的针尖
+  C_DROP = 'rgba(248,252,255,0.86)';
+}
+function makeMagSpr() {
+  const R = 72;
+  const c = document.createElement('canvas'); c.width = c.height = R * 2;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(R, R, 0, R, R, R);
+  grd.addColorStop(0, 'rgba(255,222,248,0.98)');
+  grd.addColorStop(0.10, 'rgba(255,120,210,0.80)');
+  grd.addColorStop(0.30, 'rgba(214,74,186,0.26)');
+  grd.addColorStop(0.62, 'rgba(128,62,190,0.07)');
+  grd.addColorStop(1, 'rgba(80,40,140,0)');
+  g.fillStyle = grd; g.beginPath(); g.arc(R, R, R, 0, 6.2832); g.fill();
+  return c;
+}
+
+/* ============================ 8 · 背景 / 液面（预烘，绝不在 frame 里建渐变） ============================ */
+function buildBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  /* 和屏幕 1:1 —— 每帧一次缩放 blit 等于多填一遍两百万像素，
+     软件渲染下直接吃掉十几帧。视差交给液面/针丛去做。 */
+  const bw = Math.max(1, Math.round(W)), bh = Math.max(1, Math.round(H));
+  bgCv.width = bw; bgCv.height = bh;
+  const g = bgCv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.fillStyle = '#04050a'; g.fillRect(0, 0, bw, bh);
+
+  /* 顶部冷银天光 + 中心一点点提亮（光是从上面来的） */
+  let rg = g.createRadialGradient(bw * 0.5, bh * 0.20, 0, bw * 0.5, bh * 0.26, Math.max(bw, bh) * 0.78);
+  rg.addColorStop(0, 'rgba(30,40,60,1)');
+  rg.addColorStop(0.40, 'rgba(12,16,26,1)');
+  rg.addColorStop(1, 'rgba(3,3,6,1)');
+  g.fillStyle = rg; g.fillRect(0, 0, bw, bh);
+
+  /* 液槽：下半部一层冷银雾，上沿一条镜面高光带（液面），往下压暗 */
+  surfaceY = H * 0.675;
+  const sy = surfaceY;
+  let lg = g.createLinearGradient(0, sy - bh * 0.10, 0, bh);
+  lg.addColorStop(0, 'rgba(46,66,100,0)');
+  lg.addColorStop(0.30, 'rgba(52,74,110,0.52)');
+  lg.addColorStop(0.55, 'rgba(30,44,66,0.34)');
+  lg.addColorStop(1, 'rgba(3,5,9,0.90)');
+  g.fillStyle = lg; g.fillRect(0, sy - bh * 0.10, bw, bh - (sy - bh * 0.10));
+  /* 液面镜面高光：一条很窄的亮带 —— 铁磁流体表面是**镜面**的，这条线是质感的锚 */
+  let hl = g.createLinearGradient(0, sy - 9, 0, sy + 9);
+  hl.addColorStop(0, 'rgba(150,188,232,0)');
+  hl.addColorStop(0.42, 'rgba(206,228,255,0.30)');
+  hl.addColorStop(0.56, 'rgba(255,255,255,0.14)');
+  hl.addColorStop(1, 'rgba(110,150,196,0)');
+  g.fillStyle = hl; g.fillRect(0, sy - 9, bw, 18);
+
+  /* 角落压暗（把 #vig 那层 CSS 渐变减弱，减轻每帧合成负担） */
+  let vg = g.createRadialGradient(bw * 0.5, bh * 0.46, bh * 0.30, bw * 0.5, bh * 0.5, Math.max(bw, bh) * 0.70);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(1,1,3,0.62)');
+  g.fillStyle = vg; g.fillRect(0, 0, bw, bh);
+}
+
+/* ============================ 9 · 预烘：光晕 + 下一句（空闲帧做重活） ============================ */
+/* §G 唯一允许的文字图层：一整句 fillText + blur 烘一次，垫在粒子**下面**当氛围。
+   主体轮廓仍然是粒子的针尖 —— 光晕只提供"字在那里"的柔光氛围。 */
+function bakeHalo() {
+  if (!offCv.width) { halo = null; return null; }
+  const pad = 34;
+  const hw = offCv.width + pad * 2, hh = offCv.height + pad * 2;
+  const c = document.createElement('canvas'); c.width = hw; c.height = hh;
+  const g = c.getContext('2d');
+  /* 柔化**不能**用 ctx.filter='blur()'：实测在 headless 软件渲染下它可能整个不生效，
+     那样光晕就变成一份**清晰的字**，和粒子针尖错开重叠 —— 看上去就是"重影"（这个 bug 真踩过）。
+     改成"降采样再放大"：先画进 1/4 尺寸的小画布，再插值放大回来，一定有柔边。 */
+  const dw = Math.max(8, Math.round(hw / 4)), dh = Math.max(8, Math.round(hh / 4));
+  const small = document.createElement('canvas'); small.width = dw; small.height = dh;
+  const sg = small.getContext('2d');
+  sg.imageSmoothingEnabled = true;
+  sg.drawImage(offCv, 0, 0, Math.max(1, Math.round(offCv.width / 4)), Math.max(1, Math.round(offCv.height / 4)));
+  g.imageSmoothingEnabled = true;
+  g.drawImage(small, 0, 0, dw, dh, 0, 0, hw, hh);
+  g.globalCompositeOperation = 'source-in';
+  const ar = accent[0], ag = accent[1], ab = accent[2];
+  g.fillStyle = `rgb(${mix(140, ar, 0.34)},${mix(170, ag, 0.34)},${mix(214, ab, 0.34)})`;
+  g.fillRect(0, 0, hw, hh);
+  g.globalCompositeOperation = 'source-over';
+  halo = { cv: c, w: hw, h: hh, pad };
+  return halo;
+}
+
+let prep = null;
+function prepLine(idx) {
+  const line = lines[idx];
+  if (!line || !line.text) return null;
+  const text = line.text;
+  const latin = isLatin(text);
+  const fs0 = latin ? 78 : (text.length <= 10 ? 108 : text.length <= 16 ? 92 : 78);
+  /* sampleFit 会按粒子数反推采样步长 —— 让 K≈pc(1.12)，等间隔取样就不会沿
+     扫描线抽稀（抽稀出来的字是一片横虚线，不是字）。 */
+  const g = sampleFit(text, { fs: fs0, maxW: Math.min(W * 0.74, 1160), maxH: H * 0.40 }, N);
+  if (!g.pc) return null;
+  g.text = text;
+  const h = null;   // 光晕层与针场的对齐没做对（两层错开叠加=糊），先关掉，只留针场
+  g.halo = h;
+
+  const spans = spansForLine(text);
+  const spanOf = new Int16Array(g.n).fill(-1);
+  const spList = [];
+  const cc = line.chars && line.chars.length === text.length ? line.chars : null;
+  for (let k = 0; k < spans.length; k++) {
+    const s = spans[k];
+    if (!s || s.i1 <= s.i0) continue;
+    let t;
+    if (cc && cc[s.i0] && typeof cc[s.i0].t === 'number') t = cc[s.i0].t;
+    else t = line.t + (line.dur || 4) * (s.i0 / Math.max(1, text.length));
+    spList.push({ i0: s.i0, i1: s.i1, t, wcx: 0, wcy: 0 });
+    for (let c2 = s.i0; c2 < s.i1; c2++) spanOf[c2] = spList.length - 1;
+  }
+  if (!spList.length) return null;
+  for (let k = 1; k < spList.length; k++) if (spList[k].t < spList[k - 1].t) spList[k].t = spList[k - 1].t;
+  return { idx, g, spans: spList, spanOf, cc };
+}
+
+/* ============================ 10 · 布局（换句只做指针切换 + 派活） ============================ */
+let __layMs = 0;
+const LATT = 8.6;                    // Rosensweig 晶格周期：晶格太密就成梳子，太疏字会散
+let TIP_BASE = 3;                    // 针尖基础尺寸（布局时按采样步长定）
+
+function layoutLine(idx) {
+  const __t0 = performance.now();
+  const line = lines[idx];
+  if (!line || !line.text) { L = null; return; }
+  const use = (prep && prep.idx === idx) ? prep : prepLine(idx);
+  if (!use) { L = null; return; }
+  const g = use.g;
+  /* 针尖必须 ≥ 采样步长 + 1，否则针尖之间留缝、字读成点阵而不是实心笔画 */
+  TIP_BASE = Math.max(3, Math.min(5, g.step + 2));
+
+  blockGx = W / 2;
+  blockGy = H * 0.395;
+  for (let k = 0; k < use.spans.length; k++) {
+    const s = use.spans[k];
+    let mx = 0, my = 0, cnt = 0;
+    for (let c = s.i0; c < s.i1; c++) { mx += g.charCx[c]; my += g.charCy[c]; cnt++; }
+    s.wcx = blockGx + mx / Math.max(1, cnt);
+    s.wcy = blockGy + my / Math.max(1, cnt);
+  }
+  g.spans = use.spans; g.spanOf = use.spanOf;
+  L = g;
+  charGlow = new Float32Array(g.n);
+  charChars = use.cc;
+  spanFired = new Uint8Array(use.spans.length);
+
+  /* 派活：等间隔取样字形（pi = k*pc/K）。针尖钉在字形点上 —— 位置永不改变，
+     变的只有针长。这就是"零位移形变"。 */
+  const K = Math.min(N, g.pc);
+  for (let i = 0; i < N; i++) {
+    if (i >= K) { pci[i] = -1; psi[i] = 0; plen[i] = 0; ph[i] = 0; phv[i] = 0; ptuft[i] = 0; continue; }
+    const pi = (i * g.pc / K) | 0;
+    const c = g.own[pi];
+    pci[i] = c;
+    psi[i] = use.spanOf[c] < 0 ? 0 : use.spanOf[c];
+    const wx = blockGx + g.px[pi];
+    const wy = blockGy + g.py[pi];
+    pgx[i] = wx; pgy[i] = wy;
+
+    /* ---- Rosensweig 晶格：真实铁磁流体会长成离散的锥簇，而不是均匀梳子 ----
+       8.6px 方格上做 tuft 调制：格心长、格边短（但**不归零**，否则字会被打穿）。
+       同时按行给一点"簇序"随机，让相邻几根针共享相近长度 —— 这才是簇。
+       纵向再乘 vfac：字的下沿针更长（受液面牵引的残丘），上沿更尖短。 */
+    const gx2 = Math.floor(wx / LATT), gy2 = Math.floor(wy / LATT);
+    const cxp = wx - (gx2 + 0.5) * LATT, cyp = wy - (gy2 + 0.5) * LATT;
+    const rr = Math.min(1, Math.hypot(cxp, cyp) / (LATT * 0.66));
+    const cellRnd = (((gx2 * 73856093) ^ (gy2 * 19349663)) >>> 4) % 89 / 89;
+    const tuft = (1 - rr * rr * 0.72) * (0.62 + 0.72 * cellRnd);
+    ptuft[i] = tuft;
+    const vfac = 0.82 + 0.44 * clamp01((wy - blockGy) / (g.h * 0.52) + 0.5);
+    /* 针长 4~17px。早期写成 4~34px，长出来的全是垂在字下面的"钟乳石"，
+       整行字像在滴颜料（读图第一版就是这么废掉的）。 */
+    const rowH = g.h / Math.max(1, g.rows);
+    plen[i] = (1.5 + 5.5 * tuft) * vfac * rnd(0.85, 1.15);
+    /* 关键：多行时必须把针长压到"不会伸进下一行"。
+       原来 plim 允许伸到 rowBottom+6，而磁铁还能把针拉长 170% ——
+       折行之后上一行的针正好扎在下一行的字上，整块读成重影（这就是 lyra05 第一版的样子）。
+       现在：字号行高减去半个针身余量，多行时再整体缩一档。 */
+    const rowBottom = blockGy + (Math.round((wy - blockGy) / rowH) + 0.5) * rowH;
+    const rowGap = Math.max(2, rowBottom - wy);
+    const multi = g.rows > 1 ? 0.42 : 1;
+    plim[i] = Math.max(1.5, Math.min(plen[i] * 1.6 * multi, rowGap * 0.55));
+    plen[i] = Math.min(plen[i] * multi, plim[i] * 0.8);
+    plane[i] = rnd(-0.22, 0.22);
+    ph[i] = 1.2; phv[i] = 0;
+  }
+  cam.tz = 1.0; cam.tpz = cam.pz * 0.5;
+  __layMs = performance.now() - __t0;
+}
+
+/* ============================ 11 · 事件 ============================ */
+function spawnDrops(wx, wy, n, power) {
+  for (let k = 0; k < n; k++) {
+    const a = -Math.PI / 2 + rnd(-1.15, 1.15);
+    const sp = rnd(100, 470) * (0.5 + power);
+    drops.push({
+      x: wx + rnd(-30, 30), y: wy + rnd(-8, 18),
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      t: 0, life: rnd(0.38, 0.90), r: rnd(1.0, 2.2),
+    });
+  }
+}
+function spawnRipple(wx, wy, power) {
+  ripples.push({ x: wx, y: wy, t: 0, life: 0.60 + power * 0.34, r0: 16, r1: 170 + power * 210, a: 0.26 + power * 0.26 });
+}
+
+/* ============================ 12 · 磁铁 ============================ */
+const mag = { x: 0, y: 0, tx: 0, ty: 0 };
+let magOn = 0;
+function seedPool() {
+  /* 液面针丛：铺在液面下方一段纵深里（近大远小的假透视靠 ql 大小体现） */
+  const top = surfaceY - 26, bot = surfaceY + H * 0.22;
+  for (let i = 0; i < PN; i++) {
+    qx[i] = rnd(-0.11, 1.11) * W;
+    const t = Math.pow(Math.random(), 0.78);
+    qy[i] = top + t * (bot - top);
+    ql[i] = (3.5 + t * 6) * rnd(0.7, 1.5);
+  }
+}
+
+/* ============================ 13 · 主循环 ============================ */
+let last = performance.now();
+let T0 = 0;
+let lookX = 0, lookY = 0;
+const OFF = new Set((new URLSearchParams(location.search).get('off') || '').split(',').filter(Boolean));
+const on = (k) => !OFF.has(k);
+if (OFF.has('vig')) vig.style.display = 'none';
+
+function frame(nowMs) {
+  const dtReal = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; T0 += dtReal;
+  if (AE.freeze > 0) AE.freeze -= dtReal;
+  const pdt = Math.min(AE.freeze > 0 ? 0 : dtReal, 0.034);   // 顿帧：物理时间归零
+  const T = now();
+  timing(T);
+
+  /* ---- 逐字亮度（YRC 逐字） ---- */
+  let curChar = 0;
+  if (L) {
+    if (charChars) {
+      for (let c = 0; c < L.n; c++) {
+        const cc = charChars[c];
+        charGlow[c] = cc ? clamp01((T - cc.t) / 0.16) : 0;
+        if (cc && cc.t <= T) curChar = c;
+      }
+    } else if (curIdx >= 0) {
+      const lt = lines[curIdx].t, ld = lines[curIdx].dur || 4;
+      for (let c = 0; c < L.n; c++) {
+        charGlow[c] = clamp01((T - lt - ld * 0.85 * c / L.n) / 0.26);
+        if (T >= lt + ld * 0.85 * c / L.n) curChar = c;
+      }
+    }
+  }
+
+  /* ---- 磁铁跟着正在唱的那个字（因果：唱到哪、哪里被磁化） ---- */
+  if (L && curIdx >= 0) {
+    const cxw = blockGx + L.charCx[curChar], cyw = blockGy + L.charCy[curChar];
+    mag.tx = cxw + Math.sin(T * 1.7) * 30;
+    mag.ty = cyw - L.fs * 0.52 + Math.cos(T * 2.1) * 22;
+    lookX += (cxw - lookX) * Math.min(1, dtReal * 2.4);
+    lookY += (cyw - lookY) * Math.min(1, dtReal * 2.4);
+  } else {
+    mag.tx = W * 0.5 + Math.sin(T * 0.7) * W * 0.20;
+    mag.ty = H * 0.22 + Math.cos(T * 0.9) * H * 0.07;
+  }
+  { const ke = 1 - Math.pow(0.0009, dtReal); mag.x += (mag.tx - mag.x) * ke; mag.y += (mag.ty - mag.y) * ke; }
+  magOn += ((L && curIdx >= 0 ? 1 : 0) - magOn) * Math.min(1, dtReal * 3.0);
+
+  /* ---- 相机 ---- */
+  cam.tx = blockGx + (lookX - blockGx) * 0.40;
+  cam.ty = blockGy + (lookY - blockGy) * 0.40;
+  /* 常驻 dolly 呼吸：镜头一直在缓推/回拉，画面永远不会"停住" */
+  const dollyBase = 0.115 * Math.sin(T * 0.44) + 0.055 * Math.sin(T * 0.19 + 2.0);
+  cam.tpz += (dollyBase * (0.55 + magOn * 0.45) - cam.tpz) * Math.min(1, dtReal * 2.2);
+  camUpdate(dtReal);
+
+  /* ---- 词团触发：顿帧 + 白闪 + 定向震动 + dolly 弹跳 ---- */
+  if (L && curIdx >= 0) {
+    for (let k = 0; k < L.spans.length; k++) {
+      if (spanFired[k] || T < L.spans[k].t) continue;
+      spanFired[k] = 1;
+      const s = L.spans[k], first = k === 0;
+      hitStop(first ? 0.076 : 0.044);
+      flash(first ? 0.95 : 0.46);
+      cam.tz = first ? 1.070 : 1.030;
+      cam.vpz += (first ? -0.70 : -0.38) * (k % 2 ? -1 : 1);   // dolly zoom 的"踢"
+      cam.vrot += (k % 2 ? 1 : -1) * (first ? 1.6 : 0.8);
+      camShake(s.wcx - mag.x, s.wcy - mag.y, first ? 13 : 7.5);   // 沿磁力线方向
+      spawnRipple(s.wcx, surfaceY + 8, first ? 1 : 0.5);
+      spawnDrops(s.wcx, s.wcy + L.fs * 0.42, first ? 24 : 13, first ? 1 : 0.5);
+    }
+  }
+  cam.tz += (1.0 - cam.tz) * Math.min(1, dtReal * 2.0);
+
+  /* ================= 物理：只做"针长"生长，位置零位移 ================= */
+  const MAG_R = 200, MAG_R2 = MAG_R * MAG_R;
+  const z = cam.z, ox2 = W / 2 - cam.x * z + cam.shx, oy2 = H / 2 - cam.y * z + cam.shy;
+  const mxw = mag.x, myw = mag.y;
+  let hotN = 0;
+  for (let i = 0; i < N; i++) {
+    if (pci[i] < 0) { psz[i] = 0; continue; }
+    const act = charGlow[pci[i]];
+    const dx = pgx[i] - mxw, dy = pgy[i] - myw;
+    const d2 = dx * dx + dy * dy;
+    let infl = 0, bend = 0;
+    if (d2 < MAG_R2) {
+      const q = 1 - d2 / MAG_R2;
+      infl = q * q * magOn;
+      if (infl > 0.02) {
+        const d1 = Math.sqrt(d2) + 1;
+        bend = -dx / d1 * infl * 30;            // 朝磁铁偏折：偏折量就是这个
+      }
+    }
+    /* 目标针长：地基 × 唱到(10%→100%) × 磁铁拉长(最多 +170%) */
+    /* 针长上限必须真的用上：plim 在布局时算好了，但如果这里不夹， 
+       磁铁那 170% 的拉伸会让上一行的针扎进下一行 —— 折行之后整块读成重影。 */
+    const tgt = Math.min(plim[i], plen[i] * (0.10 + 0.90 * act) * (1 + infl * 1.70));
+    /* 弹簧（欠阻尼）→ 针尖会冲过头再回位，这就是"长出来"的手感 */
+    phv[i] += ((tgt - ph[i]) * 320 - phv[i] * 17.0) * pdt;
+    ph[i] += phv[i] * pdt;
+    if (ph[i] < 0) { ph[i] = 0; if (phv[i] < 0) phv[i] = 0; }
+
+    plean[i] = bend;
+    psx[i] = pgx[i] * z + ox2;
+    psy[i] = pgy[i] * z + oy2;
+    pln[i] = ph[i] * z;
+    /* 针尖尺寸 = 亮度：未唱 2px → 唱到 4~5px → 磁化 6px（一次 fill 就能分级）。
+       尺寸必须 ≥ 采样步长(2px)+1，否则针尖之间留缝，字会读成"点阵半调"而不是实心笔画。 */
+    /* 针尖尺寸 = 亮度，也是**字的可读性**来源：必须 ≥ 采样步长+1，
+       否则针尖之间留缝、字读成点阵而不是实心笔画（第一版读图就是这个毛病）。 */
+    const tb = TIP_BASE;
+    let s2 = tb - 1;
+    if (act > 0.06) s2 = tb + (act * 2.0 | 0);
+    psz[i] = s2 < tb - 1 ? tb - 1 : s2 > tb + 2 ? tb + 2 : s2;
+    pdim[i] = act > 0.06 ? 0 : 1;
+    if (infl > 0.50 && act > 0.35) { phot[i] = 1; hotN++; } else phot[i] = 0;
+  }
+
+  for (let k = drops.length - 1; k >= 0; k--) {
+    const d = drops[k];
+    d.t += dtReal;
+    if (d.t > d.life) { drops.splice(k, 1); continue; }
+    d.vy += 1180 * dtReal; d.vx *= 0.982;
+    d.x += d.vx * dtReal; d.y += d.vy * dtReal;
+  }
+  for (let k = ripples.length - 1; k >= 0; k--) { ripples[k].t += dtReal; if (ripples[k].t > ripples[k].life) ripples.splice(k, 1); }
+
+  /* ================= 绘制（每帧只有 5 次 fillStyle / 5 次 beginPath） ================= */
+  /* 背景：一张同尺寸不透明贴图直接 blit —— 不打底 fillRect（省 0.7ms） */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  if (bgCv) ctx.drawImage(bgCv, 0, 0);
+  else { ctx.fillStyle = '#04050a'; ctx.fillRect(0, 0, W, H); }
+
+  /* ---- 液面针丛（dk = 0.55：dolly 时它被拉、字不动） ---- */
+  if (on('pool')) {
+    const Sp = layerS(0.55);
+    const pox = W / 2 - cam.x * Sp + cam.shx, poy = H / 2 - cam.y * Sp + cam.shy;
+    ctx.fillStyle = C_POOL;
+    ctx.beginPath();
+    for (let i = 0; i < PN; i++) {
+      const sx2 = qx[i] * Sp + pox, sy2 = qy[i] * Sp + poy;
+      if (sx2 < -20 || sx2 > W + 20 || sy2 < -40 || sy2 > H + 30) continue;
+      const wob = 0.55 + 0.45 * Math.sin(T0 * 1.5 + qj[i]);
+      const hgt = ql[i] * wob * Sp * (0.55 + magOn * 0.55);
+      if (hgt < 1.5) continue;
+      ctx.rect(sx2 | 0, sy2 | 0, 2, hgt | 0);
+    }
+    ctx.fill();
+  }
+
+  /* ---- 光晕层（垫在粒子下面，只提供氛围） ---- */
+  if (L && L.halo && on('halo')) {
+    const hz = z, hw = L.halo.w, hh = L.halo.h;
+    const cx2 = (blockGx - cam.x) * hz + W / 2 + cam.shx;
+    const cy2 = (blockGy - cam.y) * hz + H / 2 + cam.shy;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.15 + 0.10 * (charGlow.length ? charGlow[curChar] : 0);
+    ctx.drawImage(L.halo.cv, cx2 - hw * hz / 2, cy2 - hh * hz / 2, hw * hz, hh * hz);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---- 磁铁（预烘贴图 1 次 drawImage；环用 rect 拼，绝不用 arc ——
+      arc 实测 19fps，rect 才是可用的东西） ---- */
+  if (on('mag')) {
+    const msx = (mag.x - cam.x) * z + W / 2 + cam.shx;
+    const msy = (mag.y - cam.y) * z + H / 2 + cam.shy;
+    const mr = 82 * z * (0.82 + 0.18 * Math.sin(T0 * 3.1));
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.50 + 0.34 * magOn;
+    ctx.drawImage(magSpr, msx - mr, msy - mr, mr * 2, mr * 2);
+    ctx.globalAlpha = 1;
+    /* 磁力环：16 段小 rect 围一圈（比 arc 便宜一个数量级） */
+    const r1 = 15 * z, r2 = 27 * z;
+    ctx.fillStyle = 'rgba(255,150,226,0.30)';
+    ctx.beginPath();
+    for (let k = 0; k < 16; k++) {
+      const a = k / 16 * 6.2832 + T0 * 0.6;
+      ctx.rect((msx + Math.cos(a) * r1) | 0, (msy + Math.sin(a) * r1) | 0, 2, 2);
+    }
+    ctx.fill();
+    ctx.fillStyle = 'rgba(196,224,255,0.20)';
+    ctx.beginPath();
+    for (let k = 0; k < 20; k++) {
+      const a = k / 20 * 6.2832 - T0 * 0.4;
+      ctx.rect((msx + Math.cos(a) * r2) | 0, (msy + Math.sin(a) * r2) | 0, 2, 2);
+    }
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,240,255,0.92)';
+    ctx.beginPath(); ctx.rect((msx - 3) | 0, (msy - 3) | 0, 6, 6); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---- 涟漪（液面被磁力压出的椭圆环 = 透视）。椭圆用 28 个 rect 拼，
+      不用 ellipse()（弧线是这台机器上最贵的东西） ---- */
+  for (let k = 0; k < ripples.length; k++) {
+    const r = ripples[k], p = r.t / r.life;
+    const rad = (r.r0 + (r.r1 - r.r0) * easeOut5(p)) * z;
+    const a = r.a * Math.pow(1 - p, 2.0);
+    const sxx = (r.x - cam.x) * z + W / 2 + cam.shx;
+    const syy = (r.y - cam.y) * z + H / 2 + cam.shy;
+    ctx.fillStyle = `rgba(186,212,246,${(a * 0.55).toFixed(3)})`;
+    ctx.beginPath();
+    for (let q = 0; q < 30; q++) {
+      const aq = q / 30 * 6.2832;
+      ctx.rect((sxx + Math.cos(aq) * rad) | 0, (syy + Math.sin(aq) * rad * 0.26) | 0, 2, 1);
+    }
+    ctx.fill();
+  }
+
+  /* ---- 针身：1 趟（整数坐标） ----
+     针尖钉在字形采样点上、针身**向下**伸进液面 —— 每根针都是"立在液面上的一根刺"，
+     针尖那一层就是字。针长只有 3~15px：早期写成 4~34px，长出来的全是垂在字下面的
+     "钟乳石"，整行字像在滴颜料（读图第一版就是这么废掉的）。
+     只给已唱到的针画针身 —— 未唱的针尖只是液面上的暗残丘，不画柱子。 */
+  if (on('spike')) {
+    ctx.fillStyle = C_SHAFT;
+    ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      if (psz[i] === 0 || pdim[i]) continue;
+      const l2 = pln[i];
+      if (l2 < 3) continue;
+      const sx2 = psx[i] | 0, sy2 = psy[i] | 0;
+      if (sx2 < -8 || sx2 > W + 8 || sy2 < -8 || sy2 > H + 8) continue;
+      ctx.rect(sx2, sy2 + 1, 2, l2);
+    }
+    ctx.fill();
+
+    /* ---- 针尖：2 趟（暗银=未唱 / 亮白=已唱 + 品红=磁化）。'lighter' 让重叠自然更亮 ---- */
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = C_TIP_DIM;
+    ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      if (psz[i] === 0 || !pdim[i]) continue;
+      const sx2 = psx[i] | 0, sy2 = psy[i] | 0;
+      if (sx2 < -8 || sx2 > W + 8 || sy2 < -20 || sy2 > H + 8) continue;
+      const d0 = TIP_BASE - 1, h0 = d0 >> 1;
+      ctx.rect(sx2 - h0, sy2 - h0, d0, d0);
+    }
+    ctx.fill();
+
+    ctx.fillStyle = C_TIP;
+    ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      const s2 = psz[i];
+      if (s2 === 0 || pdim[i] || phot[i]) continue;
+      const sx2 = psx[i], sy2 = psy[i];
+      if (sx2 < -8 || sx2 > W + 8 || sy2 < -20 || sy2 > H + 8) continue;
+      const hw = s2 >> 1;
+      ctx.rect(((sx2 + plean[i] * z) | 0) - hw, (sy2 | 0) - hw, s2, s2);
+    }
+    ctx.fill();
+
+    /* ---- 磁化针尖（品红，只有磁铁附近几百颗） ---- */
+    if (hotN) {
+      ctx.fillStyle = C_HOT;
+      ctx.beginPath();
+      for (let i = 0; i < N; i++) {
+        if (!phot[i]) continue;
+        const sx2 = psx[i], sy2 = psy[i];
+        if (sx2 < -8 || sx2 > W + 8 || sy2 < -20 || sy2 > H + 8) continue;
+        ctx.rect(((sx2 + plean[i] * z) | 0) - 3, (sy2 | 0) - 3, 6, 6);
+      }
+      ctx.fill();
+    }
+  }
+
+  /* ---- 溅起的铁磁液珠 ---- */
+  if (drops.length) {
+    ctx.fillStyle = C_DROP;
+    ctx.beginPath();
+    for (let k = 0; k < drops.length; k++) {
+      const d = drops[k];
+      const sxx = (d.x - cam.x) * z + W / 2 + cam.shx;
+      const syy = (d.y - cam.y) * z + H / 2 + cam.shy;
+      if (sxx < -10 || sxx > W + 10 || syy < -10 || syy > H + 10) continue;
+      const s2 = d.r * (1 - d.t / d.life) * Math.max(0.9, z);
+      ctx.rect(sxx | 0, syy | 0, (s2 * 2) | 0, (s2 * 2) | 0);
+    }
+    ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* ---- 冲击帧白闪 ---- */
+  if (AE.flash > 0.012) {
+    ctx.fillStyle = `rgba(255,250,255,${(AE.flash * 0.10).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    AE.flash *= Math.pow(0.0000022, dtReal);
+  }
+
+  /* ---- 镜头滚转（极轻，2 层）：只转"看得见"的那部分，用画布 transform 一次搞定 ---- */
+  /* 滚转放到最前面做会更贵（要清屏两次），所以这里只做整体 0.4° 以内的微小旋转 */
+
+  requestAnimationFrame(frame);
+}
+
+/* ============================ 14 · 节奏 ============================ */
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {                 // 只有拖进度条才重置
+    curIdx = -1; brewIdx = -1; L = null; prep = null;
+    drops.length = 0; ripples.length = 0;
+  }
+  lastT = T;
+  let c = curIdx;
+  while (c + 1 < lines.length && T >= lines[c + 1].t) c++;   // 索引只前进
+  if (c !== curIdx) {
+    curIdx = c; brewIdx = -1; prep = null;
+    if (curIdx >= 0) { lookX = W / 2; lookY = H * 0.40; layoutLine(curIdx); hintShow('', 0); }
+    else hintShow(lines.length ? '等待第一句…' : '这首没有歌词', 0.5);
+  }
+  /* 酝酿下一句：只在 t - 1.5s 之后做，别提前顶掉当前句 */
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    if (T >= lines[nx].t - Math.min(LEAD, Math.max(0.6, gap * 0.55))) {
+      brewIdx = nx;
+      prep = prepLine(nx);           // ← 重活在空闲帧做，不在换句那一帧
+    }
+  }
+}
+
+/* ============================ 15 · 通信协议 ============================ */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length >= 3) accent = p.accent;
+    rebuildPalette();
+    curIdx = -1; brewIdx = -1; lastT = -1; L = null; prep = null;
+    drops.length = 0; ripples.length = 0;
+    clockT = 0; clockAt = performance.now();
+    hintShow(lines.length ? '等待第一句…' : '这首没有歌词', lines.length ? 1 : 0.5);
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.6;
+    /* 踩拍相干（整场一起动），方向沿磁力线 */
+    camShake(mag.x - blockGx, mag.y - blockGy, 1.8 + lv * 3.6);
+    cam.vpz += (lv > 0.55 ? -1 : 1) * 0.045;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+
+window.__dbg = () => {
+  if (!L) return { L: null };
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (let k = 0; k < L.pc; k++) {
+    const x = L.px[k], y = L.py[k];
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  let y0t = 1e9, y1t = -1e9, lit = 0;
+  for (let i = 0; i < N; i++) {
+    if (pci[i] < 0) continue;
+    if (pgy[i] < y0t) y0t = pgy[i];
+    if (pgy[i] > y1t) y1t = pgy[i];
+    if (ph[i] > 2) lit++;
+  }
+  return {
+    text: L.text, rows: L.rows, pc: L.pc, n: L.n, fs: Math.round(L.fs),
+    block: [Math.round(blockGx), Math.round(blockGy)],
+    ptBox: [Math.round(x0), Math.round(x1), Math.round(y0), Math.round(y1)],
+    needleY: [Math.round(y0t), Math.round(y1t)], lit,
+  };
+};
+window.__stage = () => {
+  let lit = 0, up = 0, mx = 0;
+  for (let i = 0; i < N; i++) {
+    if (psz[i] === 0) continue;
+    if (psz[i] >= 4) lit++;
+    if (pln[i] > 6) up++;
+    if (pln[i] > mx) mx = pln[i];
+  }
+  return {
+    curIdx, n: lines.length, lit, up, maxLen: +mx.toFixed(1),
+    pc: L ? L.pc : 0, spans: L ? L.spans.length : 0,
+    z: +cam.z.toFixed(3), pz: +cam.pz.toFixed(3), magOn: +magOn.toFixed(2),
+    t: +now().toFixed(2), layMs: +__layMs.toFixed(1),
+  };
+};
+
+/* ============================ 16 · 启动 ============================ */
+rebuildPalette();
+magSpr = makeMagSpr();
+surfaceY = H * 0.675;
+resize();
+mag.x = mag.tx = W / 2; mag.y = mag.ty = H * 0.28;
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

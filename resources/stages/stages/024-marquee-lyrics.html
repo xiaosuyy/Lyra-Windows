@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>字幕墙</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#05060a}
+  #wall{position:fixed;inset:0;display:flex;flex-direction:column;justify-content:center;
+        gap:.35vh;pointer-events:none;will-change:transform}
+  .row{position:relative;height:6.6vh;min-height:34px;overflow:hidden;white-space:nowrap;
+       opacity:.34;will-change:opacity}
+  .track{position:absolute;left:0;top:0;height:100%;display:block;will-change:transform}
+  .cell{display:inline-block;vertical-align:middle;text-align:center;
+        font:800 5.6vh/6.6vh "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+        letter-spacing:0;
+        background-image:linear-gradient(92deg,#ffffff,#aeb6e2);
+        -webkit-background-clip:text;background-clip:text;color:transparent}
+  /* 中心压暗遮罩：把中间那条"正在唱的"让出来，边缘自然沉下去 */
+  #spot{position:fixed;inset:0;pointer-events:none;z-index:5;
+        background:radial-gradient(58% 34% at 50% 50%,rgba(5,6,10,.97) 0%,rgba(5,6,10,.86) 46%,rgba(5,6,10,.30) 78%,rgba(5,6,10,.10) 100%)}
+  #center{position:fixed;left:0;right:0;top:50%;transform:translateY(-50%);z-index:6;
+          display:flex;flex-direction:column;align-items:center;justify-content:center;
+          height:23vh;pointer-events:none}
+  .cl{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+      white-space:nowrap;text-align:center;
+      font:800 clamp(30px,6.4vw,90px)/1.14 "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+      letter-spacing:.015em;
+      background-image:linear-gradient(96deg,#ffffff 4%,#cfd6ff 52%,#9aa6ff 100%);
+      -webkit-background-clip:text;background-clip:text;color:transparent;
+      text-shadow:0 0 60px rgba(120,140,255,.0)}
+  /* 跑马灯轨道：整句在 .cl 里水平滑行，当前唱到的字被滑到中心高亮区。
+     注意：字符状态只用 opacity 表达 —— 给 span 挂常驻 filter 会创建合成层，
+     祖先 background-clip:text 的渐变无法透过它绘制，字会整句隐形 */
+  .tk{display:inline-block;will-change:transform}
+  .cl .c{display:inline-block;opacity:.30}
+  .cl .c.sung{opacity:.85}
+  .cl .c.sing{opacity:1}
+  /* 进场：整条从下方升起；出场：整条滑出去（旧类名机制保留） */
+  .cl.rise{transition:none;transform:translate(-50%,-50%) translateY(46px);opacity:0}
+  .cl.rise.in{transition:transform .62s cubic-bezier(.16,.86,.28,1),opacity .5s ease;
+              transform:translate(-50%,-50%);opacity:1}
+  .cl.go{transition:transform .46s cubic-bezier(.4,0,.75,.35),opacity .46s ease;
+         transform:translate(-50%,-190%) scale(.94);opacity:0}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(175,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<div id="wall"></div>
+<div id="spot"></div>
+<div id="center">
+  <div class="cl" id="clA"></div>
+  <div class="cl" id="clB"></div>
+</div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   024 · 字幕墙 —— **正在唱的那句就是墙上跑得最快的那条跑马灯**
+   ----------------------------------------------------------------------------
+   和已有 10 个形态的区别：整个屏幕就是一面 13 行的跑马灯墙，
+   每行滚动速度不同、方向交替，行里的字**全部取自歌词本身**（当前句的前后邻居），
+   所以这面墙是"这首歌的文字"在跑，不是装饰性的假字。
+
+   精修记录（批次B）：① **中央句改为真·跑马灯 + YRC 逐字高亮** —— 整句在
+   水平方向滑行，滑行目标由"当前唱到的字"（chars[k].t 决定 k）反推：
+   到点 t 时第 k 个字正好经过屏幕中心高亮区（字位置在 build 后逐 span 实测）；
+   未唱的字压暗、正在唱的最亮（accent 染色）、已唱的恢复 —— 当前字位置
+   就是可读性锚点，所以**长句天然滚动、永不截断**（分词不必加）。
+   ② 无 chars 时按 t + dur*i/n 均分。③ 动效：整面墙缓慢上下漂移 + beat 相干
+   提速/提亮保留、spot 遮罩随 beat 呼吸、句进场升起/出场滑出保留。
+   ========================================================================== */
+const wall = document.getElementById('wall');
+const hint = document.getElementById('hint');
+const clA = document.getElementById('clA'), clB = document.getElementById('clB');
+const spot = document.getElementById('spot');
+
+const ROWS = 13;
+const FILL = "·—=+*<>/\\|~";
+let rows = [];
+let accent = [160, 176, 255];
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* 槽位宽度：和 .cell 的字号严格对应，滚动才能严丝合缝地对齐 */
+let cw = 16;
+function measure() {
+  const probe = document.createElement('span');
+  probe.className = 'cell';
+  probe.textContent = '字';
+  probe.style.position = 'fixed';
+  probe.style.left = '-9999px';
+  probe.style.top = '0';
+  document.body.appendChild(probe);
+  cw = Math.max(6, probe.getBoundingClientRect().width);
+  document.body.removeChild(probe);
+}
+
+function buildRows() {
+  wall.innerHTML = '';
+  rows = [];
+  const n = Math.max(8, Math.ceil(innerWidth / cw) + 4);
+  for (let i = 0; i < ROWS; i++) {
+    const el = document.createElement('div');
+    el.className = 'row';
+    const track = document.createElement('div');
+    track.className = 'track';
+    el.appendChild(track);
+    wall.appendChild(el);
+    const cells = [];
+    const last = new Array(n);
+    for (let k = 0; k < n; k++) {
+      const c = document.createElement('span');
+      c.className = 'cell';
+      c.style.width = cw.toFixed(2) + 'px';
+      c.textContent = FILL[k % FILL.length];
+      track.appendChild(c);
+      cells.push(c);
+      last[k] = -1;
+    }
+    rows.push({
+      el, track, cells, last, n,
+      dir: i % 2 === 0 ? 1 : -1,
+      speed: (46 + (i * 37) % 120) * (1 + (i % 3) * 0.22),
+      base: 0,
+      pool: FILL + FILL,
+      slot: 0
+    });
+  }
+  /* 每行的字池来自不同的歌词行 —— 墙的内容随歌推进而整体改变 */
+  assignPools();
+}
+
+function assignPools() {
+  const pool = [];
+  for (const ln of lines) {
+    const t = (ln.text || '').replace(/\s+/g, '');
+    if (t) pool.push(t);
+  }
+  if (!pool.length) pool.push('等待第一句');
+  for (let i = 0; i < rows.length; i++) {
+    const base = pool[(i * 5 + 2) % pool.length];
+    const extra = pool[(i * 3 + 1) % pool.length];
+    rows[i].pool = base + FILL + extra.slice(0, Math.max(2, extra.length >> 1)) + FILL;
+  }
+}
+
+/* ---------- 中央跑马灯句 ----------
+   slot = {el, tk, spans, pos[], charT[], text, idx} */
+let curCl = clA, nxtCl = clB;
+let curSlot = null, brewSlot = null;
+let entered = false, lastT = -1;
+let curIdx = -1, curLineRef = null;
+let singIdx = -1;                    // 当前正在唱的字（-1 未开唱）
+
+function setCenter(slot, line, rise) {
+  const text = (line && line.text) || '';
+  slot.el.textContent = '';
+  slot.el.className = 'cl' + (rise ? ' rise' : '');
+  const tk = document.createElement('span');
+  tk.className = 'tk';
+  const spans = [];
+  for (const ch of text) {
+    if (ch === ' ') { tk.appendChild(document.createTextNode(' ')); spans.push(null); continue; }
+    const s = document.createElement('span');
+    s.className = 'c';
+    s.textContent = ch;
+    tk.appendChild(s);
+    spans.push(s);
+  }
+  slot.el.appendChild(tk);
+  slot.tk = tk; slot.spans = spans; slot.text = text;
+  if (rise) {
+    /* 进场：挂 .rise 从下方升起，下一帧挂 .in 触发 transition */
+    slot.el.className = 'cl rise';
+    void slot.el.offsetWidth;
+    slot.el.classList.add('in');
+  } else {
+    slot.el.className = 'cl';
+    slot.el.style.transform = 'translate(-50%,-50%)';
+    slot.el.style.opacity = '1';
+  }
+  /* 逐字点亮时刻：YRC 压 chars[k].t；无 chars 按 t + dur*i/n 均分 */
+  const n = text.length;
+  const chs = line && line.chars && line.chars.length === n ? line.chars : null;
+  const t0 = line ? line.t : 0;
+  const dur = Math.max(0.8, (line && line.dur) || 2.4);
+  const charT = new Float32Array(n);
+  let prev = 0;
+  for (let i = 0; i < n; i++) {
+    let t = chs && isFinite(+chs[i].t) ? +chs[i].t : t0 + dur * 0.72 * (i / Math.max(1, n));
+    if (!(t >= t0)) t = t0;
+    if (t < prev) t = prev;
+    prev = t;
+    charT[i] = t;
+  }
+  slot.charT = charT;
+  slot.yrc = !!chs;
+  /* 实测每个字的屏幕中心位置（相对 .cl 中心），跑马灯滑行就靠它 */
+  const pos = new Float32Array(n);
+  const elr = slot.el.getBoundingClientRect();
+  const mid = elr.left + elr.width / 2;
+  for (let i = 0; i < n; i++) {
+    const s = spans[i];
+    if (!s) { pos[i] = i ? pos[i - 1] : 0; continue; }
+    const r = s.getBoundingClientRect();
+    pos[i] = r.left + r.width / 2 - mid;
+  }
+  slot.pos = pos;
+  slot.off = 0;
+  slot._cls = '';
+  applySlot(slot, t0, true);
+}
+
+/* 把滑行偏移与逐字状态写到槽位上（snap=true 跳过平滑直接就位） */
+function applySlot(slot, T, snap) {
+  const n = slot.spans.length;
+  if (!n) return;
+  const charT = slot.charT, pos = slot.pos;
+  /* 当前唱到的字 k + 到下一字的过渡比例 u */
+  let k = -1;
+  for (let i = n - 1; i >= 0; i--) { if (T >= charT[i]) { k = i; break; } }
+  let target = 0;
+  if (k < 0) target = -pos[0];                                   // 开唱前停在第一个字
+  else {
+    const t1 = k + 1 < n ? charT[k + 1] : charT[k] + Math.max(0.5, (slot.durHint || 2));
+    const u = t1 > charT[k] ? Math.min(1, (T - charT[k]) / (t1 - charT[k])) : 0;
+    const pe = u * u * (3 - 2 * u);                              // smoothstep，滑行像跑马灯不像电击
+    const x = k + 1 < n ? pos[k] + (pos[k + 1] - pos[k]) * pe : pos[k];
+    target = -x;
+  }
+  slot.target = target;
+  if (snap || slot.off === undefined) slot.off = target;
+  /* 逐字状态：只在跨字时改类（性能：不变帧零写入） */
+  const cls = k < 0 ? '' : String(k);
+  if (cls !== slot._cls) {
+    slot._cls = cls;
+    const spans = slot.spans;
+    for (let i = 0; i < n; i++) {
+      const s = spans[i];
+      if (!s) continue;
+      const want = i < k ? 'c sung' : i === k ? 'c sing' : 'c';
+      if (s.className !== want) s.className = want;
+    }
+  }
+}
+
+let smoothOff = 0;
+const SLOT_A = { el: clA }, SLOT_B = { el: clB };
+function slotOf(el) { return el === clA ? SLOT_A : SLOT_B; }
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let brewIdx = -1;
+const LEAD = 1.3;
+let hotIdx = -1, nextRow = -1;
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; reset(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      const oldEl = curCl;
+      curCl = nxtCl; nxtCl = oldEl;
+      /* 上一句整条滑出去 —— 它的字符节点会被下一句复用，没有池子泄漏 */
+      nxtCl.className = 'cl go';
+      curSlot = slotOf(curCl);
+      setCenter(curSlot, lines[ci], true);
+      curLineRef = lines[ci];
+      smoothOff = curSlot.off;
+      hotIdx = ci % rows.length;     // 这一句对应墙上的一条轨道（每句换一条）
+      nextRow = -1;
+      hint.style.opacity = '0';
+      entered = true;
+    } else {
+      reset();
+    }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      /* 酝酿：下一句对应的那一行先开始加速 —— 墙先知道，中央还不知道 */
+      nextRow = nx % rows.length;
+    }
+  }
+}
+
+function reset() {
+  clA.className = 'cl'; clB.className = 'cl';
+  clA.textContent = ''; clB.textContent = '';
+  curCl = clA; nxtCl = clB;
+  curSlot = null; curLineRef = null; singIdx = -1;
+  hotIdx = -1; nextRow = -1;
+  entered = false;
+}
+
+let last = performance.now();
+let beat = 0;
+let drift = 0;
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  const T = now();
+  timing(T);
+  beat *= Math.exp(-dt * 5.0);
+  drift += dt;
+
+  const hot = hotIdx >= 0 ? hotIdx : -1;
+  /* 行样式变化检测：opacity/boost 只在量化后变了才写（性能：静止行零写入） */
+  const q = (v) => Math.round(v * 40);
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const isHot = i === hot;
+    /* 中央那条最快，两侧按距离衰减 —— 速度差就是"这句在唱"的提示 */
+    const d = hot < 0 ? 99 : Math.abs(i - hot);
+    const boost = d === 0 ? 1 : Math.max(0, 1 - d / 5) * 0.45;
+    const pre = i === nextRow ? 0.5 : 0;         // 下一句所在的行提前提速（酝酿）
+    const v = r.speed * (1 + boost * 2.4 + pre * 1.2 + beat * 0.5) * r.dir;
+
+    r.slot -= v * dt / cw;
+    const bi = Math.floor(r.slot);
+    const fr = r.slot - bi;
+    r.track.style.transform = 'translateX(' + (-fr * cw).toFixed(2) + 'px)';
+    const oq = q(0.16 + 0.42 * boost + 0.30 * pre + 0.16 * beat);
+    if (oq !== r._oq) { r._oq = oq; r.el.style.opacity = (oq / 40).toFixed(3); }
+
+    /* 滚动一格 → 只有新进入视野的那一格要换字。
+       索引按"屏幕位置"定：同一格的字符不随滚动漂移，图案才会跟着轨道整体走。 */
+    if (bi !== r.base) {
+      const idx = r.dir > 0 ? r.n - 1 : 0;
+      const want = r.dir > 0 ? bi + (r.n - 1) : bi + r.n;
+      if (r.last[idx] !== want) {
+        r.last[idx] = want;
+        const p = r.pool;
+        r.cells[idx].textContent = p[((want % p.length) + p.length) % p.length];
+      }
+      r.base = bi;
+    }
+    const fq = isHot ? q(1.5 + 0.5 * beat) : 0;
+    if (fq !== r._fq) { r._fq = fq; r.el.style.filter = isHot ? 'brightness(' + (fq / 40).toFixed(2) + ')' : 'none'; }
+  }
+
+  /* 中央跑马灯：滑行目标平滑追踪（1-exp 混合，遇到换句 snap 直接就位） */
+  if (curSlot && curSlot.spans && curSlot.spans.length) {
+    applySlot(curSlot, T, false);
+    smoothOff += (curSlot.target - smoothOff) * (1 - Math.exp(-dt * 7));
+    curSlot.tk.style.transform = 'translateX(' + smoothOff.toFixed(1) + 'px)';
+  }
+
+  /* 中央那句：踩拍时整体抬亮（相干），量化后变化才写 */
+  if (entered) {
+    const [ar, ag, ab] = accent;
+    const sq = q(beat);
+    if (sq !== curSlot._sq) {
+      curSlot._sq = sq;
+      curCl.style.textShadow = '0 0 ' + (40 + 90 * beat).toFixed(0) + 'px rgba(' +
+        Math.min(255, ar) + ',' + Math.min(255, ag) + ',' + Math.min(255, ab) + ',' +
+        (0.18 + 0.34 * beat).toFixed(3) + ')';
+      curCl.style.filter = beat > 0.02 ? 'brightness(' + (1 + 0.14 * beat).toFixed(3) + ')' : 'none';
+    }
+  }
+  spot.style.opacity = '0.94';
+  /* 整面墙缓慢上下漂移（镜头语言：墙是活的） */
+  wall.style.transform = 'translateY(' + (Math.sin(drift * 0.16) * 9).toFixed(2) + 'px)';
+
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => {
+  measure();
+  buildRows();
+  if (curSlot && curLineRef) setCenter(curSlot, curLineRef, false);
+});
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) accent = p.accent;
+    reset();
+    measure();
+    buildRows();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：相干 —— 整面墙一起提速、一起亮，中央那句一起抬 */
+    beat = Math.min(1.4, beat + 0.35 + 0.65 * (d.payload.level || 0));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+requestAnimationFrame(frame);
+window.__stage = () => ({
+  lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2), rows: rows.length,
+  sing: curSlot && curSlot._cls ? +curSlot._cls : -1,
+  yrc: !!(curSlot && curSlot.yrc)
+});
+</script>
+</body>
+</html>

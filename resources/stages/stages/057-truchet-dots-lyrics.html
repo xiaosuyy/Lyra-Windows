@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>特鲁谢圆点歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#080605;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(255,190,130,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   057 · 特鲁谢圆点歌词 —— 字是一张"把光点关起来"的网
+
+   画面是一整片特鲁谢瓷砖（每格两条对角圆弧，二选一），圆弧首尾相接，
+   于是整张网在拓扑上是一堆**互不相交的闭合曲线**（碰到画布边缘的算开链）。
+   光点像列车一样沿着圆弧跑，跨过格边就换到邻格那条弧上。
+
+   字怎么出现 —— 这一版靠的是**拓扑，不是亮度**：
+   · 字形区域内，瓷砖排成棋盘格 —— 任意 2×2 方块恰好构成一个 4 格小闭环；
+   · 字形区域外，瓷砖按列交替 —— 曲线是横着跑到画布边缘的蛇形长链。
+   字 = 被闭环**关住**的那一片光点，外面的网留不住东西，光点流到边上就没了。
+
+   和 001-010 的区别：那十个全是"把粒子搬到位"（吸引、堆积、粘附、轨道、驻留……），
+   这里**没有任何"位"**：光点只是沿弧跑，字是网络拓扑的一个副产品。
+   和 017（特鲁谢光轨：靠"离字形多近"决定瓷砖亮度 + 一道扫过的光轨）也不同：
+   这里瓷砖亮度由**连通分量的拓扑**决定（闭环/开链，一次并查集算完），
+   字形决定的是"哪些格子必须成环"，跟距离场没关系。
+
+   为什么快（实测定位后重写）：
+   原来每帧要描 11890 格的弧（23780 段）+ 5945 个棋盘矩形 + 11890 个网格矩形，
+   实测单帧光栅化 127~437ms（软件渲染下弧线描边约 10µs/段），只有 2.3~6fps。
+   现在把"铺底 + 整张网"烘成一张静态图，每帧只 drawImage 一次（0.8ms）：
+   · 字形外 type 只由 i&1 决定 → 背景网是 **2 格周期的花色**，一次 pattern 铺满；
+   · 字形区（bb）内的弧分 6 带建，换句前每帧建一带（每带 ~6ms），句首只剩引用交换；
+   · 暗角也烘成一张，每帧一次 drawImage（原来每帧一次全屏径向渐变）。
+   光点仍是 3 档合批，每档一条 path 一次 fill —— 没有逐颗 beginPath。
+
+   精修记录：① YRC 逐字点亮 —— 每格记下"自己属于第几个字"（tchar，排版表二分反查，
+   不做逐字读回），第 k 字的网在 chars[k].t 那一刻才允许关住光点（charOn 门），
+   同时把这个字的闭环弧 + 字形补绘进已烘好的静态层（累积式，每字只画一次，
+   ~20 格 ≈ 40 条弧），于是"网格一片片亮起来"的顺序就是唱字顺序。
+   无 chars 按 t+dur*k/n 均分回退，__stage 增 yrc。② 长句折 1~3 行（41 字 = 14/14/13），
+   字号自适应；整句先烘一层**淡字形底稿**（lighter 0.24），没唱到的字也完整可读。
+   ③ 镜头：整张网连光点一起缓慢推拉（1.02~1.05）+ 踩拍加速（相干）。
+   分词：不使用。逐字时刻已到字，按词团只会让网格点亮的节奏变粗。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const gmask = document.createElement('canvas');
+const gctx = gmask.getContext('2d', { willReadFrequently: true });
+
+let W = 0, H = 0, DPR = 1;
+
+/* ---------------- 瓷砖网格 ---------------- */
+let cell = 13, cols = 0, rows = 0, ox = 0, oy = 0;
+let checkerPath = null, gridPath = null;
+let vigCv = null;                      // 暗角（resize 时烘一张，每帧一次 drawImage）
+let patTile = null;                    // 背景网的 2 格周期花色（小图，铺满即得整张背景网）
+let bakeCvs = [];                      // 静态层乒乓：铺底 + 整张网
+let bakeJob = null;                    // 正在分带烘焙的图案
+const NBAND = 6;                       // 字形区的弧分 6 带建
+
+/* ---------------- 图案（每句一份，brew 时建好） ---------------- */
+let pat = null;        // 正在显示的
+let pend = null;       // 已经酝酿好的下一句
+let pendIdx = -1;
+
+/* ---------------- 光点 ---------------- */
+let N = 0;
+let pi = null, pj = null, pe = null, ps = null, ptrap = null, psp = null;
+let plife = null, page = null;
+let trapCount = 0, TRAPCAP = 0;
+
+const NX = [0, 1, 0, -1], NY = [-1, 0, 1, 0], OPP = [2, 3, 0, 1];
+const EX0 = [3, 2, 1, 0], EX1 = [1, 0, 3, 2];
+
+let accent = [255, 186, 120];
+let surge = 0;                       // 踩拍的整体加速（相干）
+const mouse = { x: 0, y: 0, has: false };
+
+/* ---------------- 排版 / 逐字时间 ----------------
+   长句折 1~3 行；"哪一格属于哪个字"用排版表**二分反查**，不做 41 次逐字 getImageData。 */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+
+let lay = null;                 // 当前句排版（buildPattern 里建，挂在 pattern 上）
+let ctArr = null;               // 逐字成立时刻
+let curYrc = false, lit = 0, onDrawn = 0;
+let charOn = new Uint8Array(1); // 每字是否已亮（关住光点的门）
+let litTiles = [];              // 已亮闭环格（光点重投的优先落点）
+
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+/* chars 必须与正文逐字等长、每个 t 有限才采信，并单调钳位；否则 t+dur*k/n 均分回退 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+function makeLayout(text, idx) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.84, 1500);
+  const maxH = H * 0.58;
+  octx.font = fontOf(100);
+  let widest = 1;
+  for (let r = 0; r < nr; r++) widest = Math.max(widest, octx.measureText(rows[r]).width);
+  let fs = Math.min(100 * maxW / widest, maxH / (nr * 1.24), 140);
+  fs = Math.max(22, Math.floor(fs));
+  octx.font = fontOf(fs);
+  const LH = fs * 1.24;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let minX = 1e9, maxX = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      if (x < minX) minX = x;
+      if (x + w > maxX) maxX = x + w;
+      x += w; gi++;
+    }
+    rowsOut.push({ y: y, g: gr, w: wsum });
+  }
+  const minY = y0 - fs * 0.52, maxY = y0 + (nr - 1) * LH + fs * 0.52;
+  const gcx = (minX + maxX) / 2, gcy = (minY + maxY) / 2;
+  const A = placeAnchor(anchors[idx % anchors.length], (maxX - minX) / 2, (maxY - minY) / 2, gcx, gcy);
+  const dx = Math.max(-W * 0.04, Math.min(W * 0.04, (A.x - gcx) * 0.5));
+  const dy = Math.max(-H * 0.05, Math.min(H * 0.05, (A.y - gcy) * 0.5));
+  for (let u = 0; u < glyphs.length; u++) { glyphs[u].x += dx; glyphs[u].y += dy; }
+  for (let r = 0; r < rowsOut.length; r++) {
+    rowsOut[r].y += dy;
+    for (let j = 0; j < rowsOut[r].g.length; j++) { rowsOut[r].g[j].x0 += dx; rowsOut[r].g[j].x1 += dx; }
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length, font: fontOf(fs) };
+}
+
+function charAt(L, x, y) {
+  if (!L || !L.rows.length) return 255;
+  let bi = 0, bd = 1e9;
+  for (let r = 0; r < L.rows.length; r++) {
+    const d = Math.abs(y - L.rows[r].y);
+    if (d < bd) { bd = d; bi = r; }
+  }
+  const g = L.rows[bi].g;
+  if (!g.length) return 255;
+  if (x <= g[0].x0) return g[0].i;
+  const last = g.length - 1;
+  if (x >= g[last].x1) return g[last].i;
+  let lo = 0, hi = last;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < x) lo = m + 1; else hi = m; }
+  return g[lo].i;
+}
+
+/* ---------------- 锚点 ---------------- */
+const anchors = [];
+for (let i = 0; i < 96; i++) {
+  const g = i * 2.399963;
+  const rr = 0.30 + 0.70 * (((i * 37) % 97) / 97);
+  anchors.push({ nx: Math.cos(g) * rr, ny: Math.sin(g) * rr * 0.66 });
+}
+function placeAnchor(a, hw, hh, gcx, gcy) {
+  const M = 60;
+  const x0 = M + hw - gcx, x1 = W - M - hw - gcx;
+  const y0 = M + hh - gcy, y1 = H - M - hh - gcy;
+  return {
+    x: x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2 - gcx,
+    y: y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2 - gcy,
+  };
+}
+
+/* ---------------- 瓷砖弧几何 ---------------- */
+function addArc(path, type, a, x, y, S) {
+  const r = S * 0.5;
+  if (type === 0) {
+    if (a === 0) { path.moveTo(x, y + r); path.arc(x, y, r, Math.PI / 2, 0, true); }
+    else { path.moveTo(x + S, y + r); path.arc(x + S, y + S, r, -Math.PI / 2, -Math.PI, true); }
+  } else {
+    if (a === 0) { path.moveTo(x + r, y); path.arc(x + S, y, r, Math.PI, Math.PI / 2, true); }
+    else { path.moveTo(x + r, y + S); path.arc(x, y + S, r, 0, -Math.PI / 2, true); }
+  }
+}
+/* 光点在弧上的位置：先按 (型, 弧, 入边, 参数) 求圆心角，再取点 */
+let _dx = 0, _dy = 0;
+function dotAt(type, arc, entry, x, y, S, s) {
+  const r = S * 0.5, hpi = Math.PI * 0.5;
+  let cx, cy, a;
+  if (type === 0) {
+    if (arc === 0) { cx = x; cy = y; a = entry === 3 ? hpi * (1 - s) : hpi * s; }
+    else { cx = x + S; cy = y + S; a = entry === 1 ? -hpi - hpi * s : -Math.PI + hpi * s; }
+  } else {
+    if (arc === 0) { cx = x + S; cy = y; a = entry === 0 ? Math.PI - hpi * s : hpi + hpi * s; }
+    else { cx = x; cy = y + S; a = entry === 2 ? -hpi * s : -hpi + hpi * s; }
+  }
+  _dx = cx + Math.cos(a) * r;
+  _dy = cy + Math.sin(a) * r;
+}
+
+/* ---------------- 建图案：棋盘格闭环 / 同型开链 + 并查集定拓扑 ----------------
+   纯计算 + 一次 Path2D 构建，放在 brew 阶段做，句首只做一次引用交换。 */
+function buildPattern(idx) {
+  const n = cols * rows;
+  const types = new Uint8Array(n);
+  const inG = new Uint8Array(n);
+  const arcOf = new Uint8Array(n * 4);
+  const tchar = new Uint8Array(n).fill(255);
+  let bb = null, L = null;
+
+  /* 1) 字形遮罩（1 格 = 1 像素，逐字画并用 strokeText 加粗，
+        保证笔画至少横跨 2 格 —— 否则 2×2 的闭环塞不进去） */
+  gctx.setTransform(1, 0, 0, 1, 0, 0);
+  gctx.clearRect(0, 0, cols, rows);
+  if (idx >= 0 && lines[idx] && lines[idx].text) {
+    L = makeLayout(lines[idx].text, idx);
+    if (L) {
+      gctx.setTransform(1 / cell, 0, 0, 1 / cell, 0, 0);
+      gctx.font = L.font;
+      gctx.textAlign = 'center'; gctx.textBaseline = 'middle';
+      gctx.lineJoin = 'round'; gctx.lineCap = 'round';
+      gctx.fillStyle = '#fff'; gctx.strokeStyle = '#fff';
+      gctx.lineWidth = L.fs * 0.11;
+      for (let u = 0; u < L.glyphs.length; u++) {
+        const g = L.glyphs[u];
+        gctx.strokeText(g.ch, g.x - ox, g.y - oy);
+        gctx.fillText(g.ch, g.x - ox, g.y - oy);
+      }
+      const d = gctx.getImageData(0, 0, cols, rows).data;
+      let i0 = cols, i1 = -1, j0 = rows, j1 = -1;
+      for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+          if (d[((j * cols + i) * 4) + 3] > 90) {
+            inG[j * cols + i] = 1;
+            if (i < i0) i0 = i; if (i > i1) i1 = i;
+            if (j < j0) j0 = j; if (j > j1) j1 = j;
+          }
+        }
+      }
+      if (i1 >= i0) {
+        bb = { i0: Math.max(0, i0 - 2), i1: Math.min(cols - 1, i1 + 2), j0: Math.max(0, j0 - 2), j1: Math.min(rows - 1, j1 + 2) };
+        /* 每格属于哪个字（排版表二分反查；只在字形格上算一次） */
+        for (let j = j0; j <= j1; j++) {
+          const row = j * cols;
+          for (let i = i0; i <= i1; i++) {
+            if (!inG[row + i]) continue;
+            tchar[row + i] = charAt(L, ox + i * cell + cell * 0.5, oy + j * cell + cell * 0.5);
+          }
+        }
+      }
+    }
+  }
+
+  /* 2) 型别：字形内棋盘格（每 2×2 恰好一环），字形外按列交替。
+        背景为什么不用"全同型"：全同型在**没有洞**的时候确实全是开链，
+        但字形一挖洞，斜线被改道后会互相接成大环 —— 实测字形外会有 16% 的格子成环，
+        字就跟背景分不开了。改成按列交替后只剩 5%，而且走子跑的是蛇形长链，更好看。
+        剩下那 5% 的"背景死环"由运行时的 inG 判定兜底（见 stepParticles）。 */
+  for (let j = 0; j < rows; j++) {
+    const row = j * cols;
+    for (let i = 0; i < cols; i++) {
+      const k = row + i;
+      types[k] = inG[k] ? (((i + j) & 1) ? 1 : 0) : (i & 1);
+      const t4 = k * 4;
+      if (types[k] === 0) { arcOf[t4 + 3] = 0; arcOf[t4] = 0; arcOf[t4 + 1] = 1; arcOf[t4 + 2] = 1; }
+      else { arcOf[t4] = 0; arcOf[t4 + 1] = 0; arcOf[t4 + 2] = 1; arcOf[t4 + 3] = 1; }
+    }
+  }
+
+  /* 3) 并查集：把所有弧按"共享格边中点"连起来 */
+  const par = new Int32Array(n * 2);
+  for (let k = 0; k < n * 2; k++) par[k] = k;
+  const find = (x) => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+  const uni = (a, b) => { a = find(a); b = find(b); if (a !== b) par[b] = a; };
+  for (let j = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++) {
+      const t = j * cols + i;
+      for (let e = 0; e < 4; e++) {
+        const ni = i + NX[e], nj = j + NY[e];
+        if (ni < 0 || nj < 0 || ni >= cols || nj >= rows) continue;
+        const nt = nj * cols + ni;
+        uni(t * 2 + arcOf[t * 4 + e], nt * 2 + arcOf[nt * 4 + OPP[e]]);
+      }
+    }
+  }
+  /* 4) 碰到画布边缘的分量 = 开链；其余 = 闭环（光点进去就出不来） */
+  const openRoot = new Uint8Array(n * 2);
+  for (let i = 0; i < cols; i++) {
+    const t0 = i, t1 = (rows - 1) * cols + i;
+    for (let e = 0; e < 4; e++) {
+      openRoot[find(t0 * 2 + arcOf[t0 * 4 + e])] = 1;
+      openRoot[find(t1 * 2 + arcOf[t1 * 4 + e])] = 1;
+    }
+  }
+  for (let j = 0; j < rows; j++) {
+    const t0 = j * cols, t1 = j * cols + cols - 1;
+    for (let e = 0; e < 4; e++) {
+      openRoot[find(t0 * 2 + arcOf[t0 * 4 + e])] = 1;
+      openRoot[find(t1 * 2 + arcOf[t1 * 4 + e])] = 1;
+    }
+  }
+  const closedArc = new Uint8Array(n * 2);
+  for (let k = 0; k < n * 2; k++) closedArc[k] = openRoot[find(k)] ? 0 : 1;
+  /* "能关住光点的弧" = 拓扑上是闭环 **且** 落在字形里。
+     背景里偶然成的那几个死环不算 —— 否则字就跟背景糊成一片了。 */
+  const loopArc = new Uint8Array(n * 2);
+  for (let t = 0; t < n; t++) {
+    if (!inG[t]) continue;
+    if (closedArc[t * 2]) loopArc[t * 2] = 1;
+    if (closedArc[t * 2 + 1]) loopArc[t * 2 + 1] = 1;
+  }
+
+  /* 5) 只留 loopTiles（光点要随机投到闭环格上）。两条 Path2D 不再整张建：
+        换成"静态层烘焙"——字形区按行分带建，每帧一带（见 bakeBand） */
+  const loopTiles = [];
+  for (let t = 0; t < n; t++) if (loopArc[t * 2] || loopArc[t * 2 + 1]) loopTiles.push(t);
+  /* 每个字占哪些闭环格：逐字点亮时只描这一小把弧（~20 格 ≈ 40 条） */
+  const byChar = [];
+  for (let t = 0; t < loopTiles.length; t++) {
+    const k = loopTiles[t], c = tchar[k];
+    if (c === 255) continue;
+    (byChar[c] || (byChar[c] = [])).push(k);
+  }
+  return {
+    types: types, arcOf: arcOf, closedArc: closedArc, loopArc: loopArc, inG: inG, tchar: tchar,
+    loopTiles: loopTiles, byChar: byChar, bb: bb, lay: L,
+    bc: pickBake(), bs: 0, ready: false,
+  };
+}
+
+/* ---------------- 静态层烘焙 ----------------
+   一张图装下"铺底 + 整张网"，每帧只 drawImage。
+   字形外是 2 格周期的花色 → 一次 pattern 铺满；字形区内的弧按行分 6 带，
+   每帧建一带（~6ms），所以换句前那一下不会卡帧。 */
+function pickBake() {
+  const b = bakeCvs[0];
+  return (pat && pat.bc === b) ? bakeCvs[1] : b;
+}
+function bakeBackdrop(bc) {
+  bc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bc.globalCompositeOperation = 'source-over';
+  bc.globalAlpha = 1; bc.lineCap = 'round'; bc.lineJoin = 'round';
+  const g1 = bc.createLinearGradient(0, 0, 0, H);
+  g1.addColorStop(0, '#0a0806');
+  g1.addColorStop(0.5, '#0b0806');
+  g1.addColorStop(1, '#070505');
+  bc.fillStyle = g1; bc.fillRect(0, 0, W, H);
+  const g2 = bc.createRadialGradient(W * 0.5, H * 0.45, 0, W * 0.5, H * 0.45, Math.max(W, H) * 0.72);
+  g2.addColorStop(0, 'rgba(255,168,108,0.055)');
+  g2.addColorStop(0.6, 'rgba(180,90,70,0.02)');
+  g2.addColorStop(1, 'rgba(0,0,0,0)');
+  bc.fillStyle = g2; bc.fillRect(0, 0, W, H);
+  bc.fillStyle = 'rgba(255,226,196,0.016)';
+  bc.fill(checkerPath);
+  bc.strokeStyle = 'rgba(255,226,196,0.028)';
+  bc.lineWidth = 1;
+  bc.stroke(gridPath);
+}
+function bakeBgNet(bc, bb) {
+  const fill = bc.createPattern(patTile, 'repeat');
+  if (fill.setTransform) fill.setTransform(new DOMMatrix().translate(ox, oy).scale(1 / DPR));
+  bc.globalCompositeOperation = 'lighter';
+  bc.fillStyle = fill;
+  if (!bb) { bc.fillRect(-cell * 2, -cell * 2, W + cell * 4, H + cell * 4); return; }
+  const x0 = ox + bb.i0 * cell, x1 = ox + (bb.i1 + 1) * cell;
+  const y0 = oy + bb.j0 * cell, y1 = oy + (bb.j1 + 1) * cell;
+  bc.fillRect(-cell * 2, -cell * 2, W + cell * 4, y0 + cell * 2);
+  bc.fillRect(-cell * 2, y1, W + cell * 4, H - y1 + cell * 2);
+  bc.fillRect(-cell * 2, y0, x0 + cell * 2, y1 - y0);
+  bc.fillRect(x1, y0, W - x1 + cell * 2, y1 - y0);
+}
+function bakeBand(bc, p, b) {
+  const b0 = p.bb.j0, b1 = p.bb.j1 + 1;
+  const j0 = b0 + Math.floor((b1 - b0) * b / NBAND), j1 = b0 + Math.floor((b1 - b0) * (b + 1) / NBAND);
+  const open = new Path2D(), closed = new Path2D();
+  for (let j = j0; j < j1; j++) {
+    const y = oy + j * cell, row = j * cols;
+    for (let i = p.bb.i0; i <= p.bb.i1; i++) {
+      const t = row + i, x = ox + i * cell, ty = p.types[t];
+      const c0 = p.loopArc[t * 2], c1 = p.loopArc[t * 2 + 1];
+      addArc(c0 ? closed : open, ty, 0, x, y, cell);
+      addArc(c1 ? closed : open, ty, 1, x, y, cell);
+    }
+  }
+  bc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bc.globalCompositeOperation = 'lighter';
+  bc.globalAlpha = 1; bc.lineCap = 'butt'; bc.lineJoin = 'bevel';
+  bc.lineWidth = Math.max(1.4, cell * 0.05);
+  bc.strokeStyle = 'rgba(206,196,190,0.045)';
+  bc.stroke(open);
+  bc.lineWidth = Math.max(3, cell * 0.19);
+  bc.strokeStyle = 'rgba(255,168,96,0.045)';
+  bc.stroke(closed);
+  bc.lineWidth = Math.max(1.6, cell * 0.075);
+  bc.strokeStyle = 'rgba(255,196,132,0.20)';
+  bc.stroke(closed);
+}
+/* 整句的淡字形底稿：网是机制，底稿负责"没唱到的字也看得清"（旧版 4s 只亮到第 19 字）。
+   唱到某个字时 lightChar() 再把这个字连同它的闭环弧补亮 —— 逐字点亮是累积的，只画一次。 */
+function bakeGuide(bc, p) {
+  if (!p || !p.lay) return;
+  bc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bc.globalCompositeOperation = 'lighter';
+  bc.globalAlpha = 1;
+  bc.font = p.lay.font;
+  bc.textAlign = 'center'; bc.textBaseline = 'middle';
+  bc.fillStyle = 'rgba(230,212,190,0.25)';
+  const L = p.lay;
+  for (let u = 0; u < L.glyphs.length; u++) bc.fillText(L.glyphs[u].ch, L.glyphs[u].x, L.glyphs[u].y);
+}
+function arcsOf(p, tiles) {
+  const path = new Path2D();
+  for (let q = 0; q < tiles.length; q++) {
+    const t = tiles[q], i = t % cols, j = (t / cols) | 0;
+    const x = ox + i * cell, y = oy + j * cell, ty = p.types[t];
+    if (p.loopArc[t * 2]) addArc(path, ty, 0, x, y, cell);
+    if (p.loopArc[t * 2 + 1]) addArc(path, ty, 1, x, y, cell);
+  }
+  return path;
+}
+/* 第 k 字点亮：它的闭环弧变亮 + 字形补到可读亮度（都画进已经烘好的静态层） */
+function lightChar(p, k) {
+  if (!p || !p.lay || !p.ready) return;
+  const bc = p.bc.getContext('2d');
+  bc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bc.globalCompositeOperation = 'lighter';
+  bc.globalAlpha = 1;
+  bc.lineCap = 'butt'; bc.lineJoin = 'bevel';
+  const tiles = p.byChar[k];
+  if (tiles && tiles.length) {
+    const path = arcsOf(p, tiles);
+    bc.lineWidth = Math.max(2.2, cell * 0.18);
+    bc.strokeStyle = 'rgba(255,168,90,0.045)';
+    bc.stroke(path);
+    bc.lineWidth = Math.max(1.6, cell * 0.075);
+    bc.strokeStyle = 'rgba(255,208,152,0.17)';
+    bc.stroke(path);
+  }
+  const g = p.lay.glyphs[k];
+  if (g) {
+    bc.font = p.lay.font;
+    bc.textAlign = 'center'; bc.textBaseline = 'middle';
+    bc.fillStyle = 'rgba(255,236,208,0.40)';
+    bc.fillText(g.ch, g.x, g.y);
+  }
+}
+
+/* 推进 n 步烘焙（一步 = 铺底 / 一带） */
+function bakeStep(p, n) {
+  if (!p || p.ready) return;
+  while (n-- > 0 && !p.ready) {
+    const bc = p.bc.getContext('2d');
+    if (p.bs === 0) {
+      bc.setTransform(1, 0, 0, 1, 0, 0);
+      bc.clearRect(0, 0, p.bc.width, p.bc.height);
+      bakeBackdrop(bc);
+      bakeGuide(bc, p);
+      bakeBgNet(bc, p.bb);
+    } else if (p.bb) {
+      bakeBand(bc, p, p.bs - 1);
+    }
+    p.bs++;
+    if (p.bs > NBAND || !p.bb) p.ready = true;
+  }
+}
+const finishBake = (p) => bakeStep(p, 999);
+
+/* ---------------- 分配 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  cell = Math.max(9, Math.min(16, Math.round(Math.min(W, H) * 0.24 * 0.052)));
+  cols = Math.ceil(W / cell) + 1;
+  rows = Math.ceil(H / cell) + 1;
+  ox = Math.round((W - cols * cell) * 0.5);   /* 取整：花色 pattern 才能和格网 1:1 对齐 */
+  oy = Math.round((H - rows * cell) * 0.5);
+  gmask.width = cols; gmask.height = rows;
+
+  checkerPath = new Path2D(); gridPath = new Path2D();
+  for (let j = 0; j < rows; j++) {
+    const y = oy + j * cell;
+    for (let i = 0; i < cols; i++) {
+      const x = ox + i * cell;
+      if ((i + j) & 1) checkerPath.rect(x, y, cell, cell);
+      gridPath.rect(x + 0.5, y + 0.5, cell - 1, cell - 1);
+    }
+  }
+
+  /* 暗角烘一张（原来每帧一次全屏径向渐变 = 6ms） */
+  vigCv = document.createElement('canvas');
+  vigCv.width = cv.width; vigCv.height = cv.height;
+  const vg = vigCv.getContext('2d');
+  vg.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const vgr = vg.createRadialGradient(W * 0.5, H * 0.48, Math.min(W, H) * 0.3, W * 0.5, H * 0.48, Math.max(W, H) * 0.8);
+  vgr.addColorStop(0, 'rgba(0,0,0,0)');
+  vgr.addColorStop(1, 'rgba(4,2,1,0.5)');
+  vg.fillStyle = vgr; vg.fillRect(0, 0, W, H);
+
+  /* 背景网的 2 格周期花色：字形外 type 只由 i&1 决定，一张小图铺满 */
+  patTile = document.createElement('canvas');
+  patTile.width = Math.round(cell * 2 * DPR); patTile.height = Math.round(cell * DPR);
+  const tg = patTile.getContext('2d');
+  tg.setTransform(DPR, 0, 0, DPR, 0, 0);
+  tg.lineCap = 'butt'; tg.lineJoin = 'bevel';
+  tg.lineWidth = Math.max(1.4, cell * 0.05);
+  tg.strokeStyle = 'rgba(206,196,190,0.045)';
+  for (let i = 0; i < 2; i++) {
+    const p = new Path2D();
+    addArc(p, i & 1, 0, i * cell, 0, cell);
+    addArc(p, i & 1, 1, i * cell, 0, cell);
+    tg.stroke(p);
+  }
+
+  bakeCvs = [document.createElement('canvas'), document.createElement('canvas')];
+  for (let i = 0; i < 2; i++) { bakeCvs[i].width = cv.width; bakeCvs[i].height = cv.height; }
+  bakeJob = null;
+
+  N = Math.max(2200, Math.min(5200, Math.round(W * H / 450)));
+  pi = new Uint16Array(N); pj = new Uint16Array(N); pe = new Uint8Array(N);
+  ps = new Float32Array(N); psp = new Float32Array(N); ptrap = new Uint8Array(N);
+  plife = new Float32Array(N); page = new Float32Array(N);
+  TRAPCAP = Math.floor(N * 0.55);
+  trapCount = 0;
+  for (let k = 0; k < N; k++) { psp[k] = 42 + Math.random() * 62; respawn(k, 0); }
+
+  pat = buildPattern(curIdx);
+  finishBake(pat);
+  setLine(pat);
+  pend = null; pendIdx = -1;
+}
+addEventListener('resize', resize);
+
+/* ---------------- 光点 ----------------
+   关键的一条（踩过的坑）：**开链上的光点永远走不到闭环上** —— 两者是互不相交的
+   连通分量，沿弧跑根本跨不过去。所以"关住"只可能发生在光点**刚投进来**的那一刻。
+   于是每颗光点都有一条寿命（1.8~4.2 秒），跑完就重新投一次；
+   重投时四成直接落在字形的闭环格上（当场被关住），其余落在外面继续流。
+   字就是这样一点点被填满的：投进来的留下，投在外面的流走。 */
+function respawn(k, mode) {
+  let i, j;
+  if (mode === 1 && pat && (litTiles.length || pat.loopTiles.length)) {
+    /* 只往"已经亮起来的字"的闭环上投，光点才会被关在唱到的字里 */
+    const pool = litTiles.length ? litTiles : pat.loopTiles;
+    const t = pool[(Math.random() * pool.length) | 0];
+    i = t % cols; j = (t / cols) | 0;
+  } else if (mode === 2 && pat && pat.bb) {
+    const b = pat.bb;
+    i = b.i0 + ((Math.random() * (b.i1 - b.i0 + 1)) | 0);
+    j = b.j0 + ((Math.random() * (b.j1 - b.j0 + 1)) | 0);
+  } else {
+    i = (Math.random() * cols) | 0;
+    j = (Math.random() * rows) | 0;
+  }
+  pi[k] = i; pj[k] = j;
+  pe[k] = (Math.random() * 4) | 0;
+  ps[k] = Math.random() * 0.9;
+  ptrap[k] = 0;
+  page[k] = 0;
+  plife[k] = 1.5 + Math.random() * 2.0;
+}
+
+function releaseTrapped() {
+  /* 换句 = 把上一句关住的光点全部放掉（坑③：不释放的话池子会被慢慢耗干） */
+  for (let k = 0; k < N; k++) {
+    if (ptrap[k]) { ptrap[k] = 0; respawn(k, Math.random() < 0.55 ? 1 : 0); }
+  }
+  trapCount = 0;
+}
+
+function stepParticles(dt) {
+  if (!pat) return;
+  const types = pat.types, arcOf = pat.arcOf, loopArc = pat.loopArc, inG = pat.inG, tchar = pat.tchar;
+  const arcLen = Math.PI * cell * 0.5;
+  const mul = 1 + surge * 1.6;
+  const mHas = mouse.has;
+  const open = trapCount < TRAPCAP;
+  for (let k = 0; k < N; k++) {
+    if (!ptrap[k]) {
+      page[k] += dt;
+      if (page[k] > plife[k]) { respawn(k, open && Math.random() < 0.55 ? 1 : 0); continue; }
+    }
+    let sp = psp[k] * mul;
+    if (mHas) {
+      const ddx = (ox + pi[k] * cell + cell * 0.5) - mouse.x;
+      const ddy = (oy + pj[k] * cell + cell * 0.5) - mouse.y;
+      const d2 = ddx * ddx + ddy * ddy;
+      if (d2 < 20000) sp *= 1 + (1 - d2 / 20000) * 1.4;
+    }
+    ps[k] += sp * dt / arcLen;
+    let guard = 0;
+    while (ps[k] >= 1 && guard++ < 8) {
+      const t = pj[k] * cols + pi[k];
+      const ty = types[t];
+      const ex = ty === 0 ? EX0[pe[k]] : EX1[pe[k]];
+      ps[k] -= 1;
+      if (ex === 0) { pj[k]--; pe[k] = 2; }
+      else if (ex === 1) { pi[k]++; pe[k] = 3; }
+      else if (ex === 2) { pj[k]++; pe[k] = 0; }
+      else { pi[k]--; pe[k] = 1; }
+      if (pi[k] >= cols || pj[k] >= rows) { respawn(k, Math.random() < 0.55 ? 1 : 0); break; }
+      /* 跨进"能关住光点的弧"= 被关住；背景里偶然成环的死轨道就直接放走。
+         但这个字得先亮起来（charOn）—— 网一片片点亮，光点才一处处被关住 */
+      if (!ptrap[k]) {
+        const nt = pj[k] * cols + pi[k];
+        const na = arcOf[nt * 4 + pe[k]];
+        if (loopArc[nt * 2 + na]) {
+          const cc = tchar[nt];
+          if (cc !== 255 && !charOn[cc]) { /* 这个字的网还没亮，留不住 */ }
+          else if (trapCount < TRAPCAP) { ptrap[k] = 1; trapCount++; }
+          else { respawn(k, 0); break; }
+        } else if (pat.closedArc[nt * 2 + na] && !inG[nt]) {
+          respawn(k, 0); break;
+        }
+      }
+    }
+  }
+}
+/* ---------------- 绘制 ----------------
+   静态的一层（铺底 + 棋盘 + 网格 + 整张网）已经烘在 pat.bc 里，这里只 drawImage。 */
+function draw() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  /* 镜头：整张网连光点一起缓慢推拉（一层相干位移，背景花色和光点永远对齐） */
+  const zoom = 1.035 + 0.012 * Math.sin(t0 * 0.048);
+  const panX = Math.sin(t0 * 0.043) * W * 0.010;
+  const panY = Math.cos(t0 * 0.036) * H * 0.008;
+  ctx.save();
+  ctx.translate(W * 0.5 + panX, H * 0.5 + panY);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W * 0.5, -H * 0.5);
+  if (pat) ctx.drawImage(pat.bc, 0, 0, W, H);
+
+  if (pat && N) {
+    ctx.globalCompositeOperation = 'lighter';
+    const ac = accent;
+    /* 3 档合批：每档一条 path、一次 fill（坑⑨⑩） */
+    ctx.fillStyle = 'rgba(214,206,198,0.30)';
+    ctx.beginPath();
+    for (let k = 0; k < N; k++) {
+      if (ptrap[k]) continue;
+      const t = pj[k] * cols + pi[k];
+      dotAt(pat.types[t], pat.arcOf[t * 4 + pe[k]], pe[k], ox + pi[k] * cell, oy + pj[k] * cell, cell, ps[k]);
+      ctx.rect(_dx - 0.7, _dy - 0.7, 1.4, 1.4);
+    }
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(' + ac[0] + ',' + ac[1] + ',' + ac[2] + ',0.14)';
+    ctx.beginPath();
+    for (let k = 0; k < N; k++) {
+      if (!ptrap[k]) continue;
+      const t = pj[k] * cols + pi[k];
+      dotAt(pat.types[t], pat.arcOf[t * 4 + pe[k]], pe[k], ox + pi[k] * cell, oy + pj[k] * cell, cell, ps[k]);
+      ctx.rect(_dx - 3.4, _dy - 3.4, 6.8, 6.8);
+    }
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(255,' + Math.min(255, ac[1] + 30) + ',' + Math.min(255, ac[2] + 60) + ',0.92)';
+    ctx.beginPath();
+    for (let k = 0; k < N; k++) {
+      if (!ptrap[k]) continue;
+      const t = pj[k] * cols + pi[k];
+      dotAt(pat.types[t], pat.arcOf[t * 4 + pe[k]], pe[k], ox + pi[k] * cell, oy + pj[k] * cell, cell, ps[k]);
+      ctx.rect(_dx - 1.15, _dy - 1.15, 2.3, 2.3);
+    }
+    ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
+  ctx.drawImage(vigCv, 0, 0, W, H);
+}
+
+/* ---------------- 时间 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+/* 一句的逐字时刻（从 pattern 自带的排版取字数） */
+function setLine(p) {
+  lit = 0; onDrawn = 0; ctArr = null; curYrc = false; ampN = 0;
+  charOn = new Uint8Array(1); litTiles = [];
+  if (!p || !p.lay || curIdx < 0 || !lines[curIdx]) return;
+  const ct = charTimes(lines[curIdx], p.lay.n);
+  ctArr = ct.t; curYrc = ct.ok; ampN = p.lay.n;
+  charOn = new Uint8Array(ampN + 1);
+}
+let ampN = 0;
+
+/* 逐字开锁：第 k 字的网从 chars[k].t - 0.10 起可以关住光点 */
+function updChars(T) {
+  if (!ctArr || !ampN) return;
+  let c = 0;
+  for (let k = 0; k < ampN; k++) {
+    const on = T >= ctArr[k] - 0.10 ? 1 : 0;
+    charOn[k] = on;
+    if (on) c++;
+  }
+  if (c !== lit) {
+    lit = c;
+    /* 候选闭环格跟着更新：光点重投只往已亮的字里投 */
+    const out = [];
+    if (pat) {
+      const lt = pat.loopTiles, tc = pat.tchar;
+      for (let q = 0; q < lt.length; q++) {
+        const t = lt[q], cc = tc[t];
+        if (cc !== 255 && charOn[cc]) out.push(t);
+      }
+    }
+    litTiles = out;
+  }
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pend = null; pendIdx = -1; bakeJob = null;
+    releaseTrapped();
+    lit = 0; onDrawn = 0; ctArr = null; ampN = 0; charOn = new Uint8Array(1); litTiles = [];
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    /* 显示切到第 ci 句。图案在 brew 阶段已经建好、静态层也烘好了，
+       这里只交换引用；万一没烘完就当场补齐（极少见），
+       同时把上一句关住的光点全部放掉（坑③） */
+    releaseTrapped();
+    if (pend && pendIdx === ci) { pat = pend; finishBake(pat); }
+    else { pat = buildPattern(ci); finishBake(pat); }
+    setLine(pat);
+    pend = null; pendIdx = -1;
+    bakeJob = null;
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      /* 开始准备第 nx 句：几何（字形栅格化 + 并查集）在这里算完，
+         静态层的烘焙交给 frame()，每帧一带，句首那一下只剩一次赋值 */
+      if (pendIdx !== nx) { pend = buildPattern(nx); pendIdx = nx; bakeJob = pend; }
+    }
+  }
+}
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+
+  timing(T);
+  if (bakeJob) { bakeStep(bakeJob, 1); if (bakeJob.ready) bakeJob = null; }
+  updChars(T);
+  /* 逐字点亮：每帧最多补两个字（seek 之后也不会一口气堆出上百次描边） */
+  if (pat && pat.ready) {
+    let guard = 0;
+    while (onDrawn < lit && guard++ < 2) { lightChar(pat, onDrawn); onDrawn++; }
+  }
+  surge *= Math.exp(-dt * 3.2);
+  stepParticles(dt);
+  draw();
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 启动 ---------------- */
+lines = [];
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', (e) => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.has = true; ping(); }, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; pend = null; pendIdx = -1; bakeJob = null;
+    if (p.accent) {
+      const a = p.accent;
+      accent = [
+        Math.min(255, Math.round(a[0] * 0.45 + 255 * 0.55)),
+        Math.min(255, Math.round(a[1] * 0.45 + 178 * 0.55)),
+        Math.min(255, Math.round(a[2] * 0.45 + 104 * 0.55)),
+      ];
+    }
+    /* 清掉所有粒子/结构 */
+    releaseTrapped();
+    pat = buildPattern(-1);
+    finishBake(pat);
+    lit = 0; onDrawn = 0; ctArr = null; curYrc = false; ampN = 0;
+    charOn = new Uint8Array(1); litTiles = [];
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整张网上的光点一起加速（相干），网本身一起亮一下 —— 不逐颗乱踢（坑⑬） */
+    surge = Math.min(1.6, surge + 0.45 + (d.payload.level || 0) * 0.55);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  cols: cols, rows: rows, cell: cell, N: N, trapped: trapCount, cap: TRAPCAP,
+  loops: pat ? pat.loopTiles.length : 0, t: +now().toFixed(2),
+  yrc: curYrc, yrcLen: lines[curIdx] && lines[curIdx].chars ? lines[curIdx].chars.length : 0,
+  lit: lit, drawn: onDrawn, chars: ampN, rowsN: pat && pat.lay ? pat.lay.nr : 0,
+  fs: pat && pat.lay ? +pat.lay.fs.toFixed(1) : 0,
+  bb: pat && pat.bb ? [pat.bb.i0, pat.bb.i1, pat.bb.j0, pat.bb.j1] : null,
+  baked: pat ? (pat.ready ? 2 : pat.bs) : -1, pendBaked: pend ? (pend.ready ? 2 : pend.bs) : -1,
+});
+</script>
+</body>
+</html>

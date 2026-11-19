@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>行进地形歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#04090d;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(122,226,214,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   056 · 行进地形歌词 —— 字是地形上被抬起来的一道山脊
+
+   和 001-010 全都不同：这一版**一颗粒子都没有**。
+   画面是一整片标量高度场（低频 fbm 地形 + 水面 + 山体阴影），
+   每帧把高度场光栅化成一张 ImageData，再一次性 drawImage 放大铺满屏幕 ——
+   地形是实心的、被一束斜光打亮的，等高线只是浮在上面的一层线稿。
+
+   字怎么出现：句首那一刻，字形被"刻"进高度场 ——
+   笔画位置用**字形距离场**当模板，整体隆起一道窄山脊（外圈还有一层缓坡）。
+   于是在山体阴影里，字是一道**被光打亮的隆起铭文**：
+   迎光面亮、背光面暗，像沙盘上刚压出来的浮雕。
+   换句时山脊被重新雕刻：旧脊 0.45 秒内落平，新脊同时升起（两块距离场乒乓）。
+
+   为什么快：不是几万次 fillRect，而是**一次 ImageData 写入 + 一次 drawImage**；
+   等高线用 stride=3 的稀疏 marching squares，每帧只有 4 条 Path2D 描边；
+   高度场里没有一处 exp/sin 是逐像素现算的（bump 走 LUT，漂移走行列三角函数表）。
+   精修记录：① YRC 逐字抬升 —— 距离变换时**顺手把"最近笔画属于第几个字"也传播下去**
+      （标签沿倒角路径一起走，一次建表、之后每格 O(1)），于是每格知道自己是哪个字的脊；
+      第 k 字的脊高在 chars[k].t 从 0.60 抬到 1.00（未唱的字留 0.6 底脊，
+      整句从开唱起就完整可读 —— 旧版 4s 时只刻出前半句）。无 chars 按 t+dur*k/n 均分回退，
+      __stage 增 yrc 字段。② 长句不再压成一行（41 字时字号只剩 ~30px、笔画细到读不出），
+      改 1~3 行自适应（41 字 = 14/14/13 @ ~86px），"哪格属于哪字"用排版表二分反查，
+      不做 41 次 getImageData。③ 镜头：地形连等高线一起缓慢推拉（1.03~1.06），
+      踩拍仍是相干环波（原点跟着当前句落点）。
+    分词：不使用。逐字时刻已精确到字，按词团释放只会让山脊抬升的节奏变粗。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+
+/* ---------------- 场 ---------------- */
+let step = 9, gw = 0, gh = 0;
+let base = null;                    // 静态地形（resize 时算一次）
+let hf = null;                      // 每帧高度场
+let dfA = null, dfB = null, useA = true;   // 字形距离场（乒乓：cur / prev）
+let lblA = null, lblB = null;              // 每格"最近笔画属于第几个字"（跟距离一起传）
+let bumpLUT = null;                 // 距离(格) → 隆起高度
+let ai = null, bi = null, aj = null, bj = null;   // 漂移用行列三角函数表
+const gmask = document.createElement('canvas');
+const gctx = gmask.getContext('2d', { willReadFrequently: true });
+const tmpCv = document.createElement('canvas');
+const tctx = tmpCv.getContext('2d');
+let img = null;
+
+const LUTN = 44;                    // LUT 长度（格）
+let RIDGE_W = 32;                   // 窄脊半宽（px）—— 按字号定：长句的笔画只有 ~8px，
+                                    // 脊若保持 32px 就会把相邻笔画糊成一整块（旧版 41 字不可读的根因）
+const RIDGE_A = 0.34;               // 窄脊高度
+let SWELL_S = 74;                   // 外圈缓坡 sigma（px，同样跟着字号）
+const SWELL_A = 0.09;               // 外圈缓坡高度
+const WATER = 0.46;                 // 水面高度
+const FAR = 60000;                  // 距离场"很远"（有限值：只用来查表，绝不参与时间比较 —— 坑⑫）
+const CL = [0.30, 0.38, 0.46, 0.54];   // 等高线层（0.46 = 海岸线）
+
+let grow = 1;                       // 新脊隆起进度
+let rip = null;                     // 踩拍激起的单道环形波
+let accent = [110, 226, 214];
+const glyphCenter = { x: 0, y: 0 };
+
+/* ---------------- 噪声 ---------------- */
+function hash2(x, y) {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+function noise2(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf);
+  const v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y) {
+  return noise2(x, y) * 0.72 +
+    noise2(x * 2.7 + 11.3, y * 2.7 - 4.1) * 0.19 +
+    noise2(x * 6.1 - 3.3, y * 6.1 + 7.7) * 0.09;
+}
+
+/* ---------------- 排版 / 逐字时间 ----------------
+   长句折 1~3 行：旧版把 41 字压成一行，字号只剩 ~30px、笔画细到读不出来。
+   "哪一格属于哪个字"用排版表**二分反查**，不做 41 次逐字 getImageData。 */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+
+let lay = null;                       // 当前句排版 { glyphs, rows, fs, LH, nr, font, n, dx, dy }
+let ctArr = null;                     // 逐字成立时刻（Float32Array）
+let curYrc = false;
+let amp = new Float32Array(192), ampN = 0, lit = 0;
+const BASE_AMP = 0.60;                // 还没唱到的字也留 0.6 的底脊：整句始终读得出来
+
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+/* chars 必须与正文逐字等长、每个 t 有限才采信，并单调钳位；否则 t+dur*k/n 均分回退 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+function makeLayout(text, idx) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.82, 1480);
+  const maxH = H * 0.58;
+  octx.font = fontOf(100);
+  let widest = 1;
+  for (let r = 0; r < nr; r++) widest = Math.max(widest, octx.measureText(rows[r]).width);
+  let fs = Math.min(100 * maxW / widest, maxH / (nr * 1.24), 132);
+  fs = Math.max(22, Math.floor(fs));
+  octx.font = fontOf(fs);
+  const LH = fs * 1.24;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let minX = 1e9, maxX = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      if (x < minX) minX = x;
+      if (x + w > maxX) maxX = x + w;
+      x += w; gi++;
+    }
+    rowsOut.push({ y: y, g: gr, w: wsum });
+  }
+  const minY = y0 - fs * 0.52, maxY = y0 + (nr - 1) * LH + fs * 0.52;
+  const gcx = (minX + maxX) / 2, gcy = (minY + maxY) / 2;
+  /* 每句换一个落点（锚点表），幅度只取一半：长句必须留在安全区 */
+  const A = placeAnchor(anchors[idx % anchors.length], (maxX - minX) / 2, (maxY - minY) / 2, gcx, gcy);
+  const dx = Math.max(-W * 0.05, Math.min(W * 0.05, (A.x - gcx) * 0.5));
+  const dy = Math.max(-H * 0.05, Math.min(H * 0.05, (A.y - gcy) * 0.5));
+  for (let u = 0; u < glyphs.length; u++) { glyphs[u].x += dx; glyphs[u].y += dy; }
+  for (let r = 0; r < rowsOut.length; r++) {
+    rowsOut[r].y += dy;
+    for (let j = 0; j < rowsOut[r].g.length; j++) { rowsOut[r].g[j].x0 += dx; rowsOut[r].g[j].x1 += dx; }
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length,
+           font: fontOf(fs), dx: dx, dy: dy, cx: gcx + dx, cy: gcy + dy };
+}
+
+/* 世界坐标 → 字索引：先找最近的行带，再在该行的字框里二分 */
+function charAt(L, x, y) {
+  if (!L || !L.rows.length) return 255;
+  let bi = 0, bd = 1e9;
+  for (let r = 0; r < L.rows.length; r++) {
+    const d = Math.abs(y - L.rows[r].y);
+    if (d < bd) { bd = d; bi = r; }
+  }
+  const g = L.rows[bi].g;
+  if (!g.length) return 255;
+  if (x <= g[0].x0) return g[0].i;
+  const last = g.length - 1;
+  if (x >= g[last].x1) return g[last].i;
+  let lo = 0, hi = last;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < x) lo = m + 1; else hi = m; }
+  return g[lo].i;
+}
+
+/* ---------------- 锚点 ---------------- */
+const anchors = [];
+for (let i = 0; i < 96; i++) {
+  const g = i * 2.399963;
+  const rr = 0.30 + 0.70 * (((i * 37) % 97) / 97);
+  anchors.push({ nx: Math.cos(g) * rr, ny: Math.sin(g) * rr * 0.66 });
+}
+function placeAnchor(a, hw, hh, gcx, gcy) {
+  const M = 60;
+  const x0 = M + hw - gcx, x1 = W - M - hw - gcx;
+  const y0 = M + hh - gcy, y1 = H - M - hh - gcy;
+  return {
+    x: x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2 - gcx,
+    y: y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2 - gcy,
+  };
+}
+
+/* ---------------- 分配 / 重建 ---------------- */
+function buildLUT() {
+  bumpLUT = new Float32Array(LUTN);
+  for (let d = 0; d < LUTN; d++) {
+    const px = d * step;
+    let v = 0;
+    if (px < RIDGE_W) v += RIDGE_A * (1 - px / RIDGE_W);
+    v += SWELL_A * Math.exp(-(px * px) / (2 * SWELL_S * SWELL_S));
+    bumpLUT[d] = v;
+  }
+}
+
+function alloc() {
+  step = Math.max(3, Math.min(8, Math.round(Math.min(W, H) / 210)));
+  gw = Math.ceil(W / step) + 1;
+  gh = Math.ceil(H / step) + 1;
+  const n = gw * gh;
+  base = new Float32Array(n);
+  hf = new Float32Array(n);
+  dfA = new Float32Array(n); dfB = new Float32Array(n);
+  dfA.fill(FAR); dfB.fill(FAR);
+  lblA = new Uint8Array(n); lblB = new Uint8Array(n);
+  lblA.fill(255); lblB.fill(255);
+  ai = new Float32Array(gw); bi = new Float32Array(gw);
+  aj = new Float32Array(gh); bj = new Float32Array(gh);
+  const f = 0.00075;
+  for (let j = 0; j < gh; j++) {
+    const yy = j * step * f;
+    const row = j * gw;
+    for (let i = 0; i < gw; i++) {
+      base[row + i] = (fbm(i * step * f, yy) - 0.5) * 0.30;
+    }
+  }
+  buildLUT();
+  gmask.width = gw; gmask.height = gh;
+  gctx.setTransform(1, 0, 0, 1, 0, 0);
+  tmpCv.width = gw; tmpCv.height = gh;
+  img = tctx.createImageData(gw, gh);
+  useA = true;
+  grow = 1;
+  rip = null;
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.lineCap = 'round';
+  alloc();
+  if (curIdx >= 0) { buildLine(curIdx); grow = 1; }
+}
+addEventListener('resize', resize);
+
+/* ---------------- 把字形刻进距离场 ----------------
+   往"另一块"缓冲里刻新字，旧的那块留着淡出 —— 这就是换句时的释放：
+   上一句占用的距离场不再是当前句的依据，0.45 秒后它自然落平。
+   标签（=属于第几个字）在倒角的同时一起传播：`lbl` 初值 255，笔画格是自己的字索引，
+   每格沿"更近的那个邻居"继承标签，于是每格都知道 NearestStroke 的字号。 */
+function buildGlyph(idx) {
+  const dst = useA ? dfB : dfA;
+  const dlb = useA ? lblB : lblA;
+  const n = gw * gh;
+  gctx.setTransform(1, 0, 0, 1, 0, 0);
+  gctx.clearRect(0, 0, gw, gh);
+  dlb.fill(255);
+
+  if (!(idx >= 0 && lines[idx] && lines[idx].text && lay)) {
+    for (let k = 0; k < n; k++) dst[k] = FAR;
+    useA = !useA;
+    return;
+  }
+
+  /* 逐字画进 1 格 1 像素的遮罩（41 次 fillText 在 160×90 的图上几乎不花时间；
+     反过来逐字 getImageData 才是真的贵） */
+  gctx.setTransform(1 / step, 0, 0, 1 / step, 0, 0);
+  gctx.font = lay.font;
+  gctx.textAlign = 'center'; gctx.textBaseline = 'middle';
+  gctx.fillStyle = '#fff';
+  for (let u = 0; u < lay.glyphs.length; u++) gctx.fillText(lay.glyphs[u].ch, lay.glyphs[u].x, lay.glyphs[u].y);
+  const d = gctx.getImageData(0, 0, gw, gh).data;
+  let any = 0;
+  for (let k = 0; k < n; k++) {
+    if (d[k * 4 + 3] > 90) {
+      dst[k] = 0;
+      dlb[k] = charAt(lay, (k % gw) * step, ((k / gw) | 0) * step);
+      any++;
+    } else dst[k] = FAR;
+  }
+  if (!any) {
+    for (let k = 0; k < n; k++) dst[k] = FAR;
+    useA = !useA;
+    return;
+  }
+  glyphCenter.x = lay.cx; glyphCenter.y = lay.cy;
+
+  /* 两遍 chamfer 距离变换：一次算完，之后每格 O(1) 查表 —— 坑⑯ */
+  for (let j = 0; j < gh; j++) {
+    const row = j * gw, rowu = row - gw;
+    for (let i = 0; i < gw; i++) {
+      const k = row + i;
+      let v = dst[k], l = dlb[k];
+      if (i > 0 && dst[k - 1] + 1 < v) { v = dst[k - 1] + 1; l = dlb[k - 1]; }
+      if (j > 0 && dst[rowu + i] + 1 < v) { v = dst[rowu + i] + 1; l = dlb[rowu + i]; }
+      if (i > 0 && j > 0 && dst[rowu + i - 1] + 1.414 < v) { v = dst[rowu + i - 1] + 1.414; l = dlb[rowu + i - 1]; }
+      if (i < gw - 1 && j > 0 && dst[rowu + i + 1] + 1.414 < v) { v = dst[rowu + i + 1] + 1.414; l = dlb[rowu + i + 1]; }
+      dst[k] = v; dlb[k] = l;
+    }
+  }
+  for (let j = gh - 1; j >= 0; j--) {
+    const row = j * gw, rowd = row + gw;
+    for (let i = gw - 1; i >= 0; i--) {
+      const k = row + i;
+      let v = dst[k], l = dlb[k];
+      if (i < gw - 1 && dst[k + 1] + 1 < v) { v = dst[k + 1] + 1; l = dlb[k + 1]; }
+      if (j < gh - 1 && dst[rowd + i] + 1 < v) { v = dst[rowd + i] + 1; l = dlb[rowd + i]; }
+      if (i < gw - 1 && j < gh - 1 && dst[rowd + i + 1] + 1.414 < v) { v = dst[rowd + i + 1] + 1.414; l = dlb[rowd + i + 1]; }
+      if (i > 0 && j < gh - 1 && dst[rowd + i - 1] + 1.414 < v) { v = dst[rowd + i - 1] + 1.414; l = dlb[rowd + i - 1]; }
+      dst[k] = v; dlb[k] = l;
+    }
+  }
+  useA = !useA;
+  grow = 0;
+}
+
+/* 建一句：排版 → 逐字时刻 → 脊高初值 → 刻进距离场 */
+function buildLine(idx) {
+  lay = null; ctArr = null; curYrc = false; ampN = 0; lit = 0;
+  if (idx >= 0 && lines[idx] && lines[idx].text) {
+    lay = makeLayout(lines[idx].text, idx);
+    if (lay) {
+      const ct = charTimes(lines[idx], lay.n);
+      ctArr = ct.t; curYrc = ct.ok; ampN = lay.n;
+      if (amp.length < ampN) amp = new Float32Array(ampN + 16);
+      for (let k = 0; k < ampN; k++) amp[k] = BASE_AMP;
+      /* 脊宽跟着字号走：短句可以宽厚，长句必须窄到贴住笔画，字才认得出 */
+      RIDGE_W = Math.max(4, Math.min(30, lay.fs * 0.065));
+      SWELL_S = Math.max(12, Math.min(80, lay.fs * 0.24));
+      buildLUT();
+    }
+  }
+  buildGlyph(idx);
+}
+
+/* ---------------- 高度场 ---------------- */
+const RINGN = 120;
+const ringLUT = new Float32Array(RINGN);
+for (let u = 0; u < RINGN; u++) {
+  const off0 = u * 4 - 240;
+  ringLUT[u] = Math.sin(-off0 * 0.05) * Math.exp(-Math.abs(off0) / 150);
+}
+
+function updateField() {
+  for (let i = 0; i < gw; i++) {
+    ai[i] = Math.sin(i * 0.055 + t0 * 0.31);
+    bi[i] = Math.sin(i * 0.028 - t0 * 0.19);
+  }
+  for (let j = 0; j < gh; j++) {
+    aj[j] = Math.sin(j * 0.062 - t0 * 0.27) * 0.030;
+    bj[j] = Math.sin(j * 0.033 + t0 * 0.17) * 0.030;
+  }
+  const cur = useA ? dfA : dfB, prv = useA ? dfB : dfA;
+  const lcur = useA ? lblA : lblB, lprv = useA ? lblB : lblA;
+  const g1 = grow, g0 = 1 - grow;
+  for (let j = 0; j < gh; j++) {
+    const row = j * gw, ajj = aj[j], bjj = bj[j];
+    for (let i = 0; i < gw; i++) {
+      const k = row + i;
+      const dc = cur[k] < LUTN ? cur[k] | 0 : LUTN - 1;
+      const dp = prv[k] < LUTN ? prv[k] | 0 : LUTN - 1;
+      /* 每格的脊高乘上"它属于哪个字"的抬升系数 —— 逐字抬升就发生在这一个乘法里 */
+      const la = lcur[k], lp = lprv[k];
+      const ac = la < ampN ? amp[la] : BASE_AMP;
+      const ap = lp < ampN ? amp[lp] : BASE_AMP;
+      hf[k] = 0.5 + base[k] + ai[i] * ajj + bi[i] * bjj +
+        bumpLUT[dc] * g1 * ac + bumpLUT[dp] * g0 * ap;
+    }
+  }
+  if (rip) {
+    const age = t0 - rip.t0;
+    if (age > 3.0) { rip = null; }
+    else {
+      const rad = 40 + age * 230;
+      const env = Math.exp(-age * 0.85) * rip.lvl * 0.085;
+      if (env > 0.002) {
+        for (let j = 0; j < gh; j++) {
+          const dy = j * step - rip.y, row = j * gw;
+          for (let i = 0; i < gw; i++) {
+            const dx = i * step - rip.x;
+            const q = (Math.sqrt(dx * dx + dy * dy) - rad + 240) * 0.25;
+            if (q < 0 || q >= RINGN - 1) continue;
+            hf[row + i] += ringLUT[q | 0] * env;
+          }
+        }
+      }
+    }
+  }
+}
+
+/* ---------------- 山体阴影：一次 ImageData + 一次 drawImage ---------------- */
+const LX = -0.55, LY = -0.62, LZ = 0.56;
+function renderTerrain() {
+  const d = img.data;
+  const ZS = 330;
+  const ar = accent[0], ag = accent[1], ab = accent[2];
+  const cur = useA ? dfA : dfB;
+  const lcur = useA ? lblA : lblB;
+  let p = 0;
+  for (let j = 0; j < gh; j++) {
+    const row = j * gw;
+    const rowu = (j > 0 ? j - 1 : 0) * gw;
+    const rowd = (j < gh - 1 ? j + 1 : gh - 1) * gw;
+    for (let i = 0; i < gw; i++) {
+      const im = i > 0 ? i - 1 : 0, ip = i < gw - 1 ? i + 1 : gw - 1;
+      const h = hf[row + i];
+      const nx = -(hf[row + ip] - hf[row + im]) * ZS;
+      const ny = -(hf[rowd + i] - hf[rowu + i]) * ZS;
+      const inv = 1 / Math.sqrt(nx * nx + ny * ny + 1);
+      const sh = (nx * LX + ny * LY + LZ) * inv;
+      let r, g, b;
+      if (h < WATER) {
+        const w = 1 - h / WATER;
+        r = 5 + w * 3; g = 13 + w * 10; b = 24 + w * 18;
+      } else {
+        const u = (h - WATER) * 1.85;
+        const uu = u > 1 ? 1 : u;
+        r = 10 + uu * 56; g = 30 + uu * 142; b = 40 + uu * 122;
+      }
+      const lit = 0.30 + sh * 0.80;
+      r *= lit; g *= lit; b *= lit;
+      const dc = cur[row + i];
+      if (dc < 4.5) {
+        /* 两层：笔画芯里那道"铭文"高光（dc<1.5 ≈ 一个脊宽）+ 外面一圈很淡的余温。
+           都乘上逐字抬升系数 —— 唱到的字亮、没唱到的字只留能读出来的底温 */
+        const li = lcur[row + i];
+        const am2 = li < ampN ? amp[li] : BASE_AMP;
+        const crest = dc < 1.0 ? (1 - dc) * 0.62 : 0;
+        const halo = (1 - dc / 3.5) * 0.11;
+        const w = (crest * (0.45 + am2 * 0.55) + halo) * (0.35 + am2 * 0.65);
+        r += ar * w; g += ag * w; b += ab * w;
+      }
+      d[p] = r < 0 ? 0 : r > 255 ? 255 : r;
+      d[p + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
+      d[p + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+      d[p + 3] = 255;
+      p += 4;
+    }
+  }
+  tctx.putImageData(img, 0, 0);
+  ctx.drawImage(tmpCv, 0, 0, gw, gh, 0, 0, W, H);
+}
+
+/* ---------------- 等高线（稀疏 marching squares） ---------------- */
+const TABLE = [[], [[3, 0]], [[0, 1]], [[3, 1]], [[1, 2]], [[3, 0], [1, 2]], [[0, 2]], [[3, 2]],
+  [[2, 3]], [[0, 2]], [[0, 1], [2, 3]], [[1, 2]], [[3, 1]], [[0, 1]], [[3, 0]], []];
+let _ex = 0, _ey = 0;
+function edgePt(edge, x, y, s, L, tl, tr, br, bl) {
+  let a, b;
+  if (edge === 0) { a = tl; b = tr; }
+  else if (edge === 1) { a = tr; b = br; }
+  else if (edge === 2) { a = bl; b = br; }
+  else { a = tl; b = bl; }
+  const dd = b - a;
+  let t = Math.abs(dd) < 1e-6 ? 0.5 : (L - a) / dd;
+  if (t < 0) t = 0; else if (t > 1) t = 1;
+  if (edge === 0) { _ex = x + t * s; _ey = y; }
+  else if (edge === 1) { _ex = x + s; _ey = y + t * s; }
+  else if (edge === 2) { _ex = x + t * s; _ey = y + s; }
+  else { _ex = x; _ey = y + t * s; }
+}
+const cpath = [];
+function renderContours() {
+  const S = 3, sp = step * S, nl = CL.length;
+  for (let li = 0; li < nl; li++) cpath[li] = new Path2D();
+  for (let j = 0; j + S < gh; j += S) {
+    const row = j * gw, row2 = (j + S) * gw;
+    for (let i = 0; i + S < gw; i += S) {
+      const k = row + i;
+      const tl = hf[k], tr = hf[k + S], bl = hf[row2 + i], br = hf[row2 + i + S];
+      let mn = tl, mx = tl;
+      if (tr < mn) mn = tr;
+      if (tr > mx) mx = tr;
+      if (bl < mn) mn = bl;
+      if (bl > mx) mx = bl;
+      if (br < mn) mn = br;
+      if (br > mx) mx = br;
+      const x = i * step, y = j * step;
+      for (let li = 0; li < nl; li++) {
+        const L = CL[li];
+        if (L <= mn || L >= mx) continue;
+        let idx = 0;
+        if (tl > L) idx |= 1;
+        if (tr > L) idx |= 2;
+        if (br > L) idx |= 4;
+        if (bl > L) idx |= 8;
+        const segs = TABLE[idx];
+        const path = cpath[li];
+        for (let q = 0; q < segs.length; q++) {
+          const sg = segs[q];
+          edgePt(sg[0], x, y, sp, L, tl, tr, br, bl);
+          const ax = _ex, ay = _ey;
+          edgePt(sg[1], x, y, sp, L, tl, tr, br, bl);
+          path.moveTo(ax, ay);
+          path.lineTo(_ex, _ey);
+        }
+      }
+    }
+  }
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineWidth = 1;
+  for (let li = 0; li < nl; li++) {
+    ctx.strokeStyle = 'hsla(' + (166 + li * 13) + ',72%,' + (56 + li * 5) + '%,' + (0.09 + li * 0.05).toFixed(3) + ')';
+    ctx.stroke(cpath[li]);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------- 时间 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    /* 拖进度条：清掉地形上的字（两块距离场都放平，标签一起作废） */
+    dfA.fill(FAR); dfB.fill(FAR); useA = true; grow = 1; rip = null;
+    lblA.fill(255); lblB.fill(255); lay = null; ctArr = null; ampN = 0; lit = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    /* 显示切到第 ci 句：把新字刻进高度场（排版 + 逐字时刻一起在这里建好）。
+       buildGlyph 用的是"另一块"距离场，上一句那块随即落平 —— 旧结构已释放 */
+    if (ci >= 0) buildLine(ci);
+    else { dfA.fill(FAR); dfB.fill(FAR); useA = true; grow = 1; lay = null; ctArr = null; ampN = 0; }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; /* 只做标记：地形的雕刻在句首那一下完成 */ }
+  }
+}
+
+let last = performance.now();
+let t0 = 0;
+
+/* 逐字抬升：第 k 字的脊高从 chars[k].t - 0.10 起朝 1.0 逼近（约 0.3s 到位）；
+   没到的字停在 BASE_AMP（0.6），整句从开唱起就完整可读 */
+function updAmp(T, dt) {
+  if (!ctArr || !ampN) return;
+  const k1 = 1 - Math.exp(-dt * 7.5);
+  let c = 0;
+  for (let k = 0; k < ampN; k++) {
+    const on = T >= ctArr[k] - 0.10;
+    if (on) c++;
+    const tgt = on ? 1 : BASE_AMP;
+    amp[k] += (tgt - amp[k]) * k1;
+  }
+  if (c > lit) lit = c;
+}
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+
+  timing(T);
+  updAmp(T, dt);
+  if (grow < 1) grow = Math.min(1, grow + dt / 0.45);
+
+  /* 镜头：整片地形连等高线一起缓慢推拉（slow dolly）——
+     相干的一层位移，不是逐格乱动；节奏感靠踩拍那道环波 */
+  const zoom = 1.045 + 0.012 * Math.sin(t0 * 0.050);
+  const panX = Math.sin(t0 * 0.041) * W * 0.012;
+  const panY = Math.cos(t0 * 0.037) * H * 0.010;
+  ctx.save();
+  ctx.translate(W * 0.5 + panX, H * 0.5 + panY);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W * 0.5, -H * 0.5);
+  updateField();
+  renderTerrain();
+  renderContours();
+  ctx.restore();
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 启动 ---------------- */
+lines = [];
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) {
+      const a = p.accent;
+      /* 地形是青绿底，主色只做四成染色，别把等高线染脏 */
+      accent = [
+        Math.round(a[0] * 0.45 + 110 * 0.55),
+        Math.round(a[1] * 0.45 + 226 * 0.55),
+        Math.round(a[2] * 0.45 + 214 * 0.55),
+      ];
+    }
+    /* 清掉所有粒子/结构：这里就是两块距离场 */
+    dfA.fill(FAR); dfB.fill(FAR); useA = true; grow = 1; rip = null;
+    lblA.fill(255); lblB.fill(255);
+    lay = null; ctArr = null; curYrc = false; ampN = 0; lit = 0;
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整片地形一起被一道环形波推一下（相干，不是逐格乱踢 —— 坑⑬） */
+    const lv = 0.45 + (d.payload.level || 0) * 0.55;
+    rip = { x: glyphCenter.x || W * 0.5, y: glyphCenter.y || H * 0.5, t0: t0, lvl: lv };
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => {
+  let near = 0;
+  const cur = useA ? dfA : dfB;
+  for (let k = 0; k < cur.length; k += 7) if (cur[k] < 3) near++;
+  return { lines: lines.length, curIdx: curIdx, brewIdx: brewIdx, gw: gw, gh: gh, step: step,
+    near: near, grow: +grow.toFixed(2), t: +now().toFixed(2),
+    yrc: curYrc, yrcLen: lines[curIdx] && lines[curIdx].chars ? lines[curIdx].chars.length : 0,
+    lit: lit, chars: ampN, rows: lay ? lay.nr : 0, fs: lay ? +lay.fs.toFixed(1) : 0 };
+};
+</script>
+</body>
+</html>

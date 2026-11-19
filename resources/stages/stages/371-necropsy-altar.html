@@ -1,0 +1,1353 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>腐骸祭坛</title>
+<style>
+  html,body{margin:0;height:100%;background:#0a0406;overflow:hidden}
+  #stage{display:block;width:100%;height:100%}
+  #void{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;
+    gap:2.2vh;text-align:center;padding:6vw;pointer-events:none}
+  #void b{font:900 clamp(30px,7vw,86px)/1 "Songti SC","SimSun",serif;letter-spacing:.22em;color:#eadac2;
+    text-shadow:0 0 28px rgba(150,20,60,.85),0 0 60px rgba(90,10,40,.6),0 4px 0 #3a0a18;user-select:none}
+  #void span{font:400 clamp(12px,3.2vw,16px)/1.7 "Songti SC","SimSun",serif;letter-spacing:.16em;color:#a9867e;
+    text-shadow:0 0 14px rgba(10,2,6,.9)}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="void" aria-live="polite"><b>无 词</b><span>此曲没有歌词 · 只剩鼓点与呼吸</span></div>
+<script>
+"use strict";
+window.__stage = function () {
+  return { lines: state.lineCount, idx: state.idx, t: state.t, playing: state.playing,
+    frames: state.frames, js: state.js, err: (Date.now() - state.errAt < 4000) ? state.err : "",
+    text: state.text, gl: false, rm: state.rm };
+};
+var state = { lines: [], order: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "", errAt: 0,
+  lineCount: 0, text: "", rm: false, accent: [190, 40, 60], ready: false, duration: 0,
+  songName: "", artists: "", headerTex: null };
+var canvas = document.getElementById("stage");
+var ctx = canvas.getContext("2d", { alpha: false });
+var view = { w: 1440, h: 900, dpr: 1 };
+var clock = { tickT: 0, at: 0, playing: true };
+var errAt = 0;
+var PALETTE = {
+  void: "#0a0406",
+  bruise: [62, 18, 46],
+  rot: [104, 122, 38],
+  artery: [176, 26, 44],
+  bone: [214, 196, 172],
+  wax: [255, 240, 218],
+  shade: [20, 6, 10]
+};
+var bg = { canvas: null, ctx: null, tasks: [], step: 0, w: 0, h: 0 };
+var fx = { pulse: 0, bass: 0, mid: 0, treble: 0, bassTarget: 0, midTarget: 0, trebleTarget: 0,
+  beatAt: 0, lastFrame: 0, bpm: 0 };
+
+function clampChannel(value) {
+  var num = Number(value);
+  if (!isFinite(num)) return 0;
+  return Math.round(num < 0 ? 0 : (num > 255 ? 255 : num));
+}
+function rgb(color, alpha) {
+  var list = Array.isArray(color) ? color : [0, 0, 0];
+  var red = clampChannel(list[0]), green = clampChannel(list[1]), blue = clampChannel(list[2]);
+  var mixAlpha = clampNumber(alpha, 0, 1, 1);
+  return "rgba(" + red + "," + green + "," + blue + "," + Math.round(mixAlpha * 1000) / 1000 + ")";
+}
+function hashFloat(seed) {
+  var value = Math.sin(seed * 127.1 + 311.7) * 43758.5453;
+  return value - Math.floor(value);
+}
+function addStop(gradient, at, color, alpha) {
+  try { gradient.addColorStop(clampNumber(at, 0, 1, 0), rgb(color, alpha)); }
+  catch (err) { reportError("addStop", err); }
+}
+function makeCanvas(width, height) {
+  var surface = document.createElement("canvas");
+  surface.width = Math.max(1, Math.round(clampNumber(width, 1, 8192, 1)));
+  surface.height = Math.max(1, Math.round(clampNumber(height, 1, 8192, 1)));
+  return surface;
+}
+function isRealCanvas(source) {
+  if (!source || typeof source.getContext !== "function") return false;
+  return source.width > 0 && source.height > 0;
+}
+function blit(source, posX, posY, width, height) {
+  if (!isRealCanvas(source)) return false;
+  var destWidth = Number(width), destHeight = Number(height);
+  if (!(destWidth > 0) || !(destHeight > 0) || !isFinite(destWidth) || !isFinite(destHeight)) return false;
+  try { ctx.drawImage(source, posX, posY, destWidth, destHeight); return true; }
+  catch (err) { reportError("blit", err); return false; }
+}
+function accentColor(offset) {
+  var base = Array.isArray(state.accent) ? state.accent : PALETTE.artery;
+  var mix = [base[0] * 0.55 + PALETTE.artery[0] * 0.45, base[1] * 0.55 + PALETTE.artery[1] * 0.45,
+    base[2] * 0.55 + PALETTE.artery[2] * 0.45];
+  mix[(offset || 0) % 3] = Math.min(255, mix[(offset || 0) % 3] + 26);
+  return mix;
+}
+
+function clampNumber(value, lo, hi, fallback) {
+  var num = Number(value);
+  if (!isFinite(num)) return fallback;
+  return num < lo ? lo : (num > hi ? hi : num);
+}
+function stageSize() {
+  var width = Number(window.innerWidth);
+  var height = Number(window.innerHeight);
+  if (!isFinite(width) || width <= 0) width = 1440;
+  if (!isFinite(height) || height <= 0) height = 900;
+  return { w: Math.round(Math.min(width, 8000)), h: Math.round(Math.min(height, 8000)) };
+}
+function reportError(where, err) {
+  state.err = where + ": " + (err && err.message ? err.message : String(err));
+  state.errAt = Date.now();
+  var now = Date.now();
+  if (now - errAt >= 1000) { errAt = now; console.error("[371]", where, err); }
+}
+function nowTime() {
+  return clock.tickT;
+}
+function softBlob(target, x, y, radius, color, alpha) {
+  var reach = clampNumber(radius, 0, 4000, 0);
+  if (!(reach > 1)) return;
+  try {
+    var grad = target.createRadialGradient(x, y, reach * 0.02, x, y, reach);
+    addStop(grad, 0, color, alpha);
+    addStop(grad, 0.52, color, alpha * 0.42);
+    addStop(grad, 1, color, 0);
+    target.fillStyle = grad;
+    target.fillRect(x - reach, y - reach, reach * 2, reach * 2);
+  } catch (err) { reportError("blob", err); }
+}
+function bezierPoint(start, ctrlA, ctrlB, end, at) {
+  var rest = 1 - at;
+  return {
+    x: rest * rest * rest * start.x + 3 * rest * rest * at * ctrlA.x + 3 * rest * at * at * ctrlB.x + at * at * at * end.x,
+    y: rest * rest * rest * start.y + 3 * rest * rest * at * ctrlA.y + 3 * rest * at * at * ctrlB.y + at * at * at * end.y
+  };
+}
+function paintBaseWash(target, w, h) {
+  var base = target.createLinearGradient(0, 0, 0, h);
+  addStop(base, 0, [18, 5, 14], 1);
+  addStop(base, 0.45, [30, 8, 20], 1);
+  addStop(base, 0.82, [14, 4, 10], 1);
+  addStop(base, 1, [5, 2, 4], 1);
+  target.fillStyle = base;
+  target.fillRect(0, 0, w, h);
+  var span = Math.min(w, h);
+  target.globalCompositeOperation = "lighter";
+  for (var cloud = 0; cloud < 16; cloud += 1) {
+    var tone = hashFloat(cloud * 7.31 + 1.2);
+    var color = tone > 0.72 ? PALETTE.rot : (tone > 0.38 ? accentColor(cloud) : PALETTE.bruise);
+    softBlob(target, hashFloat(cloud * 3.77) * w, h * (0.12 + hashFloat(cloud * 9.13) * 0.86),
+      span * (0.14 + hashFloat(cloud * 5.51) * 0.3), color, 0.05 + hashFloat(cloud * 2.2) * 0.08);
+  }
+  target.globalCompositeOperation = "source-over";
+}
+function paintBaseClouds(target, w, h) {
+  var span = Math.min(w, h);
+  for (var cloud = 0; cloud < 18; cloud += 1) {
+    var tone = hashFloat(cloud * 4.41 + 7.7);
+    var color = tone > 0.8 ? PALETTE.rot : (tone > 0.45 ? PALETTE.bruise : accentColor(cloud + 1));
+    softBlob(target, hashFloat(cloud * 8.13 + 2) * w, h * (0.05 + hashFloat(cloud * 6.27) * 0.95),
+      span * (0.08 + hashFloat(cloud * 3.13) * 0.22), color, 0.03 + hashFloat(cloud * 1.6) * 0.055);
+  }
+  var pool = target.createRadialGradient(w * 0.5, h * 0.55, span * 0.05, w * 0.5, h * 0.55, span * 0.62);
+  addStop(pool, 0, [8, 2, 5], 0.42);
+  addStop(pool, 0.65, [8, 2, 5], 0.18);
+  addStop(pool, 1, [8, 2, 5], 0);
+  target.fillStyle = pool;
+  target.fillRect(0, 0, w, h);
+}
+function paintTornMembranes(target, w, h) {
+  for (var veil = 0; veil < 5; veil += 1) {
+    var topEdge = -h * 0.04 + veil * h * 0.042;
+    var depth = h * (0.07 + hashFloat(veil * 3.3) * 0.1);
+    var path = new Path2D();
+    path.moveTo(-w * 0.05, topEdge);
+    path.lineTo(w * 1.05, topEdge - h * 0.012);
+    path.lineTo(w * 1.05, topEdge + depth * 0.62);
+    for (var node = 12; node >= 0; node -= 1) {
+      var xAt = -w * 0.05 + (w * 1.1 * node) / 12;
+      var sway = Math.sin(node * 0.9 + veil * 2.1) * h * 0.02 + hashFloat(node + veil * 17) * h * 0.022;
+      path.lineTo(xAt, topEdge + depth + sway);
+    }
+    path.closePath();
+    var flesh = target.createLinearGradient(0, topEdge, 0, topEdge + depth + h * 0.02);
+    addStop(flesh, 0, [36, 6, 16], 0.94);
+    addStop(flesh, 0.55, [72, 10, 26], 0.62);
+    addStop(flesh, 1, [24, 4, 10], 0.05);
+    target.fillStyle = flesh;
+    target.fill(path);
+    target.strokeStyle = rgb([132, 30, 44], 0.24);
+    target.lineWidth = Math.max(1, h * 0.0022);
+    target.beginPath();
+    for (var fibre = 0; fibre <= 12; fibre += 1) {
+      var fxAt = -w * 0.05 + (w * 1.1 * fibre) / 12;
+      var fyAt = topEdge + depth + Math.sin(fibre * 0.9 + veil * 2.1) * h * 0.02 +
+        hashFloat(fibre + veil * 17) * h * 0.022;
+      fibre === 0 ? target.moveTo(fxAt, fyAt) : target.lineTo(fxAt, fyAt);
+    }
+    target.stroke();
+  }
+  for (var bead = 0; bead < 16; bead += 1) {
+    var beadX = hashFloat(bead * 3.9 + 0.7) * w;
+    var beadTop = h * (0.05 + hashFloat(bead * 5.3) * 0.23);
+    var beadLen = h * (0.018 + hashFloat(bead * 7.1) * 0.055);
+    var beadR = Math.max(1.2, h * (0.003 + hashFloat(bead * 2.9) * 0.004));
+    target.strokeStyle = rgb([148, 32, 40], 0.32);
+    target.lineWidth = beadR * 0.9;
+    target.lineCap = "round";
+    target.beginPath();
+    target.moveTo(beadX, beadTop);
+    target.lineTo(beadX, beadTop + beadLen);
+    target.stroke();
+    target.fillStyle = rgb([164, 44, 48], 0.38);
+    target.beginPath();
+    target.ellipse(beadX, beadTop + beadLen, beadR, beadR * 1.35, 0, 0, Math.PI * 2);
+    target.fill();
+  }
+}
+
+function paintWounds(target, w, h) {
+  var span = Math.min(w, h);
+  for (var mark = 0; mark < 26; mark += 1) {
+    var woundX = hashFloat(mark * 3.7 + 1.1) * w;
+    var woundY = h * (0.26 + hashFloat(mark * 6.3) * 0.68);
+    var radius = span * (0.008 + hashFloat(mark * 2.9) * 0.024);
+    try {
+      var wound = target.createRadialGradient(woundX, woundY, 0, woundX, woundY, radius);
+      addStop(wound, 0, [128, 16, 30], 0.26);
+      addStop(wound, 0.55, [72, 8, 20], 0.15);
+      addStop(wound, 1, [40, 4, 12], 0);
+      target.fillStyle = wound;
+      target.fillRect(woundX - radius, woundY - radius, radius * 2, radius * 2);
+    } catch (err) { reportError("wound", err); }
+    target.strokeStyle = rgb([198, 132, 122], 0.1);
+    target.lineWidth = Math.max(1, span * 0.0012);
+    target.beginPath();
+    target.arc(woundX, woundY, radius * 0.74, 0, Math.PI * 2);
+    target.stroke();
+    target.fillStyle = rgb([242, 204, 182], 0.07);
+    target.beginPath();
+    target.arc(woundX - radius * 0.22, woundY - radius * 0.22, Math.max(0.6, radius * 0.17), 0, Math.PI * 2);
+    target.fill();
+  }
+  for (var shard = 0; shard < 14; shard += 1) {
+    var shardX = hashFloat(shard * 5.9 + 4.3) * w;
+    var shardY = h * (0.3 + hashFloat(shard * 8.3) * 0.6);
+    var shardSize = span * (0.006 + hashFloat(shard * 3.3) * 0.012);
+    target.fillStyle = rgb(PALETTE.bone, 0.1 + hashFloat(shard) * 0.09);
+    target.beginPath();
+    target.moveTo(shardX, shardY);
+    target.lineTo(shardX + shardSize * 0.8, shardY + shardSize * 0.4);
+    target.lineTo(shardX + shardSize * 0.1, shardY + shardSize * 0.9);
+    target.closePath();
+    target.fill();
+  }
+}
+function paintChains(target, w, h) {
+  var span = Math.min(w, h);
+  for (var chain = 0; chain < 3; chain += 1) {
+    var chainX = w * (0.2 + chain * 0.3) + (chain === 1 ? 0 : (hashFloat(chain * 3.7) - 0.5) * w * 0.04);
+    var chainEnd = h * (0.16 + hashFloat(chain * 5.1) * 0.1);
+    var linkSize = span * 0.012;
+    var links = 9;
+    for (var link = 0; link < links; link += 1) {
+      var linkY = -h * 0.02 + (chainEnd / links) * link;
+      var sway = Math.sin(link * 0.5 + chain) * linkSize * 0.6;
+      target.strokeStyle = rgb([196, 176, 156], 0.16);
+      target.lineWidth = Math.max(1, linkSize * 0.22);
+      target.beginPath();
+      target.ellipse(chainX + sway, linkY, linkSize * 0.42, linkSize * (link % 2 ? 0.5 : 0.78),
+        link % 2 ? Math.PI / 2 : 0, 0, Math.PI * 2);
+      target.stroke();
+    }
+    target.strokeStyle = rgb([176, 152, 132], 0.14);
+    target.lineWidth = Math.max(1, span * 0.003);
+    target.beginPath();
+    target.moveTo(chainX, chainEnd);
+    target.quadraticCurveTo(chainX + linkSize * 2, chainEnd + linkSize * 3.2, chainX, chainEnd + linkSize * 4.6);
+    target.stroke();
+  }
+}
+function paintBoneThrone(target, w, h) {
+  var span = Math.min(w, h);
+  var mid = w * 0.5;
+  var baseY = h * 1.05;
+  var topY = h * 0.28;
+  var half = span * 0.3;
+  softBlob(target, mid, h * 0.64, span * 0.52, accentColor(0), 0.14);
+  var arch = new Path2D();
+  arch.moveTo(mid - half * 1.2, baseY);
+  arch.bezierCurveTo(mid - half * 1.1, h * 0.56, mid - half * 0.82, topY + span * 0.16, mid - half * 0.12, topY + span * 0.06);
+  arch.lineTo(mid, topY - span * 0.07);
+  arch.lineTo(mid + half * 0.12, topY + span * 0.06);
+  arch.bezierCurveTo(mid + half * 0.82, topY + span * 0.16, mid + half * 1.1, h * 0.56, mid + half * 1.2, baseY);
+  arch.closePath();
+  var stone = target.createLinearGradient(0, topY, 0, baseY);
+  addStop(stone, 0, PALETTE.bone, 0.2);
+  addStop(stone, 0.42, PALETTE.bone, 0.11);
+  addStop(stone, 0.78, [46, 20, 22], 0.5);
+  addStop(stone, 1, [8, 3, 5], 0.9);
+  target.fillStyle = stone;
+  target.fill(arch);
+  target.save();
+  target.clip(arch);
+  var interior = target.createRadialGradient(mid, h * 0.62, span * 0.02, mid, h * 0.62, span * 0.42);
+  addStop(interior, 0, accentColor(2), 0.2);
+  addStop(interior, 0.6, [42, 6, 18], 0.1);
+  addStop(interior, 1, [6, 2, 4], 0);
+  target.fillStyle = interior;
+  target.fillRect(mid - half * 1.4, topY - span * 0.1, half * 2.8, baseY - topY + span * 0.1);
+  for (var rib = 0; rib < 7; rib += 1) {
+    var ribY = topY + span * 0.22 + rib * ((baseY - topY - span * 0.3) / 7);
+    var ribHalf = half * (0.92 - rib * 0.045);
+    var ribWidth = Math.max(2, span * (0.009 - rib * 0.0009));
+    target.strokeStyle = rgb(PALETTE.bone, 0.2 + rib * 0.012);
+    target.lineWidth = ribWidth;
+    target.beginPath();
+    target.moveTo(mid - ribHalf, ribY + span * 0.02);
+    target.quadraticCurveTo(mid - ribHalf * 0.4, ribY + span * 0.075, mid, ribY + span * 0.03);
+    target.quadraticCurveTo(mid + ribHalf * 0.4, ribY + span * 0.075, mid + ribHalf, ribY + span * 0.02);
+    target.stroke();
+    target.strokeStyle = rgb([32, 10, 12], 0.5);
+    target.lineWidth = ribWidth * 1.9;
+    target.beginPath();
+    target.moveTo(mid - ribHalf, ribY + span * 0.02 + ribWidth);
+    target.quadraticCurveTo(mid - ribHalf * 0.4, ribY + span * 0.075 + ribWidth, mid, ribY + span * 0.03 + ribWidth);
+    target.quadraticCurveTo(mid + ribHalf * 0.4, ribY + span * 0.075 + ribWidth, mid + ribHalf, ribY + span * 0.02 + ribWidth);
+    target.stroke();
+  }
+  for (var bone = 0; bone < 11; bone += 1) {
+    var boneY = topY + span * 0.2 + bone * ((baseY - topY) / 11);
+    var boneR = span * 0.024 * (1 - bone * 0.045);
+    target.fillStyle = rgb(PALETTE.bone, 0.22);
+    target.beginPath();
+    target.ellipse(mid, boneY, boneR * 1.5, boneR, 0, 0, Math.PI * 2);
+    target.fill();
+    target.fillStyle = rgb([24, 8, 10], 0.55);
+    target.beginPath();
+    target.ellipse(mid, boneY - boneR * 0.18, boneR * 0.8, boneR * 0.45, 0, 0, Math.PI * 2);
+    target.fill();
+  }
+  target.restore();
+  target.strokeStyle = rgb(PALETTE.bone, 0.26);
+  target.lineWidth = Math.max(1.5, span * 0.0035);
+  target.stroke(arch);
+  for (var spike = 0; spike < 12; spike += 1) {
+    var side = spike % 2 === 0 ? -1 : 1;
+    var ratio = (0.18 + Math.floor(spike / 2) * 0.16);
+    var spikeY = topY + span * 0.14 + ratio * (h * 0.62);
+    var spikeX = mid + side * half * (1.24 - ratio * 0.16);
+    var spikeLen = span * (0.05 + hashFloat(spike * 3.1) * 0.07);
+    target.fillStyle = rgb(PALETTE.bone, 0.14);
+    target.beginPath();
+    target.moveTo(spikeX, spikeY - spikeLen * 0.12);
+    target.lineTo(spikeX + side * spikeLen, spikeY - spikeLen * 0.5);
+    target.lineTo(spikeX + side * spikeLen * 0.16, spikeY + spikeLen * 0.2);
+    target.closePath();
+    target.fill();
+  }
+  var skullY = h * 0.35;
+  var skullR = span * 0.062;
+  target.fillStyle = rgb(PALETTE.bone, 0.3);
+  target.beginPath();
+  target.ellipse(mid, skullY, skullR * 1.06, skullR, 0, 0, Math.PI * 2);
+  target.fill();
+  target.fillStyle = rgb(PALETTE.bone, 0.26);
+  target.beginPath();
+  target.moveTo(mid - skullR * 0.7, skullY + skullR * 0.55);
+  target.lineTo(mid + skullR * 0.7, skullY + skullR * 0.55);
+  target.lineTo(mid + skullR * 0.45, skullY + skullR * 1.5);
+  target.lineTo(mid - skullR * 0.45, skullY + skullR * 1.5);
+  target.closePath();
+  target.fill();
+  target.fillStyle = "rgba(6,2,4,0.92)";
+  target.beginPath();
+  target.ellipse(mid - skullR * 0.42, skullY - skullR * 0.02, skullR * 0.3, skullR * 0.34, 0.2, 0, Math.PI * 2);
+  target.ellipse(mid + skullR * 0.42, skullY - skullR * 0.02, skullR * 0.3, skullR * 0.34, -0.2, 0, Math.PI * 2);
+  target.fill();
+  softBlob(target, mid - skullR * 0.42, skullY, skullR * 0.2, PALETTE.rot, 0.28);
+  softBlob(target, mid + skullR * 0.42, skullY, skullR * 0.2, PALETTE.rot, 0.28);
+  target.fillStyle = "rgba(8,3,4,0.9)";
+  target.beginPath();
+  target.ellipse(mid, skullY + skullR * 0.34, skullR * 0.16, skullR * 0.2, 0, 0, Math.PI * 2);
+  target.fill();
+  target.strokeStyle = rgb([12, 4, 6], 0.85);
+  target.lineWidth = Math.max(1, span * 0.002);
+  for (var tooth = 0; tooth < 6; tooth += 1) {
+    var toothX = mid - skullR * 0.5 + tooth * skullR * 0.2;
+    target.beginPath();
+    target.moveTo(toothX, skullY + skullR * 0.66);
+    target.lineTo(toothX + skullR * 0.02, skullY + skullR * 0.97);
+    target.stroke();
+  }
+}
+
+function paintMuscleFibres(target, w, h) {
+  var bands = [
+    { start: { x: -w * 0.02, y: h * 0.16 }, ctrlA: { x: w * 0.12, y: h * 0.3 }, ctrlB: { x: w * 0.03, y: h * 0.78 }, end: { x: w * 0.14, y: h * 1.03 }, normal: { x: 1, y: 0.12 }, spread: w * 0.09, tone: [64, 14, 26] },
+    { start: { x: w * 1.02, y: h * 0.1 }, ctrlA: { x: w * 0.85, y: h * 0.34 }, ctrlB: { x: w * 0.96, y: h * 0.8 }, end: { x: w * 0.86, y: h * 1.04 }, normal: { x: -1, y: 0.1 }, spread: w * 0.1, tone: [58, 12, 22] },
+    { start: { x: w * 0.06, y: h * 1.05 }, ctrlA: { x: w * 0.18, y: h * 0.88 }, ctrlB: { x: w * 0.04, y: h * 0.62 }, end: { x: w * 0.02, y: h * 0.44 }, normal: { x: 0.9, y: -0.3 }, spread: w * 0.07, tone: [76, 20, 30] },
+    { start: { x: w * 0.94, y: h * 1.05 }, ctrlA: { x: w * 0.82, y: h * 0.9 }, ctrlB: { x: w * 0.96, y: h * 0.66 }, end: { x: w * 0.99, y: h * 0.5 }, normal: { x: -0.9, y: -0.3 }, spread: w * 0.075, tone: [70, 16, 28] }
+  ];
+  for (var bandIndex = 0; bandIndex < bands.length; bandIndex += 1) {
+    var band = bands[bandIndex];
+    var fibres = 14;
+    for (var fibre = 0; fibre < fibres; fibre += 1) {
+      var ratio = fibre / (fibres - 1) - 0.5;
+      var offsetX = band.normal.x * ratio * band.spread;
+      var offsetY = band.normal.y * ratio * band.spread;
+      var wave = (hashFloat(fibre * 2.7 + bandIndex * 9.1) - 0.5) * w * 0.012;
+      target.strokeStyle = rgb(band.tone, 0.07 + Math.abs(ratio) * 0.05 + hashFloat(fibre + bandIndex) * 0.03);
+      target.lineWidth = Math.max(0.7, 1.6 - Math.abs(ratio) * 1.2);
+      target.beginPath();
+      target.moveTo(band.start.x + offsetX, band.start.y + offsetY);
+      target.bezierCurveTo(band.ctrlA.x + offsetX + wave, band.ctrlA.y + offsetY,
+        band.ctrlB.x + offsetX - wave, band.ctrlB.y + offsetY,
+        band.end.x + offsetX, band.end.y + offsetY);
+      target.stroke();
+    }
+  }
+}
+function paintHorns(target, w, h) {
+  var span = Math.min(w, h);
+  var mid = w * 0.5;
+  var baseY = h * 0.66;
+  var baseX = w * 0.5 - span * 0.34;
+  var tipX = w * 0.5 - span * 0.46;
+  var tipY = h * 0.12;
+  for (var side = -1; side <= 1; side += 2) {
+    target.save();
+    target.translate(mid, 0);
+    target.scale(side, 1);
+    target.translate(-mid, 0);
+    var horn = new Path2D();
+    horn.moveTo(baseX, baseY);
+    horn.bezierCurveTo(baseX - span * 0.14, h * 0.5, tipX + span * 0.04, tipY + span * 0.2, tipX, tipY);
+    horn.bezierCurveTo(tipX + span * 0.1, tipY + span * 0.18, baseX + span * 0.12, h * 0.46, baseX + span * 0.075, baseY);
+    horn.closePath();
+    var bone = target.createLinearGradient(baseX, baseY, tipX, tipY);
+    addStop(bone, 0, PALETTE.bone, 0.16);
+    addStop(bone, 0.45, [176, 152, 132], 0.13);
+    addStop(bone, 1, [232, 214, 190], 0.05);
+    target.fillStyle = bone;
+    target.fill(horn);
+    target.strokeStyle = rgb([228, 208, 184], 0.13);
+    target.lineWidth = Math.max(1, span * 0.003);
+    target.stroke(horn);
+    for (var ridge = 1; ridge < 5; ridge += 1) {
+      var at = ridge / 5;
+      var point = bezierPoint({ x: baseX, y: baseY }, { x: baseX - span * 0.14, y: h * 0.5 },
+        { x: tipX + span * 0.04, y: tipY + span * 0.2 }, { x: tipX, y: tipY }, at);
+      target.strokeStyle = rgb([40, 18, 20], 0.24);
+      target.lineWidth = Math.max(1, span * 0.0025);
+      target.beginPath();
+      target.moveTo(point.x - span * 0.02, point.y + span * 0.02);
+      target.lineTo(point.x + span * 0.02, point.y - span * 0.025);
+      target.stroke();
+    }
+    target.restore();
+  }
+}
+function paintPipes(target, w, h) {
+  var span = Math.min(w, h);
+  var cables = [
+    { a: { x: -w * 0.08, y: h * 0.34 }, b: { x: w * 0.18, y: h * 0.28 }, c: { x: w * 0.3, y: h * 0.62 }, d: { x: w * 0.44, y: h * 0.86 }, width: span * 0.032 },
+    { a: { x: w * 1.08, y: h * 0.42 }, b: { x: w * 0.82, y: h * 0.34 }, c: { x: w * 0.72, y: h * 0.68 }, d: { x: w * 0.56, y: h * 0.9 }, width: span * 0.028 },
+    { a: { x: -w * 0.06, y: h * 0.82 }, b: { x: w * 0.2, y: h * 0.92 }, c: { x: w * 0.36, y: h * 1.02 }, d: { x: w * 0.58, y: h * 1.06 }, width: span * 0.038 },
+    { a: { x: w * 1.06, y: h * 0.78 }, b: { x: w * 0.82, y: h * 0.9 }, c: { x: w * 0.7, y: h * 1.04 }, d: { x: w * 0.5, y: h * 1.08 }, width: span * 0.034 }
+  ];
+  for (var cable = 0; cable < cables.length; cable += 1) {
+    var drawn = cables[cable];
+    var tube = new Path2D();
+    tube.moveTo(drawn.a.x, drawn.a.y);
+    tube.bezierCurveTo(drawn.b.x, drawn.b.y, drawn.c.x, drawn.c.y, drawn.d.x, drawn.d.y);
+    target.strokeStyle = rgb([26, 10, 14], 0.9);
+    target.lineWidth = drawn.width;
+    target.lineCap = "round";
+    target.stroke(tube);
+    target.strokeStyle = rgb([84, 32, 40], 0.55);
+    target.lineWidth = drawn.width * 0.72;
+    target.stroke(tube);
+    target.strokeStyle = rgb([150, 90, 80], 0.18);
+    target.lineWidth = drawn.width * 0.16;
+    target.stroke(tube);
+    for (var ring = 1; ring < 7; ring += 1) {
+      var at = ring / 7;
+      var point = bezierPoint(drawn.a, drawn.b, drawn.c, drawn.d, at);
+      var prev = bezierPoint(drawn.a, drawn.b, drawn.c, drawn.d, Math.max(0, at - 0.02));
+      var angle = Math.atan2(point.y - prev.y, point.x - prev.x);
+      target.save();
+      target.translate(point.x, point.y);
+      target.rotate(angle);
+      target.strokeStyle = rgb([18, 6, 8], 0.6);
+      target.lineWidth = Math.max(1.5, drawn.width * 0.12);
+      target.beginPath();
+      target.ellipse(0, 0, drawn.width * 0.1, drawn.width * 0.52, 0, 0, Math.PI * 2);
+      target.stroke();
+      target.fillStyle = rgb([176, 136, 116], 0.22);
+      for (var bolt = -1; bolt <= 1; bolt += 2) {
+        target.beginPath();
+        target.arc(0, bolt * drawn.width * 0.4, Math.max(1, drawn.width * 0.045), 0, Math.PI * 2);
+        target.fill();
+      }
+      target.restore();
+    }
+  }
+}
+function paintHyphae(target, w, h) {
+  target.lineCap = "round";
+  var rootList = [{ x: w * 0.04, y: h * 1.02, angle: -1.75 }, { x: w * 0.96, y: h * 1.02, angle: -1.32 },
+    { x: w * 0.2, y: h * 1.04, angle: -1.9 }];
+  var segments = 0;
+  function growHypha(x, y, angle, length, thickness, depth, seed) {
+    if (segments > 260 || depth <= 0 || length < 2) return;
+    segments += 1;
+    var endX = x + Math.cos(angle) * length;
+    var endY = y + Math.sin(angle) * length;
+    var curve = Math.sin(seed * 2.3) * length * 0.35;
+    target.strokeStyle = rgb(PALETTE.rot, 0.1 + depth * 0.035);
+    target.lineWidth = Math.max(0.6, thickness);
+    target.beginPath();
+    target.moveTo(x, y);
+    target.quadraticCurveTo(x + Math.cos(angle + 0.5) * length * 0.5, y + Math.sin(angle + 0.5) * length * 0.5 + curve, endX, endY);
+    target.stroke();
+    if (depth > 1) {
+      growHypha(endX, endY, angle - 0.55, length * 0.66, thickness * 0.6, depth - 1, seed + 1.7);
+      growHypha(endX, endY, angle + 0.62, length * 0.7, thickness * 0.58, depth - 1, seed + 3.9);
+    } else {
+      target.fillStyle = rgb(PALETTE.rot, 0.3);
+      target.beginPath();
+      target.arc(endX, endY, Math.max(1, thickness * 1.6), 0, Math.PI * 2);
+      target.fill();
+    }
+  }
+  for (var root = 0; root < rootList.length; root += 1) {
+    var item = rootList[root];
+    growHypha(item.x, item.y, item.angle, Math.min(w, h) * 0.16, 3.4, 4, root * 5.1 + 1);
+  }
+  for (var spore = 0; spore < 55; spore += 1) {
+    var sporeX = hashFloat(spore * 2.7) * w;
+    var sporeY = h * (0.4 + hashFloat(spore * 6.1) * 0.62);
+    var sporeR = 0.8 + hashFloat(spore * 4.3) * 2.4;
+    target.fillStyle = rgb(PALETTE.rot, 0.1 + hashFloat(spore * 8.9) * 0.22);
+    target.beginPath();
+    target.arc(sporeX, sporeY, sporeR, 0, Math.PI * 2);
+    target.fill();
+  }
+}
+function paintVessels(target, w, h) {
+  var span = Math.min(w, h);
+  target.lineCap = "round";
+  var drawn = 0;
+  function vessel(x, y, angle, length, thickness, depth, seed) {
+    if (drawn > 130 || depth <= 0 || length < 4) return;
+    drawn += 1;
+    var endX = x + Math.cos(angle) * length;
+    var endY = y + Math.sin(angle) * length;
+    var bow = Math.sin(seed * 1.7) * length * 0.4;
+    target.strokeStyle = rgb([118, 18, 30], 0.16 + depth * 0.05);
+    target.lineWidth = Math.max(0.7, thickness);
+    target.beginPath();
+    target.moveTo(x, y);
+    target.quadraticCurveTo((x + endX) / 2 + bow, (y + endY) / 2 - bow, endX, endY);
+    target.stroke();
+    if (depth > 1) {
+      vessel(endX, endY, angle - 0.5, length * 0.64, thickness * 0.62, depth - 1, seed + 2.3);
+      vessel(endX, endY, angle + 0.46, length * 0.6, thickness * 0.6, depth - 1, seed + 5.1);
+      if (hashFloat(seed) > 0.6) {
+        vessel(endX, endY, angle + 0.05, length * 0.72, thickness * 0.7, depth - 1, seed + 7.7);
+      }
+    }
+  }
+  vessel(w * 0.02, h * 0.5, -0.75, span * 0.18, 5, 4, 2.4);
+  vessel(w * 0.98, h * 0.46, -2.35, span * 0.16, 4.4, 4, 8.2);
+  vessel(w * 0.82, h * 0.04, 2.1, span * 0.13, 3.4, 3, 4.8);
+}
+function paintGrain(target, w, h) {
+  var tile = makeCanvas(96, 96);
+  var tileCtx = tile.getContext("2d");
+  if (tileCtx) {
+    var image = tileCtx.createImageData(96, 96);
+    for (var point = 0; point < image.data.length; point += 4) {
+      var grain = Math.round(Math.random() * 255);
+      image.data[point] = grain;
+      image.data[point + 1] = grain;
+      image.data[point + 2] = grain;
+      image.data[point + 3] = 16;
+    }
+    tileCtx.putImageData(image, 0, 0);
+    var pattern = null;
+    try { pattern = target.createPattern(tile, "repeat"); } catch (err) { reportError("grain", err); }
+    if (pattern) {
+      target.fillStyle = pattern;
+      target.fillRect(0, 0, w, h);
+    }
+  }
+  var shade = target.createRadialGradient(w * 0.5, h * 0.5, Math.min(w, h) * 0.24, w * 0.5, h * 0.5, Math.max(w, h) * 0.78);
+  addStop(shade, 0, [0, 0, 0], 0);
+  addStop(shade, 0.62, [4, 1, 3], 0.22);
+  addStop(shade, 1, [2, 0, 2], 0.8);
+  target.fillStyle = shade;
+  target.fillRect(0, 0, w, h);
+  for (var scratch = 0; scratch < 26; scratch += 1) {
+    var startX = hashFloat(scratch * 3.3) * w;
+    var startY = hashFloat(scratch * 7.9) * h;
+    target.strokeStyle = rgb(PALETTE.bone, 0.025 + hashFloat(scratch) * 0.02);
+    target.lineWidth = 1;
+    target.beginPath();
+    target.moveTo(startX, startY);
+    target.lineTo(startX + (hashFloat(scratch * 2.1) - 0.5) * w * 0.3, startY + (hashFloat(scratch * 5.7) - 0.5) * h * 0.1);
+    target.stroke();
+  }
+}
+function rebuildScene() {
+  var width = view.w, height = view.h;
+  if (!(width > 0) || !(height > 0)) { width = 1440; height = 900; }
+  var surface = makeCanvas(width * view.dpr, height * view.dpr);
+  var surfaceCtx = surface.getContext("2d");
+  if (!surfaceCtx) { reportError("scene", new Error("background context unavailable")); return; }
+  surfaceCtx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  bg.canvas = surface;
+  bg.ctx = surfaceCtx;
+  bg.w = width;
+  bg.h = height;
+  bg.tasks = [paintBaseWash, paintBaseClouds, paintHorns, paintBoneThrone, paintChains,
+    paintTornMembranes, paintMuscleFibres, paintWounds, paintPipes, paintHyphae, paintVessels, paintGrain];
+  bg.step = 0;
+  pumpScene(14);
+}
+function pumpScene(budgetMs) {
+  var started = performance.now();
+  var guard = 0;
+  while (bg.step < bg.tasks.length && guard < 8 && performance.now() - started < budgetMs) {
+    var task = bg.tasks[bg.step];
+    bg.step += 1;
+    try { task(bg.ctx, bg.w, bg.h); } catch (err) { reportError("scene-task", err); }
+    guard += 1;
+  }
+}
+function resize() {
+  try {
+    var size = stageSize();
+    view.w = size.w;
+    view.h = size.h;
+    view.dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+    var pixelBudget = 2600000;
+    var fitDpr = Math.sqrt(pixelBudget / Math.max(1, view.w * view.h));
+    view.dpr = Math.max(1, Math.min(view.dpr, fitDpr));
+    TEX_SCALE = Math.min(view.dpr, 1.6);
+    canvas.width = Math.round(view.w * view.dpr);
+    canvas.height = Math.round(view.h * view.dpr);
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    rebuildScene();
+    buildHeaderTextures();
+    refreshLyricTextures();
+    draw(nowTime());
+  } catch (err) { reportError("resize", err); }
+}
+function drawScene(time) {
+  var w = view.w, h = view.h, span = Math.min(w, h);
+  var breath = state.rm ? 1 : 1 + Math.sin(time * 0.7) * 0.006 + fx.bass * 0.005;
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.scale(breath, breath);
+  ctx.translate(-w / 2, -h / 2);
+  if (!blit(bg.canvas, -w * 0.012, -h * 0.012, w * 1.024, h * 1.024)) {
+    ctx.fillStyle = PALETTE.void;
+    ctx.fillRect(0, 0, w, h);
+  }
+  ctx.restore();
+  var glowAlpha = 0.1 + fx.bass * 0.2 + fx.pulse * 0.14 + fx.treble * 0.06;
+  var glowRadius = span * (0.3 + fx.bass * 0.08);
+  try {
+    var heart = ctx.createRadialGradient(w * 0.5, h * 0.62, 0, w * 0.5, h * 0.62, glowRadius);
+    addStop(heart, 0, accentColor(0), glowAlpha);
+    addStop(heart, 0.55, accentColor(1), glowAlpha * 0.35);
+    addStop(heart, 1, accentColor(2), 0);
+    ctx.fillStyle = heart;
+    ctx.fillRect(0, 0, w, h);
+  } catch (err) { reportError("glow", err); }
+}
+function draw(time) {
+  var w = view.w, h = view.h;
+  if (!(w > 0) || !(h > 0)) return;
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = PALETTE.void;
+  ctx.fillRect(0, 0, w, h);
+  drawScene(time);
+  drawPulseVeins(time);
+  drawGuts(time);
+  drawLyric(time);
+  drawDrops();
+  drawForeground(time);
+  drawHeader();
+}
+var TEX_SCALE = 1;
+var lyric = { rows: [], size: 0, lineHeight: 0, boxX: 0, boxY: 0, boxW: 0, boxH: 0, padTop: 0,
+  dim: null, bright: null, brightKey: "", brightTries: 0, key: "", drips: [], drops: [], text: "" };
+function lyricFont(size) {
+  return "900 " + Math.round(clampNumber(size, 10, 220, 48)) +
+    "px Impact,Haettenschweiler,'Arial Narrow Bold','PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif";
+}
+function textWidth(text, size) {
+  ctx.save();
+  ctx.font = lyricFont(size);
+  var width = ctx.measureText(text).width;
+  ctx.restore();
+  return width;
+}
+function hardSplitInto(targetRows, text, limit) {
+  var chunk = "";
+  var chunkWidth = 0;
+  for (var index = 0; index < text.length; index += 1) {
+    var glyph = text.charAt(index);
+    var glyphWidth = ctx.measureText(glyph).width;
+    if (chunk && chunkWidth + glyphWidth > limit) {
+      targetRows.push(chunk);
+      chunk = glyph;
+      chunkWidth = glyphWidth;
+    } else {
+      chunk += glyph;
+      chunkWidth += glyphWidth;
+    }
+  }
+  if (chunk.length) targetRows.push(chunk);
+}
+function wrapText(text, maxWidth, size) {
+  var rows = [];
+  ctx.save();
+  ctx.font = lyricFont(size);
+  var current = "";
+  var currentWidth = 0;
+  var lastSpace = -1;
+  for (var at = 0; at < text.length; at += 1) {
+    var glyph = text.charAt(at);
+    if (glyph === " " && current.length === 0) continue;
+    var glyphWidth = ctx.measureText(glyph).width;
+    if (currentWidth + glyphWidth > maxWidth && current.length > 0) {
+      if (lastSpace > 0 && current.length - lastSpace > 2) {
+        rows.push(current.slice(0, lastSpace));
+        var carry = current.slice(lastSpace + 1) + glyph;
+        current = carry;
+        currentWidth = ctx.measureText(carry).width;
+      } else {
+        if (currentWidth > maxWidth) hardSplitInto(rows, current, maxWidth);
+        else rows.push(current);
+        current = glyph;
+        currentWidth = glyphWidth;
+      }
+      lastSpace = -1;
+    } else {
+      current += glyph;
+      currentWidth += glyphWidth;
+      if (glyph === " ") lastSpace = current.length - 1;
+    }
+  }
+  if (current.length) {
+    if (currentWidth > maxWidth) hardSplitInto(rows, current, maxWidth);
+    else rows.push(current);
+  }
+  ctx.restore();
+  return rows;
+}
+function buildLayoutRows(rows, size) {
+  var lineHeight = size * 1.17;
+  var built = [];
+  ctx.save();
+  ctx.font = lyricFont(size);
+  for (var rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    var text = rows[rowIndex];
+    var chars = [];
+    var cursor = 0;
+    for (var at = 0; at < text.length; at += 1) {
+      var glyph = text.charAt(at);
+      var glyphWidth = ctx.measureText(glyph).width;
+      chars.push({ ch: glyph, x: cursor, width: glyphWidth, time: 0 });
+      cursor += glyphWidth;
+    }
+    built.push({ text: text, chars: chars, width: cursor });
+  }
+  ctx.restore();
+  return built;
+}
+function locateCurrentLine(time) {
+  var order = state.order;
+  if (!order.length) return -1;
+  var low = 0, high = order.length - 1, found = -1;
+  for (var step = 0; step < 24 && low <= high; step += 1) {
+    var mid = (low + high) >> 1;
+    var line = state.lines[order[mid]];
+    if (!line) break;
+    if (line.t <= time + 0.03) { found = order[mid]; low = mid + 1; } else { high = mid - 1; }
+  }
+  return found;
+}
+function assignCharTimes(line, rows) {
+  var flat = [];
+  for (var rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    for (var at = 0; at < rows[rowIndex].chars.length; at += 1) flat.push(rows[rowIndex].chars[at]);
+  }
+  var span = line && line.dur > 0 ? line.dur : 2.4;
+  var start = line ? line.t : 0;
+  for (var index = 0; index < flat.length; index += 1) {
+    if (line && line.chars && line.chars.length) {
+      var source = line.chars.length === flat.length ? index
+        : Math.round(index * (line.chars.length - 1) / Math.max(1, flat.length - 1));
+      var glyph = line.chars[Math.min(source, line.chars.length - 1)];
+      flat[index].time = glyph ? clampNumber(glyph.t, -5, 36000, start) : start;
+    } else {
+      flat[index].time = start + span * (index / Math.max(1, flat.length));
+    }
+  }
+  return flat;
+}
+function paintLyricTexture(bright) {
+  if (!lyric.rows.length || !(lyric.boxW > 0) || !(lyric.boxH > 0)) return null;
+  var scale = clampNumber(TEX_SCALE, 1, 1.6, 1);
+  var surface = makeCanvas(lyric.boxW * scale, lyric.boxH * scale);
+  var target = surface.getContext("2d");
+  if (!target) { reportError("lyric-tex", new Error("no context")); return null; }
+  target.setTransform(scale, 0, 0, scale, 0, 0);
+  target.textAlign = "left";
+  target.textBaseline = "middle";
+  target.font = lyricFont(lyric.size);
+  var depth = Math.min(7, Math.max(2, Math.round(lyric.size * 0.085)));
+  var step = Math.max(1, lyric.size * 0.032);
+  var lineHeight = lyric.lineHeight;
+  var size = lyric.size;
+  for (var rowIndex = 0; rowIndex < lyric.rows.length; rowIndex += 1) {
+    var row = lyric.rows[rowIndex];
+    var rowLeft = (lyric.boxW - row.width) / 2;
+    var centerY = lyric.padTop + rowIndex * lineHeight + lineHeight * 0.5;
+    var fill = target.createLinearGradient(0, centerY - size * 0.62, 0, centerY + size * 0.62);
+    if (bright) {
+      addStop(fill, 0, [255, 252, 240], 1);
+      addStop(fill, 0.42, [255, 228, 192], 1);
+      addStop(fill, 0.74, [240, 136, 114], 1);
+      addStop(fill, 1, [186, 58, 64], 1);
+    } else {
+      addStop(fill, 0, [216, 200, 184], 0.92);
+      addStop(fill, 0.5, [178, 158, 146], 0.88);
+      addStop(fill, 1, [112, 84, 84], 0.86);
+    }
+    for (var at = 0; at < row.chars.length; at += 1) {
+      var glyph = row.chars[at];
+      if (glyph.ch === " ") continue;
+      var jitter = (hashFloat(at * 1.7 + rowIndex * 37.3) - 0.5) * size * 0.028;
+      var spin = (hashFloat(at * 3.3 + rowIndex * 11.1) - 0.5) * 0.03;
+      target.save();
+      target.translate(rowLeft + glyph.x, centerY + jitter);
+      target.rotate(spin);
+      for (var layer = depth; layer >= 1; layer -= 1) {
+        var lift = depth - layer;
+        target.fillStyle = "rgba(" + clampChannel(30 + lift * 6) + "," + clampChannel(10 + lift * 2) + "," +
+          clampChannel(14 + lift * 2) + ",0.95)";
+        target.fillText(glyph.ch, layer * step * 0.3, layer * step);
+      }
+      if (bright) {
+        target.strokeStyle = "rgba(255,64,76,0.42)";
+        target.lineWidth = size * 0.075;
+        target.strokeText(glyph.ch, 0, 0);
+      }
+      target.fillStyle = fill;
+      target.fillText(glyph.ch, 0, 0);
+      target.strokeStyle = bright ? "rgba(38,6,12,0.7)" : "rgba(14,5,8,0.55)";
+      target.lineWidth = Math.max(1, size * 0.016);
+      target.strokeText(glyph.ch, 0, 0);
+      target.restore();
+    }
+  }
+  return surface;
+}
+function refreshLyricTextures() {
+  try {
+    var line = state.idx >= 0 ? state.lines[state.idx] : null;
+    var text = line && line.text ? line.text : "";
+    lyric.text = text;
+    var key = view.w + "x" + view.h + ":" + state.idx + ":" + text;
+    if (!text) {
+      lyric.rows = [];
+      lyric.dim = null;
+      lyric.bright = null;
+      lyric.brightKey = "";
+      lyric.key = key;
+      lyric.drips = [];
+      lyric.drops.length = 0;
+      return;
+    }
+    if (key === lyric.key && lyric.dim) return;
+    lyric.key = key;
+    lyric.brightTries = 0;
+    lyric.dim = null;
+    lyric.bright = null;
+    lyric.brightKey = "";
+    lyric.drops.length = 0;
+    var maxWidth = Math.min(view.w * 0.86, 1120);
+    var maxHeight = view.h * (view.h > view.w ? 0.34 : 0.46);
+    var base = clampNumber(Math.min(view.w * 0.084, view.h * 0.138), 24, 126, 64);
+    var size = base;
+    var rows = [];
+    for (var attempt = 0; attempt < 14; attempt += 1) {
+      rows = wrapText(text, maxWidth, size);
+      var lineHeightGuess = size * 1.17;
+      var maxRows = view.h > view.w ? 5 : 4;
+      if (rows.length <= maxRows && rows.length * lineHeightGuess <= maxHeight) break;
+      size *= 0.9;
+      if (size < 17) { size = 17; break; }
+    }
+    var rowLimit = view.h > view.w ? 5 : 4;
+    if (rows.length > rowLimit) {
+      rows = rows.slice(0, rowLimit);
+      var tail = rows[rowLimit - 1] || "";
+      rows[rowLimit - 1] = tail.slice(0, Math.max(1, tail.length - 1)) + "…";
+    }
+    lyric.rows = [];
+    lyric.drips = [];
+    var built = buildLayoutRows(rows, size);
+    if (!built.length) { lyric.key = key; return; }
+    var lineHeight = size * 1.17;
+    var widest = 0;
+    for (var rowIndex = 0; rowIndex < built.length; rowIndex += 1) widest = Math.max(widest, built[rowIndex].width);
+    lyric.size = size;
+    lyric.lineHeight = lineHeight;
+    lyric.rows = built;
+    lyric.boxW = Math.min(view.w * 0.94, widest + size * 0.75);
+    lyric.boxH = lineHeight * built.length + size * 0.95;
+    lyric.padTop = size * 0.42;
+    lyric.boxX = Math.max(0, (view.w - lyric.boxW) / 2);
+    var centerY = view.h * 0.555;
+    lyric.boxY = clampNumber(centerY - lyric.boxH * 0.52, view.h * 0.12, view.h * 0.72, view.h * 0.3);
+    assignCharTimes(line, built);
+    lyric.drips = [];
+    var dripCount = 0;
+    for (var rowIndex2 = 0; rowIndex2 < built.length && dripCount < 16; rowIndex2 += 1) {
+      var row = built[rowIndex2];
+      var rowLeft = (lyric.boxW - row.width) / 2;
+      for (var at = 0; at < row.chars.length && dripCount < 16; at += 1) {
+        var glyph = row.chars[at];
+        if (glyph.ch === " ") continue;
+        var seed = hashFloat(at * 2.3 + rowIndex2 * 19.7 + 0.3);
+        if (seed < 0.58) continue;
+        dripCount += 1;
+        lyric.drips.push({
+          x: rowLeft + glyph.x + glyph.width * (0.3 + seed * 0.4),
+          y: lyric.padTop + rowIndex2 * lineHeight + lineHeight * 0.5 + size * 0.33,
+          time: glyph.time,
+          seed: seed,
+          maxLen: size * (0.28 + seed * 0.85)
+        });
+      }
+    }
+    lyric.dim = paintLyricTexture(false);
+  } catch (err) { reportError("lyric-build", err); }
+}
+function buildHeaderTextures() {
+  try {
+    state.headerTex = null;
+    var label = state.songName.slice(0, 30);
+    if (!label) return;
+    var size = clampNumber(Math.min(view.w * 0.038, view.h * 0.05), 13, 44, 22);
+    var width = textWidth(label, size);
+    var cap = view.w * 0.64;
+    for (var fit = 0; fit < 8 && width > cap && size > 11; fit += 1) {
+      size = Math.max(11, size * (cap / Math.max(1, width)));
+      width = textWidth(label, size);
+    }
+    if (width > cap) { label = label.slice(0, 12) + "…"; width = textWidth(label, size); }
+    var pad = size;
+    var surfaceWidth = width + pad * 2;
+    var surfaceHeight = size * 2.9;
+    var scale = clampNumber(TEX_SCALE, 1, 1.6, 1);
+    var surface = makeCanvas(surfaceWidth * scale, surfaceHeight * scale);
+    var target = surface.getContext("2d");
+    if (!target) return;
+    target.setTransform(scale, 0, 0, scale, 0, 0);
+    target.textAlign = "left";
+    target.textBaseline = "middle";
+    target.font = lyricFont(size);
+    var widthPerChar = width / Math.max(1, label.length);
+    target.strokeStyle = "rgba(255,240,215,0.4)";
+    target.lineWidth = Math.max(1, size * 0.05);
+    target.lineCap = "round";
+    for (var drop = 0; drop < 7; drop += 1) {
+      var dripX = pad + Math.min(Math.max(0, width - size * 0.2),
+        widthPerChar * (0.4 + drop * 1.35) + hashFloat(drop * 6.1) * size * 0.2);
+      var dripLen = size * (0.25 + hashFloat(drop * 4.7) * 0.7);
+      target.beginPath();
+      target.moveTo(dripX, size * 1.55);
+      target.lineTo(dripX, size * 1.55 + dripLen);
+      target.stroke();
+    }
+    target.fillStyle = "rgba(52, 12, 20, 0.9)";
+    target.fillText(label, pad + size * 0.05, size * 1.25 + size * 0.07);
+    var fill = target.createLinearGradient(0, size * 0.5, 0, size * 1.9);
+    addStop(fill, 0, PALETTE.wax, 0.75);
+    addStop(fill, 0.6, [232, 198, 168], 0.6);
+    addStop(fill, 1, [150, 96, 88], 0.4);
+    target.fillStyle = fill;
+    target.fillText(label, pad, size * 1.25);
+    target.strokeStyle = "rgba(10, 2, 5, 0.7)";
+    target.lineWidth = Math.max(1, size * 0.05);
+    target.strokeText(label, pad, size * 1.25);
+    state.headerTex = { canvas: surface, width: surfaceWidth, height: surfaceHeight };
+  } catch (err) { reportError("header", err); }
+}
+function sungWidthOfRow(row, time) {
+  var width = 0;
+  for (var at = 0; at < row.chars.length; at += 1) {
+    var glyph = row.chars[at];
+    if (glyph.time <= time + 0.001) width = glyph.x + glyph.width;
+    else break;
+  }
+  return width;
+}
+function drawLyricDrips(time) {
+  var size = lyric.size;
+  if (!(size > 0)) return;
+  for (var at = 0; at < lyric.drips.length; at += 1) {
+    var drip = lyric.drips[at];
+    var grow = clampNumber((time - drip.time) / 0.9, 0, 1, 0);
+    if (grow <= 0.03) continue;
+    var x = lyric.boxX + drip.x;
+    var y = lyric.boxY + drip.y;
+    var length = drip.maxLen * grow;
+    var bend = (drip.seed - 0.5) * size * 0.22;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(24,6,10,0.55)";
+    ctx.lineWidth = size * 0.08;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.quadraticCurveTo(x + bend, y + length * 0.55, x + bend * 1.3, y + length);
+    ctx.stroke();
+    ctx.strokeStyle = rgb([236, 178, 158], 0.7);
+    ctx.lineWidth = size * 0.042;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.quadraticCurveTo(x + bend, y + length * 0.55, x + bend * 1.3, y + length);
+    ctx.stroke();
+    ctx.fillStyle = rgb([196, 74, 78], 0.72);
+    ctx.beginPath();
+    ctx.arc(x + bend * 1.3, y + length + size * 0.02, Math.max(1, size * 0.045), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+function updateDrops(time, delta) {
+  var list = lyric.drops;
+  if (state.rm) { list.length = 0; return; }
+  for (var at = list.length - 1; at >= 0; at -= 1) {
+    var drop = list[at];
+    drop.vy += 720 * delta;
+    drop.vy = Math.min(drop.vy, 900);
+    drop.y += drop.vy * delta;
+    drop.x += drop.vx * delta;
+    if (drop.y > view.h * 1.06) list.splice(at, 1);
+  }
+  if (state.rm || !lyric.drips.length || list.length >= 12) return;
+  if (Math.random() > delta * (1.5 + Math.min(2.2, (fx.bpm || 0) / 90))) return;
+  var source = lyric.drips[Math.floor(hashFloat(time * 1.7 + Math.random()) * lyric.drips.length) % lyric.drips.length];
+  if (!source || time < source.time) return;
+  list.push({
+    x: lyric.boxX + source.x + (source.seed - 0.5) * 4,
+    y: lyric.boxY + source.y + source.maxLen * 0.9,
+    vx: (source.seed - 0.5) * 18,
+    vy: 30 + source.seed * 40,
+    r: Math.max(1.2, lyric.size * 0.032)
+  });
+}
+function drawDrops() {
+  for (var at = 0; at < lyric.drops.length; at += 1) {
+    var drop = lyric.drops[at];
+    ctx.strokeStyle = "rgba(210,120,110,0.28)";
+    ctx.lineWidth = Math.max(1, drop.r * 0.7);
+    ctx.beginPath();
+    ctx.moveTo(drop.x, drop.y - drop.r * 3.4);
+    ctx.lineTo(drop.x, drop.y);
+    ctx.stroke();
+    ctx.fillStyle = rgb([232, 150, 132], 0.82);
+    ctx.beginPath();
+    ctx.ellipse(drop.x, drop.y, drop.r, drop.r * 1.25, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+function drawLyric(time) {
+  if (!state.lines.length) return;
+  var found = locateCurrentLine(time);
+  if (found !== state.idx) {
+    state.idx = found;
+    state.text = found >= 0 && state.lines[found] ? state.lines[found].text : "";
+    refreshLyricTextures();
+  }
+  if (!lyric.dim) return;
+  var centerX = lyric.boxX + lyric.boxW / 2;
+  var centerY = lyric.boxY + lyric.padTop + lyric.rows.length * lyric.lineHeight / 2;
+  var haloRadius = Math.max(lyric.boxW * 0.52, lyric.size * 2.4);
+  try {
+    var halo = ctx.createRadialGradient(centerX, centerY, lyric.size * 0.15, centerX, centerY, haloRadius);
+    addStop(halo, 0, [8, 2, 5], 0.4);
+    addStop(halo, 0.62, [8, 2, 5], 0.16);
+    addStop(halo, 1, [8, 2, 5], 0);
+    ctx.fillStyle = halo;
+    ctx.fillRect(centerX - haloRadius, centerY - haloRadius, haloRadius * 2, haloRadius * 2);
+  } catch (err) { reportError("lyric-halo", err); }
+  if (!blit(lyric.dim, lyric.boxX, lyric.boxY, lyric.boxW, lyric.boxH)) return;
+  if (lyric.bright && lyric.brightKey === lyric.key) {
+    for (var rowIndex = 0; rowIndex < lyric.rows.length; rowIndex += 1) {
+      var row = lyric.rows[rowIndex];
+      var sung = sungWidthOfRow(row, time);
+      if (sung <= 0.5) continue;
+      var rowLeft = (lyric.boxW - row.width) / 2;
+      var rowTop = lyric.padTop + rowIndex * lyric.lineHeight;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(lyric.boxX + rowLeft - 2, lyric.boxY + rowTop - 2, sung + 4, lyric.lineHeight + 4);
+      ctx.clip();
+      blit(lyric.bright, lyric.boxX, lyric.boxY, lyric.boxW, lyric.boxH);
+      ctx.restore();
+    }
+  }
+  drawLyricDrips(time);
+}
+
+function drawHeader() {
+  var tex = state.headerTex;
+  if (!tex || !isRealCanvas(tex.canvas)) return;
+  var x = (view.w - tex.width) / 2;
+  var y = view.h * 0.095 - tex.height * 0.5;
+  ctx.save();
+  ctx.globalAlpha = 0.82;
+  blit(tex.canvas, x, y, tex.width, tex.height);
+  ctx.restore();
+}
+function drawPulseVeins(time) {
+  var w = view.w, h = view.h, span = Math.min(w, h);
+  var paths = [
+    { start: { x: -w * 0.02, y: h * 0.62 }, ctrlA: { x: w * 0.16, y: h * 0.42 }, ctrlB: { x: w * 0.1, y: h * 0.88 }, end: { x: w * 0.32, y: h * 0.8 }, speed: 0.11, phase: 0.1 },
+    { start: { x: w * 1.02, y: h * 0.58 }, ctrlA: { x: w * 0.84, y: h * 0.38 }, ctrlB: { x: w * 0.9, y: h * 0.86 }, end: { x: w * 0.68, y: h * 0.82 }, speed: 0.087, phase: 0.55 }
+  ];
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  for (var at = 0; at < paths.length; at += 1) {
+    var item = paths[at];
+    var travel = state.rm ? item.phase : (time * item.speed + item.phase) % 1;
+    var point = bezierPoint(item.start, item.ctrlA, item.ctrlB, item.end, travel);
+    var radius = span * (0.055 + fx.treble * 0.03);
+    try {
+      var halo = ctx.createRadialGradient(point.x, point.y, 0, point.x, point.y, radius);
+      addStop(halo, 0, accentColor(1), 0.14 + fx.treble * 0.13);
+      addStop(halo, 0.5, accentColor(0), 0.05);
+      addStop(halo, 1, accentColor(0), 0);
+      ctx.fillStyle = halo;
+      ctx.fillRect(point.x - radius, point.y - radius, radius * 2, radius * 2);
+    } catch (err) { reportError("vein", err); }
+  }
+  ctx.restore();
+}
+function drawGuts(time) {
+  var w = view.w, h = view.h;
+  var lift = 0.055 + fx.bass * 0.07 + fx.mid * 0.025;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(w * 0.14, h * 1.03);
+  ctx.bezierCurveTo(w * 0.2, h * (0.87 - lift), w * 0.36, h * (0.83 - lift), w * 0.5, h * (0.855 - lift * 0.7));
+  ctx.bezierCurveTo(w * 0.64, h * (0.83 - lift), w * 0.8, h * (0.88 - lift * 0.8), w * 0.86, h * 1.03);
+  ctx.closePath();
+  var flesh = ctx.createLinearGradient(0, h * (0.78 - lift), 0, h * 1.03);
+  addStop(flesh, 0, [64, 10, 22], 0.95);
+  addStop(flesh, 0.4, [42, 6, 16], 0.95);
+  addStop(flesh, 1, [10, 2, 6], 1);
+  ctx.fillStyle = flesh;
+  ctx.fill();
+  ctx.strokeStyle = rgb([186, 82, 84], 0.24);
+  ctx.lineWidth = Math.max(1, w * 0.0022);
+  for (var fold = 0; fold < 4; fold += 1) {
+    var foldX = w * (0.26 + fold * 0.15);
+    ctx.beginPath();
+    ctx.moveTo(foldX, h * 1.02);
+    ctx.quadraticCurveTo(foldX + w * 0.02, h * (0.9 - lift), foldX + w * 0.05, h * (0.875 - lift));
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawMotes(time) {
+  var w = view.w, h = view.h;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  for (var at = 0; at < 16; at += 1) {
+    var seed = hashFloat(at * 4.7 + 0.9);
+    var drift = state.rm ? 0 : time * (0.006 + seed * 0.008);
+    var cycle = (seed + drift) % 1;
+    var x = w * (0.05 + hashFloat(at * 2.1) * 0.9) + Math.sin(time * 0.23 + at) * w * 0.008;
+    var y = h * (0.92 - cycle * 0.78);
+    var radius = 0.8 + seed * 2.2;
+    var alpha = 0.05 + Math.sin(cycle * Math.PI) * 0.16;
+    ctx.fillStyle = rgb(at % 3 === 0 ? PALETTE.rot : [214, 150, 130], alpha);
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+function drawForeground(time) {
+  var w = view.w, h = view.h, span = Math.min(w, h);
+  drawMotes(time);
+  var edge = ctx.createLinearGradient(0, 0, 0, h);
+  addStop(edge, 0, [6, 1, 3], 0.55);
+  addStop(edge, 0.2, [6, 1, 3], 0);
+  addStop(edge, 0.82, [6, 1, 3], 0);
+  addStop(edge, 1, [4, 1, 2], 0.8);
+  ctx.fillStyle = edge;
+  ctx.fillRect(0, 0, w, h);
+  if (fx.pulse > 0.01) {
+    var flash = ctx.createRadialGradient(w * 0.5, h * 0.52, span * 0.28, w * 0.5, h * 0.52, span * 0.8);
+    addStop(flash, 0, accentColor(0), 0);
+    addStop(flash, 0.7, accentColor(0), fx.pulse * 0.13);
+    addStop(flash, 1, accentColor(0), fx.pulse * 0.24);
+    ctx.fillStyle = flash;
+    ctx.fillRect(0, 0, w, h);
+  }
+}
+function frame(stamp) {
+  var started = performance.now();
+  if (!state.ready) {
+    state.ready = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (err) { reportError("ready", err); }
+  }
+  var delta = clampNumber((started - fx.lastFrame) / 1000, 0.001, 0.05, 0.016);
+  fx.lastFrame = started;
+  try {
+    fx.pulse *= Math.pow(0.87, delta * 60);
+    fx.bass += (fx.bassTarget - fx.bass) * Math.min(1, delta * 6);
+    fx.mid += (fx.midTarget - fx.mid) * Math.min(1, delta * 5);
+    fx.treble += (fx.trebleTarget - fx.treble) * Math.min(1, delta * 7);
+    if (bg.step < bg.tasks.length) pumpScene(6);
+    if (bg.step >= bg.tasks.length && lyric.dim && lyric.brightKey !== lyric.key &&
+        lyric.rows.length && lyric.brightTries < 4) {
+      lyric.brightTries += 1;
+      var bright = paintLyricTexture(true);
+      if (bright) { lyric.bright = bright; lyric.brightKey = lyric.key; }
+    }
+    var clockTime = nowTime();
+    updateDrops(clockTime, state.rm ? 0 : delta);
+    draw(clockTime);
+    state.frames += 1;
+  } catch (err) { reportError("draw", err); }
+  state.js = state.js * 0.88 + (performance.now() - started) * 0.12;
+  requestAnimationFrame(frame);
+}
+
+function normalizeLine(raw, position) {
+  var line = { t: 0, dur: 0, text: "", chars: null, index: position };
+  if (!raw || typeof raw !== "object") return line;
+  line.t = clampNumber(raw.t, -5, 36000, 0);
+  line.text = raw.text == null ? "" : String(raw.text).slice(0, 220);
+  line.dur = clampNumber(raw.dur, 0, 600, 0);
+  if (Array.isArray(raw.chars) && raw.chars.length) {
+    var chars = [];
+    var limit = Math.min(raw.chars.length, 240);
+    for (var at = 0; at < limit; at += 1) {
+      var glyph = raw.chars[at];
+      if (!glyph) continue;
+      chars.push({ c: glyph.c == null ? "" : String(glyph.c).slice(0, 2), t: clampNumber(glyph.t, -5, 36000, line.t) });
+    }
+    if (chars.length) line.chars = chars;
+  }
+  if (!(line.dur > 0)) {
+    var length = Math.max(1, line.text.length);
+    line.dur = clampNumber(length * 0.26, 0.8, 14, 2.4);
+  }
+  return line;
+}
+function applyInit(payload) {
+  try {
+    var song = (payload && payload.song) || {};
+    var rawLines = Array.isArray(payload && payload.lines) ? payload.lines : [];
+    var accent = payload && Array.isArray(payload.accent) ? payload.accent : state.accent;
+    state.accent = [0, 1, 2].map(function (channel, at) {
+      return clampChannel(Array.isArray(accent) ? accent[at] : [190, 40, 60][at]);
+    });
+    state.lines = rawLines.slice(0, 600).map(normalizeLine);
+    state.lineCount = rawLines.length;
+    state.order = [];
+    for (var at = 0; at < state.lines.length; at += 1) state.order.push(at);
+    state.order.sort(function (left, right) {
+      var diff = state.lines[left].t - state.lines[right].t;
+      return diff === 0 ? left - right : diff;
+    });
+    state.duration = clampNumber(payload && payload.duration, 0, 36000, 0);
+    state.playing = !(payload && payload.playing === false);
+    clock.playing = state.playing;
+    clock.tickT = 0;
+    clock.at = performance.now();
+    state.t = 0;
+    state.idx = -1;
+    state.text = "";
+    var title = song && Array.isArray(song.artists) ? song.artists.join(" / ") : (song && song.artists ? String(song.artists) : "");
+    state.songName = song.name == null ? "" : String(song.name).slice(0, 80);
+    state.artists = title.slice(0, 80);
+    var hasText = false;
+    for (var scan = 0; scan < state.lines.length; scan += 1) {
+      if (state.lines[scan].text && state.lines[scan].text.trim().length) { hasText = true; break; }
+    }
+    var voidNode = document.getElementById("void");
+    if (voidNode) voidNode.style.display = hasText ? "none" : "flex";
+    buildHeaderTextures();
+    refreshLyricTextures();
+  } catch (err) { reportError("init", err); }
+}
+window.addEventListener("message", function (event) {
+  var data = event && event.data;
+  if (!data || data.__c100 !== 1) return;
+  try {
+    if (data.type === "init") { applyInit(data.payload || {}); }
+    else if (data.type === "tick") {
+      var tick = data.payload || {};
+      state.t = clampNumber(tick.time, -5, 36000, 0);
+      clock.tickT = state.t;
+      clock.at = performance.now();
+      if (tick.playing === true || tick.playing === false) { state.playing = tick.playing; clock.playing = tick.playing; }
+    } else if (data.type === "beat") {
+      var beat = data.payload || {};
+      fx.pulse = Math.max(fx.pulse, clampNumber(beat.level, 0, 1, 0.4) * 0.85);
+      fx.beatAt = performance.now();
+    } else if (data.type === "live") {
+      var live = data.payload || {};
+      fx.bassTarget = clampNumber(live.bass, 0, 1, fx.bassTarget);
+      fx.midTarget = clampNumber(live.mid, 0, 1, fx.midTarget);
+      fx.trebleTarget = clampNumber(live.treble, 0, 1, fx.trebleTarget);
+      if (live.playing === true || live.playing === false) {
+        state.playing = live.playing;
+        clock.playing = live.playing;
+      }
+      fx.bpm = clampNumber(live.bpm, 20, 320, fx.bpm || 0);
+    }
+  } catch (err) { reportError("message:" + (data && data.type), err); }
+});
+window.addEventListener("resize", function () {
+  try {
+    clearTimeout(view.resizeTimer);
+    view.resizeTimer = setTimeout(function () { view.resizeTimer = 0; resize(); }, 110);
+  } catch (err) { reportError("resize-schedule", err); }
+});
+try { state.rm = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches); }
+catch (err) { reportError("reduced-motion", err); }
+try { resize(); } catch (err) { reportError("resize-boot", err); }
+try { requestAnimationFrame(frame); } catch (err) { reportError("raf", err); }
+setTimeout(function () {
+  if (!state.ready) {
+    state.ready = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (err) { reportError("ready-timer", err); }
+  }
+}, 900);
+
+</script>
+</body>
+</html>

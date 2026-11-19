@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>多米诺</title>
+<style>
+  html,body{margin:0;height:100%;background:#06060b;overflow:hidden}
+  body{background:radial-gradient(120% 100% at 50% 44%,#0e0c16,#06060b 74%)}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(112% 94% at 50% 48%,transparent 42%,rgba(4,4,8,.58) 82%,rgba(2,2,5,.94))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(206,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   065 · 多米诺 —— 每个字是一排立着的骨牌，逐字按 YRC 推倒成笔画
+   ---------------------------------------------------------------------------
+   字是**倒下的骨牌铺出来的**：把每个字的墨量切成一张小网格，每格放一张骨牌。
+   立着的时候它是一根细窄的牌（顶沿有一道亮边），char[k].t 一到，属于这个字的
+   骨牌按"字内从左到右"的顺序一张接一张往前扑倒 —— 扑倒的骨牌正面朝上、
+   近大远小（梯形），牌面比立着时宽一倍多、长两倍，铺满笔画就是那个字。
+   牌面留白、中间一道腰线、两半各一颗深色点数，所以一眼认得出是骨牌。
+
+   时间怎么演：ts = chars[k].t - 0.26 + (字内 x 比例)*0.20，落定 0.30 秒，
+   重力加速（p = e^1.7）+ 落地小回弹。于是每张牌都在字时刻那一下翻过去，
+   整句就是一道从左到右的"啪、啪、啪"。
+
+   句末"整排倒下"：最后一个字落定 0.42 秒后，一道冲击波从画面左边扫到右边，
+   扫到的骨牌全部被掀起来（p 掉到 0.35）再拍回去，同时有一道竖向光带跟着走 ——
+   整排重新倒一遍，句号。
+
+   可读性：底下垫一层很淡的"字影"（整句 41 字永远在那儿，0.34），
+   骨牌是往上叠的亮面；长句折 3 行、字号自适应，不会溢出。
+
+   和 001-010 的区别：那些是粒子/流场；这里是**朝向**（立 vs 倒）决定字形，
+   而且是硬着地、有腰线和点数的骨牌。
+   和 007（铁屑磁场）的区别：铁屑是转向对齐笔画切向，这里是整块翻倒、翻倒后
+   靠牌面的**面积**铺笔画，还带着多米诺特有的连锁顺序。
+   和 064（球池）的区别：球是被抛进凹槽、圆、有高光；骨牌是原地翻倒、方、有腰线。
+
+   YRC：第 k 字的骨牌在 chars[k].t 落定（提前 0.26 秒起倒，字内再摊 0.20 秒）；
+   缺 chars / 长度不符按 t + dur*k/n 均分。__stage 带 yrc。
+   分词：不使用。多米诺的看点是"一张接一张"的单字连锁；按词合并会让
+   连锁断成一团一团的跳变，反而看不出顺序。
+   性能：骨牌 ~1200 张，每帧只 6 次绘制（面/立牌/上沿高光/腰线/点数/闪光），
+   全部合批进 Path2D；1440×810 无头稳在 60。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+const TAU = 6.283185307;
+
+let W = 0, H = 0, DPR = 1, t0 = 0;
+
+/* ---------------- accent 派生色 ---------------- */
+let accent = [198, 180, 255];
+const C = { face: '', faceC: '', stand: '', edge: '', div: '', pip: '', glow: '', tint: '', plate: '' };
+const AC = { r: 198, g: 180, b: 255 };
+const mix = (a, b, k) => Math.round(a + (b - a) * k);
+function derive() {
+  const r = accent[0] | 0, g = accent[1] | 0, b = accent[2] | 0;
+  AC.r = r; AC.g = g; AC.b = b;
+  C.face = 'rgb(' + mix(r, 240, .28) + ',' + mix(g, 244, .26) + ',' + mix(b, 255, .22) + ')';
+  C.faceC = 'rgba(' + mix(r, 250, .56) + ',' + mix(g, 252, .54) + ',' + mix(b, 255, .50) + ',';
+  C.stand = 'rgba(' + mix(r, 196, .22) + ',' + mix(g, 200, .22) + ',' + mix(b, 236, .18) + ',0.52)';
+  C.edge = 'rgba(' + mix(r, 255, .72) + ',' + mix(g, 255, .72) + ',' + mix(b, 255, .70) + ',0.62)';
+  C.div = 'rgba(14,15,26,0.52)';
+  C.pip = 'rgba(16,16,28,0.80)';
+  C.glow = 'rgba(' + r + ',' + g + ',' + b + ',';
+  C.tint = 'rgba(' + r + ',' + g + ',' + b + ',';
+  C.plate = 'rgba(' + mix(r, 220, .40) + ',' + mix(g, 226, .40) + ',' + mix(b, 244, .36) + ',';
+}
+
+/* ---------------- 离屏位图（取墨用） ---------------- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+/* ---------------- 布局：折行 + 自适应字号 ---------------- */
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+function makeLayout(text) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.86, 1360);
+  const maxH = H * 0.58;
+  octx.font = fontOf(120);
+  let widest = 1;
+  for (let i = 0; i < nr; i++) widest = Math.max(widest, octx.measureText(rows[i]).width);
+  let fs = Math.min(120 * maxW / widest, maxH / (nr * 1.20), 150);
+  fs = Math.max(20, Math.floor(fs));
+  octx.font = fontOf(fs);
+  let wMax = 1;
+  for (let i = 0; i < nr; i++) wMax = Math.max(wMax, octx.measureText(rows[i]).width);
+  if (wMax > maxW) { fs = Math.max(18, Math.floor(fs * maxW / wMax)); octx.font = fontOf(fs); }
+  const font = fontOf(fs);
+  const LH = fs * 1.20;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      x += w; gi++;
+    }
+    if (x - wsum < bx0) bx0 = x - wsum;
+    if (x > bx1) bx1 = x;
+    rowsOut.push({ y: y, g: gr, w: wsum });
+    if (y - fs * 0.68 < by0) by0 = y - fs * 0.68;
+    if (y + fs * 0.68 > by1) by1 = y + fs * 0.68;
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length, font: font, bx0: bx0, bx1: bx1, by0: by0, by1: by1 };
+}
+
+/* ---------------- 每个字的墨点（步长 2，一次 getImageData） ---------------- */
+const inkTotal = { n: 0 };
+function inkSampling(L) {
+  const n = L.glyphs.length;
+  const pad = 6;
+  const bx = Math.floor(L.bx0) - pad, by = Math.floor(L.by0) - pad;
+  const bw = Math.max(4, Math.ceil(L.bx1 - L.bx0) + pad * 2);
+  const bh = Math.max(4, Math.ceil(L.by1 - L.by0) + pad * 2);
+  if (off.width !== bw || off.height !== bh) { off.width = bw; off.height = bh; }
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, bw, bh);
+  octx.font = L.font; octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  for (let i = 0; i < n; i++) octx.fillText(L.glyphs[i].ch, L.glyphs[i].x - bx, L.glyphs[i].y - by);
+  const d = octx.getImageData(0, 0, bw, bh).data;
+  const lists = [];
+  for (let i = 0; i < n; i++) lists.push([]);
+  const rows = L.rows, S = 2;
+  let tot = 0;
+  for (let y = 0; y < bh; y += S) {
+    const ay = y + by;
+    let best = 0, bd = 1e9;
+    for (let k = 0; k < rows.length; k++) { const dd = Math.abs(rows[k].y - ay); if (dd < bd) { bd = dd; best = k; } }
+    const g = rows[best].g;
+    if (!g.length) continue;
+    const rowOff = y * bw;
+    for (let x = 0; x < bw; x += S) {
+      if (d[(rowOff + x) * 4 + 3] <= 128) continue;
+      const ax = x + bx;
+      let kk;
+      if (ax <= g[0].x0) kk = 0;
+      else if (ax >= g[g.length - 1].x1) kk = g.length - 1;
+      else {
+        let lo = 0, hi = g.length - 1;
+        while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < ax) lo = m + 1; else hi = m; }
+        kk = lo;
+      }
+      const arr = lists[g[kk].i];
+      arr.push(ax, ay); tot++;
+    }
+  }
+  inkTotal.n = tot;
+  return lists;
+}
+
+/* ---------------- 逐字时刻 ---------------- */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+/* ---------------- 字影（整句的浅色底；骨牌叠在上面） ---------------- */
+let plate = null, plateX = 0, plateY = 0, plateW = 1, plateH = 1, plateA = 0;
+const PLATE_S = 0.55;
+function bakePlate(L) {
+  if (!L) { plate = null; plateA = 0; return; }
+  if (!plate) plate = document.createElement('canvas');
+  const pad = 26;
+  plateX = Math.floor(L.bx0 - pad); plateY = Math.floor(L.by0 - pad);
+  plateW = Math.max(8, Math.ceil(L.bx1 - L.bx0 + pad * 2));
+  plateH = Math.max(8, Math.ceil(L.by1 - L.by0 + pad * 2));
+  plate.width = Math.round(plateW * PLATE_S); plate.height = Math.round(plateH * PLATE_S);
+  const g = plate.getContext('2d');
+  g.setTransform(PLATE_S, 0, 0, PLATE_S, 0, 0);
+  g.clearRect(0, 0, plateW, plateH);
+  g.font = L.font; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = C.plate + '0.34)';
+  for (let i = 0; i < L.glyphs.length; i++) g.fillText(L.glyphs[i].ch, L.glyphs[i].x - plateX, L.glyphs[i].y - plateY);
+  plateA = 0;
+}
+/* 唱到的字，字影也亮一档（骨牌之间漏出的缝里靠它保住字形） */
+function lightPlate(k) {
+  if (!plate || !curLay) return;
+  const gl = curLay.glyphs[k];
+  if (!gl) return;
+  const g = plate.getContext('2d');
+  g.setTransform(PLATE_S, 0, 0, PLATE_S, 0, 0);
+  g.font = curLay.font; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = C.plate + '0.22)';
+  g.fillText(gl.ch, gl.x - plateX, gl.y - plateY);
+  g.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------- 骨牌 ---------------- */
+const TCAP = 2300;
+let TN = 0, TW = 9, TL = 18;
+const T2 = {
+  x: new Float32Array(TCAP), y: new Float32Array(TCAP),
+  ts: new Float32Array(TCAP), ch: new Int16Array(TCAP)
+};
+const FALLD = 0.30;
+let pinT = -Infinity, waveAt = 0, beatP = 0, nFlat = 0, nStand = 0;
+
+const hsh = (i) => {
+  let x = (i * 2654435761) >>> 0;
+  x ^= x >>> 15; x = Math.imul(x, 2246822519) >>> 0;
+  x ^= x >>> 13; return (x >>> 8) / 16777216;
+};
+
+/* 把一张字的墨点按 (csx,csy) 分格；每格只留**离格心最近的墨点**（不取平均 ——
+   平均会把横竖两笔的墨点拉到笔画之间的空隙里，字就被填成一堵砖墙）。 */
+function cellsOf(P, csx, csy) {
+  const map = new Map();
+  for (let k = 0; k < P.length; k += 2) {
+    const x = P[k], y = P[k + 1];
+    const ix = Math.floor(x / csx), iy = Math.floor(y / csy);
+    const key = (ix + 4096) * 8192 + (iy + 4096);
+    const mx = (ix + 0.5) * csx, my = (iy + 0.5) * csy;
+    const d = (x - mx) * (x - mx) + (y - my) * (y - my);
+    const e = map.get(key);
+    if (!e || d < e[2]) map.set(key, [x, y, d]);
+  }
+  return map;
+}
+
+function buildTiles(L, ct, T) {
+  const lists = inkSampling(L);
+  const nch = L.glyphs.length;
+  TW = Math.max(4.4, Math.min(12.0, L.fs * 0.072));
+  TL = TW * 1.72;
+  let csx = TW * 1.15, csy = TW * 1.88;
+  /* 预算守卫：先数格子，超预算就等比放大格子再数（最多 4 轮）。
+     这样每句的牌数都压在 1500 以内，41 字的最后一张牌也不会被 break 截掉。 */
+  const maps = [];
+  let total = 0, guard = 0;
+  for (;;) {
+    maps.length = 0; total = 0;
+    for (let c = 0; c < nch; c++) {
+      const P = lists[c];
+      const m = (P && P.length) ? cellsOf(P, csx, csy) : null;
+      maps.push(m);
+      if (m) total += m.size;
+    }
+    if (total <= 2000 || ++guard >= 4) break;
+    const k = Math.sqrt(total / 2000) * 1.04;
+    csx *= k; csy *= k;
+  }
+  TN = 0; pinT = -Infinity;
+  for (let c = 0; c < nch && TN < TCAP; c++) {
+    const m = maps[c];
+    if (!m) continue;
+    const a = (ct && c < ct.length) ? ct[c] : Infinity;
+    const gl = L.glyphs[c];
+    const gx0 = gl.x - gl.w / 2, gw = Math.max(1, gl.w);
+    for (const e of m.values()) {
+      if (TN >= TCAP) break;
+      const x = e[0], y = e[1];
+      const u = Math.min(1, Math.max(0, (x - gx0) / gw));
+      T2.x[TN] = x; T2.y[TN] = y; T2.ch[TN] = c;
+      T2.ts[TN] = a - 0.26 + u * 0.20;
+      TN++;
+    }
+  }
+  if (ct) for (let c = 0; c < ct.length; c++) if (ct[c] + 0.30 > pinT) pinT = ct[c] + 0.30;
+  waveAt = 0;
+}
+
+/* 每张牌当前"倒到哪"：0 = 立着，1 = 躺平。纯函数，无状态 */
+function tileP(i, T) {
+  const e = (T - T2.ts[i]) / FALLD;
+  let p;
+  if (e <= 0) p = 0;
+  else if (e >= 1) p = 1;
+  else p = Math.pow(e, 1.7);
+  /* 落地回弹 */
+  const tb = T - (T2.ts[i] + FALLD);
+  if (tb > 0 && tb < 0.34) p -= 0.09 * Math.sin(tb * 27) * Math.exp(-tb * 9);
+  /* 句末冲击波：掀起来再拍回去 */
+  if (waveAt > 0) {
+    const tk = T - (waveAt + (T2.x[i] / W) * 0.45);
+    if (tk > 0 && tk < 0.7) p *= 1 - 0.66 * Math.exp(-tk * 6) * Math.cos(tk * 15);
+  }
+  return p < 0.10 ? 0.10 : (p > 1.08 ? 1.08 : p);
+}
+
+/* ---------------- 冲击波光带（预渲染，1 次 drawImage） ---------------- */
+let bandCv = null, bandW = 300;
+function bakeBand() {
+  if (!bandCv) bandCv = document.createElement('canvas');
+  bandCv.width = Math.max(8, Math.round(bandW * DPR));
+  bandCv.height = Math.max(8, Math.round(H * DPR));
+  const g = bandCv.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.clearRect(0, 0, bandW, H);
+  const lg = g.createLinearGradient(0, 0, bandW, 0);
+  lg.addColorStop(0, C.tint + '0)');
+  lg.addColorStop(0.5, C.tint + '0.18)');
+  lg.addColorStop(1, C.tint + '0)');
+  g.fillStyle = lg; g.fillRect(0, 0, bandW, H);
+  const vg = g.createLinearGradient(0, 0, 0, H);
+  vg.addColorStop(0, 'rgba(0,0,0,0.9)');
+  vg.addColorStop(0.35, 'rgba(0,0,0,0)');
+  vg.addColorStop(0.68, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.95)');
+  g.globalCompositeOperation = 'destination-out';
+  g.fillStyle = vg; g.fillRect(0, 0, bandW, H);
+  g.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------- 背景 ---------------- */
+let bgCv = null;
+function bakeBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  bgCv.width = Math.max(8, cv.width); bgCv.height = Math.max(8, cv.height);
+  const g = bgCv.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const lg = g.createLinearGradient(0, 0, 0, H);
+  lg.addColorStop(0, '#0c0a14'); lg.addColorStop(0.52, '#07060d'); lg.addColorStop(1, '#040308');
+  g.fillStyle = lg; g.fillRect(0, 0, W, H);
+  const rg = g.createRadialGradient(W * 0.5, H * 0.45, 0, W * 0.5, H * 0.45, Math.max(W, H) * 0.64);
+  rg.addColorStop(0, C.tint + '0.11)');
+  rg.addColorStop(0.5, C.tint + '0.032)');
+  rg.addColorStop(1, C.tint + '0)');
+  g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  /* 桌面上极淡的经纬线：骨牌摆在上面的感觉 */
+  g.lineWidth = 1;
+  g.strokeStyle = C.tint + '0.020)';
+  const p = new Path2D();
+  for (let y = H * 0.22; y < H; y += 34) { p.moveTo(0, y); p.lineTo(W, y); }
+  for (let x = 0; x < W; x += 46) { p.moveTo(x, H * 0.18); p.lineTo(x, H); }
+  g.stroke(p);
+  /* 远处的一圈暗光，给纵深 */
+  const vg = g.createRadialGradient(W * 0.5, H * 0.42, Math.min(W, H) * 0.20, W * 0.5, H * 0.42, Math.max(W, H) * 0.62);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.30)');
+  g.fillStyle = vg; g.fillRect(0, 0, W, H);
+}
+
+/* ---------------- 时间 / 节奏 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许清场
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+let curLay = null, curCT = null, curYrc = false, lit = 0;
+let pend = null, pendIdx = -1;
+
+function brewLine(i) {
+  const L = lines[i];
+  pend = L && L.text ? { lay: makeLayout(L.text) } : null;
+  pendIdx = i;
+}
+function applyLine(lay) {
+  curLay = lay;
+  if (!lay) { curCT = null; curYrc = false; TN = 0; plate = null; return; }
+  const tm = charTimes(lines[curIdx], lay.glyphs.length);
+  curCT = tm.t; curYrc = tm.ok; lit = 0;
+  bakePlate(lay);
+  buildTiles(lay, curCT, now());
+  const T = now();
+  while (lit < curCT.length && T >= curCT[lit]) { lightPlate(lit); lit++; }
+}
+function startLine(i) {
+  if (pendIdx !== i) brewLine(i);
+  const b = pend; pend = null; pendIdx = -1;
+  applyLine(b ? b.lay : null);
+}
+function relayout() {
+  if (curIdx >= 0 && lines[curIdx] && lines[curIdx].text) {
+    applyLine(makeLayout(lines[curIdx].text));
+  } else { curLay = null; TN = 0; plate = null; }
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pend = null; pendIdx = -1;
+    curLay = null; curCT = null; lit = 0; TN = 0; plate = null; waveAt = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci); else { TN = 0; plate = null; }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine(nx); }
+  }
+  if (curCT) while (lit < curCT.length && T >= curCT[lit]) { lightPlate(lit); lit++; }
+  /* 句末：整排再倒一遍 */
+  if (!waveAt && pinT > -1e8 && T > pinT + 0.42) waveAt = T;
+}
+
+/* ---------------- 镜头 ---------------- */
+let panX = 0, panY = 0;
+function camera(dt) {
+  let tx = 0, ty = 0;
+  if (curLay && curLay.glyphs.length) {
+    const g = curLay.glyphs[Math.min(curLay.glyphs.length - 1, Math.max(0, lit - 1))];
+    if (g) { tx = (g.x - W / 2) * 0.09; ty = (g.y - H / 2) * 0.055; }
+  }
+  tx += Math.sin(t0 * 0.035) * W * 0.007 + Math.sin(t0 * 0.013) * W * 0.004;
+  ty += Math.cos(t0 * 0.027) * H * 0.007;
+  const k = Math.min(1, dt * 2.4);
+  panX += (tx - panX) * k; panY += (ty - panY) * k;
+}
+
+/* ---------------- 绘制 ---------------- */
+let last = performance.now();
+function draw(T) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+  else { ctx.fillStyle = '#06060b'; ctx.fillRect(0, 0, W, H); }
+  if (!TN || !curLay) return;
+
+  const zoom = 1.008 + 0.014 * Math.sin(t0 * 0.043) + 0.010 * beatP;
+  ctx.save();
+  ctx.translate(W * 0.5 + panX, H * 0.5 + panY);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W * 0.5, -H * 0.5);
+
+  if (plate) {
+    plateA = Math.min(1, plateA + 0.07);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = plateA;
+    ctx.drawImage(plate, plateX, plateY, plateW, plateH);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  const w = TW, l = TL;
+  const w0 = w * 0.58, h0 = l * 0.52;
+  const pFace = new Path2D(), pStand = new Path2D(), pEdge = new Path2D();
+  const pDiv = new Path2D(), pPip = new Path2D(), pFlash = new Path2D();
+  const pipR = Math.max(0.7, w * 0.085);
+  const wantPip = w >= 7.6 && l >= 13.2;
+  let nf = 0, ns = 0;
+
+  for (let i = 0; i < TN; i++) {
+    const p = tileP(i, T);
+    const x = T2.x[i], y = T2.y[i];
+    if (p <= 0.12) {
+      /* 立着：一根细牌，顶沿一道亮边 */
+      const hh = h0;
+      const bx = x - w0 / 2, by = y - l * 0.26;
+      pStand.moveTo(bx, by + hh); pStand.lineTo(bx + w0, by + hh);
+      pStand.lineTo(bx + w0, by); pStand.lineTo(bx, by); pStand.closePath();
+      pEdge.moveTo(bx + 0.4, by + 0.6); pEdge.lineTo(bx + w0 - 0.4, by + 0.6);
+      ns++;
+      continue;
+    }
+    nf++;
+    const hw = w0 + (w * 0.96 - w0) * p;
+    const hh = h0 + (l - h0) * p;
+    const cy = y - l * 0.26 + l * 0.26 * p;
+    const ty = cy - hh / 2, by = cy + hh / 2;
+    const tw = hw * 0.93, bw = hw * (1 + 0.09 * p);
+    pFace.moveTo(x - tw / 2, ty);
+    pFace.lineTo(x + tw / 2, ty);
+    pFace.lineTo(x + bw / 2, by);
+    pFace.lineTo(x - bw / 2, by);
+    pFace.closePath();
+    pEdge.moveTo(x - tw / 2 + 0.3, ty + 0.55); pEdge.lineTo(x + tw / 2 - 0.3, ty + 0.55);
+    if (p > 0.55) { pDiv.moveTo(x - bw * 0.33, cy); pDiv.lineTo(x + bw * 0.33, cy); }
+    if (wantPip && p > 0.86) {
+      const dy = hh * 0.23;
+      pPip.rect(x - pipR, cy - dy - pipR, pipR * 2, pipR * 2);
+      pPip.rect(x - pipR, cy + dy - pipR, pipR * 2, pipR * 2);
+    }
+    /* 刚落地 / 被冲击波掀起的牌闪一下 */
+    let gl = 0;
+    const tb = T - (T2.ts[i] + FALLD);
+    if (tb > 0) gl = Math.exp(-tb * 7);
+    if (waveAt > 0) {
+      const tk = T - (waveAt + (x / W) * 0.45);
+      if (tk > 0) gl = Math.max(gl, Math.exp(-tk * 4.5) * 0.9);
+    }
+    if (gl > 0.06) {
+      pFlash.moveTo(x - bw / 2, ty); pFlash.lineTo(x + bw / 2, ty);
+      pFlash.lineTo(x + bw / 2, by); pFlash.lineTo(x - bw / 2, by);
+      pFlash.closePath();
+    }
+  }
+  nFlat = nf; nStand = ns;
+
+  /* 牌面 + 深色描边（牌与牌之间必须有黑缝，否则整句糊成一块砖墙） */
+  ctx.fillStyle = C.face;
+  ctx.fill(pFace);
+  ctx.strokeStyle = 'rgba(10,10,20,0.58)';
+  ctx.lineWidth = 0.8;
+  ctx.stroke(pFace);
+  /* 立牌 */
+  ctx.fillStyle = C.stand;
+  ctx.fill(pStand);
+  /* 冲击波光带 */
+  if (waveAt > 0) {
+    const wx = -60 + (T - waveAt) / 0.45 * (W + 120);
+    if (wx > -bandW && wx < W + bandW && bandCv) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.85;
+      ctx.drawImage(bandCv, wx - bandW / 2, 0, bandW, H);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+  /* 上沿高光 + 腰线 */
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = C.edge; ctx.lineWidth = 1; ctx.stroke(pEdge);
+  ctx.strokeStyle = C.div; ctx.lineWidth = Math.max(0.8, w * 0.075); ctx.stroke(pDiv);
+  /* 点数 */
+  if (wantPip) { ctx.fillStyle = C.pip; ctx.fill(pPip); }
+  /* 落地闪光（加法） */
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = C.glow + (0.22 + 0.16 * beatP).toFixed(3) + ')';
+  ctx.fill(pFlash);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
+
+  if (beatP > 0.01) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = C.glow + (0.026 * beatP).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  beatP *= Math.exp(-dt * 2.6);
+  camera(dt);
+  draw(T);
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.lineCap = 'round';
+  derive(); bakeBg(); bakeBand();
+  if (lines.length) relayout(); else { TN = 0; plate = null; }
+}
+addEventListener('resize', resize);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; pend = null; pendIdx = -1;
+    curLay = null; curCT = null; curYrc = false; lit = 0;
+    TN = 0; plate = null; pinT = -Infinity; waveAt = 0;
+    if (p.accent) accent = p.accent;
+    derive(); bakeBg(); bakeBand();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整排一起轻掀一下（相干），再整体亮一下 */
+    beatP = Math.min(1.4, beatP + 0.36 + (d.payload.level || 0) * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+resize();
+requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx, yrc: !!curYrc,
+  lit: lit, chars: curCT ? curCT.length : 0, rows: curLay ? curLay.nr : 0,
+  fs: curLay ? +curLay.fs.toFixed(1) : 0,
+  tiles: TN, flat: nFlat, stand: nStand, w: +TW.toFixed(2), len: +TL.toFixed(2),
+  wave: waveAt > 0 ? +(now() - waveAt).toFixed(2) : -1,
+  ink: inkTotal.n, T: +now().toFixed(2)
+});
+</script>
+</body>
+</html>
+
+
+
+
+
+

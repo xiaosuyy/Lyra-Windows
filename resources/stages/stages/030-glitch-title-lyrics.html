@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>故障标题</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,160,190,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+
+  #stage{position:fixed;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:clamp(14px,3vh,30px);z-index:4}
+  #title{position:relative;font-family:ui-sans-serif,system-ui,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-weight:900;line-height:1.18;user-select:none;-webkit-user-select:none}
+  #title .rw{white-space:nowrap;text-align:center}
+  #title .layer{position:absolute;inset:0;will-change:transform}
+  #title .layer.base{position:relative;color:#eef1ff;text-shadow:0 0 26px rgba(80,110,255,.20)}
+  #title .layer.r{color:#ff2d55;mix-blend-mode:screen}
+  #title .layer.c{color:#00f0ff;mix-blend-mode:screen}
+  /* 扫带：静态裁切（一次算好），每帧只改 transform —— 便宜且好合成 */
+  #title .band{position:absolute;left:0;right:0;top:0;
+    color:#eef1ff;visibility:hidden;will-change:transform}
+  #title .band .rw{color:#eef1ff}
+  #title.torn .band{visibility:visible}
+
+  /* 写入头：竖线挂在 #title 内，x=当前字中心，y=当前排 */
+  #head{position:absolute;left:0;top:0;width:2px;pointer-events:none;
+    background:linear-gradient(180deg,rgba(0,240,255,0),rgba(0,240,255,.55) 22%,rgba(255,45,85,.55) 78%,rgba(255,45,85,0));
+    opacity:0;transition:opacity .4s ease}
+  #head b{position:absolute;left:50%;top:-11px;width:9px;height:9px;margin-left:-4.5px;
+    background:#00f0ff;transform:rotate(45deg);box-shadow:0 0 12px rgba(0,240,255,.8)}
+
+  .sub{font:600 clamp(10px,1.35vw,13px)/1.6 ui-monospace,Consolas,monospace;
+    letter-spacing:.32em;color:#7f89ab;text-align:center;padding-left:.32em}
+  .sub em{font-style:normal;color:#ff5d7a}
+  .sub.on em{color:#5de38f}
+
+  .hud{position:fixed;top:16px;right:18px;display:flex;flex-direction:column;align-items:flex-end;gap:6px;
+    font:600 10px/1.5 ui-monospace,Consolas,monospace;letter-spacing:.20em;color:#ff5d7a;z-index:6;pointer-events:none}
+  .hud em{font-style:normal;color:#667092}
+  .hud .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#ff2d55;
+    box-shadow:0 0 8px #ff2d55;margin-right:6px;vertical-align:1px;animation:pulse 1.4s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.22}}
+  .rd{position:fixed;left:18px;top:16px;margin:0;font:500 12px/1.9 ui-monospace,Consolas,monospace;
+    color:var(--acc,#5de38f);opacity:.85;pointer-events:none;white-space:pre;z-index:6}
+  .rd i{display:inline-block;width:8px;height:14px;background:var(--acc,#5de38f);vertical-align:-2px;margin-left:2px;
+    animation:cur 1.05s steps(1) infinite}
+  @keyframes cur{50%{opacity:0}}
+
+  .scan{position:fixed;inset:0;pointer-events:none;z-index:5;
+    background:repeating-linear-gradient(0deg,rgba(255,255,255,.030) 0 1px,rgba(255,255,255,0) 1px 3px)}
+  .bar{position:fixed;left:0;right:0;height:150px;top:-170px;pointer-events:none;z-index:5;
+    background:linear-gradient(180deg,rgba(0,240,255,0) 0%,rgba(0,240,255,.055) 50%,rgba(0,240,255,0) 100%);
+    animation:sweep 7s linear infinite}
+  @keyframes sweep{to{transform:translateY(calc(100vh + 340px))}}
+  #flash{position:fixed;inset:0;background:#d6e6ff;opacity:0;pointer-events:none;z-index:8;
+    transition:opacity .45s ease}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div class="scan"></div>
+<div class="bar"></div>
+<div id="stage">
+  <div id="title">
+    <span class="layer base" id="layBase"></span>
+    <span class="layer r" id="layR"></span>
+    <span class="layer c" id="layC"></span>
+    <div id="head"><b></b></div>
+  </div>
+  <div class="sub" id="sub">SIGNAL LOCKED · <em>同步正常</em></div>
+</div>
+<pre class="rd" id="rd"></pre>
+<div class="hud">
+  <span><span class="dot"></span><em id="state">SYNC</em></span>
+  <em id="skew">SKEW 00.0ms</em>
+</div>
+<div id="flash"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   030 · 故障标题 —— 屏幕是一台**丢了行同步的显像管**，而同步是从"正在唱的那个字"丢的
+   ----------------------------------------------------------------------------
+   核心机制：**逐扫带的时钟偏斜（clock skew），偏斜量由写入头的位移一点点攒出来**。
+   整块标题被切成 12 条水平扫带（每条带是一次静态 clip-path，每帧只改 transform）。
+   每一条带都挂着一个自己的**同步误差 err[b]**：
+     · 写入头（= 正在唱的那个字）每跳一个字，就按"跳了多远"给所有扫带注入一次
+       误差；越往下的带子拿到的越多（lag = (b/(NB-1))^1.4）—— 整块字被拉成
+       阶梯状的斜，像滚动快门，而不是随机的小纸条；
+     · 误差每帧按指数回正：唱完这个字、头不动了，画面就自己"锁"回干净
+       （句尾 0.3s 内一定回到锁定态）；
+     · 踩拍 = 一次**垂直同步脉冲**：所有扫带的误差按正负交替一次性砸下去，
+       然后一起回正 —— 整场一起动，绝不逐条随机乱撕。
+   RGB 分离量跟着误差走：不撕的时候两个通道几乎重合，撕起来红青才分开。
+
+   精修记录：① 长句折行——>16 字 2 排、>30 字 3 排（每行一个 .rw div、整块
+     flex 居中、字号按最长行自适应），修掉"41 字压成 29px 细横线"；
+     扫带 clip 仍作用于整块（多行一起撕，机制不变）；
+   ② 写入头改为**跟踪 (字 x, 当前排 y)**：竖线跳到正在唱的那一排；
+   ③ glitch 强度重调：单字注入与误差上限收敛（|err|≤20px、衰减 9/s），
+     撕裂只在字跳动的瞬间发生，字间与句尾自动锁定；镜头抖动幅度接 beat
+     （beatE 越大 base 层抖得越狠）；
+   ④ YRC：chars.length === text.length 才逐字可信，否则均分回退；__stage 加 yrc。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const hint = document.getElementById('hint');
+const title = document.getElementById('title');
+const layBase = document.getElementById('layBase');
+const layR = document.getElementById('layR');
+const layC = document.getElementById('layC');
+const sub = document.getElementById('sub');
+const head = document.getElementById('head');
+const rd = document.getElementById('rd');
+const flash = document.getElementById('flash');
+const skewEl = document.getElementById('skew');
+const stateEl = document.getElementById('state');
+
+let W = 0, H = 0, DPR = 1;
+let accent = [120, 150, 255];
+
+const NB = 12;                       // 扫带数
+const LAG = new Float32Array(NB);
+for (let b = 0; b < NB; b++) LAG[b] = Math.pow(b / (NB - 1), 1.4);
+const err = new Float32Array(NB);
+const bandEl = new Array(NB);
+const lastTr = new Float32Array(NB);
+let torn = false;
+
+/* ---------- 排版 ---------- */
+const om = document.createElement('canvas').getContext('2d');
+const FONT_OF = (fs) => '900 ' + fs.toFixed(1) + 'px ui-sans-serif,system-ui,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
+let cur = null, pend = null, headIdx = -1, kick = 0, yrcFlag = false;
+
+/* ---------- 长句折行：>16 字 2 排、>30 字 3 排，尽量不从拉丁词中间断开 ---------- */
+function splitRows(text) {
+  const want = text.length > 30 ? 3 : (text.length > 16 ? 2 : 1);
+  if (want === 1) return [{ text: text, off: 0 }];
+  const LAT = /[A-Za-z0-9'’]/;
+  const parts = [];
+  let start = 0;
+  for (let p = 1; p <= want; p++) {
+    let cut = (p === want) ? text.length : Math.round(text.length * p / want);
+    if (p < want) {
+      if (LAT.test(text[cut - 1]) && text[cut] && LAT.test(text[cut])) {
+        let best = -1;
+        for (let d = 1; d <= 8 && best < 0; d++) {
+          if (cut - d > start + 3 && /\s/.test(text[cut - d])) best = cut - d;
+          else if (cut + d < text.length - 3 && /\s/.test(text[cut + d])) best = cut + d + 1;
+        }
+        if (best > 0) cut = best;
+      }
+    }
+    parts.push({ text: text.slice(start, cut), off: start });
+    start = cut;
+  }
+  return parts.filter((r) => r.text.length);
+}
+
+function layoutLine(line) {
+  const text = (line && line.text) || '';
+  if (!text) return null;
+  const rowsArr = splitRows(text);
+  const R = rowsArr.length;
+  const maxRow = Math.max(...rowsArr.map((r) => r.text.length));
+  let fs = Math.min(W * 0.92 / maxRow, H * 0.62 / (R * 1.22), 210);
+  fs = Math.max(20, fs);
+  const lh = fs * 1.22;
+  const rows = [];
+  let maxW = 0;
+  for (const r of rowsArr) {
+    om.font = FONT_OF(fs);
+    const tw = om.measureText(r.text).width;
+    maxW = Math.max(maxW, tw);
+    rows.push({ s: r.text, off: r.off, tw: tw });
+  }
+  const blockH = R * lh;
+  const rowsTop = [];                    // 每排顶边相对 title 块的 y
+  for (let i = 0; i < R; i++) rowsTop.push((i + 0.5) * lh - fs * 0.54);
+  /* 每个字的屏幕 x 与起唱时刻（全局索引） */
+  const n = text.length;
+  const cx = new Float64Array(n);
+  const rowOf = new Uint8Array(n);
+  const rowY = new Float64Array(n);
+  const on = new Float64Array(n);
+  const chars = line.chars && line.chars.length === text.length ? line.chars : null;
+  yrcFlag = !!chars;
+  const dur = line.dur || 4;
+  for (let ri = 0; ri < R; ri++) {
+    const row = rows[ri];
+    const left = (W - row.tw) * 0.5;
+    om.font = FONT_OF(fs);
+    for (let i = 0; i < row.s.length; i++) {
+      const gi = row.off + i;
+      const a = om.measureText(row.s.substring(0, i)).width;
+      const b = om.measureText(row.s.substring(0, i + 1)).width;
+      cx[gi] = left + (a + b) * 0.5;
+      rowOf[gi] = ri;
+      rowY[gi] = rowsTop[ri];
+      on[gi] = chars ? chars[gi].t : line.t + (gi / n) * dur * 0.85;
+    }
+  }
+  const sp = n > 1 ? Math.max(8, (cx[n - 1] - cx[0]) / (n - 1)) : fs;
+  return { s: text, rows, R, n, fs, lh, blockH, maxW, cx, rowOf, rowY, on, sp };
+}
+
+/* 把每一层（含扫带）的内容换成 rows 的 div 序列 */
+function fillLayer(el, L) {
+  el.textContent = '';
+  for (const r of L.rows) {
+    const d = document.createElement('div');
+    d.className = 'rw';
+    d.textContent = r.s;
+    el.appendChild(d);
+  }
+}
+function applyLine(L) {
+  cur = L;
+  title.style.fontSize = L.fs.toFixed(2) + 'px';
+  title.style.lineHeight = (L.lh / L.fs).toFixed(3);
+  fillLayer(layBase, L); fillLayer(layR, L); fillLayer(layC, L);
+  for (let b = 0; b < NB; b++) fillLayer(bandEl[b], L);
+  headIdx = -1;
+}
+
+/* ---------- 扫带（静态 clip-path，一次算好） ---------- */
+(function buildBands() {
+  for (let b = 0; b < NB; b++) {
+    const el = document.createElement('span');
+    el.className = 'band layer';
+    const top = (b / NB) * 100, h = 100 / NB;
+    el.style.clipPath = 'inset(' + top.toFixed(4) + '% 0 ' + (100 - top - h).toFixed(4) + '% 0)';
+    title.appendChild(el);
+    bandEl[b] = el;
+    lastTr[b] = -999;
+  }
+})();
+
+/* ---------- CRT 底：扫描线/暗角画一次，噪声只在撕的时候画 ---------- */
+function backdrop() {
+  ctx.fillStyle = '#05060a';
+  ctx.fillRect(0, 0, W, H);
+  const g = ctx.createRadialGradient(W * 0.5, H * 0.5, 10, W * 0.5, H * 0.5, Math.max(W, H) * 0.66);
+  g.addColorStop(0, 'rgba(255,255,255,.045)');
+  g.addColorStop(0.7, 'rgba(255,255,255,.008)');
+  g.addColorStop(1, 'rgba(0,0,0,.55)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(150,180,255,.030)';
+  for (let y = 0; y < H; y += 3) ctx.fillRect(0, y, W, 1);
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+let beatE = 0, noise = 0, rdStr = '', rdAt = 0, preload = false, flashUntil = 0;
+let splitShown = -999, jitShown = -999, headXY = '';
+const rdText = document.createTextNode('');
+(function initRd() {
+  const i = document.createElement('i');
+  rd.appendChild(rdText);
+  rd.appendChild(i);
+})();
+
+function resetAll() {
+  curIdx = -1; brewIdx = -1; lastT = -1;
+  cur = null; pend = null; headIdx = -1;
+  err.fill(0); beatE = 0; preload = false; yrcFlag = false;
+  layBase.textContent = ''; layR.textContent = ''; layC.textContent = '';
+  for (let b = 0; b < NB; b++) bandEl[b].textContent = '';
+  title.classList.remove('torn');
+  head.style.opacity = '0';
+  sub.className = 'sub';
+  sub.innerHTML = 'SIGNAL LOCKED · <em>同步正常</em>';
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) resetAll();
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      /* 显示切到第 ci 句：换字，并当场注入一次强失同步（重新锁定） */
+      const lay = (pend && pend.line === lines[ci]) ? pend.lay : layoutLine(lines[ci]);
+      if (lay) {
+        applyLine(lay);
+        pend = null; preload = false;
+        for (let b = 0; b < NB; b++) err[b] += (b & 1 ? 1 : -1) * (5 + LAG[b] * 9);
+        beatE = Math.min(1.4, beatE + 0.7);
+        sub.className = 'sub';
+        sub.innerHTML = 'SIGNAL LOST · <em>重新锁定中</em>';
+        hint.style.opacity = '0';
+        head.style.opacity = '0.9';
+      } else {
+        cur = null;
+      }
+    } else {
+      cur = null;
+    }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      /* 准备下一句：量出每个字的 x/排/起唱时刻，HUD 挂 PRELOAD；字一个不换 */
+      pend = { line: lines[nx], lay: layoutLine(lines[nx]) };
+      preload = true;
+    }
+  }
+}
+
+let last = performance.now();
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  const T = now();
+  timing(T);
+
+  if (flashUntil && nowMs >= flashUntil) {
+    flashUntil = 0;
+    flash.style.transition = 'opacity .45s ease';
+    flash.style.opacity = '0';
+  }
+
+  /* ---- 写入头：正在唱的那个字（x + 所在排 y） ---- */
+  if (cur) {
+    let i = -1;
+    for (let k = 0; k < cur.n; k++) { if (T >= cur.on[k]) i = k; else break; }
+    if (i >= 0) {
+      const key = cur.cx[i].toFixed(1) + '/' + cur.rowY[i].toFixed(1);
+      if (i !== headIdx) {
+        /* 头跳了一格 —— 按"跳了多远"给所有扫带注入同步误差 */
+        const d = headIdx >= 0 ? Math.abs(cur.cx[i] - cur.cx[headIdx]) : cur.sp;
+        kick = Math.min(2.2, d / Math.max(8, cur.sp));
+        headIdx = i;
+      }
+      if (key !== headXY) {
+        headXY = key;
+        head.style.transform = 'translate(' + (cur.cx[i] - 1).toFixed(1) + 'px,' + (cur.rowY[i] - 6).toFixed(1) + 'px)';
+        head.style.height = (cur.fs * 1.08).toFixed(1) + 'px';
+      }
+    }
+  }
+
+  /* ---- 同步误差：注入 → 指数回正（句尾 0.3s 内一定锁回） ---- */
+  const decay = Math.exp(-dt * 9.0);
+  noise = noise * 0.90 + (Math.random() - 0.5) * 0.30;
+  for (let b = 0; b < NB; b++) {
+    let v = err[b] * decay;
+    v += kick * (1.4 + LAG[b] * 4.2) * (1 + beatE * 0.4);
+    v += noise * (0.08 + LAG[b] * 0.14);
+    if (v > 20) v = 20; else if (v < -20) v = -20;
+    err[b] = v;
+  }
+  kick *= Math.exp(-dt * 9.0);
+  beatE *= Math.exp(-dt * 3.4);
+
+  /* ---- 应用：扫带只改 transform，且变化不大就不写 ---- */
+  let mx = 0;
+  for (let b = 0; b < NB; b++) {
+    const v = err[b];
+    const a = v < 0 ? -v : v;
+    if (a > mx) mx = a;
+    if (Math.abs(v - lastTr[b]) > 0.12) {
+      bandEl[b].style.transform = 'translateX(' + v.toFixed(2) + 'px)';
+      lastTr[b] = v;
+    }
+  }
+  const wantTorn = mx > 3.2;
+  if (wantTorn !== torn) {
+    torn = wantTorn;
+    title.classList.toggle('torn', torn);
+    sub.className = torn ? 'sub' : 'sub on';
+    sub.innerHTML = torn ? 'SIGNAL LOST · <em>重新锁定中</em>' : 'SIGNAL LOCKED · <em>同步正常</em>';
+  }
+
+  /* ---- RGB 分离量 = 同步误差 + 拍子（两个通道整块地分开） ---- */
+  let avg = 0;
+  for (let b = 0; b < NB; b++) avg += err[b];
+  avg /= NB;
+  const split = 1.1 + Math.abs(avg) * 0.45 + beatE * 3.0;
+  if (Math.abs(split - splitShown) > 0.08) {
+    splitShown = split;
+    const js = (Math.random() - 0.5) * (0.3 + beatE * 0.8);
+    layR.style.transform = 'translate(' + (-split + js).toFixed(2) + 'px,' + (js * 0.4).toFixed(2) + 'px)';
+    layC.style.transform = 'translate(' + (split + js).toFixed(2) + 'px,' + (js * 0.4).toFixed(2) + 'px)';
+  }
+  /* 镜头抖动：幅度接 beat（踩拍瞬间抖一下，字间很轻） */
+  const jit = (Math.random() - 0.5) * (0.5 + beatE * 3.2);
+  if (Math.abs(jit - jitShown) > 0.15) {
+    jitShown = jit;
+    layBase.style.transform = 'translate(' + jit.toFixed(2) + 'px,' + ((Math.random() - 0.5) * beatE * 1.4).toFixed(2) + 'px)';
+  }
+
+  /* ---- 画布只在"撕"的时候补噪声 ---- */
+  if (torn) {
+    ctx.fillStyle = 'rgba(120,150,255,.05)';
+    for (let k = 0; k < 3; k++) {
+      const y = (Math.random() * H) | 0;
+      ctx.fillRect(0, y, W, 1 + ((Math.random() * 2) | 0));
+    }
+    if (Math.random() < 0.10) {
+      const y = (Math.random() * H) | 0;
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.03 + Math.random() * 0.05).toFixed(3) + ')';
+      ctx.fillRect(0, y, W, 2 + ((Math.random() * 7) | 0));
+    }
+  }
+
+  /* ---- 读数 ---- */
+  if (nowMs >= rdAt) {
+    rdAt = nowMs + 130;
+    const s = 'WRITE ▸ ' + (cur ? (headIdx >= 0 ? cur.s.charAt(headIdx) : '…') : '—') +
+              '  ' + (headIdx + 1) + '/' + (cur ? cur.n : 0) + (preload ? '  PRELOAD' : '');
+    if (s !== rdStr) { rdStr = s; rdText.nodeValue = '> ' + s; }
+    skewEl.textContent = 'SKEW ' + mx.toFixed(1) + 'px';
+    stateEl.textContent = torn ? 'ERR//0x7F' : 'SYNC';
+  }
+
+  requestAnimationFrame(frame);
+}
+
+let rzTimer = 0;
+addEventListener('resize', () => {
+  clearTimeout(rzTimer);
+  rzTimer = setTimeout(() => {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    backdrop();
+    if (cur && curIdx >= 0) applyLine(layoutLine(lines[curIdx]));
+    if (pend) pend.lay = layoutLine(pend.line);
+  }, 150);
+});
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length === 3) {
+      accent = p.accent;
+      /* 封面主色只用来偏一点色温：台的骨架还是参考文件的品红/青 */
+      const [ar, ag, ab] = accent;
+      document.documentElement.style.setProperty('--acc',
+        'rgb(' + (ar * 0.6 + 90 | 0) + ',' + (ag * 0.6 + 70 | 0) + ',' + (ab * 0.6 + 110 | 0) + ')');
+    }
+    resetAll();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：相干 —— 一次"垂直同步脉冲"：所有扫带按正负交替一起砸下去，
+       再一起回正；加一帧白闪。绝不逐条随机乱撕 */
+    const lv = d.payload.level || 0;
+    for (let b = 0; b < NB; b++) err[b] += (b & 1 ? 1 : -1) * (4 + lv * 9) * (0.35 + LAG[b]);
+    beatE = Math.min(1.6, beatE + 0.35 + lv * 0.55);
+    flash.style.transition = 'none';
+    flash.style.opacity = (0.05 + lv * 0.10).toFixed(3);
+    flashUntil = performance.now() + 34;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+DPR = Math.min(2, window.devicePixelRatio || 1);
+W = window.innerWidth; H = window.innerHeight;
+cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+backdrop();
+resetAll();
+requestAnimationFrame(frame);
+window.__stage = () => ({ lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+  skew: +Math.max.apply(null, Array.from(err).map(Math.abs)).toFixed(2), torn, headIdx,
+  chars: cur ? cur.n : 0, preload, yrc: yrcFlag, rows: cur ? cur.R : 0 });
+</script>
+</body>
+</html>

@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>海风半拍</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #FBFAF5; }
+  #stage { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+/* 392 · 海风半拍 — Copacabana line & bossa color blocks */
+window.__stage = function () {
+  return {
+    lines: state.lines.length,
+    idx: state.idx,
+    t: state.t,
+    playing: state.playing,
+    frames: state.frames,
+    js: state.js,
+    err: state.err,
+    text: state.text,
+    gl: false,
+    rm: state.rm
+  };
+};
+
+var canvas = document.getElementById("stage");
+var ctx = canvas.getContext("2d", { alpha: false });
+if (!ctx) ctx = canvas.getContext("2d");
+
+var DEFAULT_PALETTE = {
+  ink: [20, 18, 15],
+  paper: [251, 250, 245],
+  lemon: [247, 199, 60],
+  ocean: [30, 116, 163],
+  coral: [230, 106, 62]
+};
+
+var state = {
+  w: 1440, h: 900, dpr: 1,
+  lines: [], idx: -1, t: 0, playing: true,
+  frames: 0, js: 0, err: "", text: "",
+  rm: false, readySent: false, initCount: 0,
+  accent: null, beat: 0, live: { bpm: 0, level: 0, bass: 0, mid: 0, treble: 0 },
+  palette: null, layout: null, bgCanvas: null, grainCanvas: null,
+  guitarCanvas: null, parasolCanvas: null,
+  lyricLayout: null, lyricKey: "",
+  elapsed: 0, lastTs: 0, bassSmooth: 0, levelSmooth: 0, phase: 0, emptyFade: 1
+};
+
+var errWindowAt = 0, errSuppressed = 0;
+function reportError(where, error) {
+  var msg = error && error.message ? error.message : String(error);
+  state.err = where + ": " + msg;
+  var now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+  if (now - errWindowAt > 1000) {
+    errWindowAt = now;
+    errSuppressed = 0;
+    console.error("[stage 392] " + where, error);
+  } else {
+    errSuppressed++;
+    if (errSuppressed === 60) console.error("[stage 392] error log rate-limited at " + where);
+  }
+}
+
+function nowMs() {
+  return (typeof performance !== "undefined" ? performance.now() : Date.now());
+}
+
+try {
+  state.rm = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  if (window.matchMedia) {
+    window.matchMedia("(prefers-reduced-motion: reduce)").addEventListener("change", function (event) {
+      state.rm = !!event.matches;
+    });
+  }
+} catch (error) { reportError("matchMedia", error); }
+
+function sendReady() {
+  if (state.readySent) return;
+  state.readySent = true;
+  try {
+    parent.postMessage({ __c100: 1, type: "ready" }, "*");
+  } catch (error) { reportError("sendReady", error); }
+  setTimeout(function () {
+    try { bakeStaticLayers(); } catch (error) { reportError("bakeStaticLayers", error); }
+  }, 0);
+}
+
+function resize() {
+  var width = window.innerWidth;
+  var height = window.innerHeight;
+  if (!isFinite(width) || width <= 0) width = 1440;
+  if (!isFinite(height) || height <= 0) height = 900;
+  var ratio = window.devicePixelRatio || 1;
+  if (!isFinite(ratio) || ratio <= 0) ratio = 1;
+  ratio = Math.min(ratio, 2);
+  state.w = width;
+  state.h = height;
+  state.dpr = ratio;
+  canvas.width = Math.max(1, Math.round(width * ratio));
+  canvas.height = Math.max(1, Math.round(height * ratio));
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  layoutAll();
+}
+
+function clampNumber(value, min, max, fallback) {
+  var num = Number(value);
+  if (!isFinite(num)) return fallback;
+  if (num < min) return min;
+  if (num > max) return max;
+  return num;
+}
+
+function cssColor(rgb, alpha) {
+  var source = (rgb && rgb.length >= 3) ? rgb : DEFAULT_PALETTE.ink;
+  var red = Math.round(clampNumber(source[0], 0, 255, 20));
+  var green = Math.round(clampNumber(source[1], 0, 255, 18));
+  var blue = Math.round(clampNumber(source[2], 0, 255, 15));
+  var a = clampNumber(alpha, 0, 1, 1);
+  return "rgba(" + red + "," + green + "," + blue + "," + a + ")";
+}
+
+function mixRgb(first, second, amount) {
+  if (!first || first.length < 3) first = DEFAULT_PALETTE.ocean;
+  if (!second || second.length < 3) return [first[0], first[1], first[2]];
+  var k = clampNumber(amount, 0, 1, 0);
+  return [
+    Math.round(first[0] + (second[0] - first[0]) * k),
+    Math.round(first[1] + (second[1] - first[1]) * k),
+    Math.round(first[2] + (second[2] - first[2]) * k)
+  ];
+}
+
+function buildPalette() {
+  var accent = (state.accent && state.accent.length >= 3) ? state.accent : null;
+  var ocean = accent ? mixRgb(DEFAULT_PALETTE.ocean, accent, 0.42) : DEFAULT_PALETTE.ocean.slice();
+  var lemon = accent ? mixRgb(DEFAULT_PALETTE.lemon, accent, 0.10) : DEFAULT_PALETTE.lemon.slice();
+  var oceanLuma = (0.2126 * ocean[0] + 0.7152 * ocean[1] + 0.0722 * ocean[2]) / 255;
+  if (oceanLuma > 0.62 || oceanLuma < 0.10) ocean = DEFAULT_PALETTE.ocean.slice();
+  state.palette = {
+    ink: DEFAULT_PALETTE.ink.slice(),
+    paper: DEFAULT_PALETTE.paper.slice(),
+    ocean: ocean,
+    lemon: lemon,
+    coral: DEFAULT_PALETTE.coral.slice(),
+    muted: [136, 128, 113],
+    soft: [146, 138, 124]
+  };
+}
+
+function layoutAll() {
+  var width = state.w;
+  var height = state.h;
+  var unit = Math.min(width, height);
+  var portrait = height > width * 1.02;
+  var layout = { portrait: portrait, unit: unit, width: width, height: height };
+
+  if (!portrait) {
+    layout.sea = { x: width * 0.552, y: height * 0.085, w: width * 0.392, h: height * 0.408, r: unit * 0.085 };
+    layout.sun = { cx: width * 0.748, cy: height * 0.448, r: unit * 0.132 };
+    layout.waves = { x0: width * 0.495, x1: width * 0.985, yTop: height * 0.585, rows: 5, step: height * 0.0295, amp: height * 0.0135 };
+    layout.coral = { x: width * 0.797, y: height * 0.752, w: width * 0.143, h: height * 0.132, r: unit * 0.028 };
+    layout.parasol = { cx: width * 0.638, cy: height * 0.80, scale: unit * 0.165 };
+    layout.guitar = { cx: width * 0.137, cy: height * 0.858, scale: unit * 0.205, rot: -0.13 };
+    layout.text = { x: width * 0.075, width: width * 0.415, centerY: height * 0.505, align: "left", maxRows: 3 };
+    layout.labelY = height * 0.20;
+  } else {
+    layout.sea = { x: width * 0.07, y: height * 0.045, w: width * 0.86, h: height * 0.255, r: unit * 0.10 };
+    layout.sun = { cx: width * 0.695, cy: height * 0.272, r: width * 0.152 };
+    layout.waves = { x0: width * 0.065, x1: width * 0.935, yTop: height * 0.355, rows: 4, step: height * 0.026, amp: height * 0.0095 };
+    layout.coral = { x: width * 0.585, y: height * 0.468, w: width * 0.315, h: height * 0.045, r: unit * 0.018 };
+    layout.parasol = null;
+    layout.guitar = null;
+    layout.text = { x: width * 0.085, width: width * 0.83, centerY: height * 0.72, align: "left", maxRows: 4 };
+    layout.labelY = height * 0.028;
+  }
+
+  state.layout = layout;
+  buildPalette();
+  buildBackground();
+  rebuildLyricLayout();
+}
+
+function beginPathSafe(target) {
+  if (target && typeof target.beginPath === "function") {
+    target.beginPath();
+    return true;
+  }
+  return false;
+}
+
+function roundRectPath(target, x, y, w, h, r) {
+  if (!beginPathSafe(target)) return false;
+  var radius = clampNumber(r, 0, Math.min(w, h) * 0.5, 0);
+  target.moveTo(x + radius, y);
+  target.arcTo(x + w, y, x + w, y + h, radius);
+  target.arcTo(x + w, y + h, x, y + h, radius);
+  target.arcTo(x, y + h, x, y, radius);
+  target.arcTo(x, y, x + w, y, radius);
+  target.closePath();
+  return true;
+}
+
+function curvedSlabPath(target, x, y, w, h, topLeft, topRight, bottomRight, bottomLeft) {
+  if (!beginPathSafe(target)) return false;
+  var limit = Math.min(w, h) * 0.5;
+  var tl = clampNumber(topLeft, 0, limit, 0);
+  var tr = clampNumber(topRight, 0, limit, 0);
+  var br = clampNumber(bottomRight, 0, limit, 0);
+  var bl = clampNumber(bottomLeft, 0, limit, 0);
+  target.moveTo(x + tl, y);
+  target.lineTo(x + w - tr, y);
+  target.arcTo(x + w, y, x + w, y + tr, tr);
+  target.lineTo(x + w, y + h - br);
+  target.arcTo(x + w, y + h, x + w - br, y + h, br);
+  target.lineTo(x + bl, y + h);
+  target.arcTo(x, y + h, x, y + h - bl, bl);
+  target.lineTo(x, y + tl);
+  target.arcTo(x, y, x + tl, y, tl);
+  target.closePath();
+  return true;
+}
+
+function buildBackground() {
+  var width = Math.max(1, Math.round(state.w));
+  var height = Math.max(1, Math.round(state.h));
+  if (state.bgCanvas && state.bgCanvas.width === width && state.bgCanvas.height === height) return;
+  var bg = document.createElement("canvas");
+  bg.width = width;
+  bg.height = height;
+  var bgCtx = bg.getContext("2d");
+  if (!bgCtx) return;
+  bgCtx.fillStyle = cssColor(state.palette.paper, 1);
+  bgCtx.fillRect(0, 0, width, height);
+
+  if (!state.grainCanvas) {
+    var grain = document.createElement("canvas");
+    grain.width = 480;
+    grain.height = 300;
+    var grainCtx = grain.getContext("2d");
+    if (grainCtx && typeof grainCtx.createImageData === "function") {
+      var image = grainCtx.createImageData(480, 300);
+      var buffer = image.data;
+      for (var i = 0; i < buffer.length; i += 4) {
+        var value = 128 + (Math.random() * 70 - 35);
+        buffer[i] = value;
+        buffer[i + 1] = value;
+        buffer[i + 2] = value;
+        buffer[i + 3] = Math.floor(Math.random() * 22);
+      }
+      grainCtx.putImageData(image, 0, 0);
+    }
+    state.grainCanvas = grain;
+  }
+  bgCtx.globalAlpha = 0.55;
+  bgCtx.imageSmoothingEnabled = true;
+  try {
+    if (state.grainCanvas && state.grainCanvas.width > 0 && state.grainCanvas.height > 0) {
+      bgCtx.drawImage(state.grainCanvas, 0, 0, width, height);
+    }
+  } catch (error) { reportError("buildBackground.grain", error); }
+  bgCtx.globalAlpha = 1;
+  state.bgCanvas = bg;
+}
+
+function applyInit(payload) {
+  state.initCount++;
+  var data = (payload && typeof payload === "object") ? payload : {};
+  var song = (data.song && typeof data.song === "object") ? data.song : {};
+
+  try {
+    var accent = data.accent;
+    state.accent = (accent && accent.length >= 3) ? [accent[0], accent[1], accent[2]] : null;
+    var lines = Array.isArray(data.lines) ? data.lines : [];
+    state.lines = lines;
+    state.idx = -1;
+    state.text = "";
+    state.playing = (typeof data.playing === "boolean") ? data.playing : true;
+    state.duration = (typeof data.duration === "number" && isFinite(data.duration) && data.duration > 0) ? data.duration : 0;
+    state.songName = (typeof song.name === "string") ? song.name.trim() : "";
+    var artists = song.artists;
+    var artistText = "";
+    if (Array.isArray(artists)) {
+      var parts = [];
+      for (var a = 0; a < Math.min(artists.length, 6); a++) {
+        if (artists[a] !== null && artists[a] !== undefined) parts.push(String(artists[a]).trim());
+      }
+      artistText = parts.join(" / ");
+    } else if (typeof artists === "string") {
+      artistText = artists.trim();
+    }
+    state.artist = artistText;
+    if (!isFinite(state.t) || state.t < 0) state.t = 0;
+    if (!lines.length) {
+      state.emptyFade = 0;
+      state.lyricLayout = null;
+      state.lyricKey = "";
+    }
+  } catch (error) { reportError("applyInit.state", error); }
+
+  try {
+    layoutAll();
+    updateLyricsIndex(state.t);
+    markLyricsDirty();
+  } catch (error) { reportError("applyInit.layout", error); }
+}
+
+function updateLyricsIndex(time) {
+  var lines = state.lines;
+  var previousIndex = state.idx;
+  var found = -1;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (!line) continue;
+    var start = Number(line.t);
+    if (!isFinite(start)) continue;
+    if (time >= start - 0.001) found = i;
+    else break;
+  }
+  state.idx = found;
+  state.text = (found >= 0 && lines[found] && typeof lines[found].text === "string") ? lines[found].text : "";
+  if (found !== previousIndex) {
+    state.lyricKey = "";
+    state.lyricLayout = null;
+  }
+}
+
+function markLyricsDirty() {
+  state.lyricKey = "";
+  state.lyricLayout = null;
+}
+
+var FONT_STACK = "'Segoe UI', 'Helvetica Neue', 'Microsoft YaHei', 'PingFang SC', sans-serif";
+
+function measureChar(paint, ch) {
+  var width = paint.measureText(ch).width;
+  if (!isFinite(width) || width <= 0) return 0;
+  return width;
+}
+
+function wrapChars(paint, text, maxWidth, fontSize) {
+  var source = String(text === null || text === undefined ? "" : text);
+  var limit = Math.min(source.length, 180);
+  var chars = [];
+  for (var i = 0; i < limit; i++) chars.push(source.charAt(i));
+  if (source.length > limit) chars.push("…");
+  if (maxWidth <= 0) maxWidth = 320;
+
+  var rows = [];
+  var row = { chars: [], width: 0 };
+  for (var j = 0; j < chars.length; j++) {
+    var ch = chars[j];
+    var charWidth = measureChar(paint, ch);
+    if (charWidth > maxWidth && row.chars.length > 0) {
+      rows.push(row);
+      row = { chars: [], width: 0 };
+    }
+    row.chars.push({ ch: ch, x: row.width, w: charWidth });
+    row.width += charWidth;
+    if (row.width > maxWidth && row.chars.length > 1) {
+      var last = row.chars.pop();
+      row.width = last.x;
+      rows.push(row);
+      row = { chars: [{ ch: last.ch, x: 0, w: last.w }], width: last.w };
+    }
+  }
+  if (row.chars.length) rows.push(row);
+  return rows.slice(0, 7);
+}
+
+function trimToWidth(paint, text, maxWidth) {
+  var source = String(text === null || text === undefined ? "" : text);
+  if (!source) return "";
+  if (paint.measureText(source).width <= maxWidth) return source;
+  var out = "";
+  var limit = Math.min(source.length, 120);
+  for (var i = 0; i < limit; i++) {
+    var candidate = source.slice(0, i + 1) + "…";
+    if (paint.measureText(candidate).width > maxWidth) break;
+    out = candidate;
+  }
+  return out;
+}
+
+function rebuildLyricLayout() {
+  var layout = state.layout;
+  if (!layout) return;
+  var paint = ctx;
+  var cfg = layout.text;
+  var lines = state.lines;
+  var index = state.idx;
+  var line = (index >= 0 && index < lines.length) ? lines[index] : null;
+  var currentText = (line && typeof line.text === "string") ? line.text : "";
+  var hasLyrics = lines.length > 0;
+
+  var key = [index, currentText, hasLyrics, Math.round(cfg.width), Math.round(cfg.centerY), layout.portrait ? 1 : 0].join("|");
+  if (key === state.lyricKey && state.lyricLayout) return;
+  state.lyricKey = key;
+
+  var baseSize = layout.portrait ? Math.min(state.w * 0.092, state.h * 0.05) : layout.unit * 0.052;
+  baseSize = clampNumber(baseSize, 16, 58, 28);
+
+  var entry = {
+    empty: !hasLyrics,
+    fs: baseSize,
+    lineHeight: baseSize * 1.34,
+    rows: [],
+    textWidth: cfg.width,
+    centerY: cfg.centerY,
+    prev: "",
+    next: "",
+    prevY: 0,
+    nextY: 0
+  };
+
+  if (hasLyrics) {
+    var fontSize = baseSize;
+    var wrapped = [];
+    for (var attempt = 0; attempt < 6; attempt++) {
+      paint.font = "600 " + Math.round(fontSize) + "px " + FONT_STACK;
+      wrapped = wrapChars(paint, currentText, cfg.width, fontSize);
+      if (wrapped.length <= (cfg.maxRows || 3)) break;
+      fontSize = fontSize * 0.85;
+    }
+    entry.fs = fontSize;
+    entry.lineHeight = fontSize * 1.34;
+
+    var total = wrapped.length * entry.lineHeight;
+    var top = cfg.centerY - total * 0.5;
+    for (var r = 0; r < wrapped.length; r++) {
+      var row = wrapped[r];
+      var chars = row.chars;
+      var plain = "";
+      for (var c = 0; c < chars.length; c++) plain += chars[c].ch;
+      entry.rows.push({
+        chars: chars,
+        text: plain,
+        width: row.width,
+        baseline: top + r * entry.lineHeight + fontSize * 0.82
+      });
+    }
+
+    paint.font = "400 " + Math.round(fontSize * 0.5) + "px " + FONT_STACK;
+    var neighborWidth = cfg.width * 0.92;
+    var prevLine = (index > 0 && index - 1 < lines.length) ? lines[index - 1] : null;
+    var nextLine = (index >= 0 && index + 1 < lines.length) ? lines[index + 1] : (index < 0 && lines.length > 0 ? lines[0] : null);
+    entry.prev = (prevLine && typeof prevLine.text === "string") ? trimToWidth(paint, prevLine.text, neighborWidth) : "";
+    entry.next = (nextLine && typeof nextLine.text === "string") ? trimToWidth(paint, nextLine.text, neighborWidth) : "";
+    var firstBaseline = entry.rows.length ? entry.rows[0].baseline : cfg.centerY;
+    var lastBaseline = entry.rows.length ? entry.rows[entry.rows.length - 1].baseline : cfg.centerY;
+    entry.prevY = firstBaseline - entry.lineHeight * 1.28;
+    entry.nextY = lastBaseline + entry.lineHeight * 1.22;
+  }
+
+  state.lyricLayout = entry;
+}
+
+function estimateLineEnd(index, line, count) {
+  var start = Number(line.t);
+  if (!isFinite(start)) start = 0;
+  var duration = Number(line.dur);
+  if (isFinite(duration) && duration > 0) return start + duration;
+  var lines = state.lines;
+  if (index + 1 < lines.length && lines[index + 1]) {
+    var nextStart = Number(lines[index + 1].t);
+    if (isFinite(nextStart) && nextStart > start) return nextStart;
+  }
+  return start + Math.min(30, Math.max(1.2, count * 0.24));
+}
+
+function lineProgress(line) {
+  if (!line) return 0;
+  var start = Number(line.t);
+  if (!isFinite(start)) return 0;
+  var text = typeof line.text === "string" ? line.text : "";
+  var count = Math.min(text.length, 180);
+  if (count <= 0) return 0;
+  var time = state.t;
+  var chars = Array.isArray(line.chars) ? line.chars : null;
+
+  if (chars && chars.length > 0) {
+    var times = [];
+    var previous = start;
+    for (var i = 0; i < count; i++) {
+      var source = chars[Math.min(i, chars.length - 1)];
+      var value = source ? Number(source.t) : NaN;
+      if (!isFinite(value) || value < previous) value = previous;
+      previous = value;
+      times.push(value);
+    }
+    if (time <= times[0]) return 0;
+    var found = 0;
+    for (var k = 0; k < count; k++) {
+      if (time >= times[k]) found = k + 1;
+    }
+    if (found >= count) return count;
+    var from = found > 0 ? times[found - 1] : times[0];
+    var to = times[found];
+    var span = to - from;
+    var fraction = span > 0 ? (time - from) / span : 1;
+    return found + clampNumber(fraction, 0, 1, 0);
+  }
+
+  var end = estimateLineEnd(state.idx, line, count);
+  var total = end - start;
+  var ratio = total > 0 ? (time - start) / total : 0;
+  return clampNumber(ratio, 0, 1, 0) * count;
+}
+
+function revealWidthForRow(row, progress, rowStart) {
+  var local = progress - rowStart;
+  if (local <= 0) return 0;
+  if (local >= row.chars.length) return row.width;
+  var whole = Math.floor(local);
+  var fraction = local - whole;
+  var base = 0;
+  if (whole > 0) {
+    var done = row.chars[whole - 1];
+    base = done.x + done.w;
+  }
+  var active = row.chars[whole];
+  return base + (active ? active.w * fraction : 0);
+}
+
+function drawSongLabel(layout, pal) {
+  if (!state.songName) return;
+  var paint = ctx;
+  var size = clampNumber(layout.unit * 0.016, 10, 15, 11);
+  paint.font = "600 " + Math.round(size) + "px " + FONT_STACK;
+  paint.fillStyle = cssColor(pal.muted, 0.95);
+  paint.textAlign = "left";
+  paint.textBaseline = "alphabetic";
+  var label = state.songName;
+  if (state.artist) label += "  ·  " + state.artist;
+  try {
+    if ("letterSpacing" in paint) paint.letterSpacing = Math.round(size * 0.12) + "px";
+  } catch (error) { reportError("letterSpacing", error); }
+  paint.fillText(trimToWidth(paint, label, layout.text.width), layout.text.x, layout.labelY);
+  try {
+    if ("letterSpacing" in paint) paint.letterSpacing = "0px";
+  } catch (error) { reportError("letterSpacingReset", error); }
+}
+
+function drawEmptyState(layout, pal, entry) {
+  var paint = ctx;
+  var cfg = layout.text;
+  var size = clampNumber(layout.unit * 0.028, 13, 24, 16);
+  var alpha = clampNumber(state.emptyFade, 0, 1, 1);
+  var ruleY = cfg.centerY - size * 2.4;
+
+  paint.globalAlpha = alpha;
+  paint.strokeStyle = cssColor(pal.ink, 0.85);
+  paint.lineWidth = Math.max(1.2, layout.unit * 0.0026);
+  if (beginPathSafe(paint)) {
+    paint.moveTo(cfg.x, ruleY);
+    paint.lineTo(cfg.x + size * 4.6, ruleY);
+    paint.stroke();
+  }
+
+  paint.fillStyle = cssColor(pal.ink, 0.88);
+  paint.font = "600 " + Math.round(size) + "px " + FONT_STACK;
+  paint.textAlign = "left";
+  paint.textBaseline = "alphabetic";
+  paint.fillText("这首歌没有歌词", cfg.x, ruleY + size * 2.2);
+
+  paint.fillStyle = cssColor(pal.muted, 1);
+  paint.font = "400 " + Math.round(size * 0.78) + "px " + FONT_STACK;
+  paint.fillText("那就听海风，走完这一拍", cfg.x, ruleY + size * 3.5);
+  paint.globalAlpha = 1;
+}
+
+function drawLyrics(layout, pal) {
+  var entry = state.lyricLayout;
+  if (!entry) return;
+  var paint = ctx;
+  var cfg = layout.text;
+
+  drawSongLabel(layout, pal);
+
+  if (entry.empty) {
+    drawEmptyState(layout, pal, entry);
+    return;
+  }
+
+  var index = state.idx;
+  var line = (index >= 0 && index < state.lines.length) ? state.lines[index] : null;
+
+  paint.textAlign = "left";
+  paint.textBaseline = "alphabetic";
+
+  var neighborSize = Math.max(11, Math.round(entry.fs * 0.5));
+  paint.font = "400 " + neighborSize + "px " + FONT_STACK;
+  if (entry.prev) {
+    paint.fillStyle = cssColor(pal.muted, 0.72);
+    paint.fillText(entry.prev, cfg.x, entry.prevY);
+  }
+  if (entry.next) {
+    paint.fillStyle = cssColor(pal.muted, 0.92);
+    paint.fillText(entry.next, cfg.x, entry.nextY);
+  }
+
+  if (!line || !entry.rows.length) return;
+
+  var progress = lineProgress(line);
+  var fontSize = entry.fs;
+  var rowStart = 0;
+  var playhead = null;
+
+  for (var r = 0; r < entry.rows.length; r++) {
+    var row = entry.rows[r];
+    var reveal = revealWidthForRow(row, progress, rowStart);
+    row.reveal = reveal;
+    row.rowStart = rowStart;
+
+    if (reveal > 1) {
+      paint.fillStyle = cssColor(pal.lemon, 0.9);
+      var markerHeight = fontSize * 0.94;
+      if (roundRectPath(paint, cfg.x - fontSize * 0.12, row.baseline - fontSize * 0.76, reveal + fontSize * 0.18, markerHeight, fontSize * 0.09)) {
+        paint.fill();
+      }
+    }
+
+    paint.font = "600 " + Math.round(fontSize) + "px " + FONT_STACK;
+    paint.fillStyle = cssColor(pal.soft, 1);
+    paint.fillText(row.text, cfg.x, row.baseline);
+
+    if (reveal > 0.5) {
+      paint.save();
+      if (beginPathSafe(paint)) {
+        paint.rect(cfg.x - 2, row.baseline - fontSize * 1.05, reveal + 2, fontSize * 1.42);
+        paint.clip();
+        paint.fillStyle = cssColor(pal.ink, 0.95);
+        paint.fillText(row.text, cfg.x, row.baseline);
+      }
+      paint.restore();
+    }
+
+    var localIndex = progress - rowStart;
+    if (localIndex >= 0 && localIndex < row.chars.length && reveal > 0.5) {
+      var activeChar = row.chars[Math.floor(localIndex)];
+      if (activeChar) {
+        playhead = { x: cfg.x + activeChar.x, y: row.baseline + fontSize * 0.2, w: Math.max(activeChar.w * 0.86, 3) };
+      }
+    }
+    rowStart += row.chars.length;
+  }
+
+  if (playhead) {
+    paint.fillStyle = cssColor(pal.coral, 1);
+    if (roundRectPath(paint, playhead.x, playhead.y, playhead.w, Math.max(2, fontSize * 0.085), fontSize * 0.04)) {
+      paint.fill();
+    }
+  }
+}
+
+window.addEventListener("message", function (event) {
+  try {
+    var data = event.data;
+    if (!data || data.__c100 !== 1) return;
+    var payload = data.payload || {};
+    if (data.type === "init") {
+      applyInit(payload);
+    } else if (data.type === "tick") {
+      var time = Number(payload.time);
+      if (isFinite(time)) state.t = time;
+      if (typeof payload.playing === "boolean") state.playing = payload.playing;
+      updateLyricsIndex(state.t);
+    } else if (data.type === "beat") {
+      var level = Number(payload.level);
+      state.beat = isFinite(level) ? Math.max(0, Math.min(1, level)) : 0.6;
+    } else if (data.type === "live") {
+      var live = state.live;
+      live.bpm = Number(payload.bpm) || live.bpm;
+      live.level = Number(payload.level) || 0;
+      live.bass = Number(payload.bass) || 0;
+      live.mid = Number(payload.mid) || 0;
+      live.treble = Number(payload.treble) || 0;
+      if (typeof payload.playing === "boolean") state.playing = payload.playing;
+    }
+  } catch (error) { reportError("message", error); }
+}, false);
+
+function makeCanvas(width, height) {
+  var element = document.createElement("canvas");
+  element.width = Math.max(1, Math.round(width));
+  element.height = Math.max(1, Math.round(height));
+  return element;
+}
+
+function bakeGuitar(pal) {
+  var art = makeCanvas(360, 360);
+  var paint = art.getContext("2d");
+  if (!paint) return art;
+  paint.translate(180, 205);
+  paint.scale(0.88, 0.88);
+  paint.lineCap = "round";
+  paint.lineJoin = "round";
+  paint.strokeStyle = cssColor(pal.ink, 1);
+  paint.lineWidth = 3.4;
+
+  if (beginPathSafe(paint)) {
+    paint.moveTo(0, -112);
+    paint.bezierCurveTo(34, -112, 62, -92, 62, -64);
+    paint.bezierCurveTo(62, -36, 46, -26, 46, -6);
+    paint.bezierCurveTo(46, 26, 76, 42, 76, 74);
+    paint.bezierCurveTo(76, 104, 42, 124, 0, 124);
+    paint.bezierCurveTo(-42, 124, -76, 104, -76, 74);
+    paint.bezierCurveTo(-76, 42, -46, 26, -46, -6);
+    paint.bezierCurveTo(-46, -26, -62, -36, -62, -64);
+    paint.bezierCurveTo(-62, -92, -34, -112, 0, -112);
+    paint.closePath();
+    paint.fillStyle = cssColor(pal.paper, 1);
+    paint.fill();
+    paint.stroke();
+  }
+
+  paint.strokeStyle = cssColor(pal.ink, 1);
+  paint.lineWidth = 3;
+
+  if (beginPathSafe(paint)) {
+    paint.moveTo(-13, -110);
+    paint.lineTo(-13, -176);
+    paint.lineTo(13, -176);
+    paint.lineTo(13, -110);
+    paint.stroke();
+  }
+  if (roundRectPath(paint, -23, -204, 46, 30, 9)) {
+    paint.fillStyle = cssColor(pal.paper, 1);
+    paint.fill();
+    paint.stroke();
+  }
+  for (var peg = 0; peg < 3; peg++) {
+    var pegY = -196 + peg * 8;
+    if (!beginPathSafe(paint)) break;
+    paint.moveTo(-23, pegY);
+    paint.lineTo(-29, pegY);
+    paint.moveTo(23, pegY);
+    paint.lineTo(29, pegY);
+    paint.stroke();
+  }
+
+  if (beginPathSafe(paint)) {
+    paint.arc(0, 22, 21, 0, Math.PI * 2);
+    paint.fillStyle = cssColor(pal.ink, 0.95);
+    paint.fill();
+  }
+  if (roundRectPath(paint, -27, 82, 54, 14, 6)) {
+    paint.fillStyle = cssColor(pal.ink, 0.9);
+    paint.fill();
+  }
+  paint.lineWidth = 1.1;
+  paint.strokeStyle = cssColor(pal.ink, 0.7);
+  for (var stringIndex = 0; stringIndex < 4; stringIndex++) {
+    var stringX = -9 + stringIndex * 6;
+    if (!beginPathSafe(paint)) break;
+    paint.moveTo(stringX, 84);
+    paint.lineTo(stringX, -180);
+    paint.stroke();
+  }
+  return art;
+}
+
+function bakeParasol(pal) {
+  var art = makeCanvas(320, 320);
+  var paint = art.getContext("2d");
+  if (!paint) return art;
+  var centerX = 160;
+  var centerY = 208;
+  var radius = 112;
+
+  paint.lineCap = "round";
+  paint.lineJoin = "round";
+
+  if (beginPathSafe(paint)) {
+    paint.arc(centerX, centerY, radius, Math.PI, Math.PI * 2);
+    paint.closePath();
+    paint.fillStyle = cssColor(pal.lemon, 1);
+    paint.fill();
+    paint.strokeStyle = cssColor(pal.ink, 1);
+    paint.lineWidth = 3;
+    paint.stroke();
+  }
+
+  paint.strokeStyle = cssColor(pal.ink, 0.9);
+  paint.lineWidth = 2.2;
+  for (var rib = 1; rib <= 4; rib++) {
+    var angle = Math.PI + (Math.PI * rib) / 5;
+    var edgeX = centerX + Math.cos(angle) * radius;
+    var edgeY = centerY + Math.sin(angle) * radius;
+    if (!beginPathSafe(paint)) break;
+    paint.moveTo(centerX, centerY);
+    paint.lineTo(edgeX, edgeY);
+    paint.stroke();
+  }
+
+  paint.strokeStyle = cssColor(pal.ink, 1);
+  paint.lineWidth = 3.4;
+  if (beginPathSafe(paint)) {
+    paint.moveTo(centerX, centerY);
+    paint.lineTo(centerX, centerY + 84);
+    paint.stroke();
+  }
+  if (beginPathSafe(paint)) {
+    paint.arc(centerX, centerY - radius + 3, 5, 0, Math.PI * 2);
+    paint.fillStyle = cssColor(pal.coral, 1);
+    paint.fill();
+  }
+  return art;
+}
+
+function bakeStaticLayers() {
+  try {
+    if (!state.palette) buildPalette();
+    var pal = state.palette || DEFAULT_PALETTE;
+    state.guitarCanvas = bakeGuitar(pal);
+    state.parasolCanvas = bakeParasol(pal);
+    if (state.layout) buildBackground();
+  } catch (error) { reportError("bakeStaticLayers", error); }
+  markLyricsDirty();
+}
+
+function drawFrame(nowMsValue) {
+  var frameStart = nowMs();
+  state.frames++;
+  try {
+    var stamp = isFinite(nowMsValue) ? nowMsValue : frameStart;
+    var dt = state.lastTs ? (stamp - state.lastTs) / 1000 : 0.016;
+    state.lastTs = stamp;
+    advanceAnimation(dt);
+    drawScene(stamp);
+  } catch (error) {
+    reportError("drawFrame", error);
+  } finally {
+    state.js = nowMs() - frameStart;
+    requestAnimationFrame(function (next) {
+      try { drawFrame(next); } catch (error) { reportError("raf", error); }
+    });
+  }
+}
+
+function advanceAnimation(dt) {
+  var step = clampNumber(dt, 0, 0.05, 0);
+  state.elapsed += step;
+  state.phase += state.rm ? step * 0.22 : step;
+  state.beat *= Math.pow(0.05, step);
+  if (state.beat < 0.001) state.beat = 0;
+  var ease = Math.min(1, step * 6);
+  state.bassSmooth += (clampNumber(state.live.bass, 0, 1, 0) - state.bassSmooth) * ease;
+  state.levelSmooth += (clampNumber(state.live.level, 0, 1, 0) - state.levelSmooth) * ease;
+  var emptyTarget = (state.lines.length === 0) ? 1 : 0;
+  state.emptyFade += (emptyTarget - state.emptyFade) * Math.min(1, step * 4);
+}
+
+function drawSeaBlock(layout, pal) {
+  var block = layout.sea;
+  var lift = state.bassSmooth * layout.height * 0.02;
+  var x = block.x;
+  var y = block.y - lift * 0.3;
+  var w = block.w;
+  var h = block.h + lift;
+  ctx.fillStyle = cssColor(pal.ocean, 1);
+  if (curvedSlabPath(ctx, x, y, w, h, block.r * 0.55, block.r * 0.95, block.r * 0.5, block.r * 1.7)) ctx.fill();
+}
+
+function drawSun(layout, pal) {
+  var sun = layout.sun;
+  var pulse = 1 + state.bassSmooth * 0.06 + state.beat * 0.05;
+  var radius = Math.max(4, sun.r * pulse);
+  ctx.fillStyle = cssColor(pal.lemon, 1);
+  if (beginPathSafe(ctx)) {
+    ctx.arc(sun.cx, sun.cy, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  var orbit = radius * 1.2;
+  var turn = state.rm ? 0 : state.phase * 0.22;
+  ctx.strokeStyle = cssColor(pal.ink, 0.55);
+  ctx.lineWidth = Math.max(1.2, layout.unit * 0.0026);
+  ctx.lineCap = "round";
+  if (beginPathSafe(ctx)) {
+    ctx.arc(sun.cx, sun.cy, orbit, -0.15 * Math.PI + turn, 0.72 * Math.PI + turn);
+    ctx.stroke();
+  }
+}
+
+function drawCoralBlock(layout, pal) {
+  var block = layout.coral;
+  var speed = state.rm ? 0.25 : 1;
+  var sway = Math.sin(state.phase * 0.65) * layout.unit * 0.007 * speed;
+  var tilt = Math.sin(state.phase * 0.45) * 0.018 * speed + state.levelSmooth * 0.02;
+  ctx.save();
+  ctx.translate(block.x + block.w * 0.5 + sway, block.y + block.h * 0.5);
+  ctx.rotate(tilt);
+  ctx.fillStyle = cssColor(pal.coral, 1);
+  if (roundRectPath(ctx, -block.w * 0.5, -block.h * 0.5, block.w, block.h, block.r)) ctx.fill();
+  ctx.restore();
+}
+
+function drawWaves(layout, pal) {
+  var band = layout.waves;
+  if (!band) return;
+  var phase = state.phase * 0.95;
+  var amp = band.amp * (1 + state.bassSmooth * 0.35 + state.beat * 0.55);
+  var length = Math.max(1, band.x1 - band.x0);
+  var segments = 68;
+  ctx.strokeStyle = cssColor(pal.ink, 0.9);
+  ctx.lineWidth = Math.max(1.2, layout.unit * 0.0036);
+  ctx.lineCap = "round";
+  for (var row = 0; row < band.rows; row++) {
+    if (!beginPathSafe(ctx)) return;
+    var baseY = band.yTop + row * band.step;
+    for (var step = 0; step <= segments; step++) {
+      var u = step / segments;
+      var x = band.x0 + u * length;
+      var taper = 0.55 + 0.45 * Math.sin(Math.PI * u);
+      var y = baseY + Math.sin(u * Math.PI * 3.1 + phase + row * 0.55) * amp * taper;
+      if (step === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawBakedArt(layout) {
+  if (layout.guitar && state.guitarCanvas) {
+    var art = state.guitarCanvas;
+    if (art.width > 0 && art.height > 0) {
+      var scale = layout.guitar.scale / 360;
+      var drift = state.rm ? 0 : Math.sin(state.phase * 0.5) * 0.02;
+      ctx.save();
+      ctx.translate(layout.guitar.cx, layout.guitar.cy);
+      ctx.rotate(layout.guitar.rot + drift);
+      try {
+        ctx.drawImage(art, -180 * scale, -180 * scale, 360 * scale, 360 * scale);
+      } catch (error) { reportError("guitarBlit", error); }
+      ctx.restore();
+    }
+  }
+  if (layout.parasol && state.parasolCanvas) {
+    var shade = state.parasolCanvas;
+    if (shade.width > 0 && shade.height > 0) {
+      var shadeScale = layout.parasol.scale / 320;
+      var sway = state.rm ? 0 : Math.sin(state.phase * 0.8) * 0.035;
+      ctx.save();
+      ctx.translate(layout.parasol.cx, layout.parasol.cy);
+      ctx.rotate(sway + state.levelSmooth * 0.02);
+      try {
+        ctx.drawImage(shade, -160 * shadeScale, -160 * shadeScale, 320 * shadeScale, 320 * shadeScale);
+      } catch (error) { reportError("parasolBlit", error); }
+      ctx.restore();
+    }
+  }
+}
+
+function drawScene(nowMsValue) {
+  var width = state.w;
+  var height = state.h;
+  var pal = state.palette || DEFAULT_PALETTE;
+
+  if (state.bgCanvas && state.bgCanvas.width > 0 && state.bgCanvas.height > 0) {
+    try {
+      ctx.drawImage(state.bgCanvas, 0, 0, width, height);
+    } catch (error) {
+      reportError("bgBlit", error);
+      ctx.fillStyle = cssColor(pal.paper, 1);
+      ctx.fillRect(0, 0, width, height);
+    }
+  } else {
+    ctx.fillStyle = cssColor(pal.paper, 1);
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  var layout = state.layout;
+  if (!layout) return;
+
+  drawSeaBlock(layout, pal);
+  drawSun(layout, pal);
+  drawWaves(layout, pal);
+  drawCoralBlock(layout, pal);
+  drawBakedArt(layout);
+  if (!state.lyricLayout) rebuildLyricLayout();
+  drawLyrics(layout, pal);
+}
+
+window.addEventListener("resize", function () {
+  try { resize(); markLyricsDirty(); } catch (error) { reportError("resize", error); }
+}, false);
+
+try { resize(); } catch (error) { reportError("init-resize", error); }
+
+requestAnimationFrame(function firstFrame(ts) {
+  sendReady();
+  try { drawFrame(ts || nowMs()); } catch (error) { reportError("firstFrame", error); }
+});
+setTimeout(function () { try { sendReady(); } catch (error) { reportError("readyTimeout", error); } }, 900);
+</script>
+</body>
+</html>

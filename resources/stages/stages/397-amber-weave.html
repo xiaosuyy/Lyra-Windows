@@ -1,0 +1,1691 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>琥珀织歌</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: radial-gradient(125% 95% at 78% 4%, #3A2417 0%, #26170F 42%, #140B07 100%);
+  }
+  #stage {
+    position: fixed; inset: 0; display: block;
+    width: 100%; height: 100%;
+    background: transparent;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+'use strict';
+
+/* ============ 1. 自检口：最外层无条件赋值，先于一切 ============ */
+var runtime = {
+  lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0,
+  text: '', rm: false, gl: false, ready: false,
+  duration: 0, songName: '', songArtists: ''
+};
+
+window.__stage = function () {
+  return {
+    lines: runtime.lines.length,
+    idx: runtime.idx,
+    t: runtime.t,
+    playing: runtime.playing,
+    frames: runtime.frames,
+    js: runtime.js,
+    err: '',
+    text: runtime.text,
+    gl: runtime.gl,
+    rm: runtime.rm
+  };
+};
+
+/* ============ 2. ready：排 rAF 与定时兜底，放在所有 boot 之前 ============ */
+var readySent = false;
+function sendReady() {
+  if (readySent) return;
+  readySent = true;
+  runtime.ready = true;
+  try {
+    parent.postMessage({ __c100: 1, type: 'ready' }, '*');
+  } catch (err) {
+    console.error('[397] ready postMessage failed', err);
+  }
+}
+
+/* 错误上报限流：每秒最多 1 条 */
+var lastErrorAt = 0;
+function reportError(where, err) {
+  var now = Date.now();
+  if (now - lastErrorAt < 1000) return;
+  lastErrorAt = now;
+  try {
+    console.error('[397] ' + where, err);
+  } catch (inner) { /* console 不可用时无处可去 */ }
+}
+
+window.addEventListener('error', function (event) {
+  reportError('window.error', event && (event.error || event.message));
+});
+window.addEventListener('unhandledrejection', function (event) {
+  reportError('unhandledrejection', event && event.reason);
+});
+
+requestAnimationFrame(function () { sendReady(); });
+setTimeout(sendReady, 700);
+
+/* ============ 3. 状态与工具 ============ */
+var VIEW = { w: 1440, h: 900, dpr: 1 };
+var canvas = document.getElementById('stage');
+if (!canvas) {
+  canvas = document.createElement('canvas');
+  canvas.id = 'stage';
+  document.body.appendChild(canvas);
+}
+var ctx = null;
+try {
+  ctx = canvas.getContext('2d');
+} catch (err) {
+  ctx = null;
+  console.error('[397] 2d context unavailable', err);
+}
+
+function clamp(value, low, high) {
+  if (!(value > low)) return low;
+  if (value > high) return high;
+  return value;
+}
+
+function safeNumber(value, fallback) {
+  var num = typeof value === 'number' ? value : parseFloat(value);
+  return (typeof num === 'number' && isFinite(num)) ? num : fallback;
+}
+
+function fitCanvas() {
+  var width = window.innerWidth;
+  var height = window.innerHeight;
+  if (!(width > 0) || !(width < 16000)) width = 1440;
+  if (!(height > 0) || !(height < 16000)) height = 900;
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  VIEW.w = width;
+  VIEW.h = height;
+  VIEW.dpr = dpr;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  if (!ctx) return;
+  try {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  } catch (err) {
+    reportError('setTransform', err);
+  }
+}
+
+/* ============ 4. 调色与几何工具 ============ */
+var PALETTE = {
+  ink: '#170D08',
+  sepia: '#241610',
+  caramel: '#C98B54',
+  terracotta: '#A85A34',
+  terracottaDeep: '#7C3B23',
+  olive: '#6E7040',
+  cream: '#F0DFC0',
+  amber: '#E8A85C',
+  wood: '#6B4429'
+};
+
+var art = {
+  backdrop: null,
+  portrait: null,
+  cloth: null,
+  grain: null,
+  bloom: null,
+  motes: [],
+  accentWarm: { r: 216, g: 152, b: 94 },
+  cover: null,
+  coverUrl: ''
+};
+
+var layout = {
+  portraitMode: false,
+  pad: 24,
+  med: { cx: 700, cy: 400, r: 220 },
+  lyric: { x: 80, y: 450, w: 600 }
+};
+
+function warmTint(rgb) {
+  var red = 216, green = 152, blue = 94;
+  if (Array.isArray(rgb) && rgb.length >= 3) {
+    var rawR = safeNumber(rgb[0], NaN);
+    var rawG = safeNumber(rgb[1], NaN);
+    var rawB = safeNumber(rgb[2], NaN);
+    if (isFinite(rawR) && isFinite(rawG) && isFinite(rawB)) {
+      red = Math.round(clamp(rawR * 0.72 + 92, 0, 255));
+      green = Math.round(clamp(rawG * 0.62 + 74, 0, 255));
+      blue = Math.round(clamp(rawB * 0.40 + 40, 0, 255));
+    }
+  }
+  return { r: red, g: green, b: blue };
+}
+
+function rgba(rgb, alpha) {
+  var alphaValue = clamp(safeNumber(alpha, 1), 0, 1);
+  return 'rgba(' + Math.round(clamp(rgb.r, 0, 255)) + ',' +
+    Math.round(clamp(rgb.g, 0, 255)) + ',' +
+    Math.round(clamp(rgb.b, 0, 255)) + ',' + alphaValue.toFixed(3) + ')';
+}
+
+function addStops(gradient, stops) {
+  if (!gradient || typeof gradient.addColorStop !== 'function') return;
+  for (var i = 0; i < stops.length; i++) {
+    try {
+      gradient.addColorStop(stops[i][0], stops[i][1]);
+    } catch (err) {
+      console.error('[397] addColorStop rejected', stops[i], err);
+    }
+  }
+}
+
+function beginPathOn(target) {
+  if (!target || typeof target.beginPath !== 'function') return false;
+  target.beginPath();
+  return true;
+}
+
+function makeCanvas(w, h) {
+  if (!(w > 0) || !(h > 0)) return null;
+  var cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(w));
+  cv.height = Math.max(1, Math.round(h));
+  return cv;
+}
+
+function computeLayout() {
+  var width = VIEW.w;
+  var height = VIEW.h;
+  var portraitMode = width / height < 0.95;
+  var pad = clamp(width * 0.062, 22, 112);
+  layout.portraitMode = portraitMode;
+  layout.pad = pad;
+  if (portraitMode) {
+    var smallRadius = Math.min(width * 0.30, height * 0.15);
+    layout.med = { cx: width * 0.5, cy: height * 0.345, r: smallRadius };
+    layout.lyric = { x: pad, y: height * 0.68, w: width - pad * 2 };
+  } else {
+    var radius = Math.min(width * 0.185, height * 0.295);
+    var cx = width * 0.725;
+    var cy = height * 0.455;
+    layout.med = { cx: cx, cy: cy, r: radius };
+    var textWidth = (cx - radius) - pad * 1.45;
+    layout.lyric = {
+      x: pad,
+      y: height * 0.5,
+      w: clamp(textWidth, Math.min(200, width * 0.45), width * 0.52)
+    };
+  }
+}
+
+/* ============ 5. 织物印花 / 藤蔓 / 颗粒 ============ */
+function drawStamp(target, kind, cx, cy, size, color, alpha) {
+  if (!(size > 0.5)) return;
+  target.save();
+  target.translate(cx, cy);
+  target.globalAlpha = alpha;
+  target.strokeStyle = color;
+  target.fillStyle = color;
+  target.lineWidth = Math.max(1, size * 0.10);
+  if (kind === 0) {
+    if (beginPathOn(target)) {
+      target.moveTo(0, -size);
+      target.lineTo(size, 0);
+      target.lineTo(0, size);
+      target.lineTo(-size, 0);
+      target.closePath();
+      target.stroke();
+    }
+    if (beginPathOn(target)) {
+      target.arc(0, 0, size * 0.34, 0, Math.PI * 2);
+      target.fill();
+    }
+  } else if (kind === 1) {
+    if (beginPathOn(target)) {
+      target.moveTo(-size * 0.8, -size * 0.8);
+      target.lineTo(size * 0.8, size * 0.8);
+      target.moveTo(size * 0.8, -size * 0.8);
+      target.lineTo(-size * 0.8, size * 0.8);
+      target.stroke();
+    }
+  } else if (kind === 2) {
+    for (var ring = 0; ring < 2; ring++) {
+      var half = size * (1 - ring * 0.42);
+      if (beginPathOn(target)) {
+        target.rect(-half, -half, half * 2, half * 2);
+        target.stroke();
+      }
+    }
+  } else if (kind === 3) {
+    if (beginPathOn(target)) {
+      target.moveTo(-size, size * 0.5);
+      target.lineTo(0, -size * 0.5);
+      target.lineTo(size, size * 0.5);
+      target.stroke();
+    }
+    if (beginPathOn(target)) {
+      target.moveTo(-size, size * 0.95);
+      target.lineTo(0, -size * 0.05);
+      target.lineTo(size, size * 0.95);
+      target.stroke();
+    }
+  } else {
+    if (beginPathOn(target)) {
+      target.arc(0, 0, size * 0.72, 0, Math.PI * 2);
+      target.stroke();
+    }
+    if (beginPathOn(target)) {
+      target.arc(0, 0, size * 0.30, 0, Math.PI * 2);
+      target.stroke();
+    }
+  }
+  target.restore();
+}
+
+function drawTextileBand(target, x, y, width, height, dir) {
+  if (!(width > 0) || !(height > 0)) return;
+  target.save();
+  var bandGradient = target.createLinearGradient(0, y, 0, y + height);
+  addStops(bandGradient, [
+    [0, 'rgba(58,33,22,0.90)'],
+    [0.5, 'rgba(36,21,14,0.70)'],
+    [1, 'rgba(20,11,7,0.92)']
+  ]);
+  target.fillStyle = bandGradient;
+  target.fillRect(x, y, width, height);
+
+  /* 织线 */
+  var weaveStep = Math.max(4, Math.round(height * 0.22));
+  target.globalAlpha = 0.10;
+  target.strokeStyle = PALETTE.cream;
+  target.lineWidth = 1;
+  if (beginPathOn(target)) {
+    for (var wx = 0; wx <= width; wx += weaveStep) {
+      target.moveTo(wx, y);
+      target.lineTo(wx, y + height);
+    }
+    target.stroke();
+  }
+
+  var stampSize = height * 0.28;
+  var gap = height * 1.32;
+  var count = Math.min(220, Math.floor(width / gap) + 1);
+  var colors = [PALETTE.terracotta, PALETTE.olive, PALETTE.cream];
+  for (var i = 0; i < count; i++) {
+    var sx = x + gap * 0.62 + i * gap;
+    var sy = y + height * 0.5;
+    drawStamp(target, i % 4, sx, sy, stampSize, colors[i % 3], 0.42);
+  }
+
+  /* 上下细边 */
+  target.globalAlpha = 0.55;
+  target.fillStyle = PALETTE.terracottaDeep;
+  target.fillRect(x, dir > 0 ? y + height - 2 : y, width, 2);
+  target.restore();
+}
+
+function drawVine(target, originX, originY, dir, scale) {
+  var leaves = 8;
+  target.save();
+  target.translate(originX, originY);
+  target.globalAlpha = 0.30;
+  var stem = target.createLinearGradient(0, -scale * 0.2, 0, -scale);
+  addStops(stem, [
+    [0, rgba({ r: 96, g: 104, b: 58 }, 0.0)],
+    [0.35, rgba({ r: 110, g: 118, b: 62 }, 0.85)],
+    [1, rgba({ r: 128, g: 134, b: 74 }, 0.35)]
+  ]);
+  target.strokeStyle = stem;
+  target.lineWidth = Math.max(1.2, scale * 0.006);
+  if (beginPathOn(target)) {
+    target.moveTo(0, 0);
+    target.bezierCurveTo(dir * scale * 0.30, -scale * 0.35, dir * scale * 0.16, -scale * 0.72, dir * scale * 0.38, -scale);
+    target.stroke();
+  }
+  for (var i = 0; i < leaves; i++) {
+    var prog = (i + 1) / (leaves + 1);
+    var lx = dir * (scale * 0.34 * prog + Math.sin(prog * 2.6) * scale * 0.06);
+    var ly = -scale * prog;
+    var side = i % 2 === 0 ? 1 : -1;
+    target.save();
+    target.translate(lx, ly);
+    target.rotate(dir * side * 0.95 + (i % 2 ? 0.5 : -0.5));
+    target.globalAlpha = 0.26 - prog * 0.08;
+    target.fillStyle = i % 3 === 0 ? rgba({ r: 122, g: 128, b: 70 }, 1) : rgba({ r: 88, g: 96, b: 52 }, 1);
+    if (beginPathOn(target)) {
+      var leafLen = scale * (0.115 - prog * 0.035);
+      target.ellipse(0, 0, leafLen, leafLen * 0.42, 0, 0, Math.PI * 2);
+      target.fill();
+    }
+    target.restore();
+  }
+  target.restore();
+}
+
+function buildGrainPattern(dpr) {
+  var tile = Math.round(120 * clamp(dpr, 1, 2));
+  var cv = makeCanvas(tile, tile);
+  if (!cv) return null;
+  var g = cv.getContext('2d');
+  if (!g) return null;
+  var image = null;
+  try {
+    image = g.createImageData(tile, tile);
+  } catch (err) {
+    console.error('[397] createImageData failed', err);
+    return null;
+  }
+  if (!image || !image.data) return null;
+  var data = image.data;
+  for (var i = 0; i < data.length; i += 4) {
+    var grainValue = 60 + Math.random() * 150;
+    data[i] = grainValue;
+    data[i + 1] = grainValue * 0.94;
+    data[i + 2] = grainValue * 0.82;
+    data[i + 3] = 34 + Math.random() * 60;
+  }
+  g.putImageData(image, 0, 0);
+  return cv;
+}
+
+function applyGrain(target, width, height) {
+  if (!art.grain) return;
+  var pattern = null;
+  try {
+    pattern = target.createPattern(art.grain, 'repeat');
+  } catch (err) {
+    console.error('[397] createPattern failed', err);
+    return;
+  }
+  if (!pattern) return;
+  if (typeof pattern.setTransform === 'function' && art.grainScale) {
+    try {
+      pattern.setTransform(new DOMMatrix([art.grainScale, 0, 0, art.grainScale, 0, 0]));
+    } catch (err) {
+      console.error('[397] pattern.setTransform failed', err);
+    }
+  }
+  target.save();
+  target.globalCompositeOperation = 'overlay';
+  target.globalAlpha = 0.42;
+  target.fillStyle = pattern;
+  target.fillRect(0, 0, width, height);
+  target.restore();
+}
+
+function bakeBackdrop() {
+  var width = VIEW.w;
+  var height = VIEW.h;
+  var dpr = VIEW.dpr;
+  var cv = makeCanvas(width * dpr, height * dpr);
+  if (!cv) return;
+  var g = cv.getContext('2d');
+  if (!g) return;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, width, height);
+
+  var base = g.createLinearGradient(width * 0.16, 0, width * 0.62, height);
+  addStops(base, [
+    [0, '#332014'],
+    [0.42, '#26170F'],
+    [0.78, '#1D110B'],
+    [1, '#140B07']
+  ]);
+  g.fillStyle = base;
+  g.fillRect(0, 0, width, height);
+
+  var warm = g.createRadialGradient(width * 0.80, height * 0.06, 0, width * 0.80, height * 0.06, Math.max(width, height) * 0.92);
+  addStops(warm, [
+    [0, 'rgba(240,196,138,0.30)'],
+    [0.34, 'rgba(206,142,82,0.15)'],
+    [0.72, 'rgba(120,72,40,0.05)'],
+    [1, 'rgba(0,0,0,0)']
+  ]);
+  g.fillStyle = warm;
+  g.fillRect(0, 0, width, height);
+
+  var oliveWash = g.createRadialGradient(width * 0.04, height * 0.92, 0, width * 0.04, height * 0.92, Math.max(width, height) * 0.62);
+  addStops(oliveWash, [
+    [0, 'rgba(96,102,58,0.20)'],
+    [0.55, 'rgba(70,76,44,0.07)'],
+    [1, 'rgba(0,0,0,0)']
+  ]);
+  g.fillStyle = oliveWash;
+  g.fillRect(0, 0, width, height);
+
+  drawVine(g, width * 0.015, height * 1.04, 1, Math.min(width, height) * 0.44);
+  drawVine(g, width * 0.985, height * 0.98, -1, Math.min(width, height) * 0.32);
+  if (!layout.portraitMode) {
+    drawVine(g, width * 0.995, height * 0.30, -1, Math.min(width, height) * 0.24);
+  }
+
+  /* 歌词区暖影池：让手工色底上的字更沉、更稳 */
+  var poolX = layout.lyric.x + layout.lyric.w * 0.44;
+  var poolY = layout.lyric.y;
+  var poolRadius = Math.max(layout.lyric.w * 0.92, height * 0.30);
+  var pool = g.createRadialGradient(0, 0, 0, 0, 0, poolRadius);
+  addStops(pool, [
+    [0, 'rgba(13,7,4,0.28)'],
+    [0.52, 'rgba(13,7,4,0.14)'],
+    [1, 'rgba(13,7,4,0)']
+  ]);
+  g.save();
+  g.translate(poolX, poolY);
+  g.scale(1, 0.66);
+  g.fillStyle = pool;
+  g.fillRect(-width, -height, width * 3, height * 3);
+  g.restore();
+
+  var topBand = Math.max(20, height * 0.048);
+  var bottomBand = Math.max(16, height * 0.032);
+  drawTextileBand(g, 0, 0, width, topBand, 1);
+  drawTextileBand(g, 0, height - bottomBand, width, bottomBand, -1);
+
+  art.backdrop = cv;
+}
+
+/* 颗粒与暗角单独一个任务，避免单次烘焙太久 */
+function bakeBackdropFinish() {
+  var cv = art.backdrop;
+  if (!cv || !(cv.width > 0)) return;
+  var g = cv.getContext('2d');
+  if (!g) return;
+  var width = VIEW.w;
+  var height = VIEW.h;
+  g.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+
+  applyGrain(g, width, height);
+
+  var vignette = g.createRadialGradient(width * 0.5, height * 0.46, Math.min(width, height) * 0.22, width * 0.5, height * 0.46, Math.max(width, height) * 0.78);
+  addStops(vignette, [
+    [0, 'rgba(10,5,3,0)'],
+    [0.58, 'rgba(10,5,3,0.16)'],
+    [1, 'rgba(8,4,2,0.62)']
+  ]);
+  g.fillStyle = vignette;
+  g.fillRect(0, 0, width, height);
+
+  var topShade = g.createLinearGradient(0, 0, 0, height * 0.22);
+  addStops(topShade, [
+    [0, 'rgba(8,4,2,0.42)'],
+    [1, 'rgba(8,4,2,0)']
+  ]);
+  g.fillStyle = topShade;
+  g.fillRect(0, 0, width, height * 0.22);
+
+  /* 相纸毛边：一条几乎看不见的细框 */
+  var inset = Math.max(9, Math.min(width, height) * 0.017);
+  g.save();
+  g.strokeStyle = 'rgba(238,208,164,0.10)';
+  g.lineWidth = 1;
+  g.strokeRect(inset + 0.5, inset + 0.5, width - inset * 2 - 1, height - inset * 2 - 1);
+  g.restore();
+}
+
+/* ============ 6. 肖像中圆片 / 头巾 / 珠链 / 光尘 ============ */
+function isDrawable(src) {
+  if (!src) return false;
+  var wide = safeNumber(src.naturalWidth, 0) || safeNumber(src.width, 0);
+  var tall = safeNumber(src.naturalHeight, 0) || safeNumber(src.height, 0);
+  return wide > 0 && tall > 0;
+}
+
+function drawImageSafe(target, src, x, y, w, h) {
+  if (!isDrawable(src)) return false;
+  if (!(w > 0) || !(h > 0)) return false;
+  try {
+    target.drawImage(src, x, y, w, h);
+    return true;
+  } catch (err) {
+    console.error('[397] drawImage failed', err);
+    return false;
+  }
+}
+
+function bakeBloom() {
+  var size = 320;
+  var cv = makeCanvas(size, size);
+  if (!cv) return;
+  var g = cv.getContext('2d');
+  if (!g) return;
+  var grad = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  addStops(grad, [
+    [0, rgba(art.accentWarm, 0.50)],
+    [0.30, rgba(art.accentWarm, 0.20)],
+    [0.62, rgba({ r: 208, g: 140, b: 82 }, 0.07)],
+    [1, 'rgba(0,0,0,0)']
+  ]);
+  g.fillStyle = grad;
+  g.fillRect(0, 0, size, size);
+  art.bloom = cv;
+}
+
+function drawPortraitFallback(g, cx, cy, radius) {
+  var halo = g.createRadialGradient(cx - radius * 0.22, cy - radius * 0.3, radius * 0.05, cx, cy, radius * 1.05);
+  addStops(halo, [
+    [0, rgba({ r: 238, g: 186, b: 128 }, 0.92)],
+    [0.45, rgba({ r: 176, g: 106, b: 62 }, 0.85)],
+    [1, rgba({ r: 64, g: 36, b: 22 }, 0.95)]
+  ]);
+  g.fillStyle = halo;
+  g.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
+
+  g.save();
+  g.globalAlpha = 0.40;
+  g.strokeStyle = rgba({ r: 250, g: 226, b: 190 }, 1);
+  g.lineWidth = Math.max(1, radius * 0.008);
+  for (var ring = 0; ring < 3; ring++) {
+    var rr = radius * (0.30 + ring * 0.19);
+    if (!beginPathOn(g)) break;
+    g.arc(cx, cy + radius * 0.10, rr, Math.PI * 1.06, Math.PI * 1.94);
+    g.stroke();
+  }
+  if (beginPathOn(g)) {
+    g.moveTo(cx - radius * 0.66, cy + radius * 0.92);
+    g.bezierCurveTo(cx - radius * 0.42, cy + radius * 0.34, cx + radius * 0.42, cy + radius * 0.34, cx + radius * 0.66, cy + radius * 0.92);
+    g.stroke();
+  }
+  if (beginPathOn(g)) {
+    g.moveTo(cx, cy - radius * 0.44);
+    g.lineTo(cx, cy + radius * 0.30);
+    g.stroke();
+  }
+  g.restore();
+}
+
+function tonePortrait(g, side) {
+  g.save();
+  g.globalCompositeOperation = 'multiply';
+  g.fillStyle = 'rgba(210,150,96,0.62)';
+  g.fillRect(0, 0, side, side);
+  g.globalCompositeOperation = 'soft-light';
+  g.fillStyle = 'rgba(255,214,163,0.55)';
+  g.fillRect(0, 0, side, side);
+  g.globalCompositeOperation = 'overlay';
+  var spot = g.createRadialGradient(side * 0.68, side * 0.26, 0, side * 0.68, side * 0.26, side * 0.62);
+  addStops(spot, [
+    [0, 'rgba(255,224,180,0.42)'],
+    [0.55, 'rgba(190,124,70,0.10)'],
+    [1, 'rgba(24,12,6,0.34)']
+  ]);
+  g.fillStyle = spot;
+  g.fillRect(0, 0, side, side);
+  g.restore();
+}
+
+function bakePortrait() {
+  var radius = layout.med.r;
+  if (!(radius > 6)) return;
+  var dilation = radius * 0.17;
+  var side = (radius + dilation) * 2;
+  var cv = makeCanvas(side * VIEW.dpr, side * VIEW.dpr);
+  if (!cv) return;
+  var g = cv.getContext('2d');
+  if (!g) return;
+  g.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+  g.clearRect(0, 0, side, side);
+  var cx = side / 2;
+  var cy = side / 2;
+
+  g.save();
+  if (!beginPathOn(g)) { g.restore(); return; }
+  g.arc(cx, cy, radius, 0, Math.PI * 2);
+  g.closePath();
+  g.clip();
+
+  if (isDrawable(art.cover)) {
+    var iw = safeNumber(art.cover.naturalWidth, 0) || safeNumber(art.cover.width, 1);
+    var ih = safeNumber(art.cover.naturalHeight, 0) || safeNumber(art.cover.height, 1);
+    var scale = Math.max((radius * 2) / iw, (radius * 2) / ih);
+    var dw = iw * scale;
+    var dh = ih * scale;
+    var ok = drawImageSafe(g, art.cover, cx - dw / 2, cy - dh / 2, dw, dh);
+    if (!ok) drawPortraitFallback(g, cx, cy, radius);
+    else tonePortrait(g, side);
+  } else {
+    drawPortraitFallback(g, cx, cy, radius);
+  }
+
+  var innerShade = g.createRadialGradient(cx, cy, radius * 0.62, cx, cy, radius);
+  addStops(innerShade, [
+    [0, 'rgba(20,10,5,0)'],
+    [0.78, 'rgba(20,10,5,0.20)'],
+    [1, 'rgba(16,8,4,0.55)']
+  ]);
+  g.fillStyle = innerShade;
+  g.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
+  g.restore();
+
+  g.save();
+  g.globalAlpha = 0.85;
+  g.strokeStyle = 'rgba(236,205,160,0.55)';
+  g.lineWidth = Math.max(1, radius * 0.008);
+  if (beginPathOn(g)) {
+    g.arc(cx, cy, radius, 0, Math.PI * 2);
+    g.stroke();
+  }
+  g.restore();
+
+  art.portrait = cv;
+}
+
+function bakeCloth() {
+  var radius = layout.med.r;
+  if (!(radius > 6)) return;
+  var halfWidth = radius * 1.78;
+  var height = radius * 1.70;
+  var cv = makeCanvas(halfWidth * 2 * VIEW.dpr, height * VIEW.dpr);
+  if (!cv) return;
+  var g = cv.getContext('2d');
+  if (!g) return;
+  g.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+  g.clearRect(0, 0, halfWidth * 2, height);
+
+  var cx = halfWidth;
+  var cy = height;
+  var inner = radius * 1.015;
+  var outer = radius * 1.29;
+  var a0 = Math.PI * 1.055;
+  var a1 = Math.PI * 1.945;
+
+  g.save();
+  if (beginPathOn(g)) {
+    g.arc(cx, cy, outer, a0, a1, false);
+    g.arc(cx, cy, inner, a1, a0, true);
+    g.closePath();
+    var cloth = g.createLinearGradient(cx - radius, cy - outer, cx + radius * 0.7, cy + radius * 0.2);
+    addStops(cloth, [
+      [0, '#B4653C'],
+      [0.34, '#A8572F'],
+      [0.66, '#8E4526'],
+      [1, '#6E3320']
+    ]);
+    g.fillStyle = cloth;
+    g.fill();
+
+    g.save();
+    g.clip();
+    g.globalAlpha = 0.30;
+    g.strokeStyle = '#F2D9B0';
+    g.lineWidth = Math.max(1, radius * 0.006);
+    for (var fold = 0; fold < 4; fold++) {
+      var fr = inner + (outer - inner) * (fold + 0.5) / 4;
+      if (!beginPathOn(g)) break;
+      g.arc(cx, cy, fr, a0, a1, false);
+      g.stroke();
+    }
+    var stampCount = Math.min(40, Math.max(7, Math.round((a1 - a0) * (inner + outer) * 0.5 / (radius * 0.30))));
+    for (var i = 0; i < stampCount; i++) {
+      var stampStep = (i + 0.5) / stampCount;
+      var angle = a0 + (a1 - a0) * stampStep;
+      var stRadius = (inner + outer) * 0.5;
+      g.save();
+      g.translate(cx + Math.cos(angle) * stRadius, cy + Math.sin(angle) * stRadius);
+      g.rotate(angle + Math.PI * 0.5);
+      g.globalAlpha = 0.42;
+      drawStampRotated(g, i % 3, radius * 0.052);
+      g.restore();
+    }
+    g.restore();
+  }
+  g.restore();
+
+  /* 结与垂布 */
+  var knotX = cx + Math.cos(a1) * (inner + outer) * 0.5;
+  var knotY = cy + Math.sin(a1) * (inner + outer) * 0.5;
+  g.save();
+  if (beginPathOn(g)) {
+    g.moveTo(knotX - radius * 0.06, knotY - radius * 0.05);
+    g.bezierCurveTo(knotX + radius * 0.30, knotY - radius * 0.26, knotX + radius * 0.48, knotY + radius * 0.10, knotX + radius * 0.24, knotY + radius * 0.44);
+    g.bezierCurveTo(knotX + radius * 0.12, knotY + radius * 0.62, knotX - radius * 0.06, knotY + radius * 0.40, knotX - radius * 0.02, knotY + radius * 0.14);
+    g.closePath();
+    var tail = g.createLinearGradient(knotX, knotY, knotX + radius * 0.4, knotY + radius * 0.5);
+    addStops(tail, [
+      [0, '#A5542E'],
+      [1, '#74351F']
+    ]);
+    g.fillStyle = tail;
+    g.fill();
+    g.globalAlpha = 0.35;
+    g.strokeStyle = 'rgba(240,214,170,0.9)';
+    g.lineWidth = Math.max(1, radius * 0.005);
+    g.stroke();
+  }
+  g.restore();
+
+  var knot = makeCanvas(radius * 0.9 * VIEW.dpr, radius * 0.9 * VIEW.dpr);
+  if (knot) {
+    var kg = knot.getContext('2d');
+    if (kg) {
+      kg.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+      kg.clearRect(0, 0, radius * 0.9, radius * 0.9);
+      var kc = radius * 0.45;
+      var kgrad = kg.createRadialGradient(kc - radius * 0.06, kc - radius * 0.08, radius * 0.04, kc, kc, radius * 0.44);
+      addStops(kgrad, [
+        [0, 'rgba(224,150,102,0.95)'],
+        [0.6, 'rgba(158,78,44,0.95)'],
+        [1, 'rgba(94,42,24,0.9)']
+      ]);
+      kg.fillStyle = kgrad;
+      if (beginPathOn(kg)) {
+        kg.arc(kc, kc, radius * 0.30, 0, Math.PI * 2);
+        kg.fill();
+        kg.globalAlpha = 0.5;
+        kg.strokeStyle = 'rgba(246,222,184,0.8)';
+        kg.lineWidth = Math.max(1, radius * 0.006);
+        kg.stroke();
+      }
+      g.save();
+      drawImageSafe(g, knot, knotX - radius * 0.42, knotY - radius * 0.40, radius * 0.86, radius * 0.86);
+      g.restore();
+    }
+  }
+
+  art.cloth = cv;
+}
+
+function drawStampRotated(target, kind, size) {
+  target.globalAlpha = 0.44;
+  target.strokeStyle = '#F0D8AC';
+  target.fillStyle = '#F0D8AC';
+  target.lineWidth = Math.max(1, size * 0.13);
+  if (kind === 0) {
+    if (beginPathOn(target)) {
+      target.moveTo(0, -size);
+      target.lineTo(size * 0.8, 0);
+      target.lineTo(0, size);
+      target.lineTo(-size * 0.8, 0);
+      target.closePath();
+      target.stroke();
+    }
+  } else if (kind === 1) {
+    if (beginPathOn(target)) {
+      target.moveTo(-size * 0.85, 0);
+      target.lineTo(0, -size * 0.75);
+      target.lineTo(size * 0.85, 0);
+      target.stroke();
+    }
+  } else {
+    if (beginPathOn(target)) {
+      target.arc(0, 0, size * 0.62, 0, Math.PI * 2);
+      target.fill();
+    }
+  }
+}
+
+function buildBeads() {
+  var radius = layout.med.r;
+  var count = 30;
+  var beads = [];
+  for (var i = 0; i < count; i++) {
+    var beadRatio = i / (count - 1);
+    var angle = Math.PI * (0.845 - 0.69 * beadRatio);
+    beads.push({
+      angle: angle,
+      x: Math.cos(angle) * radius * 1.045,
+      y: Math.sin(angle) * radius * 1.045,
+      phase: beadRatio * Math.PI * 2
+    });
+  }
+  art.beads = beads;
+}
+
+function buildMotes() {
+  var list = [];
+  var width = VIEW.w;
+  var height = VIEW.h;
+  for (var i = 0; i < 46; i++) {
+    list.push({
+      x: Math.random() * width,
+      y: Math.random() * height,
+      radius: 0.7 + Math.random() * 2.1,
+      speed: 2.5 + Math.random() * 9,
+      sway: 0.4 + Math.random() * 1.4,
+      phase: Math.random() * Math.PI * 2,
+      alpha: 0.08 + Math.random() * 0.28
+    });
+  }
+  art.motes = list;
+}
+
+function relayout() {
+  computeLayout();
+  art.grainScale = 1 / VIEW.dpr;
+  enqueueBakes([
+    ensureGrain,
+    bakeBloom,
+    bakePortrait,
+    bakeCloth,
+    buildBeads,
+    buildMotes,
+    bakeBackdrop,
+    bakeBackdropFinish
+  ]);
+}
+
+/* 重活全部挪到 ready 之后，一帧一个任务 */
+function ensureGrain() {
+  if (!art.grain) art.grain = buildGrainPattern(VIEW.dpr);
+}
+
+function enqueueBakes(jobs) {
+  art.bakeQueue = jobs.slice();
+  pumpBakes();
+}
+
+function pumpBakes() {
+  if (!art.bakeQueue || !art.bakeQueue.length) return;
+  if (art.bakeRunning) return;
+  art.bakeRunning = true;
+  var bakeJob = art.bakeQueue.shift();
+
+  function runBakeJob() {
+    art.bakeRunning = false;
+    try {
+      if (typeof bakeJob === 'function') bakeJob();
+    } catch (err) {
+      reportError('bake', err);
+    }
+    pumpBakes();
+  }
+
+  try {
+    if (typeof window.requestIdleCallback === 'function') {
+      window.requestIdleCallback(runBakeJob, { timeout: 140 });
+    } else {
+      setTimeout(runBakeJob, 16);
+    }
+  } catch (err) {
+    art.bakeRunning = false;
+    reportError('schedule bake', err);
+  }
+}
+
+/* ============ 7. 消息 ============ */
+function readText(line) {
+  if (!line || typeof line.text !== 'string') return '';
+  return line.text;
+}
+
+function normalizeArtists(value) {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) {
+    var names = [];
+    for (var i = 0; i < value.length && i < 8; i++) {
+      var part = value[i];
+      if (typeof part === 'string' && part.trim()) names.push(part.trim());
+      else if (part && typeof part === 'object' && typeof part.name === 'string') names.push(part.name.trim());
+    }
+    return names.join(' · ');
+  }
+  return '';
+}
+
+function applyInit(payload) {
+  var data = payload && typeof payload === 'object' ? payload : {};
+  var list = Array.isArray(data.lines) ? data.lines : [];
+  var clean = [];
+  for (var i = 0; i < list.length && i < 2000; i++) {
+    var item = list[i];
+    if (!item || typeof item !== 'object') continue;
+    var text = readText(item);
+    if (!text) continue;
+    clean.push({
+      t: Math.max(0, safeNumber(item.t, 0)),
+      dur: Math.max(0, safeNumber(item.dur, 0)),
+      text: text,
+      chars: Array.isArray(item.chars) ? item.chars : null
+    });
+  }
+  runtime.lines = clean;
+  runtime.idx = -1;
+  runtime.text = '';
+  lyricCache.key = '';
+  lyricCache.item = null;
+  lyricCache.failedKey = '';
+  lyricCache.enterAt = nowSeconds();
+  runtime.duration = Math.max(0, safeNumber(data.duration, 0));
+  var song = data.song && typeof data.song === 'object' ? data.song : {};
+  runtime.songName = typeof song.name === 'string' ? song.name.trim() : '';
+  runtime.songArtists = normalizeArtists(song.artists);
+  if (typeof data.time === 'number') runtime.t = safeNumber(data.time, 0);
+  if (typeof data.playing === 'boolean') runtime.playing = data.playing;
+
+  art.accentWarm = warmTint(data.accent);
+  try {
+    bakeBloom();
+  } catch (err) {
+    reportError('bloom repaint', err);
+  }
+
+  try {
+    loadCover(song);
+  } catch (err) {
+    reportError('loadCover', err);
+  }
+}
+
+function applyTick(payload) {
+  var data = payload && typeof payload === 'object' ? payload : {};
+  if (typeof data.time === 'number' && isFinite(data.time)) {
+    runtime.t = data.time; /* 大跨度跳变也照收 */
+  }
+  if (typeof data.playing === 'boolean') runtime.playing = data.playing;
+}
+
+function onMessage(event) {
+  var data = event && event.data;
+  if (!data || typeof data !== 'object' || data.__c100 !== 1) return;
+  try {
+    if (data.type === 'init') applyInit(data.payload);
+    else if (data.type === 'tick') applyTick(data.payload);
+    else if (data.type === 'beat') applyBeat(data.payload);
+    else if (data.type === 'live') applyLive(data.payload);
+  } catch (err) {
+    reportError('message ' + (data && data.type), err);
+  }
+}
+
+window.addEventListener('message', onMessage);
+
+/* ============ 8. 时钟与律动 ============ */
+var TAU = Math.PI * 2;
+var clockStart = (window.performance && performance.now) ? performance.now() : Date.now();
+
+function nowSeconds() {
+  var elapsed = ((window.performance && performance.now) ? performance.now() : Date.now()) - clockStart;
+  return elapsed / 1000;
+}
+
+var motion = {
+  level: 0, bass: 0, mid: 0, treble: 0, pulse: 0,
+  targetLevel: 0, targetBass: 0, targetMid: 0, targetTreble: 0
+};
+
+function easeMotion(dt) {
+  var rate = clamp(dt * 6.5, 0.05, 1);
+  motion.level += (motion.targetLevel - motion.level) * rate;
+  motion.bass += (motion.targetBass - motion.bass) * rate;
+  motion.mid += (motion.targetMid - motion.mid) * rate;
+  motion.treble += (motion.targetTreble - motion.treble) * rate;
+  motion.pulse *= Math.pow(0.02, dt);
+  if (motion.pulse < 0.001) motion.pulse = 0;
+}
+
+function applyBeat(payload) {
+  var data = payload && typeof payload === 'object' ? payload : {};
+  var level = clamp(safeNumber(data.level, 0.6), 0, 1);
+  motion.pulse = Math.max(motion.pulse, level);
+}
+
+function applyLive(payload) {
+  var data = payload && typeof payload === 'object' ? payload : {};
+  motion.targetLevel = clamp(safeNumber(data.level, 0.3), 0, 1);
+  motion.targetBass = clamp(safeNumber(data.bass, 0.3), 0, 1);
+  motion.targetMid = clamp(safeNumber(data.mid, 0.25), 0, 1);
+  motion.targetTreble = clamp(safeNumber(data.treble, 0.2), 0, 1);
+  if (typeof data.playing === 'boolean') runtime.playing = data.playing;
+}
+
+/* ============ 9. 舞台绘制 ============ */
+function rawEnergy() {
+  var energy = 0.10 + motion.level * 0.55 + motion.bass * 0.72 + motion.pulse * 0.45;
+  return clamp(energy * (runtime.rm ? 0.35 : 1), 0, 1.2);
+}
+
+function drawCloth(now, med, energy) {
+  if (!art.cloth) return;
+  var swayAmp = runtime.rm ? 0.002 : 0.014;
+  var sway = Math.sin(now * 0.55) * swayAmp + motion.bass * 0.006;
+  var halfWidth = med.r * 1.78;
+  var height = med.r * 1.70;
+  ctx.save();
+  ctx.translate(med.cx, med.cy);
+  ctx.rotate(sway);
+  ctx.translate(0, Math.sin(now * 0.82) * med.r * 0.005 - energy * med.r * 0.004);
+  drawImageSafe(ctx, art.cloth, -halfWidth, -height, halfWidth * 2, height);
+  ctx.restore();
+}
+
+function drawNecklace(now, med, energy) {
+  var beads = art.beads || [];
+  var duration = safeNumber(runtime.duration, 0);
+  var progress = 0;
+  if (duration > 0.5) progress = clamp(runtime.t / duration, 0, 1);
+  else if (runtime.lines.length) progress = clamp((runtime.idx + 1) / runtime.lines.length, 0, 1);
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(236,205,160,0.16)';
+  ctx.lineWidth = Math.max(1, med.r * 0.004);
+  if (beginPathOn(ctx)) {
+    ctx.arc(med.cx, med.cy, med.r * 1.045, Math.PI * 0.155, Math.PI * 0.845, false);
+    ctx.stroke();
+  }
+  for (var i = 0; i < beads.length; i++) {
+    var bead = beads[i];
+    var lit = bead.phase <= progress + 0.001;
+    var wobble = Math.sin(now * 1.8 + bead.phase * 7.4) * (runtime.rm ? 0.15 : 0.6);
+    var offset = 1 + (wobble + energy * 1.6) * 0.006;
+    var px = med.cx + bead.x * offset;
+    var py = med.cy + bead.y * offset;
+    var size = med.r * (lit ? 0.034 : 0.026) * (1 + motion.pulse * 0.16);
+    if (beginPathOn(ctx)) {
+      ctx.fillStyle = lit
+        ? rgba({ r: 236, g: 178, b: 108 }, 0.95)
+        : rgba({ r: 96, g: 58, b: 34 }, 0.55);
+      ctx.arc(px, py, size, 0, TAU);
+      ctx.fill();
+    }
+    if (lit) {
+      if (beginPathOn(ctx)) {
+        ctx.fillStyle = 'rgba(255,232,196,0.85)';
+        ctx.arc(px - size * 0.28, py - size * 0.32, size * 0.34, 0, TAU);
+        ctx.fill();
+      }
+      if (beginPathOn(ctx)) {
+        ctx.fillStyle = rgba(art.accentWarm, 0.16 + motion.pulse * 0.2);
+        ctx.arc(px, py, size * 2.4, 0, TAU);
+        ctx.fill();
+      }
+    }
+  }
+  ctx.restore();
+}
+
+function drawMotes(now, energy) {
+  var width = VIEW.w;
+  var height = VIEW.h;
+  var motes = art.motes || [];
+  var drift = runtime.rm ? 0.25 : 1;
+  ctx.save();
+  for (var i = 0; i < motes.length; i++) {
+    var mote = motes[i];
+    var travel = (mote.y - now * mote.speed * 3.2 * drift) % (height + 80);
+    if (travel < 0) travel += height + 80;
+    var px = mote.x + Math.sin(now * mote.sway + mote.phase) * 14;
+    var py = travel - 40;
+    var alpha = mote.alpha * (0.55 + 0.45 * Math.sin(now * 1.6 + mote.phase));
+    ctx.fillStyle = 'rgba(244,206,158,' + clamp(alpha * (0.6 + energy), 0, 0.6).toFixed(3) + ')';
+    if (beginPathOn(ctx)) {
+      ctx.arc(px, py, mote.radius, 0, TAU);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawArtwork(now) {
+  var width = VIEW.w;
+  var height = VIEW.h;
+  var med = layout.med;
+  var energy = rawEnergy();
+
+  if (art.backdrop) {
+    drawImageSafe(ctx, art.backdrop, 0, 0, width, height);
+  } else {
+    if (!art.primer) {
+      var primer = ctx.createLinearGradient(width * 0.15, 0, width * 0.6, height);
+      addStops(primer, [
+        [0, '#332014'],
+        [0.45, '#26170F'],
+        [1, '#150C07']
+      ]);
+      art.primer = primer;
+    }
+    ctx.fillStyle = art.primer || PALETTE.ink;
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  if (art.bloom) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'screen';
+    ctx.globalAlpha = clamp(0.18 + energy * 0.34, 0, 0.62);
+    var bloomSize = med.r * 2.8;
+    drawImageSafe(ctx, art.bloom, med.cx - bloomSize / 2, med.cy - bloomSize / 2, bloomSize, bloomSize);
+    ctx.restore();
+  }
+
+  if (art.portrait) {
+    var side = med.r * 2.34;
+    drawImageSafe(ctx, art.portrait, med.cx - side / 2, med.cy - side / 2, side, side);
+  }
+
+  drawCloth(now, med, energy);
+  drawNecklace(now, med, energy);
+  drawMotes(now, energy);
+}
+
+/* ============ 10. 歌词引擎 ============ */
+var SERIF_STACK = 'Georgia, "Songti SC", "STSong", "Source Han Serif SC", "Noto Serif CJK SC", "SimSun", serif';
+var lyricCache = { key: '', item: null, enterAt: 0, failedKey: '' };
+
+function fontOf(size, weight) {
+  return String(weight) + ' ' + Math.max(8, size).toFixed(2) + 'px ' + SERIF_STACK;
+}
+
+function lyricBaseSize() {
+  var unit = Math.min(VIEW.w, VIEW.h * 1.38);
+  var size = clamp(unit * 0.048, 19, 62);
+  if (layout.portraitMode) size = clamp(VIEW.w * 0.078, 19, 42);
+  return size;
+}
+
+function wrapGlyphs(text, size, maxWidth, maxRows) {
+  var glyphs = Array.from(String(text).replace(/\s+/g, ' ').trim());
+  var rows = [];
+  if (!glyphs.length) return { rows: rows, overflow: false };
+  ctx.font = fontOf(size, 600);
+  var tracking = size * 0.012;
+  var spaceWidth = ctx.measureText(' ').width + tracking;
+  var row = [];
+  var rowWidth = 0;
+  var overflow = false;
+  for (var i = 0; i < glyphs.length; i++) {
+    var ch = glyphs[i];
+    var advance = ch === ' ' ? spaceWidth : ctx.measureText(ch).width + tracking;
+    if (row.length > 0 && rowWidth + advance > maxWidth) {
+      rows.push({ glyphs: row, width: rowWidth });
+      if (rows.length >= maxRows + 1) {
+        overflow = true;
+        break;
+      }
+      row = [];
+      rowWidth = 0;
+      if (ch === ' ') continue;
+    }
+    row.push({ c: ch, w: advance });
+    rowWidth += advance;
+  }
+  if (row.length) rows.push({ glyphs: row, width: rowWidth });
+  return { rows: rows, overflow: rows.length > maxRows || overflow };
+}
+
+function charTimeOf(line, index, total) {
+  var chars = line.chars;
+  var fallbackDur = safeNumber(line.dur, 0);
+  if (!(fallbackDur > 0)) fallbackDur = 2.4;
+  if (Array.isArray(chars) && chars.length) {
+    if (index < chars.length) {
+      var entry = chars[index];
+      var tm = entry && typeof entry === 'object' ? safeNumber(entry.t, NaN) : NaN;
+      if (isFinite(tm)) return tm;
+    }
+    var lastIdx = chars.length - 1;
+    var lastEntry = chars[lastIdx];
+    var lastTime = lastEntry && typeof lastEntry === 'object' ? safeNumber(lastEntry.t, line.t) : line.t;
+    var step = fallbackDur / Math.max(1, chars.length);
+    return lastTime + Math.max(0, index - lastIdx) * step;
+  }
+  return line.t + fallbackDur * (index / Math.max(1, total));
+}
+
+function buildLyricItem(line, index, size, maxWidth) {
+  var maxRows = layout.portraitMode ? 4 : 3;
+  var attempt = size;
+  var fitted = wrapGlyphs(line.text, attempt, maxWidth, maxRows);
+  for (var guard = 0; guard < 5 && fitted.overflow; guard++) {
+    attempt = attempt * 0.90;
+    fitted = wrapGlyphs(line.text, attempt, maxWidth, maxRows);
+  }
+  var lineHeight = attempt * 1.40;
+  var padX = Math.ceil(attempt * 0.42);
+  var padY = Math.ceil(attempt * 0.62);
+  var blockWidth = 0;
+  for (var r = 0; r < fitted.rows.length; r++) {
+    if (fitted.rows[r].width > blockWidth) blockWidth = fitted.rows[r].width;
+  }
+  blockWidth = Math.max(1, Math.min(Math.ceil(blockWidth + padX * 2), Math.ceil(maxWidth + padX * 2)));
+  var blockHeight = Math.max(1, Math.ceil(fitted.rows.length * lineHeight + padY * 2));
+
+  var total = 0;
+  for (var n = 0; n < fitted.rows.length; n++) total += fitted.rows[n].glyphs.length;
+
+  var base = makeCanvas(blockWidth * VIEW.dpr, blockHeight * VIEW.dpr);
+  var lit = makeCanvas(blockWidth * VIEW.dpr, blockHeight * VIEW.dpr);
+  if (!base || !lit) return null;
+  var gBase = base.getContext('2d');
+  var gLit = lit.getContext('2d');
+  if (!gBase || !gLit) return null;
+  gBase.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+  gLit.setTransform(VIEW.dpr, 0, 0, VIEW.dpr, 0, 0);
+
+  var cells = [];
+  var counted = 0;
+  var cursorY = padY;
+  for (var rowIndex = 0; rowIndex < fitted.rows.length; rowIndex++) {
+    var rowData = fitted.rows[rowIndex];
+    var cursorX = padX;
+    for (var c = 0; c < rowData.glyphs.length; c++) {
+      var cell = rowData.glyphs[c];
+      cells.push({
+        c: cell.c,
+        x: cursorX,
+        y: cursorY,
+        w: cell.w,
+        h: lineHeight,
+        t: charTimeOf(line, counted, total)
+      });
+      counted++;
+      cursorX += cell.w;
+    }
+    cursorY += lineHeight;
+  }
+
+  function paintLayer(target, mode) {
+    target.textAlign = 'left';
+    target.textBaseline = 'middle';
+    target.font = fontOf(attempt, 600);
+    for (var ci = 0; ci < cells.length; ci++) {
+      var glyph = cells[ci];
+      var gx = glyph.x;
+      var gy = glyph.y + lineHeight * 0.5;
+      if (mode === 'base') {
+        target.fillStyle = 'rgba(24,11,5,0.55)';
+        target.fillText(glyph.c, gx + attempt * 0.028, gy + attempt * 0.030);
+        target.fillStyle = 'rgba(244,229,202,0.94)';
+        target.fillText(glyph.c, gx, gy);
+      } else {
+        target.shadowColor = 'rgba(255,176,94,0.75)';
+        target.shadowBlur = attempt * 0.12;
+        target.fillStyle = '#E8A863';
+        target.fillText(glyph.c, gx, gy);
+        target.shadowBlur = 0;
+        target.fillStyle = 'rgba(255,222,172,0.96)';
+        target.fillText(glyph.c, gx, gy);
+      }
+    }
+  }
+
+  paintLayer(gBase, 'base');
+  paintLayer(gLit, 'lit');
+
+  return {
+    key: index + ':' + Math.round(size) + ':' + Math.round(maxWidth) + ':' + (layout.portraitMode ? 'p' : 'l'),
+    idx: index,
+    size: attempt,
+    lineHeight: lineHeight,
+    blockWidth: blockWidth,
+    blockHeight: blockHeight,
+    padX: padX,
+    padY: padY,
+    cells: cells,
+    base: base,
+    lit: lit,
+    prevText: '',
+    nextText: ''
+  };
+}
+
+function truncateText(text, size, maxWidth) {
+  var source = String(text || '');
+  if (!source) return '';
+  ctx.font = fontOf(size, 400);
+  if (ctx.measureText(source).width <= maxWidth) return source;
+  var glyphs = Array.from(source);
+  var result = '';
+  var limit = Math.min(glyphs.length, 64);
+  for (var i = 0; i < limit; i++) {
+    var probe = result + glyphs[i];
+    if (ctx.measureText(probe + '…').width > maxWidth) break;
+    result = probe;
+  }
+  return result + '…';
+}
+
+function ensureLyricItem() {
+  var idx = runtime.idx;
+  if (idx < 0 || idx >= runtime.lines.length) {
+    lyricCache.item = null;
+    lyricCache.key = '';
+    return null;
+  }
+  var size = lyricBaseSize();
+  var maxWidth = Math.max(120, layout.lyric.w);
+  var key = idx + ':' + Math.round(size) + ':' + Math.round(maxWidth) + ':' + runtime.lines.length;
+  if (lyricCache.key === key && lyricCache.item) return lyricCache.item;
+  if (lyricCache.failedKey === key) return null;
+  var item = null;
+  try {
+    item = buildLyricItem(runtime.lines[idx], idx, size, maxWidth);
+  } catch (err) {
+    reportError('buildLyricItem', err);
+    item = null;
+  }
+  if (!item) lyricCache.failedKey = key;
+  else lyricCache.failedKey = '';
+  if (item) {
+    var neighborSize = item.size * 0.40;
+    var prevLine = idx > 0 ? runtime.lines[idx - 1] : null;
+    var nextLine = idx + 1 < runtime.lines.length ? runtime.lines[idx + 1] : null;
+    item.prevText = prevLine ? truncateText(prevLine.text, neighborSize, maxWidth * 0.94) : '';
+    item.nextText = nextLine ? truncateText(nextLine.text, neighborSize, maxWidth * 0.94) : '';
+    item.neighborSize = neighborSize;
+  }
+  lyricCache.key = key;
+  lyricCache.item = item;
+  return item;
+}
+
+function drawLyricItem(item, now, fade) {
+  if (!item) return;
+  var tail = clamp(typeof fade === 'number' ? fade : 1, 0, 1);
+  var area = layout.lyric;
+  var originX = area.x;
+  if (layout.portraitMode) {
+    originX = area.x + area.w * 0.5 - item.blockWidth * 0.5;
+  } else {
+    originX = area.x - item.padX;
+  }
+  var originY = area.y - item.blockHeight * 0.5;
+  var enter = clamp((now - lyricCache.enterAt) / 0.40, 0, 1);
+  var eased = 1 - Math.pow(1 - enter, 3);
+  var rise = (1 - eased) * item.size * 0.24;
+
+  ctx.save();
+  ctx.globalAlpha = clamp((0.35 + 0.65 * eased) * tail, 0, 1);
+  ctx.translate(0, rise);
+  drawImageSafe(ctx, item.base, originX, originY, item.blockWidth, item.blockHeight);
+
+  if (beginPathOn(ctx)) {
+    var anySung = false;
+    var expand = item.size * 0.30;
+    for (var i = 0; i < item.cells.length; i++) {
+      var cell = item.cells[i];
+      if (cell.t <= runtime.t) {
+        anySung = true;
+        ctx.rect(
+          originX + cell.x - expand,
+          originY + cell.y - expand * 0.6,
+          cell.w + expand * 2,
+          cell.h + expand * 1.2
+        );
+      }
+    }
+    if (anySung) {
+      ctx.save();
+      ctx.clip();
+      drawImageSafe(ctx, item.lit, originX, originY, item.blockWidth, item.blockHeight);
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+
+  /* 邻句 */
+  var neighborY = 0;
+  ctx.save();
+  ctx.globalAlpha = tail;
+  ctx.textAlign = layout.portraitMode ? 'center' : 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = fontOf(item.neighborSize, 400);
+  var neighborX = layout.portraitMode ? (area.x + area.w * 0.5) : (originX + item.padX);
+  if (item.prevText) {
+    neighborY = originY - item.size * 0.52;
+    ctx.fillStyle = 'rgba(226,203,168,0.34)';
+    ctx.fillText(item.prevText, neighborX, neighborY + rise, layout.lyric.w);
+  }
+  if (item.nextText) {
+    neighborY = originY + item.blockHeight + item.size * 0.66;
+    ctx.fillStyle = 'rgba(226,203,168,0.28)';
+    ctx.fillText(item.nextText, neighborX, neighborY + rise, layout.lyric.w);
+  }
+  ctx.restore();
+
+  /* 起句标记 */
+  if (!layout.portraitMode) {
+    var markX = area.x - clamp(item.size * 0.62, 16, 44);
+    var markY = area.y + rise;
+    var markSize = clamp(item.size * 0.17, 3.5, 9);
+    ctx.save();
+    ctx.translate(markX, markY);
+    ctx.rotate(Math.PI * 0.25);
+    ctx.globalAlpha = clamp((0.55 + motion.pulse * 0.35) * tail, 0, 1);
+    ctx.fillStyle = rgba({ r: 236, g: 172, b: 104 }, 1);
+    ctx.fillRect(-markSize * 0.5, -markSize * 0.5, markSize, markSize);
+    ctx.restore();
+  }
+}
+
+function drawTitleBlock() {
+  var pad = layout.pad;
+  var topBand = Math.max(20, VIEW.h * 0.048);
+  var baseY = topBand + clamp(VIEW.h * 0.035, 18, 46);
+  var titleSize = clamp(VIEW.w * 0.0125, 11, 19);
+  var label = runtime.songName || '未命名';
+  ctx.save();
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  ctx.font = fontOf(titleSize, 600);
+  var spacing = (titleSize * 0.20).toFixed(2) + 'px';
+  var hadSpacing = false;
+  try {
+    if ('letterSpacing' in ctx) {
+      ctx.letterSpacing = spacing;
+      hadSpacing = true;
+    }
+  } catch (err) {
+    console.error('[397] letterSpacing unsupported', err);
+  }
+  ctx.fillStyle = 'rgba(242,226,199,0.72)';
+  ctx.fillText(label, pad, baseY, Math.min(VIEW.w * 0.46, 520));
+
+  ctx.font = fontOf(titleSize * 0.86, 400);
+  ctx.fillStyle = 'rgba(196,176,140,0.52)';
+  if (runtime.songArtists) {
+    ctx.fillText(runtime.songArtists, pad, baseY + titleSize * 1.6, Math.min(VIEW.w * 0.46, 520));
+  }
+  if (hadSpacing) ctx.letterSpacing = '0px';
+
+  var ruleY = baseY + titleSize * (runtime.songArtists ? 2.35 : 1.1);
+  ctx.fillStyle = 'rgba(214,150,96,0.34)';
+  ctx.fillRect(pad, ruleY, clamp(VIEW.w * 0.09, 38, 150), 1);
+  ctx.restore();
+}
+
+function drawEmptyState() {
+  var area = layout.lyric;
+  var centerX = layout.portraitMode ? VIEW.w * 0.5 : area.x;
+  var centerY = area.y;
+  ctx.save();
+  ctx.textAlign = layout.portraitMode ? 'center' : 'left';
+  ctx.textBaseline = 'middle';
+  var size = clamp(Math.min(VIEW.w, VIEW.h) * 0.026, 13, 26);
+  ctx.font = fontOf(size, 400);
+  ctx.fillStyle = 'rgba(232,212,178,0.55)';
+  ctx.fillText('暂无歌词', centerX, centerY);
+
+  var dotY = centerY - size * 1.9;
+  for (var i = 0; i < 3; i++) {
+    var dotX = centerX + (layout.portraitMode ? (i - 1) * size * 0.9 : i * size * 0.9);
+    if (beginPathOn(ctx)) {
+      ctx.fillStyle = rgba({ r: 232, g: 170, b: 104 }, 0.30 + i * 0.16);
+      ctx.arc(dotX, dotY, size * 0.13, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  ctx.font = fontOf(size * 0.86, 400);
+  ctx.fillStyle = 'rgba(196,176,140,0.42)';
+  var subLabel = runtime.songArtists || (runtime.songName ? '' : '这一首没有歌词');
+  if (subLabel) ctx.fillText(subLabel, centerX, centerY + size * 1.7, area.w);
+  ctx.restore();
+}
+
+function tailAlpha() {
+  var lines = runtime.lines;
+  if (!lines.length) return 1;
+  if (!runtime.playing) return 1;
+  var last = lines[lines.length - 1];
+  var tailStart = last.t + (last.dur > 0 ? last.dur : 2.4) + 4.0;
+  var over = runtime.t - tailStart;
+  if (!(over > 0)) return 1;
+  return clamp(1 - over / 1.5, 0, 1);
+}
+
+function drawStageText(now) {
+  if (!runtime.lines.length) {
+    drawEmptyState();
+    return;
+  }
+  var fade = tailAlpha();
+  if (fade <= 0.015) return;
+  var item = ensureLyricItem();
+  if (item) {
+    drawLyricItem(item, now, fade);
+  } else if (runtime.idx >= 0 && runtime.lines[runtime.idx]) {
+    /* 字形烘焙失败时的纯文本兜底，绝不留白 */
+    var fallbackSize = lyricBaseSize() * 0.8;
+    ctx.save();
+    ctx.globalAlpha = fade;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = fontOf(fallbackSize, 600);
+    ctx.fillStyle = 'rgba(244,229,202,0.94)';
+    ctx.fillText(runtime.lines[runtime.idx].text, layout.lyric.x, layout.lyric.y, layout.lyric.w);
+    ctx.restore();
+  } else if (runtime.idx < 0) {
+    /* 前奏：预告第一句 */
+    var area = layout.lyric;
+    var size = lyricBaseSize() * 0.42;
+    ctx.save();
+    ctx.textAlign = layout.portraitMode ? 'center' : 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = fontOf(size, 400);
+    ctx.fillStyle = 'rgba(226,203,168,0.26)';
+    var preview = truncateText(runtime.lines[0].text, size, area.w);
+    ctx.fillText(preview, layout.portraitMode ? (area.x + area.w * 0.5) : area.x, area.y, area.w);
+    ctx.restore();
+  }
+}
+
+/* ============ 11. 帧循环 ============ */
+var lastFrameAt = 0;
+
+function locateLine(time) {
+  var lines = runtime.lines;
+  if (!lines.length) return -1;
+  if (time < lines[0].t - 0.02) return -1;
+  var found = -1;
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].t <= time + 0.02) found = i;
+    else break;
+  }
+  return found;
+}
+
+function drawFrame(dt) {
+  if (!ctx) return;
+  var previousIdx = runtime.idx;
+  var idx = locateLine(runtime.t);
+  runtime.idx = idx;
+  runtime.text = (idx >= 0 && idx < runtime.lines.length) ? runtime.lines[idx].text : '';
+  if (idx !== previousIdx) {
+    lyricCache.enterAt = nowSeconds();
+    lyricCache.key = '';
+    lyricCache.item = null;
+    lyricCache.failedKey = '';
+  }
+
+  var now = nowSeconds();
+  drawArtwork(now);
+  drawStageText(now);
+  drawTitleBlock();
+}
+
+function frame(now) {
+  sendReady();
+  var started = (window.performance && performance.now) ? performance.now() : Date.now();
+  var dt = lastFrameAt > 0 ? clamp((now - lastFrameAt) / 1000, 0, 0.2) : 0.016;
+  try {
+    easeMotion(dt);
+    drawFrame(dt);
+  } catch (err) {
+    reportError('drawFrame', err);
+  }
+  runtime.frames++;
+  runtime.js = Math.round(((window.performance && performance.now) ? performance.now() : Date.now()) - started);
+  lastFrameAt = now;
+  requestAnimationFrame(frame);
+}
+
+/* ============ 12. 封面 / 启动 ============ */
+function loadCover(song) {
+  var url = song && typeof song.cover === 'string' ? song.cover : '';
+  if (!url) {
+    art.cover = null;
+    art.coverUrl = '';
+    try { bakePortrait(); } catch (err) { reportError('portrait repaint', err); }
+    return;
+  }
+  if (url === art.coverUrl && (art.cover || art.coverFailed)) return;
+  art.coverUrl = url;
+  art.coverFailed = false;
+  var img = new Image();
+  img.onload = function () {
+    try {
+      if (art.coverUrl !== url) return;
+      art.cover = img;
+      art.coverFailed = false;
+      bakePortrait();
+    } catch (err) {
+      reportError('cover paint', err);
+    }
+  };
+  img.onerror = function (event) {
+    console.error('[397] cover failed, keeping painted portrait:', url, event && event.type);
+    if (art.coverUrl !== url) return;
+    art.cover = null;
+    art.coverFailed = true;
+    try { bakePortrait(); } catch (err) { reportError('cover fallback paint', err); }
+  };
+  img.src = url;
+}
+
+function boot() {
+  try {
+    runtime.rm = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    if (window.matchMedia) {
+      var mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+      if (mq && typeof mq.addEventListener === 'function') {
+        mq.addEventListener('change', function (event) {
+          runtime.rm = !!(event && event.matches);
+        });
+      }
+    }
+  } catch (err) {
+    runtime.rm = false;
+    reportError('matchMedia', err);
+  }
+  fitCanvas();
+  try { relayout(); } catch (err) { reportError('relayout', err); }
+
+  var resizeTimer = 0;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      resizeTimer = 0;
+      try {
+        fitCanvas();
+        art.primer = null;
+        relayout();
+      } catch (err) {
+        reportError('resize', err);
+      }
+    }, 160);
+  });
+  requestAnimationFrame(frame);
+}
+
+try { boot(); } catch (err) { reportError('boot', err); }
+</script>
+</body>
+</html>

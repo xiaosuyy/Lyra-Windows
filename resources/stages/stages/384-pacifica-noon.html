@@ -1,0 +1,1161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>盐味阳光</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #efe1cd; }
+  body { font-family: Georgia, "Times New Roman", "Songti SC", "Noto Serif CJK SC", serif; }
+  #stage-root { position: fixed; inset: 0; }
+  #scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #film-grain { position: absolute; inset: -6%; pointer-events: none; opacity: .48;
+    background-size: 384px 384px; background-repeat: repeat; }
+  #lyric-layer { position: absolute; inset: auto 0 0 0; z-index: 3;
+    padding: 0 5.5vw calc(env(safe-area-inset-bottom, 0px) + max(7vh, 34px));
+    display: flex; flex-direction: column; justify-content: flex-end; align-items: center; pointer-events: none; }
+  .lyric-stack { display: flex; flex-direction: column; align-items: center; gap: .62em;
+    width: 100%; max-width: 1180px; animation: lyric-rise .55s cubic-bezier(.22,.7,.2,1) both; }
+  @keyframes lyric-rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+  .lyric-line { margin: 0; color: #241a12; max-width: 100%; text-align: center; }
+  .lyric-line.is-active { font-size: clamp(23px, 3.85vw, 56px); line-height: 1.30; letter-spacing: .035em;
+    overflow-wrap: break-word; word-break: break-word; text-shadow: 0 1px 0 rgba(255,251,242,.62), 0 0 22px rgba(255,246,226,.34); }
+  .lyric-line.is-preview { opacity: .52; }
+  .lyric-line.is-prev, .lyric-line.is-next { font-size: clamp(12px, 1.35vw, 18px); line-height: 1.55;
+    letter-spacing: .07em; font-style: italic; max-width: 82%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lyric-line.is-prev { opacity: .34; }
+  .lyric-line.is-next { opacity: .46; }
+  .char { opacity: .30; transition: opacity .17s linear, color .17s linear; }
+  .lyric-empty { display: flex; flex-direction: column; align-items: center; gap: .72em; color: #3b2b1d; }
+  .lyric-empty .label { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: clamp(8.5px, .95vw, 11px);
+    letter-spacing: .34em; opacity: .52; text-transform: uppercase; }
+  .lyric-empty .rule { width: 46px; height: 1px; background: currentColor; opacity: .38; }
+  .lyric-empty .text { font-size: clamp(15px, 1.95vw, 23px); letter-spacing: .14em; }
+  .lyric-empty .song { font-size: clamp(11px, 1.2vw, 14px); font-style: italic; opacity: .58; max-width: 82%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-height: 520px) { .lyric-line.is-prev, .lyric-line.is-next { display: none; } #lyric-layer { padding-bottom: 16px; } }
+  @media (max-aspect-ratio: 3/4) { #lyric-layer { padding-left: 8vw; padding-right: 8vw; } .lyric-line.is-active { line-height: 1.34; } }
+</style>
+</head>
+<body>
+<div id="stage-root">
+  <canvas id="scene"></canvas>
+  <div id="film-grain"></div>
+  <div id="lyric-layer"></div>
+</div>
+<script>
+var stageState = {
+  lines: [], idx: -1, time: 0, playing: true, frames: 0, js: 0, err: '',
+  accent: [216, 140, 74], duration: 0, song: { name: '', artists: '', cover: '' },
+  reduced: false, ready: false, builtOnce: false, hasInit: false,
+  charSpans: [], charTimes: [], charPointer: -1, charCurrent: null
+};
+window.__stage = function () {
+  return {
+    lines: stageState.lines.length, idx: stageState.idx, t: stageState.time,
+    playing: stageState.playing, frames: stageState.frames, js: stageState.js,
+    err: stageState.err, text: stageState.lines[stageState.idx] ? stageState.lines[stageState.idx].text : '',
+    gl: false, rm: stageState.reduced
+  };
+};
+
+(function () {
+  var canvas = document.getElementById('scene');
+  var context = canvas.getContext('2d');
+  var lyricLayer = document.getElementById('lyric-layer');
+  var viewWidth = 1440, viewHeight = 900;
+
+  var lastErrorStamp = -10000;
+
+  function reportError(where, error) {
+    var now = performance.now();
+    if (stageState.err.length < 480) {
+      stageState.err = (stageState.err ? stageState.err + ' | ' : '') + where;
+    }
+    if (now - lastErrorStamp < 1000) { return; }
+    lastErrorStamp = now;
+    console.error('[stage 384] ' + where, error);
+  }
+
+  function sendReady() {
+    if (stageState.ready) { return; }
+    stageState.ready = true;
+    try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }
+    catch (error) { reportError('ready-post', error); }
+  }
+
+  function readSize() {
+    var width = canvas.clientWidth || window.innerWidth || 1440;
+    var height = canvas.clientHeight || window.innerHeight || 900;
+    if (!isFinite(width) || !isFinite(height) || width <= 0 || height <= 0) { width = 1440; height = 900; }
+    viewWidth = Math.max(320, Math.round(width));
+    viewHeight = Math.max(320, Math.round(height));
+    var ratio = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(viewWidth * ratio);
+    canvas.height = Math.round(viewHeight * ratio);
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+
+  var resizeTimer = 0;
+
+  function handleResize() {
+    try {
+      readSize();
+      if (resizeTimer) { clearTimeout(resizeTimer); }
+      resizeTimer = setTimeout(function () {
+        resizeTimer = 0;
+        if (!stageState.ready) { return; }
+        try { bakeScene(); } catch (error) { reportError('resize-bake', error); }
+      }, 150);
+    } catch (error) { reportError('resize', error); }
+  }
+
+  function buildGrainFallback() {
+    var tile = document.createElement('canvas');
+    tile.width = 96;
+    tile.height = 96;
+    var tileContext = tile.getContext('2d');
+    if (!tileContext) { return ''; }
+    var pixels = tileContext.createImageData(96, 96);
+    for (var index = 0; index < pixels.data.length; index += 4) {
+      var noise = 128 + Math.round((Math.random() - 0.5) * 150);
+      pixels.data[index] = 255;
+      pixels.data[index + 1] = 250;
+      pixels.data[index + 2] = 238;
+      pixels.data[index + 3] = Math.max(0, Math.min(255, Math.round(noise * 0.34)));
+    }
+    tileContext.putImageData(pixels, 0, 0);
+    return tile.toDataURL('image/png');
+  }
+
+  function setupFilmGrain() {
+    var grainImage = new Image();
+    grainImage.onload = function () {
+      try { grainLayer.style.backgroundImage = 'url("assets/384-sun-grain.png")'; }
+      catch (error) { reportError('grain-apply', error); }
+    };
+    grainImage.onerror = function () {
+      console.error('[stage 384] 384-sun-grain.png unavailable, procedural grain fallback');
+      try {
+        var fallback = buildGrainFallback();
+        if (fallback) { grainLayer.style.backgroundImage = 'url("' + fallback + '")'; }
+      } catch (error) { reportError('grain-fallback', error); }
+    };
+    grainImage.src = 'assets/384-sun-grain.png';
+  }
+
+  function bootVisuals() {
+    try {
+      bakeSunSprite();
+      bakeScene();
+      setupFilmGrain();
+      setupDust();
+    } catch (error) { reportError('boot-visuals', error); }
+  }
+
+  function applyInit(payload) {
+    var data = payload || {};
+    var nextSong = data.song || {};
+    var previousId = stageState.song ? stageState.song.id : null;
+    var nextId = nextSong ? nextSong.id : null;
+    if (previousId !== null && previousId !== undefined && nextId !== null && nextId !== undefined &&
+      String(nextId) !== String(previousId)) {
+      stageState.time = 0;
+    }
+    stageState.lines = Array.isArray(data.lines) ? data.lines : [];
+    stageState.duration = Number(data.duration) || 0;
+    stageState.song = nextSong;
+    if (Array.isArray(data.accent) && data.accent.length >= 3) {
+      stageState.accent = data.accent.map(function (value) { return Math.max(0, Math.min(255, Math.round(Number(value) || 0))); });
+    }
+    if (typeof data.playing === 'boolean') { stageState.playing = data.playing; } else { stageState.playing = true; }
+    stageState.idx = -1;
+    stageState.builtOnce = false;
+    stageState.hasInit = true;
+    try { syncLyrics(true); } catch (error) { reportError('init-lyrics', error); }
+    if (stageState.ready) {
+      try { bakeScene(); } catch (error) { reportError('init-bake', error); }
+    }
+  }
+
+  function findIndex(time) {
+    var list = stageState.lines;
+    if (!list.length) { return -1; }
+    var low = 0;
+    var high = list.length - 1;
+    var found = -1;
+    var guard = 0;
+    while (low <= high && guard < 64) {
+      guard += 1;
+      var middle = (low + high) >> 1;
+      var start = Number(list[middle].t);
+      if (!isFinite(start)) { start = 0; }
+      if (start <= time) { found = middle; low = middle + 1; } else { high = middle - 1; }
+    }
+    return found;
+  }
+
+  function lyricTextOf(line) {
+    if (!line || line.text === null || line.text === undefined) { return ''; }
+    return String(line.text);
+  }
+
+  function lineStartOf(line) {
+    var start = Number(line && line.t);
+    return isFinite(start) ? start : 0;
+  }
+
+  function lineSpanOf(line, following) {
+    var duration = Number(line && line.dur);
+    if (!isFinite(duration) || duration <= 0) {
+      var start = lineStartOf(line);
+      var nextStart = following ? lineStartOf(following) : 0;
+      duration = nextStart > start ? nextStart - start : 4;
+    }
+    return clampNumber(duration, 0.32, 24);
+  }
+
+  function lyricGlyphs(text) {
+    if (typeof Array.from === 'function') { return Array.from(text); }
+    return text.split('');
+  }
+
+  function buildCharTimes(line, following, glyphCount) {
+    var text = lyricTextOf(line);
+    var count = Math.max(0, Math.min(isFinite(glyphCount) ? glyphCount : text.length, 400));
+    var times = [];
+    if (count <= 0) { return times; }
+    var start = lineStartOf(line);
+    var duration = lineSpanOf(line, following);
+    var chars = Array.isArray(line.chars) ? line.chars : null;
+    var usable = chars ? Math.min(chars.length, count) : 0;
+    var lastKnown = start;
+    for (var index = 0; index < count; index += 1) {
+      var charTime = chars && index < usable ? Number(chars[index] && chars[index].t) : NaN;
+      if (isFinite(charTime) && charTime >= 0) {
+        times.push(charTime);
+        if (charTime > lastKnown) { lastKnown = charTime; }
+      } else if (index < usable) {
+        times.push(lastKnown);
+      } else {
+        times.push(Math.max(lastKnown, start + (duration * index) / count));
+      }
+    }
+    for (var cursor = 1; cursor < count; cursor += 1) {
+      if (times[cursor] < times[cursor - 1]) { times[cursor] = times[cursor - 1]; }
+    }
+    return times;
+  }
+
+  function fitActiveFontSize(textLength) {
+    var availableWidth = Math.max(320, viewWidth) * 0.86;
+    var base = clampNumber(Math.min(viewWidth * 0.072, viewHeight * 0.055), 23, 58);
+    if (textLength > 0) {
+      var charsPerRow = Math.max(4, availableWidth / (base * 1.03));
+      var rows = Math.ceil(textLength / charsPerRow);
+      if (rows > 2) { base = base * clampNumber(2 / rows, 0.45, 1); }
+      if (textLength <= 5) { base = base * 1.08; }
+    }
+    return Math.round(clampNumber(base, 20, 60));
+  }
+
+  function describeSong() {
+    var song = stageState.song || {};
+    var name = typeof song.name === 'string' ? song.name.trim() : '';
+    var artists = song.artists;
+    if (Array.isArray(artists)) {
+      artists = artists.filter(function (entry) { return typeof entry === 'string' && entry.trim().length > 0; }).join(' / ');
+    }
+    if (typeof artists !== 'string') { artists = ''; }
+    artists = artists.trim();
+    var combined = name && artists ? name + ' \u2014 ' + artists : (name || artists);
+    return combined.slice(0, 64);
+  }
+
+  function makeNeighborLine(line, className) {
+    var element = document.createElement('p');
+    element.className = 'lyric-line ' + className;
+    element.textContent = lyricTextOf(line);
+    return element;
+  }
+
+  function makeActiveLine(line, preview, following) {
+    var text = lyricTextOf(line);
+    var glyphs = lyricGlyphs(text);
+    var element = document.createElement('p');
+    element.className = 'lyric-line is-active' + (preview ? ' is-preview' : '');
+    element.style.fontSize = fitActiveFontSize(glyphs.length) + 'px';
+    if (preview || !glyphs.length) {
+      element.textContent = text;
+      return element;
+    }
+    var times = buildCharTimes(line, following, glyphs.length);
+    var spans = [];
+    var limit = Math.min(glyphs.length, 200);
+    for (var index = 0; index < limit; index += 1) {
+      var span = document.createElement('span');
+      span.className = 'char';
+      span.textContent = glyphs[index];
+      element.appendChild(span);
+      spans.push(span);
+    }
+    if (glyphs.length > limit) { element.appendChild(document.createTextNode(glyphs.slice(limit).join(''))); }
+    stageState.charSpans = spans;
+    stageState.charTimes = times.slice(0, spans.length);
+    stageState.charPointer = -1;
+    stageState.charCurrent = null;
+    return element;
+  }
+
+  function makeEmptyState() {
+    var wrap = document.createElement('div');
+    wrap.className = 'lyric-empty';
+    var label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = 'No Vocal';
+    var rule = document.createElement('span');
+    rule.className = 'rule';
+    var text = document.createElement('span');
+    text.className = 'text';
+    text.textContent = '纯器乐 · 只有海风';
+    wrap.appendChild(label);
+    wrap.appendChild(rule);
+    wrap.appendChild(text);
+    var songLine = describeSong();
+    if (songLine) {
+      var song = document.createElement('span');
+      song.className = 'song';
+      song.textContent = songLine;
+      wrap.appendChild(song);
+    }
+    return wrap;
+  }
+
+  function buildLyricDom(index) {
+    lyricLayer.textContent = '';
+    stageState.charSpans = [];
+    stageState.charTimes = [];
+    stageState.charPointer = -1;
+    stageState.charCurrent = null;
+    if (!stageState.hasInit) { return; }
+    var list = stageState.lines;
+    if (!list.length) {
+      lyricLayer.appendChild(makeEmptyState());
+      return;
+    }
+    var active = index >= 0 && index < list.length ? list[index] : null;
+    var following = index + 1 < list.length ? list[index + 1] : null;
+    var previous = index > 0 ? list[index - 1] : null;
+    var upcoming = active ? following : (list[0] || null);
+    var stack = document.createElement('div');
+    stack.className = 'lyric-stack';
+    if (previous) { stack.appendChild(makeNeighborLine(previous, 'is-prev')); }
+    if (active) {
+      stack.appendChild(makeActiveLine(active, false, following));
+    } else if (upcoming) {
+      stack.appendChild(makeActiveLine(upcoming, true, following));
+      upcoming = null;
+    }
+    if (upcoming) { stack.appendChild(makeNeighborLine(upcoming, 'is-next')); }
+    lyricLayer.appendChild(stack);
+  }
+
+  function updateLyricProgress() {
+    var spans = stageState.charSpans;
+    var times = stageState.charTimes;
+    if (!spans.length || !times.length) { return; }
+    var limit = Math.min(times.length, spans.length);
+    var pointer = -1;
+    for (var index = 0; index < limit; index += 1) {
+      if (times[index] <= stageState.time) { pointer = index; } else { break; }
+    }
+    if (pointer === stageState.charPointer) { return; }
+    if (pointer < stageState.charPointer) {
+      for (var reset = 0; reset < limit; reset += 1) {
+        spans[reset].style.opacity = reset <= pointer ? '1' : '';
+        spans[reset].style.color = '';
+      }
+    } else {
+      for (var light = stageState.charPointer + 1; light <= pointer; light += 1) {
+        spans[light].style.opacity = '1';
+      }
+    }
+    if (stageState.charCurrent) {
+      stageState.charCurrent.style.color = '';
+      stageState.charCurrent = null;
+    }
+    if (pointer >= 0 && pointer < limit) {
+      stageState.charCurrent = spans[pointer];
+      stageState.charCurrent.style.color = colorString(mixColor(stageState.accent, [28, 19, 12], 0.70), 1);
+    }
+    stageState.charPointer = pointer;
+  }
+
+  function syncLyrics(forceRebuild) {
+    var index = findIndex(stageState.time);
+    var needsRebuild = forceRebuild || stageState.builtOnce !== true || index !== stageState.idx;
+    stageState.idx = index;
+    if (needsRebuild) {
+      buildLyricDom(index);
+      stageState.builtOnce = true;
+    }
+    updateLyricProgress();
+  }
+
+  var sceneCanvas = null;
+  var sunSprite = null;
+  var grainLayer = document.getElementById('film-grain');
+  var layout = {
+    horizonY: 360, deckY: 540, poolX: 30, poolY: 600, poolWidth: 560, poolHeight: 320,
+    sunX: 900, sunY: 150, sunRadius: 46, portrait: false
+  };
+
+  function clampNumber(value, low, high) {
+    var number = Number(value);
+    if (!isFinite(number)) { return low; }
+    if (number < low) { return low; }
+    if (number > high) { return high; }
+    return number;
+  }
+
+  function colorChannel(value) { return Math.max(0, Math.min(255, Math.round(Number(value) || 0))); }
+
+  function colorString(color, alpha) {
+    return 'rgba(' + colorChannel(color[0]) + ',' + colorChannel(color[1]) + ',' + colorChannel(color[2]) +
+      ',' + clampNumber(alpha, 0, 1).toFixed(3) + ')';
+  }
+
+  function mixColor(from, to, amount) {
+    var mix = clampNumber(amount, 0, 1);
+    return [
+      colorChannel(from[0] + (to[0] - from[0]) * mix),
+      colorChannel(from[1] + (to[1] - from[1]) * mix),
+      colorChannel(from[2] + (to[2] - from[2]) * mix)
+    ];
+  }
+
+  function addStops(gradient, stops) {
+    for (var index = 0; index < stops.length; index += 1) {
+      try { gradient.addColorStop(clampNumber(stops[index][0], 0, 1), stops[index][1]); }
+      catch (error) { reportError('addColorStop', error); }
+    }
+  }
+
+  function linearGradient(target, x0, y0, x1, y1, stops) {
+    var gradient = target.createLinearGradient(x0, y0, x1, y1);
+    addStops(gradient, stops);
+    return gradient;
+  }
+
+  function radialGradient(target, x, y, inner, outer, stops) {
+    var gradient = target.createRadialGradient(x, y, Math.max(0, inner), x, y, Math.max(inner + 0.5, outer));
+    addStops(gradient, stops);
+    return gradient;
+  }
+
+  function withPath(target, build) {
+    if (!target || typeof target.beginPath !== 'function' || typeof build !== 'function') { return false; }
+    target.beginPath();
+    return build(target) !== false;
+  }
+
+  function traceRoundRect(target, x, y, width, height, radius) {
+    var corner = Math.min(radius, width / 2, height / 2);
+    target.moveTo(x + corner, y);
+    target.lineTo(x + width - corner, y);
+    target.quadraticCurveTo(x + width, y, x + width, y + corner);
+    target.lineTo(x + width, y + height - corner);
+    target.quadraticCurveTo(x + width, y + height, x + width - corner, y + height);
+    target.lineTo(x + corner, y + height);
+    target.quadraticCurveTo(x, y + height, x, y + height - corner);
+    target.lineTo(x, y + corner);
+    target.quadraticCurveTo(x, y, x + corner, y);
+  }
+
+  function measureLayout(width, height) {
+    var portrait = height > width * 0.92;
+    layout.portrait = portrait;
+    layout.horizonY = Math.round(height * (portrait ? 0.315 : 0.385));
+    layout.deckY = Math.round(height * (portrait ? 0.50 : 0.585));
+    layout.sunX = Math.round(width * (portrait ? 0.66 : 0.63));
+    layout.sunY = Math.round(height * (portrait ? 0.13 : 0.145));
+    layout.sunRadius = Math.round(Math.min(width, height) * (portrait ? 0.062 : 0.052));
+    if (portrait) {
+      layout.poolX = Math.round(width * 0.02);
+      layout.poolY = Math.round(height * 0.555);
+      layout.poolWidth = Math.round(width * 0.62);
+      layout.poolHeight = Math.round(height * 0.26);
+    } else {
+      layout.poolX = Math.round(width * 0.02);
+      layout.poolY = Math.round(height * 0.605);
+      layout.poolWidth = Math.round(width * 0.42);
+      layout.poolHeight = Math.round(height * 0.30);
+    }
+  }
+
+  function bakeSunSprite() {
+    var size = 256;
+    var sprite = document.createElement('canvas');
+    sprite.width = size;
+    sprite.height = size;
+    var spriteContext = sprite.getContext('2d');
+    if (!spriteContext) { return; }
+    spriteContext.fillStyle = radialGradient(spriteContext, size / 2, size / 2, 2, size / 2, [
+      [0.00, 'rgba(255,253,240,0.96)'],
+      [0.16, 'rgba(255,246,214,0.72)'],
+      [0.42, 'rgba(255,232,183,0.30)'],
+      [0.72, 'rgba(255,220,160,0.10)'],
+      [1.00, 'rgba(255,214,150,0)']
+    ]);
+    spriteContext.fillRect(0, 0, size, size);
+    sunSprite = sprite;
+  }
+
+  function paintSky(target, width, height) {
+    var accentWarm = mixColor([246, 231, 204], stageState.accent, 0.10);
+    target.fillStyle = linearGradient(target, 0, 0, 0, layout.horizonY + 4, [
+      [0.00, '#a6cdd8'],
+      [0.20, '#bcd9de'],
+      [0.48, '#dfe7d5'],
+      [0.74, '#f4e4c8'],
+      [1.00, colorString(accentWarm, 1)]
+    ]);
+    target.fillRect(0, 0, width, layout.horizonY + 6);
+
+    target.globalCompositeOperation = 'lighter';
+    if (sunSprite && sunSprite.width > 0) {
+      var glow = layout.sunRadius * 7.2;
+      target.globalAlpha = 0.82;
+      target.drawImage(sunSprite, layout.sunX - glow / 2, layout.sunY - glow / 2, glow, glow);
+      target.globalAlpha = 1;
+    }
+    target.globalCompositeOperation = 'source-over';
+
+    withPath(target, function (path) { path.arc(layout.sunX, layout.sunY, layout.sunRadius, 0, Math.PI * 2); });
+    target.fillStyle = 'rgba(255,252,240,0.97)';
+    target.fill();
+
+    target.strokeStyle = 'rgba(255,246,222,0.55)';
+    target.lineWidth = Math.max(1, layout.sunRadius * 0.10);
+    target.stroke();
+  }
+
+  function paintSea(target, width, height) {
+    var seaTop = layout.horizonY;
+    var seaBottom = layout.deckY;
+    target.fillStyle = linearGradient(target, 0, seaTop, 0, seaBottom, [
+      [0.00, '#d3e2d8'],
+      [0.10, '#a9c9c2'],
+      [0.42, '#6ba6ab'],
+      [0.78, '#4a8b99'],
+      [1.00, '#3b7683']
+    ]);
+    target.fillRect(0, seaTop, width, seaBottom - seaTop);
+
+    var sunColumn = width * 0.055;
+    target.globalCompositeOperation = 'lighter';
+    target.fillStyle = linearGradient(target, 0, seaTop, 0, seaBottom, [
+      [0.00, 'rgba(255,250,232,0.44)'],
+      [0.55, 'rgba(255,244,214,0.20)'],
+      [1.00, 'rgba(255,240,206,0.03)']
+    ]);
+    target.fillRect(layout.sunX - sunColumn, seaTop, sunColumn * 2, seaBottom - seaTop);
+    target.globalCompositeOperation = 'source-over';
+
+    target.fillStyle = 'rgba(255,250,238,0.55)';
+    target.fillRect(0, seaTop, width, Math.max(1.2, height * 0.0026));
+
+    var haze = target.createLinearGradient(0, seaTop, 0, seaTop + (seaBottom - seaTop) * 0.5);
+    addStops(haze, [[0, 'rgba(255,248,232,0.62)'], [1, 'rgba(255,248,232,0)']]);
+    target.fillStyle = haze;
+    target.fillRect(0, seaTop, width, (seaBottom - seaTop) * 0.5);
+  }
+
+  function paintSailboats(target, width, height) {
+    var seaTop = layout.horizonY;
+    var seaBand = Math.max(1, layout.deckY - layout.horizonY);
+    var boats = layout.portrait
+      ? [[0.30, 0.34, 0.052], [0.47, 0.18, 0.036]]
+      : [[0.205, 0.34, 0.050], [0.315, 0.16, 0.034]];
+    for (var index = 0; index < boats.length; index += 1) {
+      var boat = boats[index];
+      var boatX = width * boat[0];
+      var boatY = seaTop + seaBand * boat[1];
+      var mast = Math.max(4, height * boat[2]);
+      target.fillStyle = 'rgba(253, 250, 240, 0.88)';
+      withPath(target, function (path) {
+        path.moveTo(boatX, boatY);
+        path.lineTo(boatX + mast * 0.17, boatY - mast);
+        path.lineTo(boatX + mast * 0.21, boatY);
+      });
+      target.fill();
+      withPath(target, function (path) {
+        path.moveTo(boatX + mast * 0.28, boatY - mast * 0.02);
+        path.lineTo(boatX + mast * 0.28, boatY - mast * 0.70);
+        path.lineTo(boatX + mast * 0.64, boatY - mast * 0.02);
+      });
+      target.fill();
+      target.fillStyle = 'rgba(42, 64, 70, 0.52)';
+      withPath(target, function (path) {
+        path.moveTo(boatX - mast * 0.12, boatY + 1);
+        path.lineTo(boatX + mast * 0.72, boatY + 1);
+        path.lineTo(boatX + mast * 0.58, boatY + Math.max(2, mast * 0.10));
+        path.lineTo(boatX - mast * 0.02, boatY + Math.max(2, mast * 0.10));
+      });
+      target.fill();
+      target.fillStyle = 'rgba(244, 253, 248, 0.26)';
+      target.fillRect(boatX - mast * 0.04, boatY + mast * 0.16, mast * 0.64, Math.max(1, mast * 0.07));
+    }
+  }
+
+  function paintCoast(target, width, height) {
+    if (layout.portrait) { return; }
+    target.fillStyle = 'rgba(122,139,131,0.20)';
+    var baseY = layout.horizonY;
+    var blocks = [
+      [width * 0.055, 5, width * 0.085, 0.9],
+      [width * 0.64, 4, width * 0.06, 1.1],
+      [width * 0.72, 3, width * 0.045, 0.8],
+      [width * 0.79, 4, width * 0.07, 1.3]
+    ];
+    for (var index = 0; index < blocks.length; index += 1) {
+      var block = blocks[index];
+      target.fillRect(Math.round(block[0]), Math.round(baseY - block[1]), Math.round(block[2]), Math.round(block[1]));
+    }
+  }
+
+  function paintDeck(target, width, height) {
+    var deckTop = layout.deckY;
+    var sandTone = mixColor([241, 226, 200], stageState.accent, 0.055);
+    target.fillStyle = linearGradient(target, 0, deckTop, 0, height, [
+      [0.00, colorString(mixColor(sandTone, [210, 189, 160], 0.30), 1)],
+      [0.22, colorString(sandTone, 1)],
+      [1.00, colorString(mixColor(sandTone, [252, 243, 226], 0.55), 1)]
+    ]);
+    target.fillRect(0, deckTop, width, height - deckTop);
+
+    target.strokeStyle = 'rgba(160,138,110,0.16)';
+    target.lineWidth = 1;
+    for (var line = 1; line <= 3; line += 1) {
+      var seamY = Math.round(deckTop + (height - deckTop) * (line * 0.26));
+      withPath(target, function (path) { path.moveTo(0, seamY); path.lineTo(width, seamY); });
+      target.stroke();
+    }
+
+    target.globalCompositeOperation = 'lighter';
+    target.fillStyle = radialGradient(target, layout.sunX, deckTop + (height - deckTop) * 0.18, 0,
+      Math.max(width, height) * 0.55, [
+        [0.00, 'rgba(255,247,225,0.40)'],
+        [0.55, 'rgba(255,244,216,0.12)'],
+        [1.00, 'rgba(255,240,210,0)']
+      ]);
+    target.fillRect(0, deckTop, width, height - deckTop);
+    target.globalCompositeOperation = 'source-over';
+  }
+
+  function paintPool(target, width, height) {
+    var poolX = layout.poolX;
+    var poolY = layout.poolY;
+    var poolWidth = layout.poolWidth;
+    var poolHeight = layout.poolHeight;
+    var radius = Math.min(poolWidth, poolHeight) * 0.07;
+
+    target.save();
+    target.shadowColor = 'rgba(96, 74, 48, 0.26)';
+    target.shadowBlur = Math.max(8, height * 0.02);
+    target.shadowOffsetY = Math.max(3, height * 0.008);
+    withPath(target, function (path) { traceRoundRect(path, poolX, poolY, poolWidth, poolHeight, radius); });
+    target.fillStyle = '#f7efdd';
+    target.fill();
+    target.restore();
+
+    var inset = Math.max(3, Math.min(poolWidth, poolHeight) * 0.028);
+    var waterX = poolX + inset;
+    var waterY = poolY + inset;
+    var waterWidth = poolWidth - inset * 2;
+    var waterHeight = poolHeight - inset * 2;
+    layout.waterX = waterX;
+    layout.waterY = waterY;
+    layout.waterWidth = waterWidth;
+    layout.waterHeight = waterHeight;
+
+    withPath(target, function (path) { traceRoundRect(path, waterX, waterY, waterWidth, waterHeight, radius * 0.7); });
+    target.fillStyle = linearGradient(target, waterX, waterY, waterX, waterY + waterHeight, [
+      [0.00, '#ade4dc'],
+      [0.32, '#79c6c2'],
+      [0.70, '#4b9ea8'],
+      [1.00, '#348491']
+    ]);
+    target.fill();
+
+    target.save();
+    withPath(target, function (path) { traceRoundRect(path, waterX, waterY, waterWidth, waterHeight, radius * 0.7); });
+    target.clip();
+    target.globalCompositeOperation = 'lighter';
+    target.fillStyle = 'rgba(226, 250, 246, 0.20)';
+    target.fillRect(waterX, waterY, waterWidth, waterHeight * 0.30);
+    target.globalCompositeOperation = 'source-over';
+    target.restore();
+
+    target.strokeStyle = 'rgba(255, 253, 245, 0.75)';
+    target.lineWidth = Math.max(1, inset * 0.42);
+    withPath(target, function (path) { traceRoundRect(path, waterX, waterY, waterWidth, waterHeight, radius * 0.7); });
+    target.stroke();
+  }
+
+  function paintPoolBounce(target, width, height) {
+    var bounceX = layout.poolX + layout.poolWidth;
+    var bounceWidth = Math.max(48, width * 0.17);
+    target.save();
+    target.globalCompositeOperation = 'lighter';
+    target.fillStyle = linearGradient(target, bounceX, 0, bounceX + bounceWidth, 0, [
+      [0.00, 'rgba(202, 248, 240, 0.30)'],
+      [0.50, 'rgba(190, 242, 234, 0.13)'],
+      [1.00, 'rgba(184, 238, 230, 0)']
+    ]);
+    target.fillRect(bounceX, layout.poolY - layout.poolHeight * 0.05, bounceWidth, layout.poolHeight * 1.1);
+    target.restore();
+  }
+
+  function paintVignette(target, width, height) {
+    target.fillStyle = radialGradient(target, width * 0.52, height * 0.34, Math.min(width, height) * 0.30,
+      Math.max(width, height) * 0.92, [
+        [0.00, 'rgba(255,246,228,0.06)'],
+        [0.62, 'rgba(120,88,54,0.00)'],
+        [1.00, 'rgba(96,66,36,0.20)']
+      ]);
+    target.fillRect(0, 0, width, height);
+  }
+
+  function bakeScene() {
+    var ratio = clampNumber(window.devicePixelRatio || 1, 1, 1.8);
+    var width = Math.max(320, Math.round(viewWidth));
+    var height = Math.max(320, Math.round(viewHeight));
+    var baked = document.createElement('canvas');
+    baked.width = Math.round(width * ratio);
+    baked.height = Math.round(height * ratio);
+    var bakedContext = baked.getContext('2d');
+    if (!bakedContext) { return; }
+    bakedContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+    measureLayout(width, height);
+    paintSky(bakedContext, width, height);
+    paintSea(bakedContext, width, height);
+    paintSailboats(bakedContext, width, height);
+    paintCoast(bakedContext, width, height);
+    paintDeck(bakedContext, width, height);
+    paintPool(bakedContext, width, height);
+    paintPoolBounce(bakedContext, width, height);
+    paintVignette(bakedContext, width, height);
+    sceneCanvas = baked;
+    seedSeaGlints(width, height);
+    if (!motion.palmSprite) { bakePalmSprite(); }
+    bakeFlareSprites();
+    bakeCaption();
+  }
+
+  function setupDust() {
+    var dust = new Image();
+    dust.onload = function () { motion.dustImage = dust; };
+    dust.onerror = function () {
+      console.error('[stage 384] 384-dust.png unavailable, dust layer skipped');
+      motion.dustImage = null;
+    };
+    dust.src = 'assets/384-dust.png';
+  }
+
+  var motion = {
+    clock: 0, pulse: 0, bass: 0, treble: 0, seaGlints: [], seaBand: { top: 0, height: 1, spread: 1 },
+    palmSprite: null, dustImage: null, captionSprite: null, streakSprite: null, ghostSprite: null
+  };
+
+  function makeRandom(seed) {
+    var value = seed >>> 0;
+    return function () {
+      value = (value + 0x6d2b79f5) >>> 0;
+      var mixed = value;
+      mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+      mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+      return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function quadraticPoint(x0, y0, controlX, controlY, x1, y1, amount) {
+    var inverse = 1 - amount;
+    return [
+      inverse * inverse * x0 + 2 * inverse * amount * controlX + amount * amount * x1,
+      inverse * inverse * y0 + 2 * inverse * amount * controlY + amount * amount * y1
+    ];
+  }
+
+  function seedSeaGlints(width, height) {
+    var random = makeRandom(Math.round(width * 7 + height * 13));
+    var top = layout.horizonY;
+    var band = Math.max(1, layout.deckY - layout.horizonY);
+    var count = Math.min(150, Math.max(36, Math.round(width / 9)));
+    var glints = [];
+    for (var index = 0; index < count; index += 1) {
+      var spread = (random() + random() + random() - 1.5) / 1.5;
+      var depth = Math.pow(random(), 1.4);
+      glints.push({
+        across: clampNumber(0.5 + spread * 1.4, 0.01, 0.99),
+        depth: clampNumber(0.02 + depth * 0.96, 0, 1),
+        width: 5 + random() * 26 + depth * 24,
+        phase: random() * Math.PI * 2,
+        speed: 0.6 + random() * 1.8
+      });
+    }
+    motion.seaGlints = glints;
+    motion.seaBand = { top: top, height: band, spread: width };
+  }
+
+  function bakePalmSprite() {
+    var size = 560;
+    var sprite = document.createElement('canvas');
+    sprite.width = size;
+    sprite.height = size;
+    var palmContext = sprite.getContext('2d');
+    if (!palmContext) { return; }
+    palmContext.lineCap = 'round';
+    palmContext.shadowColor = 'rgba(48, 33, 18, 0.45)';
+    palmContext.shadowBlur = 6;
+    var centerX = size * 0.72;
+    var centerY = size * 0.22;
+    palmContext.strokeStyle = 'rgba(46, 31, 16, 0.30)';
+    palmContext.lineWidth = size * 0.017;
+    withPath(palmContext, function (path) {
+      path.moveTo(size * 1.02, -size * 0.04);
+      path.quadraticCurveTo(size * 0.9, size * 0.12, centerX, centerY);
+    });
+    palmContext.stroke();
+    for (var frond = 0; frond < 15; frond += 1) {
+      var angle = 0.26 + (frond / 14) * 1.55;
+      var reach = size * (0.28 + ((frond * 37) % 11) / 11 * 0.32);
+      var tipX = centerX + Math.cos(angle) * reach;
+      var tipY = centerY + Math.sin(angle) * reach * 0.74;
+      var controlX = centerX + Math.cos(angle) * reach * 0.56;
+      var controlY = centerY + Math.sin(angle) * reach * 0.56 - reach * 0.09;
+      palmContext.lineWidth = size * (0.0055 + ((frond * 7) % 5) / 5 * 0.0085);
+      withPath(palmContext, function (path) {
+        path.moveTo(centerX, centerY);
+        path.quadraticCurveTo(controlX, controlY, tipX, tipY);
+      });
+      palmContext.stroke();
+      for (var leaflet = 0; leaflet < 5; leaflet += 1) {
+        var amount = 0.34 + leaflet * 0.13;
+        var point = quadraticPoint(centerX, centerY, controlX, controlY, tipX, tipY, amount);
+        var side = leaflet % 2 === 0 ? 1 : -1;
+        var leafletLength = reach * (0.13 - leaflet * 0.012);
+        var leafletAngle = angle + side * (0.95 - leaflet * 0.05);
+        palmContext.lineWidth = size * 0.0045;
+        withPath(palmContext, function (path) {
+          path.moveTo(point[0], point[1]);
+          path.lineTo(point[0] + Math.cos(leafletAngle) * leafletLength, point[1] + Math.sin(leafletAngle) * leafletLength * 0.8);
+        });
+        palmContext.stroke();
+      }
+    }
+    motion.palmSprite = sprite;
+  }
+
+  function bakeCaption() {
+    var fontSize = clampNumber(Math.min(viewWidth, viewHeight) * 0.0145, 8.5, 13);
+    var caption = 'PACIFIC COAST \u00B7 HIGH NOON';
+    var spacing = fontSize * 0.24;
+    var measurer = document.createElement('canvas').getContext('2d');
+    if (!measurer) { return; }
+    var fontSpec = '600 ' + fontSize.toFixed(1) + 'px "Helvetica Neue", Helvetica, Arial, sans-serif';
+    measurer.font = fontSpec;
+    var total = 0;
+    for (var index = 0; index < caption.length; index += 1) {
+      total += measurer.measureText(caption.charAt(index)).width + spacing;
+    }
+    var sprite = document.createElement('canvas');
+    sprite.width = Math.max(8, Math.ceil(total) + 2);
+    sprite.height = Math.max(8, Math.ceil(fontSize * 4.2));
+    var captionContext = sprite.getContext('2d');
+    if (!captionContext) { return; }
+    captionContext.font = fontSpec;
+    captionContext.textBaseline = 'alphabetic';
+    captionContext.fillStyle = colorString(mixColor([56, 40, 26], stageState.accent, 0.30), 0.74);
+    var cursor = 1;
+    for (var glyphIndex = 0; glyphIndex < caption.length; glyphIndex += 1) {
+      var glyph = caption.charAt(glyphIndex);
+      captionContext.fillText(glyph, cursor, fontSize * 1.7);
+      cursor += captionContext.measureText(glyph).width + spacing;
+    }
+    captionContext.fillStyle = colorString(stageState.accent, 0.9);
+    captionContext.fillRect(0, Math.round(fontSize * 2.55), Math.round(fontSize * 3.6), Math.max(1, Math.round(fontSize * 0.13)));
+    motion.captionSprite = sprite;
+  }
+
+  function drawSeaShimmer(target) {
+    var glints = motion.seaGlints;
+    if (!glints.length) { return; }
+    var band = motion.seaBand;
+    var seconds = motion.clock;
+    var energy = clampNumber(0.6 + motion.treble * 0.8 + motion.pulse * 0.5, 0.2, 2.2);
+    target.save();
+    target.globalCompositeOperation = 'lighter';
+    target.fillStyle = '#fff7e2';
+    for (var index = 0; index < glints.length; index += 1) {
+      var glint = glints[index];
+      var sway = Math.sin(seconds * glint.speed * 0.8 + glint.phase);
+      var glintX = layout.sunX + (glint.across - 0.5) * band.spread * 1.25 + sway * 9;
+      if (glintX < -40 || glintX > viewWidth + 40) { continue; }
+      var glintY = band.top + glint.depth * band.height;
+      var flicker = 0.5 + 0.5 * Math.sin(seconds * glint.speed * 2.2 + glint.phase * 1.7);
+      var proximity = clampNumber(1 - Math.abs(glintX - layout.sunX) / (viewWidth * 0.52), 0.10, 1);
+      var alpha = (0.05 + flicker * 0.36) * energy * (0.30 + glint.depth * 0.95) * (0.35 + proximity * 0.85);
+      target.globalAlpha = clampNumber(alpha, 0, 0.7);
+      var glintWidth = glint.width * (0.7 + flicker * 0.8);
+      target.fillRect(Math.round(glintX - glintWidth / 2), Math.round(glintY), Math.round(glintWidth),
+        Math.max(1, Math.round(band.height * 0.007)));
+    }
+    target.restore();
+  }
+
+  function drawPoolCaustics(target) {
+    if (!isFinite(layout.waterWidth) || layout.waterWidth <= 0 || layout.waterHeight <= 0) { return; }
+    var seconds = motion.clock;
+    var rows = 5;
+    var columns = 7;
+    target.save();
+    if (typeof target.beginPath === 'function') {
+      target.beginPath();
+      traceRoundRect(target, layout.waterX, layout.waterY, layout.waterWidth, layout.waterHeight,
+        Math.min(layout.waterWidth, layout.waterHeight) * 0.05);
+      target.clip();
+    }
+    target.globalCompositeOperation = 'lighter';
+    target.strokeStyle = 'rgba(238,255,250,0.6)';
+    target.lineWidth = Math.max(1, layout.waterHeight * (0.008 + motion.bass * 0.005));
+    var stepX = layout.waterWidth / columns;
+    var stepY = layout.waterHeight / rows;
+    for (var row = 0; row < rows; row += 1) {
+      for (var column = 0; column < columns; column += 1) {
+        var wobble = Math.sin(seconds * 0.85 + row * 1.7 + column * 0.8);
+        var centerX = layout.waterX + stepX * (column + 0.5) + wobble * stepX * 0.26;
+        var centerY = layout.waterY + stepY * (row + 0.5) + Math.cos(seconds * 0.65 + column) * stepY * 0.16;
+        target.globalAlpha = clampNumber(0.09 + Math.abs(wobble) * 0.22 + motion.bass * 0.07, 0, 0.46);
+        withPath(target, function (path) {
+          path.arc(centerX, centerY, stepX * (0.20 + 0.09 * Math.abs(wobble)),
+            Math.PI * 0.15, Math.PI * 1.05);
+        });
+        target.stroke();
+      }
+    }
+    target.restore();
+  }
+
+  function drawPalmShadow(target) {
+    var sprite = motion.palmSprite;
+    if (!sprite || sprite.width <= 0 || sprite.height <= 0) { return; }
+    var seconds = motion.clock;
+    var sway = stageState.reduced ? 0 : Math.sin(seconds * 0.19) * 0.018 + Math.sin(seconds * 0.47) * 0.008;
+    var shadowSize = Math.min(viewWidth, viewHeight) * (layout.portrait ? 1.05 : 0.82);
+    var centerX = viewWidth * (layout.portrait ? 0.70 : 0.80);
+    var centerY = viewHeight * (layout.portrait ? 0.66 : 0.70);
+    target.save();
+    if (typeof target.beginPath === 'function') {
+      target.beginPath();
+      target.rect(0, layout.deckY - 2, viewWidth, viewHeight - layout.deckY + 6);
+      target.clip();
+    }
+    target.globalCompositeOperation = 'multiply';
+    target.globalAlpha = 0.40;
+    target.translate(centerX, centerY);
+    target.rotate(sway);
+    target.scale(-1, 1);
+    target.drawImage(sprite, -shadowSize * 0.72, -shadowSize * 0.22, shadowSize, shadowSize);
+    target.restore();
+  }
+
+  function drawSunBreath(target) {
+    if (!sunSprite || sunSprite.width <= 0 || sunSprite.height <= 0) { return; }
+    var pulse = clampNumber(motion.pulse, 0, 1);
+    var radius = layout.sunRadius * (7.0 + pulse * 2.8);
+    target.save();
+    target.globalCompositeOperation = 'lighter';
+    target.globalAlpha = clampNumber(0.10 + pulse * 0.26, 0, 0.52);
+    target.drawImage(sunSprite, layout.sunX - radius / 2, layout.sunY - radius / 2, radius, radius);
+    target.restore();
+  }
+
+  function drawFrameDust(target) {
+    var dust = motion.dustImage;
+    if (!dust || dust.width <= 0 || dust.height <= 0) { return; }
+    var seconds = motion.clock;
+    var size = Math.max(viewWidth, viewHeight) * 1.15;
+    target.save();
+    target.globalAlpha = 0.11;
+    target.drawImage(dust, -((seconds * 3.2) % 180), 0, size, size);
+    target.globalAlpha = 0.06;
+    target.drawImage(dust, size * 0.35 - ((seconds * 5) % 240), size * 0.18, size * 0.85, size * 0.85);
+    target.restore();
+  }
+
+  function drawGlareScrim(target) {
+    var top = viewHeight * (layout.portrait ? 0.66 : 0.70);
+    target.fillStyle = linearGradient(target, 0, top, 0, viewHeight, [
+      [0.00, 'rgba(252,246,232,0)'],
+      [0.45, 'rgba(250,241,224,0.28)'],
+      [1.00, 'rgba(248,237,217,0.68)']
+    ]);
+    target.fillRect(0, top, viewWidth, viewHeight - top);
+  }
+
+  function drawCaption(target) {
+    var sprite = motion.captionSprite;
+    if (!sprite || sprite.width <= 0) { return; }
+    target.drawImage(sprite, Math.round(viewWidth * 0.055), Math.round(viewHeight * 0.06));
+  }
+
+  function bakeFlareSprites() {
+    var streak = document.createElement('canvas');
+    streak.width = 256;
+    streak.height = 64;
+    var streakContext = streak.getContext('2d');
+    if (streakContext) {
+      streakContext.fillStyle = linearGradient(streakContext, 0, 0, 0, 64, [
+        [0.00, 'rgba(255,246,220,0)'],
+        [0.32, 'rgba(255,246,220,0.12)'],
+        [0.50, 'rgba(255,251,234,0.60)'],
+        [0.68, 'rgba(255,246,220,0.12)'],
+        [1.00, 'rgba(255,246,220,0)']
+      ]);
+      streakContext.fillRect(0, 0, 256, 64);
+      streakContext.globalCompositeOperation = 'destination-in';
+      streakContext.fillStyle = linearGradient(streakContext, 0, 0, 256, 0, [
+        [0.00, 'rgba(255,255,255,0)'],
+        [0.20, 'rgba(255,255,255,1)'],
+        [0.80, 'rgba(255,255,255,1)'],
+        [1.00, 'rgba(255,255,255,0)']
+      ]);
+      streakContext.fillRect(0, 0, 256, 64);
+      motion.streakSprite = streak;
+    }
+    var ghost = document.createElement('canvas');
+    ghost.width = 128;
+    ghost.height = 128;
+    var ghostContext = ghost.getContext('2d');
+    if (ghostContext) {
+      var ghostTint = mixColor([255, 250, 236], stageState.accent, 0.40);
+      ghostContext.fillStyle = radialGradient(ghostContext, 64, 64, 1, 64, [
+        [0.00, colorString(mixColor([255, 252, 240], stageState.accent, 0.28), 0.85)],
+        [0.55, colorString(ghostTint, 0.22)],
+        [1.00, colorString(ghostTint, 0)]
+      ]);
+      ghostContext.fillRect(0, 0, 128, 128);
+      motion.ghostSprite = ghost;
+    }
+  }
+
+  function drawLensFlare(target) {
+    var streak = motion.streakSprite;
+    var pulse = clampNumber(motion.pulse, 0, 1);
+    if (streak && streak.width > 0 && streak.height > 0) {
+      var length = Math.max(viewWidth, viewHeight) * 1.6;
+      target.save();
+      target.globalCompositeOperation = 'lighter';
+      target.translate(layout.sunX, layout.sunY);
+      target.rotate(-0.40);
+      target.globalAlpha = clampNumber(0.15 + pulse * 0.17, 0, 0.44);
+      target.drawImage(streak, -length / 2, -length * 0.045, length, length * 0.09);
+      target.globalAlpha = clampNumber(0.10 + pulse * 0.11, 0, 0.32);
+      target.drawImage(streak, -length * 0.42, -length * 0.009, length * 0.84, length * 0.018);
+      target.restore();
+    }
+    var ghost = motion.ghostSprite;
+    if (!ghost || ghost.width <= 0 || ghost.height <= 0) { return; }
+    var axisX = viewWidth * 0.5 - layout.sunX;
+    var axisY = viewHeight * 0.5 - layout.sunY;
+    target.save();
+    target.globalCompositeOperation = 'lighter';
+    for (var index = 1; index <= 3; index += 1) {
+      var travel = 0.60 + index * 0.48;
+      var radius = layout.sunRadius * (0.52 + index * 0.48);
+      target.globalAlpha = 0.05 + (index % 2) * 0.03;
+      target.drawImage(ghost, layout.sunX + axisX * travel - radius, layout.sunY + axisY * travel - radius,
+        radius * 2, radius * 2);
+    }
+    target.restore();
+  }
+
+  function drawFrame() {
+    var ratio = viewWidth > 0 ? canvas.width / viewWidth : 1;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    if (sceneCanvas && sceneCanvas.width > 0 && sceneCanvas.height > 0) {
+      context.drawImage(sceneCanvas, 0, 0, viewWidth, viewHeight);
+    } else {
+      context.fillStyle = '#f0dcc0';
+      context.fillRect(0, 0, viewWidth, viewHeight);
+    }
+    drawSeaShimmer(context);
+    drawPoolCaustics(context);
+    drawPalmShadow(context);
+    drawSunBreath(context);
+    drawLensFlare(context);
+    drawFrameDust(context);
+    drawGlareScrim(context);
+    drawCaption(context);
+  }
+
+  var lastFrameStamp = 0;
+
+  function loop(stamp) {
+    stageState.frames += 1;
+    var now = isFinite(Number(stamp)) ? Number(stamp) : performance.now();
+    var delta = lastFrameStamp > 0 ? clampNumber((now - lastFrameStamp) / 1000, 0, 0.12) : 0.016;
+    lastFrameStamp = now;
+    motion.clock += delta * (stageState.reduced ? 0.32 : 1) * (stageState.playing ? 1 : 0.28);
+    motion.pulse = Math.max(0, motion.pulse - delta * 1.7);
+    var started = performance.now();
+    try {
+      drawFrame();
+      syncLyrics(false);
+    } catch (error) { reportError('frame', error); }
+    stageState.js = clampNumber(performance.now() - started, 0, 9999);
+    requestAnimationFrame(loop);
+  }
+
+  function onMessage(event) {
+    var data = event.data;
+    if (!data || data.__c100 !== 1) { return; }
+    try {
+      if (data.type === 'init') { applyInit(data.payload); }
+      else if (data.type === 'tick') {
+        var payload = data.payload || {};
+        var time = Number(payload.time);
+        if (isFinite(time)) { stageState.time = time; }
+        if (typeof payload.playing === 'boolean') { stageState.playing = payload.playing; }
+      }
+      else if (data.type === 'beat') {
+        var beatPayload = data.payload || {};
+        motion.pulse = Math.max(motion.pulse, 0.22 + clampNumber(beatPayload.level, 0, 1) * 0.78);
+      }
+      else if (data.type === 'live') {
+        var livePayload = data.payload || {};
+        motion.bass += (clampNumber(livePayload.bass, 0, 1) - motion.bass) * 0.34;
+        motion.treble += (clampNumber(livePayload.treble, 0, 1) - motion.treble) * 0.34;
+        if (typeof livePayload.playing === 'boolean') { stageState.playing = livePayload.playing; }
+      }
+    } catch (error) { reportError('message-' + (data && data.type), error); }
+  }
+
+  window.addEventListener('message', onMessage);
+  window.addEventListener('resize', handleResize);
+  window.addEventListener('orientationchange', handleResize);
+  stageState.reduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  readSize();
+  requestAnimationFrame(function () {
+    sendReady();
+    requestAnimationFrame(function () { bootVisuals(); });
+    loop();
+  });
+  setTimeout(sendReady, 1200);
+})();
+</script>
+</body>
+</html>

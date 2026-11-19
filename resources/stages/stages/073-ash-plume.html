@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>火山灰柱</title>
+<style>
+  html,body{margin:0;height:100%;background:#050305;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(120% 96% at 50% 52%,transparent 34%,rgba(6,3,5,.55) 76%,rgba(2,1,2,.96))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(255,196,150,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   lyra08 · 火山灰柱 —— 每一团词是火山口的一次喷发，灰柱升到顶才凝成字
+   ---------------------------------------------------------------------------
+   机制：**浮力上升 + curl 湍流 + 冷却沉降**。
+     · 画面底部是火山口。每个词团触发一次喷发：一批灰粒带着初速被抛出
+     · 上升段被 curl-noise 速度场揉搓（这是烟像烟、不像喷泉的唯一原因），
+       同时按高度冷却：越冷升得越慢、越暗、越大（烟在扩散）
+     · 冷却到阈值的那一刻，粒子被"字"吸过去并**立即失去速度**（灰落在字形上）
+     · 字是**在烟里被发现的**，不是先有字再有烟：字形只是冷却灰落定的地方
+
+   三个关键技术：
+     ① **低分辨率烟雾层**：所有"还在飘"的灰画到一张 W/3×H/3 的离屏画布上，
+        再开 imageSmoothing 放大 blit 回来。放大插值天然把方块糊成软烟团，
+        而 fill 面积只有 1/9 —— 既有体积感又快。这是这个文件帧率稳的根本。
+     ② **已冷却的灰用全分辨率画**：字必须锐利，所以落定的灰单独画一遍，
+        不做低分辨率处理。烟糊、字清，对比才像真的。
+     ③ 喷发瞬间**升格慢动作**：物理 dt 乘 0.35 持续 0.30s（Speed Ramping），
+        同时火山口冲击波环 + 相机向上反冲 + 白闪。
+
+   AE 手法：升格慢动作 / 冲击帧 / 视差层（前景火星 3 档 z）/ 定向震动（向上）/
+   缓推 + 呼吸变焦 / 体积光（喷发时从火山口向上打的一束光）
+   ========================================================================== */
+
+/* ============================ 0 · 画布 ============================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+let W = 0, H = 0, DPR = 1;
+let bgCv = null, smokeCv = null, smokeCtx = null, midCv = null;
+let SMW = 0, SMH = 0;
+const SMK = 4;                       // 烟雾层降采样倍数（4 → fill 面积只有 1/16，放大插值更像烟团）
+let L = null, curIdx = -1;
+
+/* 必须在 resize() 之前声明它用到的一切 */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  SMW = Math.max(2, Math.round(W / SMK)); SMH = Math.max(2, Math.round(H / SMK));
+  if (!smokeCv) smokeCv = document.createElement('canvas');
+  smokeCv.width = SMW; smokeCv.height = SMH;
+  smokeCtx = smokeCv.getContext('2d');
+  buildBg();
+  buildVentGlow();
+  buildPuffs();
+  buildAsh();
+  if (L && curIdx >= 0) prepLine(curIdx, true);
+}
+addEventListener('resize', resize);
+
+/* ============================ 1 · 时钟 ============================ */
+let lines = [];
+let accent = [255, 176, 120];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* ============================ 2 · 分词（词典法 + 双向最大匹配） ============================ */
+let DICT = null;
+fetch('/segdict.bin').then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); }).catch(() => {});
+const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+function isWord(s, i, Ln) {
+  if (!DICT) return false;
+  const h = fnv(s.substr(i, Ln));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) { const m = (lo + hi) >> 1, v = DICT[m]; if (v === h) return true; if (v < h) lo = m + 1; else hi = m - 1; }
+  return false;
+}
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, text.length - i); Ln >= 2; Ln--) if (isWord(text, i, Ln)) { hit = Ln; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, j); Ln >= 2; Ln--) if (isWord(text, j - Ln, Ln)) { hit = Ln; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+function isLatin(text) { let la = 0, cjk = 0; for (let i = 0; i < text.length; i++) { const c = text[i]; if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++; else if (c >= '\u4e00' && c <= '\u9fff') cjk++; } return la > cjk; }
+function latinSpans(text) {
+  const out = []; let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i; while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j }); i = j;
+  }
+  return out;
+}
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+const countChars = (s) => { let n = 0; for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++; return n; };
+function groupByWords(text) {
+  const words = segWords(text), out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos; pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; } else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+function groupByRule(text) {
+  const out = []; let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const s = PUNCT.test(text[i]) || SPACE.test(text[i]);
+    if (!s) chars++;
+    if (s && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!s && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+const spansForLine = (t) => (isLatin(t) ? latinSpans(t) : (DICT ? groupByWords(t) : groupByRule(t)));
+
+/* ============================ 3 · 字形采样（自动折行 + 逐字归属） ============================ */
+const offCv = document.createElement('canvas');
+const octx = offCv.getContext('2d', { willReadFrequently: true });
+const FONT = (px, wt) => `${wt || 800} ${px}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+function wrapText(text, fs, maxW, wt) {
+  octx.font = FONT(fs, wt);
+  const rows = []; let start = 0, w = 0;
+  for (let i = 0; i < text.length; i++) {
+    const cw = octx.measureText(text[i]).width;
+    if (!cw) continue;
+    if (w + cw > maxW && i > start) { rows.push({ i0: start, i1: i, w }); start = i; w = 0; }
+    w += cw;
+  }
+  rows.push({ i0: start, i1: text.length, w });
+  for (const r of rows) while (r.i1 - r.i0 > 1 && SPACE.test(text[r.i0])) r.i0++;
+  return rows;
+}
+function sampleGlyph(text, opt) {
+  opt = opt || {};
+  const wt = opt.weight || 800;
+  let fs = opt.fs || 84;
+  const maxW = opt.maxW || Math.min(W * 0.70, 1120);
+  const maxH = opt.maxH || H * 0.48;
+  let rows = wrapText(text, fs, maxW, wt);
+  let lh = fs * 1.14;
+  if (rows.length * lh > maxH) { fs *= maxH / (rows.length * lh); rows = wrapText(text, fs, maxW, wt); lh = fs * 1.14; }
+  octx.font = FONT(fs, wt);
+  const widest = Math.max(1, ...rows.map((r) => octx.measureText(text.slice(r.i0, r.i1)).width));
+  const padW = Math.ceil(widest) + 20, padH = Math.ceil(lh * rows.length) + 10;
+  offCv.width = padW; offCv.height = padH;
+  octx.font = FONT(fs, wt);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.clearRect(0, 0, padW, padH);
+  const n = text.length;
+  const charCx = new Float32Array(n), charCy = new Float32Array(n);
+  const rowMaps = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r], str = text.slice(row.i0, row.i1);
+    const cy = padH / 2 + (r - (rows.length - 1) / 2) * lh;
+    octx.fillText(str, padW / 2, cy);
+    const x0 = (padW - row.w) / 2, map = new Int16Array(padW).fill(-1);
+    let acc = 0;
+    for (let i = row.i0; i < row.i1; i++) {
+      const cw = octx.measureText(text[i]).width;
+      charCx[i] = x0 + acc + cw / 2 - padW / 2; charCy[i] = cy - padH / 2;
+      for (let x = Math.max(0, Math.floor(x0 + acc)); x < Math.min(padW, Math.ceil(x0 + acc + cw)); x++) map[x] = i;
+      acc += cw;
+    }
+    rowMaps.push({ y0: cy - lh / 2, y1: cy + lh / 2, map });
+  }
+  const d = octx.getImageData(0, 0, padW, padH).data;
+  const pxA = [], pyA = [], ownA = [];
+  const step = opt.step || 2;
+  for (let y = 0; y < padH; y += step) {
+    let rm = null;
+    for (let r = 0; r < rowMaps.length; r++) { const m = rowMaps[r]; if (y >= m.y0 && y < m.y1) { rm = m; break; } }
+    if (!rm) continue;
+    for (let x = 0; x < padW; x += step) {
+      if (d[(y * padW + x) * 4 + 3] <= 128) continue;
+      const c = rm.map[x]; if (c < 0) continue;
+      pxA.push(x - padW / 2); pyA.push(y - padH / 2); ownA.push(c);
+    }
+  }
+  return { px: Float32Array.from(pxA), py: Float32Array.from(pyA), own: Int16Array.from(ownA),
+           pc: pxA.length, n, charCx, charCy, fs, w: widest, h: lh * rows.length, rows: rows.length };
+}
+
+/* ============================ 4 · 句索引 ============================ */
+let brewIdx = -1, lastT = -1;
+const hintShow = (s, o) => { hint.textContent = s; hint.style.opacity = o; };
+
+/* ============================ 5 · 相机 ============================ */
+const cam = { x: 0, y: 0, z: 1, tz: 1, vz: 0, tx: 0, ty: 0, sh: 0, dirx: 0, diry: -1, shx: 0, shy: 0 };
+function camShake(dx, dy, amp) { cam.dirx = dx; cam.diry = dy; cam.sh = Math.min(30, Math.max(cam.sh, amp)); }
+function camUpdate(dt, T) {
+  const ke = 1 - Math.pow(0.0015, dt);
+  cam.x += (cam.tx - cam.x) * ke * 0.9;
+  cam.y += (cam.ty - cam.y) * ke * 0.9;
+  cam.vz += ((cam.tz - cam.z) * 170 - cam.vz * 21) * dt;   // 弹簧变焦
+  cam.z += cam.vz * dt;
+  cam.sh *= Math.pow(0.00003, dt);
+  const wob = Math.sin(T * 57) * 0.6 + Math.sin(T * 39.3 + 1.1) * 0.4;
+  cam.shx = cam.dirx * cam.sh * wob;
+  cam.shy = cam.diry * cam.sh * wob;
+}
+const camX = (wx) => (wx - cam.x) * cam.z + W / 2 + cam.shx;
+const camY = (wy) => (wy - cam.y) * cam.z + H / 2 + cam.shy;
+
+/* ============================ 6 · AE 时间控制 ============================ */
+const AE = { freeze: 0, slow: 0, flash: 0 };
+const hitStop = (s) => { AE.freeze = Math.max(AE.freeze, s); };
+const slowMo = (s) => { AE.slow = Math.max(AE.slow, s); };
+
+/* ============================ 7 · curl noise（烟像烟的关键） ============================ */
+/* 用 4 个正弦叠加构造可导的速度场，比真 noise 快一个数量级，视觉上够用 */
+function curlX(x, y, z, t) {
+  return Math.sin(y * 0.0021 + t * 0.43 + z) * 0.9
+       + Math.sin((x + y) * 0.0013 - t * 0.31) * 0.65
+       + Math.cos(y * 0.0047 - t * 0.72 + x * 0.0008) * 0.34;
+}
+function curlY(x, y, z, t) {
+  return Math.cos(x * 0.0019 - t * 0.37 + z) * 0.85
+       + Math.cos((x - y) * 0.0011 + t * 0.27) * 0.6
+       + Math.sin(x * 0.0043 + t * 0.66 - y * 0.0007) * 0.3;
+}
+
+/* ============================ 8 · 粒子 ============================ */
+const N = 6200;
+const px = new Float32Array(N), py = new Float32Array(N);
+const vx = new Float32Array(N), vy = new Float32Array(N);
+const tx = new Float32Array(N), ty = new Float32Array(N);
+const st = new Uint8Array(N);        // 0 灰池 1 上升 2 冷却落定
+const ci = new Int16Array(N);
+const si = new Uint8Array(N);
+const heat = new Float32Array(N);    // 1 炽热 → 0 全冷
+const sz = new Float32Array(N);
+const zz = new Float32Array(N);      // 视差深度
+const emitAt = new Float32Array(N);  // 喷发时刻
+const settleT = new Float32Array(N); // 落定时刻
+const born = new Float32Array(N);
+
+/* 火山口 */
+let ventX = 0, ventY = 0;
+let ventW = 0;
+
+/* 布局 */
+let blockGx = 0, blockGy = 0;
+let spanFired = new Uint8Array(0);
+let charChars = null;
+let charGlow = new Float32Array(0);
+let spans = [];
+
+/* 特效 */
+let shocks = [];
+let sparks = [];
+let flashT = -99;
+let slowT = -99;
+
+/* 灰烬烘焙层：落定的灰一次性烘到这张画布，之后每帧只 blit。
+   尺寸按"字块能覆盖的范围"给，不做整屏 —— blit 更便宜。
+   ashStampQ/ashHead 是待烘队列（分帧摊开，避免落定瞬间一次性画 6000 个）。 */
+let ashCv = null, ashCtx = null;
+let ashOx = 0, ashOy = 0;
+const ashStampQ = [];
+let ashHead = 0;
+let charStamped = new Uint8Array(0);
+
+function buildAsh() {
+  if (!ashCv) { ashCv = document.createElement('canvas'); ashCtx = ashCv.getContext('2d'); }
+  /* 烘焙画布只覆盖"字块可能出现的区域"，不做整屏：
+     一张 1440×648 的贴图每帧缩放 blit 要 3~4ms（软件渲染），而字其实只占中间那条带。
+     取 1.05W × 0.62H 并居中在字块位置，blit 面积降 1/3，画质完全一致。 */
+  const w = Math.ceil(Math.min(W * 1.04, 1560)), h = Math.ceil(Math.min(H * 0.62, 560));
+  ashCv.width = w; ashCv.height = h;
+  ashOx = W / 2 - w / 2;
+  ashOy = H * 0.415 - h / 2;
+  ashStampQ.length = 0; ashHead = 0;
+  if (ashCtx) { ashCtx.clearRect(0, 0, w, h); ashCtx.fillStyle = 'rgba(0,0,0,0)'; }
+}
+
+/* 预烘 */
+let bgGrad = null, ventGlow = null;
+let puffDim = null, puffHot = null;
+
+/** 预烘烟团精灵：软边圆形，只做一次。这是"烟像烟"的关键 —— 
+ *  画面上看到的所有柔边都是这张图被缩放到不同大小，而不是每帧算渐变。 */
+function buildPuffs() {
+  const mk = (rgb) => {
+    const r = 32;
+    const c = document.createElement('canvas'); c.width = c.height = r * 2;
+    const g = c.getContext('2d');
+    const grd = g.createRadialGradient(r, r, 0, r, r, r);
+    grd.addColorStop(0, `rgba(${rgb},0.95)`);
+    grd.addColorStop(0.34, `rgba(${rgb},0.55)`);
+    grd.addColorStop(0.66, `rgba(${rgb},0.20)`);
+    grd.addColorStop(1, `rgba(${rgb},0)`);
+    g.fillStyle = grd; g.beginPath(); g.arc(r, r, r, 0, 6.2832); g.fill();
+    return c;
+  };
+  puffDim = mk('128,108,124');       // 冷灰（暗）
+  puffHot = mk('255,178,130');       // 热灰（发橙）
+}
+
+function buildVentGlow() {
+  /* 火山口的熔光：一次性烘好，之后每帧只按喷发强度改 alpha */
+  const r = 130;
+  const c = document.createElement('canvas'); c.width = c.height = r * 2;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(r, r, 0, r, r, r);
+  grd.addColorStop(0, 'rgba(255,214,150,0.95)');
+  grd.addColorStop(0.22, 'rgba(255,132,54,0.55)');
+  grd.addColorStop(0.55, 'rgba(190,54,26,0.20)');
+  grd.addColorStop(1, 'rgba(120,20,10,0)');
+  g.fillStyle = grd; g.beginPath(); g.arc(r, r, r, 0, 6.2832); g.fill();
+  ventGlow = c;
+}
+function buildBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  /* 半分辨率就够：背景是纯渐变，放大看不出差别，但 blit 便宜 4 倍 */
+  const bw = Math.round(W / 2), bh = Math.round(H / 2);
+  bgCv.width = bw; bgCv.height = bh;
+  const g = bgCv.getContext('2d');
+  bgGrad = g.createRadialGradient(bw / 2, bh * 1.05, 0, bw / 2, bh * 1.05, Math.max(bw, bh) * 1.05);
+  bgGrad.addColorStop(0, '#24100a');       // 火山口方向的暖光
+  bgGrad.addColorStop(0.30, '#120a0c');
+  bgGrad.addColorStop(0.68, '#08060a');
+  bgGrad.addColorStop(1, '#030204');
+  g.fillStyle = bgGrad; g.fillRect(0, 0, bw, bh);
+}
+
+/* ============================ 9 · 布局（不阻塞换句帧） ============================ */
+let prepCache = null;
+let prepIdx = -1;
+
+/** 只做采样 + 分团，不碰粒子。放在酝酿期调，绝不放在换句那一帧。 */
+function prepLine(idx, keepCache) {
+  const line = lines[idx];
+  if (!line || !line.text) { L = null; return null; }
+  if (prepCache && prepIdx === idx && !keepCache) { L = prepCache; return L; }
+  const text = line.text;
+  const latin = isLatin(text);
+  const fs0 = latin ? 74 : (text.length <= 10 ? 94 : text.length <= 16 ? 82 : 72);
+  const g = sampleGlyph(text, { fs: fs0, maxW: Math.min(W * 0.68, 1100), maxH: H * 0.46 });
+  if (!g.pc) { L = null; return null; }
+  g.text = text;
+
+  charChars = line.chars && line.chars.length === text.length ? line.chars : null;
+  const raw = spansForLine(text);
+  const spanOf = new Int16Array(g.n).fill(-1);
+  const spList = [];
+  for (let k = 0; k < raw.length; k++) {
+    const s = raw[k];
+    if (!s || s.i1 <= s.i0) continue;
+    let t;
+    if (charChars && charChars[s.i0] && typeof charChars[s.i0].t === 'number') t = charChars[s.i0].t;
+    else t = line.t + (line.dur || 4) * (s.i0 / Math.max(1, text.length));
+    spList.push({ i0: s.i0, i1: s.i1, t, wcx: 0, wcy: 0 });
+    for (let c = s.i0; c < s.i1; c++) spanOf[c] = spList.length - 1;
+  }
+  if (!spList.length) { L = null; return null; }
+  for (let k = 1; k < spList.length; k++) if (spList[k].t < spList[k - 1].t) spList[k].t = spList[k - 1].t;
+
+  blockGx = W / 2;
+  blockGy = H * 0.415;
+  for (const s of spList) {
+    let mx = 0, my = 0, cnt = 0;
+    for (let c = s.i0; c < s.i1; c++) { mx += g.charCx[c]; my += g.charCy[c]; cnt++; }
+    s.wcx = blockGx + mx / Math.max(1, cnt);
+    s.wcy = blockGy + my / Math.max(1, cnt);
+  }
+  g.spans = spList; g.spanOf = spanOf;
+  prepCache = g; prepIdx = idx;
+  L = g;
+  return g;
+}
+
+/** 换句：把粒子派给新字形。这一步很快（只是写数组），但采样要提前做好。 */
+function assignLine(idx) {
+  const g = prepLine(idx);
+  if (!g) return;
+  spans = g.spans;
+  charGlow = new Float32Array(g.n);
+  spanFired = new Uint8Array(spans.length);
+  ventX = W / 2 + (idx % 2 ? 1 : -1) * Math.min(W * 0.16, 180);
+  ventY = H + 30;
+  ventW = Math.min(W * 0.22, 300);
+
+  /* 释放旧粒子回灰池，清空烘焙层 */
+  for (let i = 0; i < N; i++) st[i] = 0;
+  ashStampQ.length = 0; ashHead = 0;
+  if (ashCtx) { ashCtx.clearRect(0, 0, ashCv.width, ashCv.height); }
+  charStamped = new Uint8Array(g.n);
+
+  const K = Math.min(N, g.pc);
+  const pool = [];
+  for (let i = 0; i < N; i++) pool.push(i);
+  for (let k = 0; k < K; k++) { const j = k + ((Math.random() * (N - k)) | 0); const t = pool[k]; pool[k] = pool[j]; pool[j] = t; }
+
+  for (let k = 0; k < K; k++) {
+    const i = pool[k];
+    const pi = (Math.floor(k * g.pc / K)) | 0;
+    const c = g.own[pi];
+    const sidx = g.spanOf[c] < 0 ? 0 : g.spanOf[c];
+    const span = spans[sidx];
+    tx[i] = g.px[pi] + blockGx;
+    ty[i] = g.py[pi] + blockGy;
+    ci[i] = c; si[i] = sidx;
+    /* 从火山口抛出：初速向上、带横向扩散 —— 不是"从字上散开"，是从地底涌上来 */
+    px[i] = ventX + rnd(-ventW * 0.34, ventW * 0.34);
+    py[i] = ventY - rnd(0, 40);
+    const up = rnd(420, 760);
+    vx[i] = rnd(-70, 70) + (px[i] - ventX) * 0.5;
+    vy[i] = -up;
+    heat[i] = 1;
+    sz[i] = rnd(1.1, 2.6);
+    zz[i] = rnd(0.62, 1.35);
+    born[i] = now();
+    /* 每个粒子在它那个团的时间之前就该到字上，所以更早发射 */
+    emitAt[i] = span.t - rnd(1.55, 2.05);
+    st[i] = 1;
+    settleT[i] = 0;
+  }
+  cam.tz = 1.0;
+}
+
+/* ============================ 10 · 主循环 ============================ */
+let last = performance.now();
+let T0 = 0;
+let lookX = 0, lookY = 0;
+/* 性能开关（?off=smoke,ash,lighter,vent,spark）—— 只用于定位掉帧 */
+const OFF = new Set((new URLSearchParams(location.search).get('off') || '').split(',').filter(Boolean));
+const on = (k) => !OFF.has(k);
+
+function frame(nowMs) {
+  const dtReal = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; T0 += dtReal;
+
+  if (AE.freeze > 0) AE.freeze -= dtReal;
+  /* 升格慢动作：物理变慢，但镜头/闪光照常走 */
+  let dt = AE.freeze > 0 ? 0 : dtReal;
+  if (AE.slow > 0) { AE.slow -= dtReal; dt *= 0.34; }
+
+  const T = now();
+  timing(T);
+
+  /* ---- 镜头：跟随正在唱的那个字，但要压低幅度（字行很宽） ---- */
+  if (L && curIdx >= 0 && L.n > 0) {
+    let c = 0;
+    if (charChars) { for (let k = 0; k < charChars.length; k++) if (charChars[k].t <= T) c = k; }
+    else c = Math.min(L.n - 1, Math.floor(clamp01((T - lines[curIdx].t) / Math.max(0.3, lines[curIdx].dur || 4)) * L.n));
+    lookX += (blockGx + L.charCx[c] - lookX) * Math.min(1, dtReal * 2.4);
+    lookY += (blockGy + L.charCy[c] - lookY) * Math.min(1, dtReal * 2.4);
+  }
+  cam.tx = blockGx + (lookX - blockGx) * 0.34;
+  cam.ty = blockGy + (lookY - blockGy) * 0.30 + H * 0.055;   // 略微下压，把火山口留在画面里
+  camUpdate(dtReal, T0);
+
+  /* ---- 逐字亮度（YRC） ---- */
+  if (L) {
+    if (charChars) for (let c = 0; c < L.n; c++) charGlow[c] = charChars[c] ? clamp01((T - charChars[c].t) / 0.22) : 0;
+    else {
+      const lt = lines[curIdx] ? lines[curIdx].t : 0, ld = lines[curIdx] ? (lines[curIdx].dur || 4) : 4;
+      for (let c = 0; c < L.n; c++) charGlow[c] = clamp01((T - lt - ld * 0.85 * c / L.n) / 0.3);
+    }
+    /* 某个字刚被唱到：把它已经落定的灰**在烘焙层上再压一遍**（叠一次 = 亮一档）。
+       不在每帧按亮度分支重画 —— 那等于每帧重绘 6000 个 rect。 */
+    if (ashCtx) {
+      for (let c = 0; c < L.n; c++) {
+        if (charStamped[c] || charGlow[c] < 0.5) continue;
+        charStamped[c] = 1;
+        const g = ashCtx;
+        g.fillStyle = `rgba(${Math.min(255, accent[0] + 46)},${Math.min(255, accent[1] + 8)},${Math.min(255, accent[2] - 20)},0.85)`;
+        g.beginPath();
+        for (let i = 0; i < N; i++) {
+          if (st[i] !== 2 || ci[i] !== c) continue;
+          const lx = px[i] - ashOx, ly = py[i] - ashOy;
+          const s = sz[i] * zz[i] * 1.75 * 1.35;
+          g.rect(lx - s * 0.5, ly - s * 0.5, s, s);
+        }
+        g.fill();
+      }
+    }
+  }
+
+  /* ---- 每团到点：喷发事件（冲击波 + 升格 + 上冲 + 变焦） ---- */
+  if (L && curIdx >= 0) {
+    for (let k = 0; k < spans.length; k++) {
+      if (spanFired[k] || T < spans[k].t) continue;
+      spanFired[k] = 1;
+      const s = spans[k], first = k === 0;
+      hitStop(first ? 0.05 : 0.028);
+      if (first) { slowMo(0.34); slowT = T0; }
+      AE.flash = Math.max(AE.flash, first ? 0.8 : 0.42);
+      cam.tz = first ? 1.05 : 1.024;
+      camShake(0, -1, first ? 14 : 8);           // 定向：向上反冲
+      shocks.push({ x: ventX, y: ventY - 20, t: 0, life: 0.62, r0: 10, r1: first ? 420 : 260, a: first ? 0.85 : 0.5 });
+      for (let j = 0; j < (first ? 26 : 14); j++) {
+        const a = -Math.PI / 2 + rnd(-0.9, 0.9);
+        const sp = rnd(220, 720);
+        sparks.push({ x: ventX + rnd(-30, 30), y: ventY - 20, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, life: rnd(0.5, 1.2) });
+      }
+      /* 喷发那一下：火山口打出一束体积光（一次性画在背景上，用 alpha 控制） */
+      flashT = T0;
+    }
+    cam.tz += (1.0 - cam.tz) * Math.min(1, dtReal * 2.2);
+  }
+
+  /* ================= 物理 ================= */
+  let moving = 0;
+  for (let i = 0; i < N; i++) {
+    const m = st[i];
+    if (m === 0) continue;
+
+    /* 冷却：随时间 + 高度单调下降。冷却到 0 就落定到字上 */
+    if (m === 1) {
+      if (T < emitAt[i]) { st[i] = 0; py[i] = ventY; continue; }
+      heat[i] -= dt * (0.30 + 0.26 * clamp01((ventY - py[i]) / (H * 0.9)));
+      const h = heat[i];
+      /* 浮力：热的时候升得快，冷了几乎悬停（这部分让烟柱有"顶"） */
+      const buoy = 150 * h - 26;
+      const ang = T0 * 0.6;
+      /* curl 湍流：强度随冷却**增大** —— 热的时候是直冲，冷了才被揉开 */
+      const tb = (1.15 - h) * 520;
+      const cxv = curlX(px[i], py[i], zz[i] * 3, T0) * tb;
+      const cyv = curlY(px[i], py[i], zz[i] * 3, T0) * tb * 0.55;
+      vx[i] += (cxv - vx[i] * 0.85) * dt;
+      vy[i] += (cyv + buoy - vy[i] * 0.85) * dt;
+      px[i] += vx[i] * dt;
+      py[i] += vy[i] * dt;
+      /* 到顶或者已经够冷 → 被字吸过去 */
+      const nearTop = py[i] < ty[i] + 60;
+      const pastTime = T >= spans[si[i]].t - 0.16;
+      if (h <= 0.06 || (nearTop && h < 0.3) || pastTime) {
+        /* 落定：位置吸附到目标，速度清零（灰落在字上就不动了） */
+        st[i] = 2;
+        settleT[i] = T;
+        px[i] = tx[i] + rnd(-1.2, 1.2);
+        py[i] = ty[i] + rnd(-1.2, 1.2);
+        heat[i] = 0;
+        if (ashStampQ.length < 40000) ashStampQ.push(i);   // 入烘焙队列，分帧摊开
+      }
+      moving++;
+    } else if (m === 2) {
+      /* 落定后只做极轻微的余颤（热对流衰减）。**位置不再写回 px/py** ——
+         字已经烘进 ashCv 了，动的是画面上的"灰雾"，不是字本身。
+         这样既省掉每帧重画 6000 个 rect，又不会把字抖糊。 */
+    }
+  }
+
+  for (let k = shocks.length - 1; k >= 0; k--) { shocks[k].t += dtReal; if (shocks[k].t > shocks[k].life) shocks.splice(k, 1); }
+  for (let k = sparks.length - 1; k >= 0; k--) {
+    const s = sparks[k];
+    s.t += dtReal;
+    if (s.t > s.life) { sparks.splice(k, 1); continue; }
+    s.vy += 460 * dtReal; s.vx *= 0.985; s.vy *= 0.99;
+    s.x += s.vx * dtReal; s.y += s.vy * dtReal;
+  }
+
+  /* ================= 绘制 ================= */
+  const [ar, ag, ab] = accent;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#050305';
+  ctx.fillRect(0, 0, W, H);
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+
+  /* 火山口熔光（喷发时更亮）。
+     只有在真的有句子在演的时候才画 —— ventX/ventY 在第一句之前是 0，
+     那时 camX(0) 正好是屏幕中心，会在画面正中冒出一团光，看着像 bug。 */
+  const burst = Math.max(0, 1 - (T0 - flashT) / 0.8);
+  const vgx = camX(ventX), vgy = camY(ventY) + 40;
+  if (ventGlow && curIdx >= 0) {
+    ctx.globalCompositeOperation = 'lighter';
+    const r = 130 * cam.z * (1 + burst * 0.5);
+    ctx.globalAlpha = 0.5 + burst * 0.5;
+    ctx.drawImage(ventGlow, vgx - r, vgy - r, r * 2, r * 2);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---------- ① 烟雾层（低分辨率 → 放大插值 = 软） ----------
+     这是"体积感"的来源：所有还在飘的灰都画进 SMW×SMH 的小画布，
+     放大 blit 时浏览器做双线性插值，方块自动糊成烟团，fill 面积只有 1/9。 */
+  if (smokeCtx && on('smoke')) {
+    smokeCtx.clearRect(0, 0, SMW, SMH);
+    smokeCtx.globalCompositeOperation = 'source-over';
+    /* 关键：烟团的预算受**填充面积（overdraw）**限制，不是受绘制调用数限制。
+       实测（真实 rAF 帧率，1440×810 软件渲染）：
+         空帧                       61.7 fps
+         6200 个 arc               19.4 fps ← arc 是灾难
+         6200 个 rect（小画布）     49.9 fps
+         6200 个 rect（主画布）     30.4 fps
+         3000 个 rect（主画布）     59.5 fps
+       一个 r=8 的烟团在 1/4 画布上就是 200 平方像素，6200 个 = 30 倍画布面积。
+       所以烟层**只取样 1/5 的粒子**（≈1240 个），每个烟团负责盖住一片，
+       靠放大插值连成一片 —— 视觉上反而更像连续的烟，而且面积降到 5 倍以内。
+       绝不用 arc（19fps），一律 batched rect。 */
+    for (let band = 0; band < 2; band++) {
+      smokeCtx.fillStyle = band ? 'rgba(255,186,142,0.44)' : 'rgba(126,104,120,0.48)';
+      smokeCtx.beginPath();
+      /* 烟团尺寸必须小：之前一个团算到 13 个小画布像素 = 屏幕上 52px，
+         放大后就是一坨方块。现在 1.7~4 个小画布像素（屏幕 7~16px），
+         靠"多而小 + 重叠 + 两级插值放大"连成连续的烟，而不是几个大方块。 */
+      for (let i = band; i < N; i += 2) {
+        if (st[i] !== 1) continue;
+        const h = heat[i];
+        if ((h > 0.42) !== !!band) continue;
+        const sx = camX(px[i]) / SMK, sy = camY(py[i]) / SMK;
+        if (sx < -30 || sx > SMW + 30 || sy < -30 || sy > SMH + 30) continue;
+        const s = (1.7 + (1 - h) * 2.6) * (0.7 + zz[i] * 0.55);
+        smokeCtx.rect(sx - s, sy - s, s * 2, s * 2);
+      }
+      smokeCtx.fill();
+    }
+    /* 两级放大：先 2 倍（smokeCv → midCv，插值抹一次），再铺满屏幕（插值抹第二次）。
+       两级插值出来的边缘比一级柔和一个档，成本是多一次小 blit（< 0.1ms）。 */
+    if (!midCv) midCv = document.createElement('canvas');
+    if (midCv.width !== SMW * 2 || midCv.height !== SMH * 2) { midCv.width = SMW * 2; midCv.height = SMH * 2; }
+    const mg = midCv.getContext('2d');
+    mg.clearRect(0, 0, midCv.width, midCv.height);
+    mg.imageSmoothingEnabled = true;
+    mg.drawImage(smokeCv, 0, 0, midCv.width, midCv.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.globalAlpha = 0.96;
+    ctx.drawImage(midCv, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------- ② 热灰 + 落定的字：全分辨率、锐利 ---------- */
+  ctx.globalCompositeOperation = 'lighter';
+  /* 还在飘、但还热的：亮橙色小点（火星） */
+  if (on('hot')) for (let band = 0; band < 2; band++) {
+    ctx.fillStyle = band ? 'rgba(255,236,190,0.92)' : 'rgba(255,148,62,0.80)';
+    ctx.beginPath();
+    const lo = band ? 0.74 : 0.34, hi = band ? 9 : 0.74;
+    for (let i = 0; i < N; i++) {
+      if (st[i] !== 1) continue;
+      const hh = heat[i];
+      if (hh <= lo || hh > hi) continue;
+      const sx = camX(px[i]), sy = camY(py[i]);
+      if (sx < -6 || sx > W + 6 || sy < -6 || sy > H + 6) continue;
+      const s = sz[i] * zz[i] * 1.35 * Math.max(0.85, cam.z) * (0.6 + heat[i] * 0.9);
+      ctx.rect(sx, sy, s, s);
+    }
+    ctx.fill();
+  }
+
+  /* 落定的灰 = 字。**这一步必须烘焙，不能每帧重画。**
+     实测（真实 rAF）：主画布 6200 个 rect 只有 30fps，3000 个才 59.5fps。
+     而"灰落定"是个一次性事件 —— 落定就烘进 ashCv，之后每帧只 blit 一张图（0.03ms）。
+     字亮起来的时候，把它那批灰**补烘一遍到同一张上**（叠一次就更亮），
+     而不是每帧按亮度分支重画。这和 lyra01 的墨墙是同一套思路。 */
+  if (on('ash') && ashCv) {
+    if (ashStampQ.length > ashHead) {
+      const g = ashCtx;
+      let budget = 700;
+      while (budget > 0 && ashHead < ashStampQ.length) {
+        const i = ashStampQ[ashHead]; ashHead++;
+        const lx = px[i] - ashOx, ly = py[i] - ashOy;   // 世界 → 烘焙画布
+        const s = sz[i] * zz[i] * 1.75 * 1.35;
+        if (lx < -20 || lx > ashCv.width + 20 || ly < -20 || ly > ashCv.height + 20) continue;
+        g.fillRect(lx - s * 0.5, ly - s * 0.5, s, s);
+        budget--;
+      }
+      if (ashHead >= ashStampQ.length) { ashStampQ.length = 0; ashHead = 0; }
+      else if (ashHead > 4000) { ashStampQ.splice(0, ashHead); ashHead = 0; }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 0.96;
+    ctx.drawImage(ashCv, ashOx - cam.x + W / 2 + cam.shx, ashOy - cam.y + H / 2 + cam.shy,
+      ashCv.width * cam.z, ashCv.height * cam.z);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'lighter';
+  }
+
+  /* 冲击波环（火山口向上的一圈） */
+  for (let k = 0; k < shocks.length; k++) {
+    const s = shocks[k], p = s.t / s.life;
+    const r = (s.r0 + (s.r1 - s.r0) * (1 - Math.pow(1 - p, 4))) * cam.z;
+    const a = s.a * Math.pow(1 - p, 2.2);
+    ctx.strokeStyle = `rgba(255,190,130,${(a * 0.42).toFixed(3)})`;
+    ctx.lineWidth = 3.2 * (1 - p);
+    ctx.beginPath(); ctx.arc(camX(s.x), camY(s.y), r, 0, 6.2832); ctx.stroke();
+    ctx.strokeStyle = `rgba(255,255,255,${(a * 0.5).toFixed(3)})`;
+    ctx.lineWidth = 1.2 * (1 - p);
+    ctx.beginPath(); ctx.arc(camX(s.x), camY(s.y), r * 0.78, 0, 6.2832); ctx.stroke();
+  }
+
+  /* 火山口喷出的火花 */
+  if (sparks.length) {
+    ctx.fillStyle = 'rgba(255,214,150,0.9)';
+    ctx.beginPath();
+    for (let k = 0; k < sparks.length; k++) {
+      const s = sparks[k];
+      const q = 1 - s.t / s.life;
+      const sx = camX(s.x), sy = camY(s.y);
+      const sz2 = 1.6 * q * Math.max(0.9, cam.z);
+      ctx.rect(sx - sz2, sy - sz2, sz2 * 2, sz2 * 2);
+    }
+    ctx.fill();
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* 冲击白闪 */
+  if (AE.flash > 0.012) {
+    ctx.fillStyle = `rgba(255,236,214,${(AE.flash * 0.085).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    AE.flash *= Math.pow(0.0000045, dtReal);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ============================ 11 · 节奏 ============================ */
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; L = null; prepCache = null; prepIdx = -1;
+    for (let i = 0; i < N; i++) st[i] = 0;
+    shocks.length = 0; sparks.length = 0;
+  }
+  lastT = T;
+  let c = curIdx;
+  while (c + 1 < lines.length && T >= lines[c + 1].t) c++;
+  if (c !== curIdx) {
+    curIdx = c;
+    brewIdx = -1;
+    if (curIdx >= 0) { lookX = W / 2; lookY = H * 0.42; assignLine(curIdx); hintShow('', 0); }
+    else hintShow(lines.length ? '等待第一句…' : '这首没有歌词', 0.5);
+  }
+  /* 酝酿：提前 1.5 秒把下一句的字形算好（这一步 6~20ms，绝不能放在换句那一帧） */
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    if (T >= lines[nx].t - Math.min(1.5, Math.max(0.55, gap * 0.5))) { brewIdx = nx; prepLine(nx, true); }
+  }
+}
+
+/* ============================ 12 · 通信协议 ============================ */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length >= 3) accent = p.accent;
+    curIdx = -1; brewIdx = -1; lastT = -1; L = null;
+    prepCache = null; prepIdx = -1;
+    for (let i = 0; i < N; i++) st[i] = 0;
+    shocks.length = 0; sparks.length = 0;
+    clockT = 0; clockAt = performance.now();
+    hintShow(lines.length ? '等待第一句…' : '这首没有歌词', lines.length ? 1 : 0.5);
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.6;
+    /* 踩拍：整场一起向上顶一下（相干），不逐颗踢 */
+    camShake(0, -1, 2 + lv * 3.5);
+    cam.tz = Math.min(1.03, cam.tz + lv * 0.008);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => {
+  let a = 0, b = 0;
+  for (let i = 0; i < N; i++) { if (st[i] === 1) a++; else if (st[i] === 2) b++; }
+  return { curIdx, n: lines.length, rising: a, settled: b,
+           pc: L ? L.pc : 0, spans: spans.length, z: +cam.z.toFixed(3), t: +now().toFixed(2) };
+};
+
+/* ============================ 13 · 启动 ============================ */
+buildPuffs();
+buildAsh();
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

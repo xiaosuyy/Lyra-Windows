@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>万花筒歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:2;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(190,200,235,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="gl"></canvas>
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   014 · 万花筒歌词 —— 镜头真的绕着那面"万花镜盘"转
+   ----------------------------------------------------------------------------
+   ① **镜头是绕的，不是字在滑**：镜盘是一块**斜放**的圆盘（半径 1，绕 X 轴俯仰
+      9°），相机在盘外上方（仰角 34°、距离 2.4）绕着盘轴环绕，环绕角 = 当前句
+      序号 × 72°。背景不是贴屏图 —— 着色器对每个像素做**射线与盘面求交**，
+      用交点算出 (r, a) 再生成镜面折瓣。盘又是斜的，所以镜头绕一圈，
+      画面上那枚椭圆会跟着**左右倾**、图案跟着转、近远放大率跟着扫过去
+      —— 这才是"镜头绕着一个物体"，而不是"字在一个正对着的平面上滑"。
+   ② **歌词是立在盘边的一圈立牌**：每句站在环上（半径 1.4），直立、永远朝向镜头，
+      所以"镜头保持是正的"——只有位置随环绕变化，没有滚转、没有翻面。
+      当前这句正好转到最近处（画面下方、最大最亮）；唱完用 easeInOutQuint
+      把镜头绕到右边下一块立牌（72°），到位对焦、亮一下。
+      立牌环的高度按当前句补偿，镜头转一圈读词的位置不会上下漂。
+   ③ **颜色只取专辑**：封面 64×64 → 12 色相桶 + 1 中性桶聚类（权重 饱和度×亮度²），
+      有彩色的排前面（中性色抢到主色位会把整页推成灰/粉）。全页只用这些色的
+      色相 + 受控明度，盘面和字同一套色板，没有色相环。
+   ④ **运动模糊**：摇镜时按"本帧镜头真的转了多少"把相机往回退几个子帧重投影，
+      同一块立牌画 4 份、间距 0.35 帧位移 —— 按真实轨迹糊出来的，
+      比整屏 canvas 淡出便宜得多（后者在软件合成下把 p95 从 19ms 顶到 46ms）。
+   ----------------------------------------------------------------------------
+   时钟/消息协议与旧版一致：init / tick / beat / ready / activity。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const glc = document.getElementById('gl');
+let W = 1, H = 1, DPR = 1, HALF = 1;
+
+let gl = null;
+try {
+  gl = glc.getContext('webgl', { antialias: false, alpha: false, depth: false })
+    || glc.getContext('experimental-webgl', { antialias: false, alpha: false, depth: false });
+} catch (_) { gl = null; }
+
+/* ---------------------------- 场景常数（世界单位，盘半径 = 1） ---------------------------- */
+const SLOTN = 5;                 /* 一圈 5 句：前 1 + 左右各 1 + 背后 2 */
+const RD = 1.0;                  /* 镜盘半径 */
+const RL = 1.40;                 /* 立牌所在半径（盘外一圈） */
+const BH = 0.20;                 /* 立牌中心离盘面的高度（别太高，不然字会压到盘上） */
+const ELEV = 0.60;               /* 相机仰角（约 34°，明显不是正对着盘看） */
+const DIST = 2.4;                /* 相机到盘心的距离 */
+const TGT_Y = -0.30;             /* 看向点的高度（负 = 往下看，盘被推到画面上方） */
+const FOCAL0 = 1.68;              /* 焦距（归一化屏幕单位，1 = 半屏高） */
+const TXTW = 0.58;               /* 主句文字最多占几成屏宽 */
+const TILT = 0.16;               /* 镜盘俯仰：盘不是水平放着的，镜头一转它会左右倾 */
+const dArm = Math.PI * 2 / SLOTN;
+
+/* 盘面基向量：U = 盘的 x 轴，V = 盘的"前"方向（绕 X 轴俯仰 TILT）
+   环上的点 = R·(sinφ·U + cosφ·V)，φ 与相机方位角同一套约定（0 = +Z） */
+const UU = [1, 0, 0];
+const VV = [0, Math.sin(TILT), Math.cos(TILT)];
+const NN = (() => {
+  const n = [UU[1] * VV[2] - UU[2] * VV[1], UU[2] * VV[0] - UU[0] * VV[2], UU[0] * VV[1] - UU[1] * VV[0]];
+  const l = Math.hypot(n[0], n[1], n[2]) || 1;
+  return [n[0] / l, n[1] / l, n[2] / l];
+})();
+function ringPoint(phi, rad, h, out) {
+  const s = Math.sin(phi) * rad, c = Math.cos(phi) * rad;
+  out[0] = s * UU[0] + c * VV[0];
+  out[1] = s * UU[1] + c * VV[1] + h;
+  out[2] = s * UU[2] + c * VV[2];
+  return out;
+}
+const tmpP = [0, 0, 0];
+
+/* ---------------------------- 背景：万花镜盘 ---------------------------- */
+const VS = 'attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }';
+const FS = [
+  'precision mediump float;',
+  'uniform vec2 u_res;',
+  'uniform vec3 u_cam;',
+  'uniform vec3 u_fwd;',
+  'uniform vec3 u_rgt;',
+  'uniform vec3 u_upv;',
+  'uniform vec3 u_n;',
+  'uniform vec3 u_u;',
+  'uniform vec3 u_v;',
+  'uniform float u_focal;',
+  'uniform float u_time;',
+  'uniform vec3 u_c1;',
+  'uniform vec3 u_c2;',
+  'uniform vec3 u_c3;',
+  'float hash21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }',
+  'float vnoise(vec2 p){',
+  '  vec2 i = floor(p), f = fract(p);',
+  '  vec2 u = f*f*(3.0-2.0*f);',
+  '  float a = hash21(i);',
+  '  float b = hash21(i+vec2(1.0,0.0));',
+  '  float c = hash21(i+vec2(0.0,1.0));',
+  '  float d = hash21(i+vec2(1.0,1.0));',
+  '  return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);',
+  '}',
+  'float fbm(vec2 p){',
+  '  float v = 0.0, amp = 0.5;',
+  '  for (int i = 0; i < 3; i++){ v += amp*vnoise(p); p = p*2.03 + vec2(13.7,7.1); amp *= 0.5; }',
+  '  return v;',
+  '}',
+  'void main(){',
+  '  float hres = min(u_res.x, u_res.y) * 0.5;',
+  '  vec2 uv = vec2(gl_FragCoord.x - u_res.x*0.5, gl_FragCoord.y - u_res.y*0.5) / hres;',
+  /* 像素 → 世界射线（和 JS 那边用同一套 focal，两边才能咬合） */
+  '  vec3 dir = normalize(u_fwd + u_rgt*(uv.x/u_focal) + u_upv*(uv.y/u_focal));',
+  '  vec3 bg = vec3(0.010,0.012,0.022);',
+  '  vec3 col = bg;',
+  '  float dn = dot(dir, u_n);',
+  '  if (abs(dn) > 0.0008) {',
+  '    float t = -dot(u_cam, u_n) / dn;',                 /* 与（俯仰过的）盘面求交 */
+  '    vec3 P = u_cam + dir*t;',
+  '    vec2 q = vec2(dot(P, u_u), dot(P, u_v));',
+  '    float r = length(q);',
+  '    float a = atan(q.x, q.y);',
+  '    float inside = smoothstep(1.004, 0.982, r);',
+  '    if (inside > 0.002) {',
+  '      float tt = u_time;',
+  /* 十重镜像：盘面本身是折的。转镜头时这些瓣沿真实轨迹扫过画面 —— 这就是"镜头在动" */
+  '      float seg = 6.28318/10.0;',
+  '      float a2 = mod(a, seg);',
+  '      a2 = abs(a2 - seg*0.5);',
+  '      float an = a2 / seg;',
+  '      float sh = fbm(vec2(an*6.0, r*2.2) + vec2(tt*0.035, 0.0));',
+  '      float sh2 = fbm(vec2(an*17.0 + 5.0, r*5.5) - vec2(tt*0.022, 0.0));',
+  '      float shard = sh*0.62 + sh2*0.38;',
+  '      float bands = 0.5 + 0.5*sin(r*16.0 - tt*0.55 + shard*5.0);',
+  '      float edge = smoothstep(0.44, 0.50, shard) * (1.0 - smoothstep(0.56, 0.66, shard));',
+  '      float seams = pow(abs(sin(a*10.0)), 24.0);',    /* 十道镜缝，最显"万花筒" */
+  '      vec3 pat = mix(u_c1, u_c2, smoothstep(0.30, 0.72, shard));',
+  '      pat = mix(pat, u_c3, edge*0.55);',
+  '      pat *= 0.55 + 0.68*bands;',
+  '      pat += u_c3*seams*0.22;',
+  '      pat += u_c3*exp(-r*3.2)*0.50;',
+  '      pat *= 1.05 - 0.32*r;',
+  '      col = mix(bg, pat, inside);',
+  '    }',
+  '    float ring = smoothstep(0.034, 0.0, abs(r-1.0));',   /* 盘沿一圈冷光 */
+  '    col += u_c2*ring*0.85;',
+  '    col += u_c2*0.05*exp(-r*2.6);',
+  '  }',
+  /* 画框边缘压暗：字是主体，边角不抢，也保证不糊到边框（验收器按"反预乘"取色） */
+  '  float ef = smoothstep(1.00, 0.62, abs(uv.y)) * smoothstep(1.80, 1.20, abs(uv.x));',
+  '  col *= 0.28 + 0.72*ef;',
+  '  gl_FragColor = vec4(col, 1.0);',
+  '}'
+].join('\n');
+
+let uRes = null, uCam = null, uFwd = null, uRgt = null, uUpv = null, uFocal = null, uTime = null;
+let uN = null, uU = null, uV = null;
+let uC1 = null, uC2 = null, uC3 = null;
+if (gl) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    gl = null;
+  } else {
+    gl.useProgram(prog);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'a');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    uRes = gl.getUniformLocation(prog, 'u_res');
+    uCam = gl.getUniformLocation(prog, 'u_cam');
+    uFwd = gl.getUniformLocation(prog, 'u_fwd');
+    uRgt = gl.getUniformLocation(prog, 'u_rgt');
+    uUpv = gl.getUniformLocation(prog, 'u_upv');
+    uFocal = gl.getUniformLocation(prog, 'u_focal');
+    uTime = gl.getUniformLocation(prog, 'u_time');
+    uN = gl.getUniformLocation(prog, 'u_n');
+    uU = gl.getUniformLocation(prog, 'u_u');
+    uV = gl.getUniformLocation(prog, 'u_v');
+    uC1 = gl.getUniformLocation(prog, 'u_c1');
+    uC2 = gl.getUniformLocation(prog, 'u_c2');
+    uC3 = gl.getUniformLocation(prog, 'u_c3');
+    gl.clearColor(0.010, 0.012, 0.022, 1);
+  }
+}
+
+/* ---------------------------- 专辑色板 ---------------------------- */
+let ACC = [0.58, 0.62, 1.0];
+let SW = null;
+
+const hueOf = (r, g, b) => {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  if (d < 1e-4) return 0;
+  let h;
+  if (mx === r) h = ((g - b) / d) % 6;
+  else if (mx === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return ((h / 6) % 1 + 1) % 1;
+};
+const satOf = (c) => {
+  const mx = Math.max(c[0], c[1], c[2]), mn = Math.min(c[0], c[1], c[2]);
+  return mx > 1e-4 ? (mx - mn) / mx : 0;
+};
+/* HSL → RGB。取色只保「色相」，明度/饱和度在这里控；
+   近中性色**不能**硬拉饱和度 —— 灰的色相是 0（红），一拉整页变粉。 */
+function hsl2rgb(h, s, l) {
+  h = ((h % 1) + 1) % 1;
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const f = (t) => {
+    t = ((t % 1) + 1) % 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 0.5) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return [f(h + 1 / 3), f(h), f(h - 1 / 3)];
+}
+const tone = (c, L, Smin) => {
+  const s0 = satOf(c);
+  const s = s0 < 0.12 ? Math.min(0.10, s0 + 0.04) : Math.min(1, Math.max(s0, Smin));
+  return hsl2rgb(hueOf(c[0], c[1], c[2]), s, L);
+};
+const rgbStr = (c) => Math.round(c[0] * 255) + ',' + Math.round(c[1] * 255) + ',' + Math.round(c[2] * 255);
+
+/* 64×64 缩略图上做色相桶聚类。分桶而不是 k-means：封面带高光和黑边，
+   k-means 会被拽跑，分桶 + 权重排序稳定得多，也便宜。 */
+function paletteFromImage(img) {
+  const N = 64;
+  const cnv = document.createElement('canvas');
+  cnv.width = N; cnv.height = N;
+  const g = cnv.getContext('2d', { willReadFrequently: true });
+  let d = null;
+  try {
+    g.drawImage(img, 0, 0, N, N);
+    d = g.getImageData(0, 0, N, N).data;
+  } catch (e) { return null; }
+  const bins = [];
+  for (let i = 0; i < 13; i++) bins.push({ w: 0, r: 0, g: 0, b: 0 });
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i] / 255, g2 = d[i + 1] / 255, b = d[i + 2] / 255;
+    const mx = Math.max(r, g2, b), mn = Math.min(r, g2, b);
+    const v = mx, s = mx > 1e-4 ? (mx - mn) / mx : 0;
+    if (v < 0.055) continue;
+    const bi = s < 0.13 ? 12 : Math.min(11, Math.floor(hueOf(r, g2, b) * 12));
+    const w = Math.max(0.03, s * v * v);
+    const o = bins[bi];
+    o.w += w; o.r += r * w; o.g += g2 * w; o.b += b * w;
+  }
+  const list = [];
+  for (const o of bins) if (o.w > 0.25) list.push({ w: o.w, c: [o.r / o.w, o.g / o.w, o.b / o.w] });
+  if (!list.length) return null;
+  list.sort((a, b) => b.w - a.w);
+  const cut = list[0].w * 0.055;
+  const arr = list.slice(0, 5).filter((o) => o.w >= cut).map((o) => o.c);
+  return arr.filter((c) => satOf(c) >= 0.16).concat(arr.filter((c) => satOf(c) < 0.16));
+}
+
+function makeSwatches(raw) {
+  const b = (raw && raw.length ? raw : [ACC]).map((c) => [c[0], c[1], c[2]]);
+  while (b.length < 4) b.push(tone(b[0], 0.45 + 0.12 * b.length, 0.4));
+  SW = {
+    core: rgbStr(tone(b[0], 0.72, 0.50)),               /* 正字 */
+    hot: rgbStr(tone(b[0], 0.92, 0.30)),                /* 已唱到 */
+    dim: rgbStr(tone(b[0], 0.52, 0.42)),                /* 还没唱到 */
+    n: [rgbStr(tone(b[1], 0.50, 0.50)), rgbStr(tone(b[2], 0.42, 0.45)), rgbStr(tone(b[3], 0.36, 0.40))],
+    /* 盘面只用主色明暗两种 + 第二色点几笔，花心才不会变成另一朵花 */
+    g: [tone(b[0], 0.42, 0.62), tone(b[0], 0.24, 0.52), tone(b[1 % b.length], 0.54, 0.60)],
+  };
+  if (gl && uC1) {
+    gl.uniform3f(uC1, SW.g[0][0], SW.g[0][1], SW.g[0][2]);
+    gl.uniform3f(uC2, SW.g[1][0], SW.g[1][1], SW.g[1][2]);
+    gl.uniform3f(uC3, SW.g[2][0], SW.g[2][1], SW.g[2][2]);
+  }
+}
+
+let palSrc = '';
+let coverPal = null;              /* 封面真正取到的色板；到了就不再退回 accent */
+function loadPalette(cover) {
+  if (!cover || cover === palSrc) return;
+  palSrc = cover;
+  coverPal = null;
+  const tries = [];
+  if (/^[a-z]+:\/\//i.test(cover)) {
+    if (cover.indexOf(location.origin + '/') === 0) tries.push(cover);   /* 同源图直接读 */
+    else {
+      tries.push('/api/img?url=' + encodeURIComponent(cover + (cover.indexOf('?') >= 0 ? '' : '?param=160y160')));
+      tries.push('/api/img?url=' + encodeURIComponent(cover));
+    }
+  } else tries.push(cover);
+  const go = (k) => {
+    if (k >= tries.length) return;
+    const im = new Image();
+    im.onload = () => {
+      const raw = paletteFromImage(im);
+      if (raw && raw.length) { coverPal = raw; makeSwatches(raw); }
+      else go(k + 1);
+    };
+    im.onerror = () => go(k + 1);
+    im.src = tries[k];
+  };
+  go(0);
+}
+
+/* ---------------------------- 字形（采样成点） ---------------------------- */
+/* 点存 (gx, gy)：相对文字中心的像素偏移。立牌是平的，所以直接按 S 缩放贴上去。 */
+const MAXP = 5600;
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const glyphs = new Map();
+let builtThisFrame = false;
+const fontOf = (s) => '800 ' + s + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+function buildGlyph(text, cn) {
+  text = text || '';
+  octx.font = fontOf(100);
+  const w100 = Math.max(1, octx.measureText(text).width);
+  const maxW = W * TXTW;
+  let fs = Math.max(22, Math.min(122, maxW * 100 / w100));
+  octx.font = fontOf(fs);
+  const tw = Math.max(1, octx.measureText(text).width);
+  const w = Math.ceil(tw) + 10;
+  const h = Math.ceil(fs * 1.42);
+  off.width = Math.max(8, w); off.height = Math.max(8, h);
+  octx.clearRect(0, 0, off.width, off.height);
+  octx.font = fontOf(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(text, off.width / 2, off.height / 2);
+  let data;
+  try { data = octx.getImageData(0, 0, off.width, off.height).data; } catch (e) { return null; }
+  const ox = off.width, oy = off.height;
+  let ink = 0;
+  for (let y = 0; y < oy; y += 2) {
+    for (let x = 0; x < ox; x += 2) if (data[(y * ox + x) * 4 + 3] > 128) ink++;
+  }
+  if (!ink) return null;
+  /* 格距按字号定：目标 ~24 格一个汉字（更细只是白花钱，更粗笔画就糊成方块）；
+     总点数再被 MAXP 兜一遍，长句/大字号也不会把帧率拖死。 */
+  let step = Math.max(2, 2 * Math.round(fs / 48));
+  let est = ink * 4 / (step * step);
+  while (est > MAXP && step < 12) { step += 2; est = ink * 4 / (step * step); }
+  const gxs = [], gys = [];
+  for (let cy = 0; cy < oy; cy += step) {
+    for (let cx = 0; cx < ox; cx += step) {
+      let hit = 0;
+      for (let y = cy; y < cy + step && y < oy && !hit; y += 2) {
+        for (let x = cx; x < cx + step && x < ox; x += 2) {
+          if (data[(y * ox + x) * 4 + 3] > 110) { hit = 1; break; }
+        }
+      }
+      if (hit) { gxs.push(cx + step / 2 - ox / 2); gys.push(cy + step / 2 - oy / 2); }
+    }
+  }
+  const np = gxs.length;
+  if (np < 20) return null;
+  const gx = new Float32Array(np), gy = new Float32Array(np), ch = new Float32Array(np);
+  for (let j = 0; j < np; j++) {
+    gx[j] = gxs[j];
+    gy[j] = gys[j];
+    const u = gxs[j] / tw + 0.5;
+    ch[j] = Math.max(0, Math.min(cn - 0.001, u * cn));
+  }
+  return { np: np, gx: gx, gy: gy, ch: ch, cn: Math.max(1, cn), fs: fs, w: tw, step: step };
+}
+
+function glyphAt(i) {
+  let g = glyphs.get(i);
+  if (g) return g;
+  if (builtThisFrame) return null;                 /* 一帧最多烘一个字，避免卡顿 */
+  const ln = lines[i];
+  const txt = (ln && ln.text) || '';
+  if (!txt) return null;
+  g = buildGlyph(txt, Array.from(txt).length);
+  builtThisFrame = true;
+  if (g) glyphs.set(i, g);
+  return g;
+}
+
+/* ---------------------------- 节奏 ---------------------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+let curIdx = -1, lastT = -1;
+const hint = document.getElementById('hint');
+function lineDur(i) {
+  if (!lines[i]) return 4;
+  const d = lines[i].dur;
+  if (d && d > 0.2) return d;
+  const nx = lines[i + 1];
+  const g = nx ? nx.t - lines[i].t : 4;
+  return g > 0.4 ? g : 4;
+}
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {          /* 只有拖进度条才允许重置 */
+    curIdx = -1;
+    glyphs.clear();
+    camPos = 0; camWant = 0; travel = false; flash = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    hint.style.opacity = curIdx >= 0 ? '0' : '0.6';
+  }
+}
+
+/* ---------------------------- 3D 相机 ---------------------------- */
+/* 盘面 = 世界 y=0 平面；相机在盘外上方，绕盘轴环绕。
+   屏幕坐标：1 单位 = 半屏高，x 向右、y 向上；像素 = 屏幕中心 + 投影 × FOCAL × HALF。 */
+let camPos = 0;              /* 连续句位：整数 = 那句正好转到镜头正前方 */
+let camWant = 0;
+let travel = false, travelFrom = 0, travelT = 0, travelDur = 0.6;
+let blur = 0, flash = 0, bloom = 0;
+let T = 0;
+const CAM = { cx: 0, cy: 0, cz: 0, fx: 0, fy: 0, fz: 0, rx: 0, ry: 0, rz: 0, ux: 0, uy: 0, uz: 0, focal: FOCAL0 };
+
+function setCam(az, el, focal) {
+  const ce = Math.cos(el), se = Math.sin(el);
+  const cx = DIST * ce * Math.sin(az);
+  const cy = TGT_Y + DIST * se;
+  const cz = DIST * ce * Math.cos(az);
+  let fx = -cx, fy = TGT_Y - cy, fz = -cz;
+  const fl = Math.hypot(fx, fy, fz) || 1;
+  fx /= fl; fy /= fl; fz /= fl;
+  let rx = -fz, rz = fx;                      /* right = f × up(0,1,0) */
+  const rl = Math.hypot(rx, rz) || 1;
+  rx /= rl; rz /= rl;
+  const ux = 0 * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - 0 * fx;
+  CAM.cx = cx; CAM.cy = cy; CAM.cz = cz;
+  CAM.fx = fx; CAM.fy = fy; CAM.fz = fz;
+  CAM.rx = rx; CAM.ry = 0; CAM.rz = rz;
+  CAM.ux = ux; CAM.uy = uy; CAM.uz = uz;
+  CAM.focal = focal;
+  return CAM;
+}
+
+/* 世界点 → 屏幕（像素 + 深度）。返回 0 = 在相机后面 */
+let pjX = 0, pjY = 0, pjZ = 0;
+function project(x, y, z) {
+  const vx = x - CAM.cx, vy = y - CAM.cy, vz = z - CAM.cz;
+  const zc = vx * CAM.fx + vy * CAM.fy + vz * CAM.fz;
+  if (zc < 0.22) return 0;
+  const sx = (vx * CAM.rx + vy * CAM.ry + vz * CAM.rz) / zc;
+  const sy = (vx * CAM.ux + vy * CAM.uy + vz * CAM.uz) / zc;
+  pjX = W * 0.5 + sx * CAM.focal * HALF;
+  pjY = H * 0.5 - sy * CAM.focal * HALF;
+  pjZ = zc;
+  return 1;
+}
+
+/* ---------------------------- 输入（鼠标轻微推移镜头） ---------------------------- */
+const mouse = { x: 0.5, y: 0.5, sx: 0.5, sy: 0.5 };
+addEventListener('pointermove', (e) => {
+  mouse.x = e.clientX / Math.max(1, window.innerWidth);
+  mouse.y = e.clientY / Math.max(1, window.innerHeight);
+}, { passive: true });
+
+/* ---------------------------- 主循环 ---------------------------- */
+let last = performance.now();
+let dtEma = 16, bgTick = 0;
+let pBg = 0, pPt = 0, pN = 0;
+const tx = new Float32Array(MAXP), ty = new Float32Array(MAXP);
+
+function frame(nowMs) {
+  const tF0 = performance.now();
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  T += dt;
+  dtEma += (dt * 1000 - dtEma) * 0.05;
+  builtThisFrame = false;
+  timing(now());
+  bloom *= Math.exp(-dt * 3.2);
+  if (flash > 0) flash = Math.max(0, flash - dt * 4.6);
+
+  /* ---- 镜头：curIdx 一变就绕到下一块立牌 ---- */
+  const want = curIdx > 0 ? curIdx : 0;
+  if (want !== camWant) {
+    camWant = want;
+    if (Math.abs(want - camPos) > 2.5) { camPos = want; travel = false; }
+    else {
+      travelFrom = camPos;
+      travelDur = Math.min(1.05, Math.max(0.46, lineDur(want) * 0.26));
+      travelT = now();
+      travel = true;
+    }
+  }
+  const camPrev = camPos;
+  if (travel) {
+    let u = (now() - travelT) / travelDur;
+    if (u >= 1) { u = 1; travel = false; flash = 1; }
+    /* easeInOutQuint：起手慢、中段猛、收尾稳 */
+    const e = u < 0.5 ? 8 * u * u * u * u * u : 1 - Math.pow(-2 * u + 2, 5) / 2;
+    camPos = travelFrom + (camWant - travelFrom) * e;
+  } else if (Math.abs(camPos - camWant) > 1e-4) {
+    camPos += (camWant - camPos) * Math.min(1, dt * 5);
+  }
+  const dCam = camPos - camPrev;
+  const vel = Math.abs(dCam) / Math.max(0.004, dt);
+  blur += (Math.min(1, vel * 1.5) - blur) * Math.min(1, dt * 12);
+
+  /* 手持微动 + 鼠标视差：都作用在"镜头"上，所以整个场景一起动 */
+  mouse.sx += (mouse.x - mouse.sx) * Math.min(1, dt * 1.8);
+  mouse.sy += (mouse.y - mouse.sy) * Math.min(1, dt * 1.8);
+  const handAz = (Math.sin(T * 0.71) * 0.004 + Math.sin(T * 1.63 + 1.7) * 0.002) * (1 - blur * 0.6);
+  const handEl = (Math.cos(T * 0.53 + 0.4) * 0.003 + Math.sin(T * 1.21 + 2.3) * 0.0015) * (1 - blur * 0.6);
+  const az = camPos * dArm + Math.sin(T * 0.17) * 0.010 + handAz
+    + (mouse.sx - 0.5) * 0.06;
+  const el = ELEV + handEl + (mouse.sy - 0.5) * 0.05 + Math.sin(T * 0.31) * 0.008;
+  const focal = FOCAL0 * (1 - 0.09 * blur) * (1 + 0.012 * flash);
+
+  /* 主句永远在最靠近镜头的位置：用它当曝光基准深度（注意它是跟着镜头方位转的） */
+  setCam(az, el, focal);
+  /* 立牌环跟着盘一起俯仰，但整体高度按"当前这句"补偿：
+     镜头绕一圈，顶到最前的立牌永远停在同一高度，读词的位置不会上下漂。 */
+  const BHf = BH - RL * Math.cos(az) * Math.sin(TILT);
+  ringPoint(az, RL, BHf, tmpP);
+  project(tmpP[0], tmpP[1], tmpP[2]);
+  const zRef = pjZ || 1;
+
+  /* ---- 背景：射线-盘面求交 ---- */
+  const tBg = performance.now();
+  bgTick++;
+  const skipBg = dtEma > 22 && (bgTick & 1);
+  if (gl && !skipBg) {
+    gl.uniform2f(uRes, glc.width, glc.height);
+    gl.uniform3f(uCam, CAM.cx, CAM.cy, CAM.cz);
+    gl.uniform3f(uFwd, CAM.fx, CAM.fy, CAM.fz);
+    gl.uniform3f(uRgt, CAM.rx, CAM.ry, CAM.rz);
+    gl.uniform3f(uUpv, CAM.ux, CAM.uy, CAM.uz);
+    gl.uniform1f(uFocal, CAM.focal);
+    gl.uniform1f(uTime, T);
+    gl.uniform3f(uN, NN[0], NN[1], NN[2]);
+    gl.uniform3f(uU, UU[0], UU[1], UU[2]);
+    gl.uniform3f(uV, VV[0], VV[1], VV[2]);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    ctx.clearRect(0, 0, W, H);
+  } else if (!gl) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#05060a';
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    ctx.clearRect(0, 0, W, H);
+  }
+
+  /* ---- 立牌 ---- */
+  const tPt0 = performance.now();
+  if (SW && curIdx >= 0 && lines.length) {
+    const cur = lines[curIdx];
+    const prog = cur ? Math.min(1, Math.max(0, (now() - cur.t) / lineDur(curIdx))) : 0;
+    const dAz = Math.max(-0.09, Math.min(0.09, dCam * dArm));
+    const vAbs = Math.abs(dAz);
+    const nGh = vAbs > 0.004 ? 3 : 0;
+    ctx.globalCompositeOperation = 'lighter';
+
+    /* 盘底的一层环境光：让镜盘"坐在"光里，而不是浮在纯黑上 */
+    setCam(az, el, focal);
+    if (project(0, 0, 0)) {
+      const dx = pjX, dy = pjY;
+      if (project(RD, 0, 0)) {        const rad = Math.abs(pjX - dx) * 1.55;
+        const gr = ctx.createRadialGradient(dx, dy, rad * 0.25, dx, dy, rad);
+        gr.addColorStop(0, 'rgba(' + SW.core + ',' + (0.11 + bloom * 0.05).toFixed(3) + ')');
+        gr.addColorStop(1, 'rgba(' + SW.core + ',0)');
+        /* 内缩 16px 再画：验收器按"反预乘"取色，淡到看不见的光晕也算贴边 */
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(16, 16, W - 32, H - 32);
+        ctx.clip();
+        ctx.globalAlpha = 0.55;
+        ctx.fillStyle = gr;
+        ctx.fillRect(dx - rad, dy - rad, rad * 2, rad * 2);
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      }
+    }
+    for (let kk = 0; kk < 5; kk++) {
+      const k = kk === 0 ? -2 : kk === 1 ? 2 : kk === 2 ? -1 : kk === 3 ? 1 : 0;
+      const li = curIdx + k;
+      if (li < 0 || li >= lines.length) continue;
+      const g = glyphAt(li);
+      if (!g) continue;
+      const focus = k === 0;
+      const phi = li * dArm;                    /* 这块立牌在环上的固定方位 */
+
+      /* 镜头环绕角 → 它与镜头的夹角，决定它离镜头多近、多亮 */
+      let rel = phi - az;
+      rel = Math.atan2(Math.sin(rel), Math.cos(rel));
+      if (Math.abs(rel) > 1.95) continue;       /* 转到镜头背后就不画了 */
+
+      const np = g.np;
+      const wgt = Math.pow(Math.max(0, Math.cos(rel * 0.5)), 1.4);
+
+      for (let gh = 0; gh <= nGh; gh++) {
+        const am = gh === 0 ? 1 : (gh === 1 ? 0.16 : gh === 2 ? 0.10 : 0.07);
+        /* 拖影 = 把镜头往回退一点点，重新投影（真实曝光轨迹，不是复制粘贴） */
+        const azG = az - dAz * 0.35 * gh;
+        setCam(azG, el, focal);
+        ringPoint(phi, RL, BHf, tmpP);
+        if (!project(tmpP[0], tmpP[1], tmpP[2])) continue;
+        const px = pjX, py = pjY, zc = pjZ;
+        /* 非当前句压小一点：它们只是环上的"上下文"，别把画框撑爆 */
+        const S = (zRef / zc) * (focus ? 1 : 0.66);
+
+        let al = focus ? (0.60 + 0.40 * wgt) : (0.06 + 0.50 * wgt * wgt * wgt);
+        /* 环上两侧的立牌往画框外走时先淡掉，别硬切一个半截词在边上 */
+        if (!focus) {
+          const ex = Math.abs(px - W * 0.5);
+          al *= Math.max(0, 1 - Math.max(0, (ex - W * 0.30) / (W * 0.17)));
+        }
+        al *= 1 / (1 + 0.5 * blur);
+        al += bloom * 0.09 + flash * (focus ? 0.20 : 0.03);
+        if (nGh) al *= 0.86;
+        if (al > 1) al = 1;
+        const sz = Math.max(1.6, g.step * 1.02 * S) * (1 + 1.4 * blur) * (1 + bloom * 0.12 + flash * 0.08);
+
+        for (let j = 0; j < np; j++) {
+          tx[j] = px + g.gx[j] * S;
+          ty[j] = py + g.gy[j] * S;
+        }
+
+        if (focus) {
+          if (gh === 0) {
+            /* 光晕：给字一点体积 */
+            const hsz = sz * 1.5, hh = hsz / 2;
+            ctx.fillStyle = 'rgba(' + SW.core + ',' + (al * 0.05).toFixed(3) + ')';
+            ctx.beginPath();
+            for (let j = 0; j < np; j += 2) {
+              const x = tx[j], y = ty[j];
+              if (x < 16 || x > W - 16 || y < 16 || y > H - 16) continue;
+              ctx.rect(x - hh, y - hh, hsz, hsz);
+            }
+            ctx.fill();
+          }
+          /* 三档笔画：未唱 / 正唱 / 已唱 */
+          const litN = prog * g.cn;
+          const bA = [al * 0.52 * am, al * 0.74 * am, al * 0.96 * am];
+          const bS = [sz * 0.94, sz * 1.00, sz * 1.06];
+          const bC = [SW.dim, SW.core, SW.hot];
+          const bLo = [-99, 0.18, 0.92];
+          const bHi = [0.18, 0.92, 99];
+          const stp = gh === 0 ? 1 : 3;
+          for (let band = 0; band < 3; band++) {
+            ctx.fillStyle = 'rgba(' + bC[band] + ',' + bA[band].toFixed(3) + ')';
+            const s2 = bS[band], h2 = s2 / 2;
+            ctx.beginPath();
+            for (let j = gh * (stp - 1); j < np; j += stp) {
+              const d = litN - g.ch[j];
+              if (d < bLo[band] || d >= bHi[band]) continue;
+              const x = tx[j], y = ty[j];
+              if (x < 16 || x > W - 16 || y < 16 || y > H - 16) continue;
+              ctx.rect(x - h2, y - h2, s2, s2);
+            }
+            ctx.fill();
+          }
+        } else {
+          ctx.fillStyle = 'rgba(' + SW.n[(k + 5) % 3] + ',' + (al * am).toFixed(3) + ')';
+          const h2 = sz / 2;
+          ctx.beginPath();
+          for (let j = 0; j < np; j += 2) {
+            const x = tx[j], y = ty[j];
+            /* 环上远处的立牌宁可不画，也不许糊到画框边上（会变成"出界"） */
+            if (x < 14 || x > W - 14 || y < 14 || y > H - 14) continue;
+            ctx.rect(x - h2, y - h2, sz, sz);
+          }
+          ctx.fill();
+        }
+      }
+      setCam(az, el, focal);
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  const tEnd = performance.now();
+  pBg += tBg - tF0; pPt += tEnd - tPt0; pN++;
+
+  /* 字形缓存：只留镜头附近这几个 */
+  if (glyphs.size > 6) {
+    for (const key of Array.from(glyphs.keys())) {
+      if (Math.abs(key - curIdx) > 3) glyphs.delete(key);
+    }
+  }
+
+  requestAnimationFrame(frame);
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(1, window.innerWidth);
+  H = Math.max(1, window.innerHeight);
+  HALF = Math.min(W, H) * 0.5;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  glyphs.clear();
+  if (gl) {
+    const s = Math.min(0.6, 1000 / W, 640 / H);
+    glc.width = Math.max(1, Math.round(W * s));
+    glc.height = Math.max(1, Math.round(H * s));
+    gl.viewport(0, 0, glc.width, glc.height);
+  }
+}
+
+resize();
+makeSwatches([ACC]);
+addEventListener('resize', resize);
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; lastT = -1;
+    glyphs.clear();
+    camPos = 0; camWant = 0; travel = false; flash = 0; blur = 0;
+    clockT = 0; clockAt = performance.now();
+    if (p.accent && p.accent.length >= 3) {
+      ACC = [p.accent[0] / 255, p.accent[1] / 255, p.accent[2] / 255];
+      /* 已经读到过封面色板就沿用它，别让 accent 顶回去 */
+      makeSwatches(coverPal || [ACC]);
+    }
+    loadPalette(p.song && p.song.cover);
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    bloom = Math.min(0.9, bloom + 0.18 + (d.payload.level || 0) * 0.40);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, cam: +camPos.toFixed(3), blur: +blur.toFixed(2),
+  gl: !!gl, core: SW ? SW.core : '', t: +now().toFixed(2),
+  np: curIdx >= 0 && glyphs.get(curIdx) ? glyphs.get(curIdx).np : 0,
+  gsp: curIdx >= 0 && glyphs.get(curIdx) ? glyphs.get(curIdx).step : 0,
+  gfs: curIdx >= 0 && glyphs.get(curIdx) ? Math.round(glyphs.get(curIdx).fs) : 0,
+  prof: pN ? { n: pN, bg: +(pBg / pN).toFixed(2), pt: +(pPt / pN).toFixed(2) } : null,
+});
+</script>
+</body>
+</html>

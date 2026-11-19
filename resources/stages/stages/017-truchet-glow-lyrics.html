@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>特鲁谢光轨</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060b;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(120,225,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   017 · 特鲁谢光轨歌词 —— 字是光轨扫过的"照明区"
+
+   画面是一整片特鲁谢瓷砖（每格两条对角圆弧，二选一），每块砖有一个相位，
+   一道光轨沿相位轴推进，砖的弧就一排排亮起来。字 = 网被照亮的区域。
+
+   精修要点（第一版的问题：1/4 分辨率把小弧糊成横向扫描线，字根本读不出）：
+   ① 瓷砖放大到 32px、光轨层提到 **1/2 分辨率**，弧真的看得出是弧；
+   ② 字有**实体层**：预烘的三档笔画（暗影挤出 + 渐变本体 + 边缘高光），
+      保证"整句一眼读完"；瓷砖的弧再 additive 叠在字上，字仍是"被照亮"而不是贴图；
+   ③ 逐字点亮：每块砖记着自己属于哪个字，唱到才提亮（未唱到的字也有 0.55 亮度）；
+   ④ 余辉物理：能量是"快充慢放"的一阶系统，光轨头部一过就留下拖尾；
+   ⑤ 镜头：整句内缓慢推近 + 摇移 + 踩拍顶一下 + 换句甩镜（背景网格走 0.55 视差）；
+   ⑥ 四边渐隐，亮带不再顶到画布边缘（checker 的贴边判据）。
+   ========================================================================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+
+/* ---------------- 状态（必须先于 resize()） ---------------- */
+let lines = [];
+let accent = [120, 225, 255];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+let clockT = 0, clockAt = 0, playing = false;
+let phase = 0, surge = 0, dolly = 0, lum = 0;
+let last = performance.now(), t0 = 0;
+let trackCv = null, trackCtx = null;
+let gridCv = null, vigCv = null;
+let G = null;                      // 本句的字形贴图 {body,glow,x,y,cw,ch,chars,bounds}
+
+const PAD = 96;                    // 瓷砖比画布多铺一圈，镜头推近/摇移不露底
+const TILE = 36;                   // 砖大一点：弧看得更清，同屏砖数少 ~25%（描边是主要开销）
+const P = 5.6;                     // 光轨周期（相位单位）
+const speed = 1.15;
+
+/* ---------------- 字形采样 ---------------- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FONT = (fs) => '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+function glyphPoints(text) {
+  const F = 100;
+  const maxW = Math.min(W * 0.76, 1200);
+  octx.font = FONT(F);
+  let w = Math.ceil(octx.measureText(text).width) + 8;
+  const fs = w > maxW ? F * (maxW / w) : F;
+  octx.font = FONT(fs);
+  const tw = octx.measureText(text).width;
+  w = Math.ceil(tw) + 8;
+  const h = Math.ceil(fs * 1.32);
+  off.width = w; off.height = h;
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(text, w / 2, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const pts = [];
+  const step = 3;
+  for (let y = 0; y < h; y += step)
+    for (let x = 0; x < w; x += step)
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - w / 2, y - h / 2);
+  return { pts: pts, w: w, h: h, fs: fs, tw: tw };
+}
+
+const anchors = [];
+for (let i = 0; i < 96; i++) {
+  const g = i * 2.399963;
+  const rr = 0.28 + 0.72 * (((i * 37) % 97) / 97);
+  anchors.push({ nx: Math.cos(g) * rr, ny: Math.sin(g) * rr * 0.60 });
+}
+function placeAnchor(a, hw, hh, gcx, gcy) {
+  const M = 74;
+  const x0 = M + hw - gcx, x1 = W - M - hw - gcx;
+  const y0 = M + hh - gcy, y1 = H - M - hh - gcy;
+  return {
+    x: x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2 - gcx,
+    y: y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2 - gcy
+  };
+}
+
+/* ---------------- 瓷砖网格 ---------------- */
+let cols = 0, rows = 0, tn = 0;
+let tx = null, ty = null, tori = null, tph = null, tmidx = null, te = null;
+const MC = 24;
+let mgw = 0, mgh = 0;
+let mask = null, mch = null;
+let gx = null, gy = null, gn = 0;
+
+/* 相位：沿一条斜着走的"光轨轴"。波前是斜的，扫过字的时候像一道光栅掠过，
+   而且一屏里能看到 3 道轨道（周期 P 小于屏幕对角线），不是一条横线刷过去。 */
+function tilePhase(x, y) {
+  return (x * 0.62 + y * 0.78 + Math.sin(y * 0.0055 + x * 0.0032) * 26) * 0.011;
+}
+
+function buildTiles() {
+  cols = Math.ceil((W + PAD * 2) / TILE) + 1;
+  rows = Math.ceil((H + PAD * 2) / TILE) + 1;
+  tn = cols * rows;
+  tx = new Float32Array(tn); ty = new Float32Array(tn);
+  tori = new Uint8Array(tn); tph = new Float32Array(tn);
+  te = new Float32Array(tn); tmidx = new Int32Array(tn);
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const i = r * cols + c;
+      tx[i] = -PAD + c * TILE;
+      ty[i] = -PAD + r * TILE;
+      /* 特鲁谢：两种朝向由位置哈希决定，才有"随机拼贴"的手感（棋盘式排列会看出斜纹） */
+      const h = (Math.imul(c + 17, 73856093) ^ Math.imul(r + 31, 19349663)) >>> 7;
+      tori[i] = h & 1;
+      tph[i] = tilePhase(tx[i], ty[i]);
+    }
+  }
+  mgw = Math.max(2, Math.ceil(W / MC) + 1);
+  mgh = Math.max(2, Math.ceil(H / MC) + 1);
+  mask = new Float32Array(mgw * mgh);
+  mch = new Int16Array(mgw * mgh);
+  for (let i = 0; i < tn; i++) {
+    const c0 = (tx[i] / MC) | 0, r0 = (ty[i] / MC) | 0;
+    tmidx[i] = (c0 >= 0 && r0 >= 0 && c0 < mgw && r0 < mgh) ? r0 * mgw + c0 : -1;
+  }
+}
+
+/* ---------------- 字：瓷砖掩膜 + 预烘贴图 ---------------- */
+function buildGlyph(idx) {
+  mask.fill(0); mch.fill(-1);
+  G = null;
+  if (idx < 0 || !lines[idx]) { gn = 0; return; }
+  const line = lines[idx];
+  const text = line.text || '';
+  const bmp = glyphPoints(text);
+  const pts = bmp.pts, pc = pts.length / 2;
+  if (!pc) { gn = 0; return; }
+  let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9;
+  for (let k = 0; k < pts.length; k += 2) {
+    if (pts[k] < bx0) bx0 = pts[k];
+    if (pts[k] > bx1) bx1 = pts[k];
+    if (pts[k + 1] < by0) by0 = pts[k + 1];
+    if (pts[k + 1] > by1) by1 = pts[k + 1];
+  }
+  const A = placeAnchor(anchors[idx % anchors.length],
+    (bx1 - bx0) / 2, (by1 - by0) / 2, (bx0 + bx1) / 2, (by0 + by1) / 2);
+  if (!gx || gx.length < pc) { gx = new Float32Array(pc); gy = new Float32Array(pc); }
+  gn = pc;
+  for (let k = 0; k < pc; k++) { gx[k] = A.x + pts[k * 2]; gy[k] = A.y + pts[k * 2 + 1]; }
+
+  /* 逐字时间：字形局部 x 的字符边界（textAlign=center，所以是 [-tw/2, tw/2]） */
+  const chars = (line.chars && line.chars.length) ? line.chars : null;
+  const bounds = [];
+  if (chars) {
+    let acc = 0;
+    for (let k = 0; k < chars.length; k++) {
+      const w0 = octx.measureText(text.slice(0, k)).width;
+      const w1 = octx.measureText(text.slice(0, k + 1)).width;
+      bounds.push([-bmp.tw / 2 + w0, -bmp.tw / 2 + w1]);
+      acc = w1;
+    }
+  }
+  const charOf = (lx) => {
+    if (!chars) return -1;
+    for (let k = 0; k < bounds.length; k++)
+      if (lx >= bounds[k][0] && lx < bounds[k][1]) return k;
+    return chars.length - 1;
+  };
+
+  /* 掩膜：按点盖章（scatter），字附近权重 1，向外 48px 衰减到 0 */
+  const RR = 48, RR2 = RR * RR;
+  for (let k = 0; k < gn; k++) {
+    const px = gx[k], py = gy[k];
+    const ci = charOf(pts[k * 2]);
+    const c0 = Math.max(0, Math.floor((px - RR) / MC));
+    const c1 = Math.min(mgw - 1, Math.floor((px + RR) / MC));
+    const r0 = Math.max(0, Math.floor((py - RR) / MC));
+    const r1 = Math.min(mgh - 1, Math.floor((py + RR) / MC));
+    for (let r = r0; r <= r1; r++) {
+      const dy = r * MC - py;
+      const row = r * mgw;
+      for (let c = c0; c <= c1; c++) {
+        const dx = c * MC - px;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= RR2) continue;
+        const t = 1 - Math.sqrt(d2) / RR;
+        const v = t * t * (3 - 2 * t);
+        const i = row + c;
+        if (v > mask[i]) { mask[i] = v; mch[i] = ci; }
+      }
+    }
+  }
+
+  octx.font = FONT(bmp.fs);
+  bakeGlyphSprite(text, bmp, A, chars, bounds);
+}
+
+/* 三档笔画：暗影挤出（厚度） + 渐变本体 + 边缘高光；另烘一张辉光 */
+function bakeGlyphSprite(text, bmp, A, chars, bounds) {
+  const pad = 48;
+  const cw = Math.round(bmp.w + pad * 2), ch = Math.round(bmp.h + pad * 2);
+  const body = document.createElement('canvas');
+  body.width = cw; body.height = ch;
+  const b = body.getContext('2d');
+  b.translate(pad, pad);
+  b.font = FONT(bmp.fs);
+  b.textAlign = 'center'; b.textBaseline = 'middle';
+  const mx = bmp.w / 2, my = bmp.h / 2;
+
+  /* ① 暗影：往下挤一层，让字从网格上"浮"起来（有重量）。
+     模糊/偏移随字号缩 —— 固定 16px 会糊掉 34 字长句的细笔画。 */
+  const shBlur = Math.max(5, Math.min(17, bmp.fs * 0.17));
+  const shOff = Math.max(2.5, Math.min(9, bmp.fs * 0.085));
+  b.save();
+  b.globalAlpha = 0.92;
+  b.fillStyle = 'rgba(1,3,9,0.95)';
+  b.shadowColor = 'rgba(0,0,0,0.95)';
+  b.shadowBlur = shBlur;
+  b.shadowOffsetY = shOff;
+  b.fillText(text, mx, my);
+  b.restore();
+
+  /* ② 本体：上暖白、下青的竖向渐变（打光方向）。暖白顶光 + 冷青底面，
+     和满屏的青蓝瓷砖弧拉开色温差，字才不会被弧网吃掉。 */
+  const gr = b.createLinearGradient(0, 0, 0, bmp.h);
+  gr.addColorStop(0, 'rgba(255,251,238,1)');
+  gr.addColorStop(0.44, 'rgba(252,246,228,1)');
+  gr.addColorStop(0.76, 'rgba(176,218,238,1)');
+  gr.addColorStop(1, 'rgba(92,158,202,1)');
+  b.fillStyle = gr;
+  b.fillText(text, mx, my);
+
+  /* ③ 顶部灯箱光：只作用在笔画上 */
+  b.globalCompositeOperation = 'source-atop';
+  const sg = b.createLinearGradient(0, 0, 0, bmp.h * 0.72);
+  sg.addColorStop(0, 'rgba(255,255,255,0.38)');
+  sg.addColorStop(0.5, 'rgba(255,255,255,0.05)');
+  sg.addColorStop(1, 'rgba(0,0,0,0.16)');
+  b.fillStyle = sg;
+  b.fillRect(0, 0, bmp.w, bmp.h);
+  /* ④ 字面刻上瓷砖网：用同一套特鲁谢弧、按世界坐标对齐，压成很淡的暗线。
+     这一层是"字 = 瓷砖网被照亮的那一块"的关键证据 —— 不然就是贴上去的字。 */
+  b.globalCompositeOperation = 'source-atop';
+  b.strokeStyle = 'rgba(12,38,62,' + Math.min(0.34, 0.1 + bmp.fs * 0.0024).toFixed(3) + ')';
+  b.lineWidth = 1;
+  b.beginPath();
+  {
+    const wx0 = A.x - bmp.w / 2 - pad;    /* 贴图左上角的世界坐标 */
+    const wy0 = A.y - bmp.h / 2 - pad;
+    const c0 = Math.floor((wx0 + PAD) / TILE), c1 = Math.ceil((wx0 + cw + PAD) / TILE);
+    const r0 = Math.floor((wy0 + PAD) / TILE), r1 = Math.ceil((wy0 + ch + PAD) / TILE);
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const ori = ((Math.imul(c + 17, 73856093) ^ Math.imul(r + 31, 19349663)) >>> 7) & 1;
+        /* 世界坐标 → 贴图局部坐标（已 translate(pad,pad)，所以还要减 pad） */
+        tileArcs(b, -PAD + c * TILE - wx0 - pad, -PAD + r * TILE - wy0 - pad, ori, TILE * 0.5);
+      }
+    }
+  }
+  b.stroke();
+  /* ⑤ 边缘高光（轮廓光，也是"有打光"的证据）。细字用小线宽，
+     否则 34 字的长句会被轮廓光糊成一片灰。 */
+  b.strokeStyle = 'rgba(255,253,246,0.58)';
+  b.lineWidth = Math.max(0.9, Math.min(1.9, bmp.fs * 0.014));
+  b.strokeText(text, mx, my);
+  b.globalCompositeOperation = 'source-over';
+
+  /* 辉光：1/4 分辨率 + blur，每帧一次 drawImage */
+  const glow = document.createElement('canvas');
+  glow.width = Math.max(4, Math.round(cw / 4));
+  glow.height = Math.max(4, Math.round(ch / 4));
+  const g2 = glow.getContext('2d');
+  g2.scale(0.25, 0.25);
+  g2.translate(pad, pad);
+  g2.font = FONT(bmp.fs);
+  g2.textAlign = 'center'; g2.textBaseline = 'middle';
+  g2.fillStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',0.95)';
+  g2.filter = 'blur(8px)';
+  g2.fillText(text, mx, my);
+
+  G = {
+    body: body, glow: glow,
+    x: A.x - bmp.w / 2 - pad, y: A.y - bmp.h / 2 - pad, cw: cw, ch: ch,
+    chars: chars, bounds: bounds || []
+  };
+  /* 逐字亮度缓存（未唱到的字也有底亮，见交接文档的坑 2） */
+  charLit = new Float32Array(chars ? chars.length : 1);
+}
+
+/* ---------------- 静息网格 + 背景 + 边缘渐隐（resize 时重烘） ---------------- */
+function tileArcs(g, x, y, ori, r) {
+  /* 每条弧前面必须显式 moveTo 到弧的起点：
+     canvas 的 arc() 在有当前子路径时会从当前点补一条直线过来，
+     不 moveTo 的话相邻砖的弧会被这些"连接线"串成贯穿全屏的直线
+     —— 画面看起来像扫描线/故障条，特鲁谢的弧反而糊掉。 */
+  if (ori) {
+    g.moveTo(x - r, y); g.arc(x, y, r, Math.PI, Math.PI * 1.5);
+    g.moveTo(x + r * 2, y + r); g.arc(x + r, y + r, r, 0, Math.PI * 0.5);
+  } else {
+    g.moveTo(x, y); g.arc(x, y + r, r, Math.PI * 1.5, Math.PI * 2);
+    g.moveTo(x + r, y + r); g.arc(x + r, y, r, Math.PI * 0.5, Math.PI);
+  }
+}
+
+function buildGridCache() {
+  /* 按 DPR 整数倍烘焙，贴回时是 1:1 设备像素（整数缩放走 Skia 快路径）；
+     用 1.5 这种非整数倍会掉进通用重采样，白送 5ms/帧。 */
+  const sc = DPR;
+  gridCv = document.createElement('canvas');
+  gridCv.width = Math.round((W + PAD * 2) * sc);
+  gridCv.height = Math.round((H + PAD * 2) * sc);
+  const g2 = gridCv.getContext('2d');
+  g2.setTransform(sc, 0, 0, sc, PAD * sc, PAD * sc);
+  /* 底色直接烘进网格图：少一次整屏 drawImage（底和网格都是"远层"，可以一起走视差） */
+  const gw = W + PAD * 2, gh = H + PAD * 2;
+  const bgr = g2.createRadialGradient(gw * 0.5, gh * 0.46, 0, gw * 0.5, gh * 0.5, Math.max(gw, gh) * 0.7);
+  bgr.addColorStop(0, '#081420');
+  bgr.addColorStop(0.55, '#050b13');
+  bgr.addColorStop(1, '#02040a');
+  g2.fillStyle = bgr;
+  g2.fillRect(-PAD, -PAD, gw, gh);
+  const R = TILE * 0.5;
+  g2.strokeStyle = 'rgba(58,152,200,0.26)';
+  g2.lineWidth = 1;
+  g2.beginPath();
+  for (let i = 0; i < tn; i++) tileArcs(g2, tx[i], ty[i], tori[i], R);
+  g2.stroke();
+  /* 砖心一点点微光，网格才有"材质"而不是线稿 */
+  g2.fillStyle = 'rgba(74,184,232,0.20)';
+  g2.beginPath();
+  for (let i = 0; i < tn; i++) g2.rect(tx[i] - 1, ty[i] - 1, 2, 2);
+  g2.fill();
+}
+
+function buildVignette() {
+  /* 只画四条边带（缓存渐变对象，每帧 4 次 fillRect）。
+     整屏贴一张 1/2 分辨率的暗角图要多做 1.2M 像素的 alpha 混合（实测 2.4ms），
+     而需要压暗的只有边缘 —— 面积减一半还不用重采样。 */
+  const e1 = Math.round(Math.min(W, H) * 0.19);
+  const e2 = Math.round(Math.min(W, H) * 0.13);
+  vigCv = {
+    l: ctx.createLinearGradient(0, 0, e1, 0),
+    r: ctx.createLinearGradient(W, 0, W - e1, 0),
+    t: ctx.createLinearGradient(0, 0, 0, e2),
+    b: ctx.createLinearGradient(0, H, 0, H - e2),
+    e1: e1, e2: e2
+  };
+  for (const k of ['l', 'r', 't', 'b']) {
+    vigCv[k].addColorStop(0, 'rgba(2,4,9,0.96)');
+    vigCv[k].addColorStop(0.55, 'rgba(2,4,9,0.42)');
+    vigCv[k].addColorStop(1, 'rgba(2,4,9,0)');
+  }
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(1, window.innerWidth);
+  H = Math.max(1, window.innerHeight);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildTiles();
+  buildGridCache();
+  buildBand();
+  buildVignette();
+  if (curIdx >= -1) buildGlyph(curIdx);
+  trackCv = null; trackCtx = null;
+}
+
+/* ---------------- 光轨层：1/2 分辨率，不透明黑底 + additive 描弧 ---------------- */
+function ensureTrack() {
+  if (!trackCv) { trackCv = document.createElement('canvas'); trackCtx = trackCv.getContext('2d'); }
+  /* 1/4 分辨率：描边面积只有全屏的 1/16，是整帧最贵那一段的解药。
+     原来的坑是"1/3 掉进 Skia 通用重采样" —— 必须是 2 的整数次幂分之一。
+     砖放大到 36px 后，1/4 层上的弧仍然能看出是弧（放大回全屏时是柔光感，正好）。 */
+  const w = Math.max(2, Math.round(W * DPR / 4)), h = Math.max(2, Math.round(H * DPR / 4));
+  if (trackCv.width !== w || trackCv.height !== h) { trackCv.width = w; trackCv.height = h; }
+}
+
+function sprite(size, r, g, b) {
+  const s = document.createElement('canvas');
+  s.width = s.height = size;
+  const c = s.getContext('2d');
+  const gr = c.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  gr.addColorStop(0, 'rgba(' + r + ',' + g + ',' + b + ',1)');
+  gr.addColorStop(0.30, 'rgba(' + r + ',' + g + ',' + b + ',0.34)');
+  gr.addColorStop(1, 'rgba(' + r + ',' + g + ',' + b + ',0)');
+  c.fillStyle = gr;
+  c.fillRect(0, 0, size, size);
+  return s;
+}
+const beamSprite = sprite(200, 255, 205, 120);
+const coreSprite = sprite(120, 210, 245, 255);
+/* 光轨本体的渐变只建一次：每帧 createLinearGradient 会喂 GC，p95 就会抖 */
+let bandG = null;
+function buildBand() {
+  bandG = ctx.createLinearGradient(0, -150, 0, 150);
+  bandG.addColorStop(0, 'rgba(255,224,166,0)');
+  bandG.addColorStop(0.32, 'rgba(255,228,176,0.40)');
+  bandG.addColorStop(0.5, 'rgba(255,240,200,0.95)');
+  bandG.addColorStop(0.68, 'rgba(255,228,176,0.40)');
+  bandG.addColorStop(1, 'rgba(255,224,166,0)');
+}
+
+/* ---------------- 7 档亮度（暗 → 亮 → 暖高光） ---------------- */
+const BUCKETS = 7;
+let BCOL = [], BW = [1.0, 1.15, 1.35, 1.65, 2.05, 2.7, 3.5];
+const paths = [[], [], [], [], [], [], []];
+const crest = [];                  // 锋线砖号（字层之后再描一遍）
+
+function buildPalette() {
+  const [r, g, b] = accent;
+  const cl = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  BCOL = [
+    'rgba(' + cl(r * 0.20) + ',' + cl(g * 0.42) + ',' + cl(b * 0.72) + ',0.22)',
+    'rgba(' + cl(r * 0.34) + ',' + cl(g * 0.58) + ',' + cl(b * 0.84) + ',0.34)',
+    'rgba(' + cl(r * 0.52) + ',' + cl(g * 0.74) + ',' + cl(b * 0.94) + ',0.50)',
+    'rgba(' + cl(r * 0.76) + ',' + cl(g * 0.90) + ',' + cl(b) + ',0.66)',
+    'rgba(' + cl(r * 0.96) + ',' + cl(g + 14) + ',' + cl(b) + ',0.84)',
+    'rgba(' + cl(r + 46) + ',' + cl(g + 22) + ',' + cl(b - 12) + ',0.95)',
+    'rgba(255,246,218,1)'
+  ];
+}
+
+/* ---------------- 光轨上的尘屑（被光轨甩出来的，物理过程的可视证据） ---------------- */
+const NS = 150;
+const dx = new Float32Array(NS), dy = new Float32Array(NS);
+const dvx = new Float32Array(NS), dvy = new Float32Array(NS);
+const dlife = new Float32Array(NS), dsz = new Float32Array(NS);
+
+function seedDust() {
+  for (let i = 0; i < NS; i++) {
+    dx[i] = -PAD; dy[i] = -PAD;
+    dvx[i] = 0; dvy[i] = 0; dlife[i] = 0; dsz[i] = 1;
+  }
+}
+
+/* ---------------- 节奏 ---------------- */
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const LEAD = 1.3;
+let charLit = new Float32Array(1);
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    mask.fill(0); mch.fill(-1); gn = 0; G = null;
+    for (let i = 0; i < tn; i++) te[i] = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    buildGlyph(ci);
+    dolly = 1;                       /* 换句：甩镜 */
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) brewIdx = nx;
+  }
+}
+
+/* ---------------- 镜头（提到模块级：每帧新建闭包会喂 GC，p95 会抖） ---------------- */
+const CAM = { z: 1, x: 0, y: 0 };
+function camS(g) {
+  g.translate(W / 2 + CAM.x, H / 2 + CAM.y);
+  g.scale(CAM.z, CAM.z);
+  g.translate(-W / 2, -H / 2);
+}
+
+/* 光轨的锋头位置：相位公式把 x 写死在里面了，这里反解 x（sin 项迭代一次就够）。
+   结果写进共享对象，不每帧返回新对象。 */
+const HEAD = { x: 0, y: 0 };
+function headPos(hv) {
+  const y = H * 0.5 + Math.sin(hv * 0.16 + 1.1) * H * 0.26;
+  const c = hv / 0.011 - y * 0.78;
+  let x = c / 0.62;
+  x = (c - 26 * Math.sin(y * 0.0055 + x * 0.0032)) / 0.62;
+  HEAD.x = x; HEAD.y = y;
+  return HEAD;
+}
+
+/* ---------------- 主循环 ---------------- */
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+
+  surge *= Math.exp(-dt * 2.1);
+  dolly *= Math.exp(-dt * 3.0);
+  lum += ((playing ? 1 : 0.5) - lum) * Math.min(1, dt * 2.2);
+  phase += speed * (1 + surge * 2.2) * dt;
+
+  /* ---- 镜头：整句缓慢推近 + 摇移 + 踩拍顶 + 换句甩 ---- */
+  const lineT = curIdx >= 0 ? lines[curIdx].t : T;
+  const ln = Math.min(1, Math.max(0, (T - lineT) / 3.8));
+  const ease = ln * ln * (3 - 2 * ln);
+  const cz = 1.03 + 0.072 * ease + 0.016 * Math.sin(t0 * 0.47) + surge * 0.032 + dolly * 0.055;
+  const cx = Math.sin(t0 * 0.29) * 24 + Math.sin(T * 0.13) * 11 + surge * 10;
+  const cy = Math.cos(t0 * 0.23) * 13;
+  CAM.z = cz; CAM.x = cx; CAM.y = cy;
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+
+  /* ---- 底色 + 远层网格（0.55 视差；整数位移 + 1:1 设备像素，别让它每帧重采样） ---- */
+  if (gridCv) {
+    const ox = Math.round(-PAD + cx * 0.55);
+    const oy = Math.round(-PAD + cy * 0.55);
+    ctx.drawImage(gridCv, ox, oy, W + PAD * 2, H + PAD * 2);
+  } else {
+    ctx.fillStyle = '#050b13';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  /* ---- 逐字亮度 ---- */
+  if (G && G.chars) {
+    for (let k = 0; k < charLit.length; k++) {
+      const ct = G.chars[k] ? G.chars[k].t : 0;
+      const u = Math.min(1, Math.max(0, (T - ct) / 0.42));
+      charLit[k] = u * u * (3 - 2 * u);
+    }
+  }
+
+  /* ---- 瓷砖能量：快充慢放的一阶系统 ----
+     充能 = 光轨波前 + 字区底光（逐字点亮）；放电 = 余辉拖尾。 */
+  const head = phase;
+  crest.length = 0;
+  for (let b = 0; b < BUCKETS; b++) paths[b].length = 0;
+  for (let i = 0; i < tn; i++) {
+    let d = Math.abs(tph[i] - head) % P;
+    if (d > P * 0.5) d = P - d;
+    /* 两道：宽的光晕 + 窄的锋。锋扫过时才有"一道光轨经过"的读感。
+       宽度按像素算：d=1 约等于 100px，所以 0.55 的衰减 = 一整条 300px 的光带。 */
+    const rail = (Math.exp(-d * d * 0.55) * 1.02 + Math.exp(-d * d * 18) * 1.25) * (1 + surge * 0.8);
+    const mi = tmidx[i];
+    const m = mi >= 0 ? mask[mi] : 0;
+    let tgt;
+    if (m > 0) {
+      const ci = mch[mi];
+      const lit = ci >= 0 && ci < charLit.length ? charLit[ci] : 1;
+      /* 字区：光轨经过时被点着；没被扫到也保留一层底光（整句始终可读）。
+         底光压得低是故意的 —— 字层自己够亮，弧只是"照过来"的痕。 */
+      tgt = rail * (0.34 + 1.9 * m) +
+        m * (0.10 + 0.26 * lit) * (0.78 + 0.22 * Math.sin(t0 * 1.35 + tph[i] * 0.20));
+    } else {
+      tgt = rail * 0.78;
+    }
+    tgt *= (0.52 + 0.48 * lum) * (1 + surge * 0.45);
+    const e = te[i];
+    const k = tgt > e ? 15 : 2.4;
+    let ne = e + (tgt - e) * Math.min(1, dt * k);
+    if (ne < 0) ne = 0;
+    te[i] = ne;
+    if (ne < 0.045) continue;
+    let bi = (ne * 3.4) | 0;
+    if (bi > BUCKETS - 1) bi = BUCKETS - 1;
+    paths[bi].push(i);
+    /* 锋线单独留一份：它要**在字层之后**再画一遍，光轨才能从字面上扫过去 */
+    if (ne > 1.15) crest.push(i);
+  }
+
+  /* ---- 光轨的头的位置 ---- */
+  const h0 = headPos(head);
+  const hx = h0.x, hy = h0.y;
+
+  /* ---- 光轨层 ---- */
+  ensureTrack();
+  const R = TILE * 0.5;
+  const tk = trackCv.width / W;
+  trackCtx.setTransform(1, 0, 0, 1, 0, 0);
+  trackCtx.globalCompositeOperation = 'source-over';
+  trackCtx.globalAlpha = 1;
+  trackCtx.fillStyle = '#000';
+  trackCtx.fillRect(0, 0, trackCv.width, trackCv.height);
+  trackCtx.setTransform(tk, 0, 0, tk, 0, 0);
+  trackCtx.globalCompositeOperation = 'lighter';
+  trackCtx.save();
+  camS(trackCtx);
+  for (let b = 0; b < BUCKETS; b++) {
+    const arr = paths[b];
+    if (!arr.length) continue;
+    trackCtx.strokeStyle = BCOL[b];
+    trackCtx.lineWidth = BW[b] * tk;
+    trackCtx.beginPath();
+    for (let k = 0; k < arr.length; k++) {
+      const i = arr[k];
+      tileArcs(trackCtx, tx[i], ty[i], tori[i], R);
+    }
+    trackCtx.stroke();
+  }
+  trackCtx.restore();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(trackCv, 0, 0, W, H);
+
+  /* ---- 字：辉光层 + 实体层（读得出来靠它） ----
+     画在光轨**之后**：砖的弧先铺满，字层压在上面，弧只从字面边缘透出来，
+     这样笔画干净、不会被弧线画花；真正的"光轨扫过字"交给下面的锋线复描。
+     ent 只驱动"缩放 + 辉光"，**不驱动字的透明度** —— 字永远是不透明的实体。
+     （踩过坑：字层做淡入，截图切在句首就只剩暗影，整句读不出来。） */
+  const rawEnt = curIdx >= 0 ? Math.min(1, Math.max(0, (T - lines[curIdx].t) / 0.45)) : 1;
+  const ent = rawEnt * rawEnt * (3 - 2 * rawEnt);
+  if (G) {
+    const bcx = G.x + G.cw / 2, bcy = G.y + G.ch / 2;
+    ctx.save(); camS(ctx);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.34 * (0.55 + 0.45 * ent) * (0.8 + 0.2 * Math.sin(t0 * 1.1));
+    ctx.drawImage(G.glow, G.x - 18, G.y - 18, G.cw + 36, G.ch + 36);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    const sc = 1 + 0.045 * (1 - ent);
+    ctx.translate(bcx, bcy); ctx.scale(sc, sc); ctx.translate(-bcx, -bcy);
+    ctx.drawImage(G.body, G.x, G.y);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---- 光轨本体：一条横贯全屏的暖光带，跟着 head 在瓷砖上扫过去 ----
+     有它，"光轨"才是画面里的一个东西，而不是只有字在发光。
+     用旋转后的线性渐变直接填充：比把一条 4px 的图拉伸到 3000px 便宜（不用重采样）。 */
+  ctx.save(); camS(ctx);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.13 + surge * 0.14;
+  ctx.translate(hx, hy);
+  ctx.rotate(Math.atan2(0.62, -0.78));
+  ctx.fillStyle = bandG; ctx.fillRect(-1500, -150, 3000, 300);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+
+  /* ---- 锋线复描：光轨经过字面时，从字上再描一遍，读感是"被光扫到了" ---- */
+  if (crest.length) {
+    ctx.save(); camS(ctx);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = 'rgba(255,240,206,0.50)';
+    ctx.lineWidth = 2.3;
+    ctx.beginPath();
+    for (let k = 0; k < crest.length; k++) {
+      const i = crest[k];
+      tileArcs(ctx, tx[i], ty[i], tori[i], TILE * 0.5);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /* ---- 光轨的头：预渲染光斑压在"相位 = head"的那条线上（三个锋头） ---- */
+  ctx.save(); camS(ctx);
+  ctx.globalCompositeOperation = 'lighter';
+  for (let k = -1; k <= 1; k++) {
+    const hp = headPos(head + k * P);
+    if (hp.x < -320 || hp.x > W + 320) continue;
+    const near = k === 0 ? 1 : 0.52;
+    const bs = (260 + surge * 150) * (k === 0 ? 1 : 0.75);
+    ctx.globalAlpha = (0.34 + surge * 0.3) * near;
+    ctx.drawImage(beamSprite, hp.x - bs / 2, hp.y - bs / 2, bs, bs);
+    if (k === 0) {
+      ctx.globalAlpha = 0.55 + surge * 0.25;
+      ctx.drawImage(coreSprite, hp.x - 46, hp.y - 46, 92, 92);
+    }
+  }
+
+  /* ---- 被光轨甩出的尘屑：贴着波前生、向外飘、渐灭 ---- */
+  const spawn = 5 + Math.round(surge * 6);
+  for (let s = 0; s < spawn; s++) {
+    const i = (Math.random() * NS) | 0;
+    if (dlife[i] > 0.25) continue;
+    const t2 = (Math.random() - 0.5) * 2;
+    dx[i] = hx + t2 * 26;
+    dy[i] = hy + Math.sin(t2 * 3) * 14;
+    dvx[i] = -60 - Math.random() * 130;
+    dvy[i] = (Math.random() - 0.5) * 90;
+    dlife[i] = 1;
+    dsz[i] = 0.8 + Math.random() * 1.8;
+  }
+  ctx.globalAlpha = 1;
+  for (let i = 0; i < NS; i++) {
+    if (dlife[i] <= 0) continue;
+    dlife[i] -= dt * 0.75;
+    dx[i] += dvx[i] * dt; dy[i] += dvy[i] * dt;
+    dvx[i] *= 1 - dt * 1.2; dvy[i] *= 1 - dt * 1.2;
+    const a = dlife[i];
+    if (a <= 0) continue;
+    ctx.globalAlpha = a * 0.75;
+    ctx.fillStyle = 'rgba(255,232,180,1)';
+    const s2 = dsz[i] * (0.6 + a * 0.9);
+    ctx.fillRect(dx[i] - s2 * 0.5, dy[i] - s2 * 0.5, s2, s2 * 1.6);
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* ---- 边缘渐隐 ---- */
+  if (vigCv) {
+    ctx.fillStyle = vigCv.l; ctx.fillRect(0, 0, vigCv.e1, H);
+    ctx.fillStyle = vigCv.r; ctx.fillRect(W - vigCv.e1, 0, vigCv.e1, H);
+    ctx.fillStyle = vigCv.t; ctx.fillRect(0, 0, W, vigCv.e2);
+    ctx.fillStyle = vigCv.b; ctx.fillRect(0, H - vigCv.e2, W, vigCv.e2);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 140); });
+buildPalette();
+seedDust();
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (mask) { mask.fill(0); mch.fill(-1); }
+    gn = 0; G = null; charLit = new Float32Array(1);
+    if (p.accent && p.accent.length === 3) {
+      accent = [
+        Math.round(120 * 0.68 + p.accent[0] * 0.32),
+        Math.round(225 * 0.68 + p.accent[1] * 0.32),
+        Math.round(255 * 0.68 + p.accent[2] * 0.32)
+      ];
+      buildPalette();
+    }
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    surge = Math.min(1.4, surge + 0.40 + (d.payload.level || 0) * 0.55);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  tiles: tn, glyphPts: gn, phase: +phase.toFixed(2), t: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

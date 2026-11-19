@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>黏稠按钮</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:pointer}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,158,190,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   035 · 黏稠按钮 —— 歌词是一滩会自己合拢的黏稠液体
+   ---------------------------------------------------------------------------
+   核心机制：**半分辨率的标量场累加 = 真正的 metaball 融合**。
+   每个采样点是一颗球，在一张半分辨率的离屏画布上用 `lighter` 叠加
+   一张预渲染的软盘精灵：场在中心饱和 → 实心；两点的衰减尾巴相加 →
+   中间自己长出桥，桥的粗细只取决于距离（表面张力）。
+   笔画之间会黏连、断开的地方会自己合拢，整句话是"一滩"而不是"一堆点"。
+
+   精修记录：① **分词（词典 /segdict.bin，抄自 004）+ 词团释放**：每颗球记录
+     所属词团，出生时刻 = 团首字的 chars[i0].t（无 chars 均分回退）；
+     理由：逐球按字释放时 2~3 字的词被拆成 2~3 次微小涨落，读感是"机关枪"；
+     按词团一次涌出一整块，黏稠体的"合拢"感才对——团内球同时从下方涌入、
+     张力把它们拉成一团。词典拿不到自动回退均分，形态不崩；
+   ② 长句折行——>16 字 2 排、>30 字 3 排，整叠高度归一化、字号自适应，
+     修掉"41 字压成一条细横亮带"（sc 被压到 0.2、全场糊成一条）；
+   ③ beat 相干脉冲保留（整滩从字形中心被推开再收回），另加镜头呼吸缩放；
+   ④ YRC 标志 __stage.yrc（chars.length === text.length 才可信）。
+
+   性能：所有球在 0.42 倍分辨率上叠加，按色相分档合批，每帧只 blit 一次。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+const PI = Math.PI, TAU = PI * 2;
+const MAXP = 2600;                 // 活跃球上限：球径缩小后要更密才连成实心笔画（41 字 ≈ 63 球/字）
+const DMAX = 400;                  // 下坠液滴上限
+const NBH = 8;                     // 色相档数
+const GS = 1.0;                    // 场的分辨率倍率：全分辨率，blit 不再二次放大 → 边缘锐利
+const SPR = 14;                    // 精灵边长（场坐标）：核 7px + 短尾巴，核平顶保证相邻球连成实心
+
+let bg = null, goo = null, gctx = null, gw = 0, gh = 0;
+let spr = [];
+let accent = [140, 130, 255];
+let hue0 = 232;
+
+/* 活跃球 */
+const tx = new Float32Array(MAXP), ty = new Float32Array(MAXP);
+const px = new Float32Array(MAXP), py = new Float32Array(MAXP);
+const vx = new Float32Array(MAXP), vy = new Float32Array(MAXP);
+const hb = new Uint8Array(MAXP), ph = new Float32Array(MAXP);
+/* 出生时刻（绝对秒）与目标点；未出生的球不画不动 */
+const born = new Float64Array(MAXP);
+let pN = 0;
+
+/* 下坠液滴（换句时从旧的一滩里重采样出来） */
+const dx2 = new Float32Array(DMAX), dy2 = new Float32Array(DMAX);
+const dvx = new Float32Array(DMAX), dvy = new Float32Array(DMAX);
+const dl = new Float32Array(DMAX), dh = new Uint8Array(DMAX);
+let dN = 0;
+
+/* 点击涟漪 */
+const rings = [];
+
+/* 时钟与当前句 */
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+const bIdx = [];
+for (let i = 0; i < NBH; i++) bIdx.push(new Int32Array(MAXP + DMAX));
+const bCnt = new Int32Array(NBH);
+
+/* ============================================================================
+   分词（抄自 004-sand-lyrics.html，纯函数原样搬）
+   ========================================================================== */
+let DICT = null;
+fetch('/segdict.bin')
+  .then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); })
+  .catch(() => {});
+
+const fnv = (s) => {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+};
+
+function isWord(s, i, L) {
+  const h = fnv(s.substr(i, L));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1, v = DICT[m];
+    if (v === h) return true;
+    if (v < h) lo = m + 1; else hi = m - 1;
+  }
+  return false;
+}
+
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let L = Math.min(4, text.length - i); L >= 2; L--) if (isWord(text, i, L)) { hit = L; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let L = Math.min(4, j); L >= 2; L--) if (isWord(text, j - L, L)) { hit = L; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+
+function isLatin(text) {
+  let la = 0, cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++;
+    else if (c >= '\u4e00' && c <= '\u9fff') cjk++;
+  }
+  return la > cjk;
+}
+
+function latinSpans(text) {
+  const out = [];
+  let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i;
+    while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j });
+    i = j;
+  }
+  return out;
+}
+
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+
+function countChars(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++;
+  return n;
+}
+
+function groupByWords(text) {
+  const words = segWords(text);
+  const out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos;
+    pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; }
+    else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+
+function groupByRule(text) {
+  const out = [];
+  let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const sep = PUNCT.test(c) || SPACE.test(c);
+    if (!sep) chars++;
+    if (sep && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!sep && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+
+function spansForLine(text) {
+  if (isLatin(text)) return latinSpans(text);
+  return DICT ? groupByWords(text) : groupByRule(text);
+}
+
+/* ---------- 长句折行：>16 字 2 排、>30 字 3 排，尽量不从拉丁词中间断开 ---------- */
+function splitRows(text) {
+  const want = text.length > 30 ? 3 : (text.length > 16 ? 2 : 1);
+  if (want === 1) return [{ text: text, off: 0 }];
+  const LAT = /[A-Za-z0-9'’]/;
+  const parts = [];
+  let start = 0;
+  for (let p = 1; p <= want; p++) {
+    let cut = (p === want) ? text.length : Math.round(text.length * p / want);
+    if (p < want) {
+      if (LAT.test(text[cut - 1]) && text[cut] && LAT.test(text[cut])) {
+        let best = -1;
+        for (let d = 1; d <= 8 && best < 0; d++) {
+          if (cut - d > start + 3 && /\s/.test(text[cut - d])) best = cut - d;
+          else if (cut + d < text.length - 3 && /\s/.test(text[cut + d])) best = cut + d + 1;
+        }
+        if (best > 0) cut = best;
+      }
+    }
+    parts.push({ text: text.slice(start, cut), off: start });
+    start = cut;
+  }
+  return parts.filter((r) => r.text.length);
+}
+
+/* ---- 字形采样：整句多排一次采，球带全局字索引 → 团首出生时刻 ---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FONTF = (fs) => '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+let yrcFlag = false;
+let rims = [];                 // 每字一张细描边精灵（金属边：黏稠体外缘的笔画走势）
+
+function sampleInto(line, lineT) {
+  pN = 0;
+  rims = [];
+  const text = (line && line.text) || '';
+  if (!text) return;
+  const rowsArr = splitRows(text);
+  const R = rowsArr.length;
+  const maxRow = Math.max(...rowsArr.map((r) => r.text.length));
+  const F = 104;
+  const maxW = Math.min(W * 0.86, 1300);
+  octx.font = FONTF(F);
+  let maxRowW = 1;
+  for (const r of rowsArr) maxRowW = Math.max(maxRowW, octx.measureText(r.text).width);
+  let fs = maxRowW > maxW ? F * (maxW / maxRowW) : F;
+  const lhK = 1.30, gapK = 0.36;
+  const totalH = R * lhK * fs + (R - 1) * gapK * fs;
+  const maxH = H * 0.62;
+  if (totalH > maxH) fs *= maxH / totalH;
+  fs = Math.max(20, fs);
+  const lh = fs * lhK, gap = fs * gapK;
+
+  /* 逐字时间：chars 可信才用 YRC，否则均分回退——绝不能因缺 chars 报错 */
+  const chars = line.chars && line.chars.length === text.length ? line.chars : null;
+  yrcFlag = !!chars;
+  const dur = line.dur > 0 ? line.dur : 4;
+  const charT = new Float64Array(text.length);
+  for (let k = 0; k < text.length; k++)
+    charT[k] = chars ? chars[k].t : lineT + dur * k / text.length;
+  /* 词团：全局字索引 → 团首全局索引 */
+  const spans = spansForLine(text);
+  const spanHead = new Int16Array(text.length);
+  for (const sp of spans) for (let k = sp.i0; k < sp.i1; k++) spanHead[k] = sp.i0;
+
+  /* 渲染每一排、采点；球的目标位置按排堆叠（整叠居中） */
+  const stackH = R * lh + (R - 1) * gap;
+  const yTop = H * 0.5 - stackH / 2;
+  const all = [];
+  for (let ri = 0; ri < R; ri++) {
+    const r = rowsArr[ri];
+    octx.font = FONTF(fs);
+    const w0 = octx.measureText(r.text).width;
+    const w = Math.ceil(w0) + 8;
+    const h = Math.ceil(lh);
+    off.width = Math.max(4, w); off.height = Math.max(4, h);
+    octx.clearRect(0, 0, off.width, off.height);
+    octx.font = FONTF(fs);
+    octx.textAlign = 'center'; octx.textBaseline = 'middle';
+    octx.fillStyle = '#fff';
+    octx.fillText(r.text, off.width / 2, h / 2);
+    const d = octx.getImageData(0, 0, off.width, off.height).data;
+    /* 该排每个字的前缀宽（字形画布坐标） */
+    const bnd = [0];
+    for (let q = 1; q <= r.text.length; q++) bnd.push(octx.measureText(r.text.substring(0, q)).width);
+    const rowCy = yTop + ri * (lh + gap) + lh / 2;
+    const left = W / 2 - w0 / 2;
+    /* 细描边层：每字一张 rim 精灵（1.4~2px 亮边），按团首时刻浮现 —— 黏稠体再软，
+       这层也能把笔画走势钉住，长句才认得出字。 */
+    const pad2 = Math.ceil(fs * 0.15);
+    const sh = Math.ceil(lh);
+    for (let k = 0; k < r.text.length; k++) {
+      const ch = r.text[k];
+      if (SPACE.test(ch)) continue;
+      const cw = Math.max(4, bnd[k + 1] - bnd[k]);
+      const sw = Math.ceil(cw) + pad2 * 2;
+      const cvs = document.createElement('canvas');
+      cvs.width = sw; cvs.height = sh;
+      const g2 = cvs.getContext('2d');
+      g2.font = FONTF(fs);
+      g2.textAlign = 'left'; g2.textBaseline = 'middle';
+      g2.lineJoin = 'round';
+      g2.strokeStyle = 'rgba(238,244,255,0.92)';
+      g2.lineWidth = Math.max(1.4, fs * 0.022);
+      g2.strokeText(ch, pad2, sh / 2);
+      rims.push({ img: cvs, x: left + bnd[k] - pad2, y: rowCy - sh / 2, t: charT[spanHead[r.off + k]] });
+    }
+    const step = 4;
+    for (let y = 0; y < h; y += step)
+      for (let x = 0; x < w; x += step)
+        if (d[(y * off.width + x) * 4 + 3] > 128) {
+          /* 排内偏移：画布采样点 → 相对文字左缘（textAlign=center 绘制在画布中心） */
+          const ox = (x + 4) - (off.width - w0) / 2;
+          const oy = (y + 4) - h / 2;
+          /* 字索引：按前缀宽二分 */
+          const lx = ox;
+          let lo = 0, hi = r.text.length - 1;
+          while (lo < hi) { const m = (lo + hi + 1) >> 1; if (bnd[m] <= lx) lo = m; else hi = m - 1; }
+          const gi = Math.min(text.length - 1, r.off + lo);
+          all.push(left + ox, rowCy + oy, spanHead[gi]);
+        }
+  }
+  const pc = all.length / 3;
+  if (!pc) return;
+  const n = Math.min(MAXP, pc);
+  for (let i = 0; i < n; i++) {
+    const p = (Math.floor(i * pc / n) % pc) * 3;
+    tx[i] = all[p]; ty[i] = all[p + 1];
+    px[i] = tx[i]; py[i] = ty[i] + 60;
+    vx[i] = 0; vy[i] = -130;                       // 从下方涌上来
+    ph[i] = (i * 2.399963) % TAU;
+    born[i] = charT[all[p + 2]];                   // 团首字的 YRC 时刻
+    const nx = (tx[i] - W / 2) / (W * 0.5);
+    let b = Math.round((nx * 0.5 + 0.5) * (NBH - 1));
+    if (b < 0) b = 0; else if (b > NBH - 1) b = NBH - 1;
+    hb[i] = b;
+  }
+  pN = n;
+}
+
+/* 换句：把上一滩重采样成液滴，原池当场归还 */
+function drainOut() {
+  dN = 0;
+  if (!pN) return;
+  const n = Math.min(DMAX, pN);
+  for (let i = 0; i < n; i++) {
+    const p = (Math.floor(i * pN / n) % pN);
+    dx2[i] = px[p]; dy2[i] = py[p];
+    dvx[i] = vx[p] * 0.35 + (Math.random() - 0.5) * 40;
+    dvy[i] = vy[p] * 0.25 + 30 + Math.random() * 70;
+    dl[i] = 1;
+    dh[i] = hb[p];
+  }
+  dN = n;
+  pN = 0;
+}
+
+/* ---- 预渲染 ---- */
+function buildColors() {
+  const r = accent[0] / 255, g = accent[1] / 255, b = accent[2] / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), dd = mx - mn;
+  let h = 0;
+  if (dd > 1e-6) {
+    if (mx === r) h = 60 * (((g - b) / dd) % 6);
+    else if (mx === g) h = 60 * ((b - r) / dd + 2);
+    else h = 60 * ((r - g) / dd + 4);
+  }
+  if (h < 0) h += 360;
+  hue0 = h;
+  spr = [];
+  for (let i = 0; i < NBH; i++) {
+    const t = (i / (NBH - 1)) * 2 - 1;
+    const hh = ((h + t * 62) % 360 + 360) % 360;
+    const rgb = hsl2rgb(hh, 0.92, 0.62).map((v) => Math.round(v * 0.62));
+    spr.push(bakeSpr(rgb.join(',')));
+  }
+}
+function hsl2rgb(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = ((h % 360) + 360) % 360 / 60;
+  const x = c * (1 - Math.abs(hp % 2 - 1));
+  let r = 0, g = 0, b = 0;
+  if (hp < 1) { r = c; g = x; } else if (hp < 2) { r = x; g = c; }
+  else if (hp < 3) { g = c; b = x; } else if (hp < 4) { g = x; b = c; }
+  else if (hp < 5) { r = x; b = c; } else { r = c; b = x; }
+  const m = l - c / 2;
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+function bakeSpr(rgb) {
+  const c = document.createElement('canvas'); c.width = SPR; c.height = SPR;
+  const g = c.getContext('2d');
+  const gr = g.createRadialGradient(SPR / 2, SPR / 2, 0, SPR / 2, SPR / 2, SPR / 2);
+  /* 硬核 + 短尾：核内几乎实心（笔画连成实心），尾巴只留 2px 让相邻球能"长桥"。
+     旧版尾巴拖到半径外 0.4 倍，半分辨率再放大一档，41 字长句直接糊成光斑。 */
+  gr.addColorStop(0.00, 'rgba(' + rgb + ',0.98)');
+  gr.addColorStop(0.52, 'rgba(' + rgb + ',0.94)');
+  gr.addColorStop(0.70, 'rgba(' + rgb + ',0.38)');
+  gr.addColorStop(0.90, 'rgba(' + rgb + ',0.06)');
+  gr.addColorStop(1.00, 'rgba(' + rgb + ',0)');
+  g.fillStyle = gr; g.fillRect(0, 0, SPR, SPR);
+  return c;
+}
+function buildBG() {
+  bg = document.createElement('canvas');
+  bg.width = Math.max(4, Math.round(W)); bg.height = Math.max(4, Math.round(H));
+  const g = bg.getContext('2d');
+  const w = bg.width, h = bg.height, m = Math.max(w, h);
+  g.fillStyle = '#05060a'; g.fillRect(0, 0, w, h);
+  let r = g.createRadialGradient(w * 0.5, h * 0.42, 0, w * 0.5, h * 0.42, m * 0.62);
+  r.addColorStop(0, '#10162e'); r.addColorStop(0.62, 'rgba(5,6,10,0)');
+  g.fillStyle = r; g.fillRect(0, 0, w, h);
+  r = g.createRadialGradient(w * 0.78, h * 0.82, 0, w * 0.78, h * 0.82, m * 0.5);
+  r.addColorStop(0, '#170f2c'); r.addColorStop(0.6, 'rgba(5,6,10,0)');
+  g.fillStyle = r; g.fillRect(0, 0, w, h);
+  r = g.createRadialGradient(w * 0.5, h * 0.60, 0, w * 0.5, h * 0.60, Math.min(w * 0.42, h * 0.34));
+  r.addColorStop(0, 'rgba(90,110,255,0.16)');
+  r.addColorStop(0.55, 'rgba(90,110,255,0.05)');
+  r.addColorStop(1, 'rgba(90,110,255,0)');
+  g.fillStyle = r; g.fillRect(0, 0, w, h);
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  gw = Math.max(4, Math.round(W * GS)); gh = Math.max(4, Math.round(H * GS));
+  goo = document.createElement('canvas'); goo.width = gw; goo.height = gh;
+  gctx = goo.getContext('2d');
+  buildBG();
+  if (pN && curIdx >= 0 && lines[curIdx]) {
+    drainOut(); dN = 0;
+    sampleInto(lines[curIdx], lines[curIdx].t);
+  }
+}
+buildColors();
+resize();
+addEventListener('resize', resize);
+
+/* ---- 节奏 ---- */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pN = 0; dN = 0; rings.length = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      drainOut();                          // 上一滩下坠排空（同时归还池子）
+      sampleInto(lines[ci], lines[ci].t);
+    } else { drainOut(); }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+    }
+  }
+}
+
+let last = performance.now();
+let t0 = 0;
+let beatPulse = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+
+  beatPulse *= Math.exp(-dt * 2.6);
+
+  /* 表面张力：弹簧 + 阻尼；未出生的球停在目标下方待命 */
+  for (let i = 0; i < pN; i++) {
+    const age = T - born[i];
+    if (age < 0) { px[i] = tx[i]; py[i] = ty[i] + 60; vx[i] = 0; vy[i] = -130; continue; }
+    if (age < 0.30) { px[i] += vx[i] * dt; py[i] += vy[i] * dt; vx[i] *= Math.pow(0.02, dt); vy[i] *= Math.pow(0.02, dt); }
+    vx[i] += ((tx[i] - px[i]) * 130 - vx[i] * 15) * dt;
+    vy[i] += ((ty[i] - py[i]) * 130 - vy[i] * 15) * dt;
+    vx[i] += Math.sin(t0 * 1.7 + ph[i]) * 16 * dt;
+    vy[i] += Math.cos(t0 * 1.4 + ph[i] * 1.3) * 16 * dt;
+    px[i] += vx[i] * dt; py[i] += vy[i] * dt;
+  }
+  /* 液滴：自由落体 + 缩小，1 秒后全部释放 */
+  for (let i = 0; i < dN; i++) {
+    dvy[i] += 460 * dt;
+    dvx[i] *= Math.pow(0.35, dt);
+    dx2[i] += dvx[i] * dt; dy2[i] += dvy[i] * dt;
+    dl[i] -= dt / 1.0;
+  }
+  if (dN && dl[0] <= 0) dN = 0;
+
+  /* ---- 场：半分辨率累加（分档合批） ---- */
+  gctx.clearRect(0, 0, gw, gh);
+  gctx.globalCompositeOperation = 'lighter';
+  bCnt.fill(0);
+  const hs = SPR / 2;
+  for (let i = 0; i < pN; i++) {
+    if (T < born[i]) continue;
+    const b = hb[i];
+    bIdx[b][bCnt[b]++] = i;
+  }
+  for (let b = 0; b < NBH; b++) {
+    const c = bCnt[b];
+    if (!c) continue;
+    const im = spr[b], list = bIdx[b];
+    for (let j = 0; j < c; j++) {
+      const i = list[j];
+      gctx.drawImage(im, px[i] * GS - hs, py[i] * GS - hs);
+    }
+  }
+  if (dN) {
+    for (let k = 0; k < 3; k++) {
+      gctx.globalAlpha = k === 0 ? 0.9 : k === 1 ? 0.6 : 0.3;
+      for (let i = 0; i < dN; i++) {
+        const l = dl[i];
+        const bi = l > 0.66 ? 0 : l > 0.33 ? 1 : 2;
+        if (bi !== k) continue;
+        gctx.drawImage(spr[dh[i]], dx2[i] * GS - hs, dy2[i] * GS - hs);
+      }
+    }
+    gctx.globalAlpha = 1;
+  }
+  gctx.globalCompositeOperation = 'source-over';
+
+  /* ---- 合成：镜头呼吸缩放 + 整张场只 blit 一次 ---- */
+  const zoom = 1 + 0.016 * Math.sin(t0 * 0.42) + 0.020 * beatPulse;
+  ctx.fillStyle = '#05060a';
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(W / 2, H * 0.5);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W / 2, -H * 0.5);
+  ctx.drawImage(bg, 0, 0, W, H);
+  ctx.drawImage(goo, 0, 0, W, H);
+
+  /* 细描边：黏稠体上再钉一层笔画亮边（1.4~2px），比纯球场好认一个量级 */
+  if (rims.length) {
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < rims.length; i++) {
+      const rm = rims[i];
+      const age = T - rm.t;
+      if (age < 0.12) continue;
+      ctx.globalAlpha = Math.min(1, (age - 0.12) / 0.35) * 0.5;
+      ctx.drawImage(rm.img, rm.x, rm.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  if (rings.length) {
+    ctx.strokeStyle = 'rgba(150,165,255,0.6)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const r = rings[i];
+      r.r += 620 * dt; r.a -= dt / 0.75;
+      if (r.a <= 0) { rings.splice(i, 1); continue; }
+      ctx.moveTo(r.x + r.r, r.y);
+      ctx.arc(r.x, r.y, r.r, 0, TAU);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  drawHUD();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function drawHUD() {
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  ctx.font = '600 11px ui-monospace,"Cascadia Code",Consolas,monospace';
+  ctx.fillStyle = 'rgba(150,158,190,0.55)';
+  ctx.fillText('靠近 → 黏连融合 · 点击 → 飞溅回弹', W - 22, H - 30);
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(150,158,190,0.40)';
+  ctx.fillText('BLOB ' + pN + ' · DROP ' + dN, 22, H - 30);
+}
+
+/* ---- 点击：从落点向外推一把（参考文件的 splash） ---- */
+addEventListener('pointerdown', (e) => {
+  const x = e.clientX, y = e.clientY;
+  for (let i = 0; i < pN; i++) {
+    const ddx = px[i] - x, ddy = py[i] - y;
+    const d = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+    const f = Math.max(0.15, 1 - d / 520) * 620;
+    vx[i] += (ddx / d) * f;
+    vy[i] += (ddy / d) * f;
+  }
+  if (rings.length < 5) rings.push({ x, y, r: 8, a: 1 });
+}, { passive: true });
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent && p.accent.length === 3) { accent = p.accent; buildColors(); }
+    pN = 0; dN = 0; rings.length = 0;
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：整滩液体被从字形中心向外推，表面鼓起来，再被张力拉回去 */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    const f = 150 * (0.45 + lv);
+    for (let i = 0; i < pN; i++) {
+      const ddx = px[i] - W / 2, ddy = py[i] - H * 0.5;
+      const d = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+      vx[i] += (ddx / d) * f;
+      vy[i] += (ddy / d) * f;
+    }
+    beatPulse = Math.min(1.5, beatPulse + 0.4 + lv * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => {
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < pN; i++) {
+    if (now() < born[i]) continue;
+    if (px[i] < mnX) mnX = px[i]; if (px[i] > mxX) mxX = px[i];
+    if (py[i] < mnY) mnY = py[i]; if (py[i] > mxY) mxY = py[i];
+  }
+  return {
+    lines: lines.length, cur: curIdx, brew: brewIdx, t: +now().toFixed(2),
+    blobs: pN, drops: dN, yrc: yrcFlag, seg: !!DICT,
+    scrBox: pN && mxX >= mnX ? { x: mnX, y: mnY, w: mxX - mnX, h: mxY - mnY } : null
+  };
+};
+</script>
+</body>
+</html>

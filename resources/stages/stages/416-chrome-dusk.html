@@ -1,0 +1,1498 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>镀铬黄昏</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #120a0f; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var reportError, sendReady, boot;
+  var state = {
+    lines: [], idx: -1, t: 0, playing: true, duration: 0,
+    frames: 0, js: 0, text: '', rm: false, accent: [214, 150, 62],
+    songName: '', artist: ''
+  };
+
+  /* 自检口：最外层无条件赋值 */
+  window.__stage = function () {
+    return {
+      lines: state.lines.length, idx: state.idx, t: state.t, playing: state.playing,
+      frames: state.frames, js: state.js, err: '', text: state.text || '',
+      gl: false, rm: state.rm
+    };
+  };
+
+  var errLast = 0;
+  reportError = function (where, err) {
+    var now = Date.now();
+    if (now - errLast < 1000) return;
+    errLast = now;
+    try { console.error('[416 ' + where + ']', err); } catch (e) { /* 控制台都炸了就真没辙 */ }
+  };
+
+  var readySent = false;
+  sendReady = function () {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }
+    catch (err) { reportError('ready', err); }
+  };
+
+  /* 第一个 rAF 里无条件 ready，另加定时兜底 */
+  requestAnimationFrame(function () { sendReady(); });
+  setTimeout(sendReady, 800);
+
+  var canvas = document.getElementById('stage');
+  var ctx = canvas && typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null;
+  var viewW = 1440, viewH = 900, dpr = 1;
+  var time = 0, playing = true;
+  var container = document.body;
+
+  function clampNum(value, low, high) {
+    if (typeof value !== 'number' || !isFinite(value)) return low;
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+  }
+
+  function roundColor(value) { return Math.round(clampNum(value, 0, 255)); }
+
+  function cssColor(rgb, alpha) {
+    var red = roundColor(rgb[0]), green = roundColor(rgb[1]), blue = roundColor(rgb[2]);
+    return 'rgba(' + red + ',' + green + ',' + blue + ',' + clampNum(alpha, 0, 1) + ')';
+  }
+
+  function resize() {
+    var width = container.clientWidth || window.innerWidth || 0;
+    var height = container.clientHeight || window.innerHeight || 0;
+    if (!(width > 0) || !(height > 0)) { width = 1440; height = 900; }
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    viewW = width; viewH = height;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    resetBake();
+  }
+
+  function findIndex(atTime) {
+    var lines = state.lines;
+    var found = -1;
+    for (var i = 0; i < lines.length; i++) {
+      var start = typeof lines[i].t === 'number' ? lines[i].t : 0;
+      if (atTime >= start) found = i; else break;
+    }
+    return found;
+  }
+
+  /* ================= 基础几何 / 工具 ================= */
+
+  function sceneGeom() {
+    var carWidth = Math.max(viewW * 0.72, viewH * 0.9);
+    carWidth = Math.min(carWidth, viewW * 1.12);
+    return {
+      width: viewW,
+      height: viewH,
+      horizon: viewH * 0.688,
+      sunX: viewW * 0.63,
+      sunY: viewH * 0.575,
+      sunR: Math.max(36, Math.min(viewW, viewH) * 0.19),
+      carW: carWidth,
+      carX: viewW * 0.5 - carWidth * 0.5,
+      carY: viewH * 0.95
+    };
+  }
+
+  function seededRandom(seed) {
+    var seedState = (Math.floor(seed) * 2654435761) % 4294967296;
+    if (seedState < 0) seedState += 4294967296;
+    return function () {
+      seedState = (seedState * 1664525 + 1013904223) % 4294967296;
+      if (seedState < 0) seedState += 4294967296;
+      return seedState / 4294967296;
+    };
+  }
+
+  function gradStop(grad, pos, color) {
+    try { grad.addColorStop(clampNum(pos, 0, 1), color); }
+    catch (err) { reportError('gradient', err); }
+  }
+
+  function canPath(paint) { return !!paint && typeof paint.beginPath === 'function'; }
+
+  function blit(paint, source, dx, dy, dw, dh) {
+    if (!source || typeof source.getContext !== 'function') return false;
+    if (!(source.width > 0) || !(source.height > 0)) return false;
+    if (!(dw > 0) || !(dh > 0)) return false;
+    paint.drawImage(source, dx, dy, dw, dh);
+    return true;
+  }
+
+  /* 取 accent 前判空回落：任何一档取不到就用西岸暖金 */
+  function accentGlow(alpha) {
+    var accent = Array.isArray(state.accent) && state.accent.length >= 3 ? state.accent : null;
+    var warm = [255, 172, 98];
+    var base = accent ? [roundColor(accent[0]), roundColor(accent[1]), roundColor(accent[2])] : warm;
+    var red = roundColor(base[0] * 0.3 + warm[0] * 0.7);
+    var green = roundColor(base[1] * 0.3 + warm[1] * 0.7);
+    var blue = roundColor(base[2] * 0.3 + warm[2] * 0.7);
+    return 'rgba(' + red + ',' + green + ',' + blue + ',' + clampNum(alpha, 0, 1).toFixed(3) + ')';
+  }
+
+  function quadPoint(p0, p1, p2, ratio) {
+    var inv = 1 - ratio;
+    return inv * inv * p0 + 2 * inv * ratio * p1 + ratio * ratio * p2;
+  }
+
+  /* ================= 分层烘焙 ================= */
+
+  var bakeScale = 1;
+  var baseLayer = null;
+  var baseCtx = null;
+  var staleBaseLayer = null;
+  var overlayLayer = null;
+  var grainTile = null;
+  var foregroundPalms = [];
+  var bakeSteps = [];
+  var bakeIndex = 0;
+
+  function renderScale() {
+    var scale = Math.min(dpr || 1, 1.5);
+    var area = viewW * viewH;
+    if (area > 2600000) scale = Math.min(scale, 1.2);
+    if (area > 4300000) scale = Math.min(scale, 1);
+    return scale;
+  }
+
+  function makeLayer() {
+    var layer = document.createElement('canvas');
+    layer.width = Math.max(1, Math.round(viewW * bakeScale));
+    layer.height = Math.max(1, Math.round(viewH * bakeScale));
+    var layerCtx = layer.getContext('2d');
+    if (layerCtx) layerCtx.setTransform(bakeScale, 0, 0, bakeScale, 0, 0);
+    return { canvas: layer, ctx: layerCtx };
+  }
+
+  function bakePalmSprite(geom, palm) {
+    var spriteScale = renderScale();
+    var spriteW = Math.round(geom.width * palm.spriteW);
+    var spriteH = Math.round(geom.height * palm.spriteH);
+    var sprite = document.createElement('canvas');
+    sprite.width = Math.max(1, Math.round(spriteW * spriteScale));
+    sprite.height = Math.max(1, Math.round(spriteH * spriteScale));
+    var paint = sprite.getContext('2d');
+    if (!paint) return null;
+    paint.setTransform(spriteScale, 0, 0, spriteScale, 0, 0);
+    paint.fillStyle = palm.color;
+    var baseX = spriteW * palm.anchorX;
+    var baseY = spriteH * palm.anchorY;
+    drawPalm(paint, baseX, baseY, spriteH * palm.heightRatio, palm.lean * spriteW, palm.thickness * spriteW, palm.color, palm.seed, 1);
+    return {
+      canvas: sprite,
+      width: spriteW,
+      height: spriteH,
+      baseX: baseX,
+      baseY: baseY,
+      phase: palm.phase,
+      sway: palm.sway
+    };
+  }
+
+  /* ---------- 棕榈 ---------- */
+
+  function drawPalm(paint, baseX, baseY, height, lean, thickness, color, seed, detail) {
+    if (!canPath(paint)) return;
+    var rng = seededRandom(seed);
+    var topX = baseX + lean;
+    var topY = baseY - height;
+    var ctrlX = baseX + lean * 0.2;
+    var ctrlY = baseY - height * 0.55;
+    var steps = 22;
+    var leftEdge = [];
+    var rightEdge = [];
+    for (var i = 0; i <= steps; i++) {
+      var ratio = i / steps;
+      var px = quadPoint(baseX, ctrlX, topX, ratio);
+      var py = quadPoint(baseY, ctrlY, topY, ratio);
+      var wide = thickness * (1 - ratio * 0.62) * (1 + Math.sin(ratio * Math.PI) * 0.22);
+      var tx = 2 * (1 - ratio) * (ctrlX - baseX) + 2 * ratio * (topX - ctrlX);
+      var ty = 2 * (1 - ratio) * (ctrlY - baseY) + 2 * ratio * (topY - ctrlY);
+      var len = Math.sqrt(tx * tx + ty * ty) || 1;
+      var nx = -ty / len;
+      var ny = tx / len;
+      leftEdge.push([px + nx * wide, py + ny * wide]);
+      rightEdge.push([px - nx * wide, py - ny * wide]);
+    }
+    paint.beginPath();
+    paint.moveTo(leftEdge[0][0], leftEdge[0][1]);
+    for (var leftIndex = 1; leftIndex < leftEdge.length; leftIndex++) paint.lineTo(leftEdge[leftIndex][0], leftEdge[leftIndex][1]);
+    for (var rightIndex = rightEdge.length - 1; rightIndex >= 0; rightIndex--) paint.lineTo(rightEdge[rightIndex][0], rightEdge[rightIndex][1]);
+    paint.closePath();
+    paint.fillStyle = color;
+    paint.fill();
+
+    /* 树冠：一圈羽状叶 */
+    var crownX = topX;
+    var crownY = topY;
+    var frondCount = 9;
+    var crownSize = height * 0.30;
+    for (var frondIndex = 0; frondIndex < frondCount; frondIndex++) {
+      var spread = frondIndex / (frondCount - 1);
+      var angle = -Math.PI * 1.12 + spread * Math.PI * 1.24 + (rng() - 0.5) * 0.16;
+      var length = crownSize * (0.82 + rng() * 0.42);
+      drawFrond(paint, crownX, crownY, angle, length, length * 0.34, color, detail ? 11 : 6, Math.max(1, thickness * 0.34));
+    }
+    /* 两片下垂的枯叶 */
+    drawFrond(paint, crownX, crownY, Math.PI * 0.34, crownSize * 0.72, crownSize * 0.5, color, detail ? 8 : 4, Math.max(1, thickness * 0.26));
+    drawFrond(paint, crownX, crownY, Math.PI * 0.64, crownSize * 0.66, crownSize * 0.44, color, detail ? 8 : 4, Math.max(1, thickness * 0.26));
+  }
+
+  function drawFrond(paint, cx, cy, angle, length, droop, color, leafletCount, weight) {
+    if (!canPath(paint)) return;
+    var tipX = cx + Math.cos(angle) * length;
+    var tipY = cy + Math.sin(angle) * length + droop;
+    var ctrlX = cx + Math.cos(angle) * length * 0.52;
+    var ctrlY = cy + Math.sin(angle) * length * 0.52 + droop * 0.2;
+
+    paint.strokeStyle = color;
+    paint.lineCap = 'round';
+    paint.lineWidth = weight;
+    paint.beginPath();
+    paint.moveTo(cx, cy);
+    paint.quadraticCurveTo(ctrlX, ctrlY, tipX, tipY);
+    paint.stroke();
+
+    var count = Math.min(leafletCount, 16);
+    paint.lineWidth = Math.max(0.8, weight * 0.7);
+    for (var i = 1; i <= count; i++) {
+      var ratio = i / (count + 1);
+      var px = quadPoint(cx, ctrlX, tipX, ratio);
+      var py = quadPoint(cy, ctrlY, tipY, ratio);
+      var dx = 2 * (1 - ratio) * (ctrlX - cx) + 2 * ratio * (tipX - ctrlX);
+      var dy = 2 * (1 - ratio) * (ctrlY - cy) + 2 * ratio * (tipY - ctrlY);
+      var dlen = Math.sqrt(dx * dx + dy * dy) || 1;
+      dx /= dlen; dy /= dlen;
+      var leafLen = length * 0.26 * Math.sin(Math.PI * Math.min(1, 0.18 + ratio * 0.9));
+      var forward = 0.62;
+      var sideX = -dy;
+      var sideY = dx;
+      var outX = (sideX + dx * forward);
+      var outY = (sideY + dy * forward);
+      var outLen = Math.sqrt(outX * outX + outY * outY) || 1;
+      outX /= outLen; outY /= outLen;
+      paint.beginPath();
+      paint.moveTo(px, py);
+      paint.lineTo(px + outX * leafLen, py + outY * leafLen + leafLen * 0.28);
+      paint.stroke();
+      paint.beginPath();
+      paint.moveTo(px, py);
+      paint.lineTo(px - outX * leafLen, py - outY * leafLen + leafLen * 0.28);
+      paint.stroke();
+    }
+  }
+
+  /* ---------- 烘焙步骤 ---------- */
+
+  function bakeSky() {
+    var paint = baseCtx;
+    var geom = sceneGeom();
+    if (!paint) return;
+    var sky = paint.createLinearGradient(0, 0, 0, geom.horizon + 2);
+    gradStop(sky, 0, '#160a18');
+    gradStop(sky, 0.15, '#2b0e1c');
+    gradStop(sky, 0.33, '#561723');
+    gradStop(sky, 0.51, '#8f2d22');
+    gradStop(sky, 0.67, '#c45a2c');
+    gradStop(sky, 0.82, '#e99643');
+    gradStop(sky, 0.94, '#f4c169');
+    gradStop(sky, 1, '#fadfae');
+    paint.fillStyle = sky;
+    paint.fillRect(0, 0, geom.width, geom.horizon + 2);
+
+    var glowR = geom.sunR * 3.2;
+    var glow = paint.createRadialGradient(geom.sunX, geom.sunY, geom.sunR * 0.18, geom.sunX, geom.sunY, glowR);
+    gradStop(glow, 0, 'rgba(255,229,176,0.9)');
+    gradStop(glow, 0.3, 'rgba(255,181,96,0.4)');
+    gradStop(glow, 0.62, 'rgba(236,120,60,0.12)');
+    gradStop(glow, 1, 'rgba(236,120,60,0)');
+    paint.fillStyle = glow;
+    paint.fillRect(geom.sunX - glowR, geom.sunY - glowR, glowR * 2, glowR * 2);
+
+    paint.save();
+    paint.beginPath();
+    paint.arc(geom.sunX, geom.sunY, geom.sunR, 0, Math.PI * 2);
+    paint.clip();
+    var sunFill = paint.createLinearGradient(0, geom.sunY - geom.sunR, 0, geom.sunY + geom.sunR);
+    gradStop(sunFill, 0, '#fff6dd');
+    gradStop(sunFill, 0.45, '#ffdda2');
+    gradStop(sunFill, 0.8, '#f9a95b');
+    gradStop(sunFill, 1, '#ef8442');
+    paint.fillStyle = sunFill;
+    paint.fillRect(geom.sunX - geom.sunR, geom.sunY - geom.sunR, geom.sunR * 2, geom.sunR * 2);
+    /* 落日里的横向薄霭 */
+    paint.fillStyle = 'rgba(196,72,40,0.22)';
+    for (var band = 0; band < 5; band++) {
+      var bandY = geom.sunY - geom.sunR * 0.45 + band * geom.sunR * 0.36;
+      var bandH = geom.sunR * (0.045 + band * 0.012);
+      paint.fillRect(geom.sunX - geom.sunR, bandY, geom.sunR * 2, bandH);
+    }
+    paint.restore();
+
+    /* 地平线附近的暖霾 */
+    var haze = paint.createLinearGradient(0, geom.horizon - geom.height * 0.16, 0, geom.horizon + 1);
+    gradStop(haze, 0, 'rgba(255,196,120,0)');
+    gradStop(haze, 0.72, 'rgba(255,196,122,0.34)');
+    gradStop(haze, 1, 'rgba(255,214,150,0.5)');
+    paint.fillStyle = haze;
+    paint.fillRect(0, geom.horizon - geom.height * 0.16, geom.width, geom.height * 0.16 + 1);
+
+    /* 变形宽银幕式的横向光斑 */
+    var streakBand = paint.createLinearGradient(geom.sunX - geom.width * 0.5, 0, geom.sunX + geom.width * 0.5, 0);
+    gradStop(streakBand, 0, 'rgba(255,214,160,0)');
+    gradStop(streakBand, 0.5, 'rgba(255,228,184,0.38)');
+    gradStop(streakBand, 1, 'rgba(255,214,160,0)');
+    paint.fillStyle = streakBand;
+    paint.fillRect(geom.sunX - geom.width * 0.5, geom.sunY - geom.height * 0.004, geom.width, geom.height * 0.008);
+  }
+
+  function bakeCity() {
+    var paint = baseCtx;
+    var geom = sceneGeom();
+    if (!canPath(paint)) return;
+    var rng = seededRandom(1964);
+
+    /* 远山 */
+    paint.fillStyle = 'rgba(58,20,30,0.9)';
+    paint.beginPath();
+    paint.moveTo(0, geom.horizon);
+    for (var ridge = 0; ridge <= 14; ridge++) {
+      var rx = geom.width * (ridge / 14);
+      var ry = geom.horizon - geom.height * (0.012 + rng() * 0.05);
+      paint.lineTo(rx, ry);
+    }
+    paint.lineTo(geom.width, geom.horizon);
+    paint.closePath();
+    paint.fill();
+
+    /* 康普顿 / 长滩一线低矮天际线 */
+    var cursor = -20;
+    while (cursor < geom.width + 20) {
+      var buildingW = 18 + rng() * 54;
+      var buildingH = geom.height * (0.012 + rng() * 0.075);
+      var top = geom.horizon - buildingH;
+      paint.fillStyle = 'rgba(38,13,21,' + (0.82 + rng() * 0.14).toFixed(3) + ')';
+      paint.fillRect(cursor, top, buildingW, buildingH + 2);
+      if (rng() > 0.72) {
+        paint.fillStyle = 'rgba(34,11,18,0.9)';
+        paint.fillRect(cursor + buildingW * 0.5, top - geom.height * 0.022, 1.6, geom.height * 0.022);
+      }
+      cursor += buildingW + 4 + rng() * 10;
+    }
+
+    /* 远处的小棕榈 */
+    for (var small = 0; small < 9; small++) {
+      var px = geom.width * (0.02 + rng() * 0.96);
+      var ph = geom.height * (0.05 + rng() * 0.05);
+      drawPalm(paint, px, geom.horizon - geom.height * 0.006, ph, (rng() - 0.5) * ph * 0.4, Math.max(1, ph * 0.025), 'rgba(30,10,16,0.92)', 700 + small, 0);
+    }
+
+    /* 横过天空的电线 */
+    paint.strokeStyle = 'rgba(32,11,18,0.5)';
+    paint.lineWidth = Math.max(1, viewH * 0.0016);
+    for (var wire = 0; wire < 3; wire++) {
+      var wireY = geom.height * (0.28 + wire * 0.06);
+      paint.beginPath();
+      paint.moveTo(-10, wireY - geom.height * 0.01);
+      paint.quadraticCurveTo(geom.width * 0.5, wireY + geom.height * 0.032, geom.width + 10, wireY - geom.height * 0.006);
+      paint.stroke();
+    }
+
+    /* 路面 */
+    var road = paint.createLinearGradient(0, geom.horizon, 0, geom.height);
+    gradStop(road, 0, '#4a1c1c');
+    gradStop(road, 0.16, '#2c1015');
+    gradStop(road, 0.6, '#160a10');
+    gradStop(road, 1, '#0b0509');
+    paint.fillStyle = road;
+    paint.fillRect(0, geom.horizon, geom.width, geom.height - geom.horizon);
+
+    /* 落日在地面的反光 */
+    var reflect = paint.createLinearGradient(0, geom.horizon, 0, geom.height);
+    gradStop(reflect, 0, 'rgba(255,190,110,0.34)');
+    gradStop(reflect, 0.3, 'rgba(240,140,70,0.13)');
+    gradStop(reflect, 1, 'rgba(220,110,60,0)');
+    paint.fillStyle = reflect;
+    paint.beginPath();
+    paint.moveTo(geom.sunX - geom.width * 0.05, geom.horizon);
+    paint.lineTo(geom.sunX + geom.width * 0.05, geom.horizon);
+    paint.lineTo(geom.sunX + geom.width * 0.16, geom.height);
+    paint.lineTo(geom.sunX - geom.width * 0.13, geom.height);
+    paint.closePath();
+    paint.fill();
+
+    /* 路面上几道横向的沥青虚影 */
+    paint.strokeStyle = 'rgba(255,170,100,0.07)';
+    paint.lineWidth = Math.max(1, viewH * 0.002);
+    for (var streak = 0; streak < 7; streak++) {
+      var sy = geom.horizon + (geom.height - geom.horizon) * (0.2 + rng() * 0.78);
+      paint.beginPath();
+      paint.moveTo(geom.width * rng() * 0.6, sy);
+      paint.lineTo(geom.width * (0.45 + rng() * 0.6), sy + 1);
+      paint.stroke();
+    }
+  }
+
+  function bakeMidPalms() {
+    var paint = baseCtx;
+    var geom = sceneGeom();
+    if (!canPath(paint)) return;
+    var palms = [
+      { x: 0.052, h: 0.58, lean: 0.055, thick: 0.0060, seed: 11, detail: 1 },
+      { x: 0.128, h: 0.47, lean: -0.035, thick: 0.0052, seed: 22, detail: 1 },
+      { x: 0.800, h: 0.55, lean: -0.050, thick: 0.0058, seed: 33, detail: 1 },
+      { x: 0.905, h: 0.44, lean: 0.042, thick: 0.0048, seed: 44, detail: 1 }
+    ];
+    for (var i = 0; i < palms.length; i++) {
+      var palmDef = palms[i];
+      var color = i % 2 === 0 ? '#1d0912' : '#260d16';
+      drawPalm(paint, geom.width * palmDef.x, geom.horizon + 6, geom.height * palmDef.h, geom.width * palmDef.lean, geom.width * palmDef.thick, color, palmDef.seed, palmDef.detail);
+    }
+  }
+
+  function bakeForegroundPalm(index) {
+    var geom = sceneGeom();
+    var configs = [
+      { anchorX: 0.5, anchorY: 1.0, heightRatio: 0.62, lean: 0.17, thickness: 0.011, color: '#0a0407', seed: 91, phase: 0.4, sway: 1, spriteW: 0.58, spriteH: 1.30 },
+      { anchorX: 0.5, anchorY: 1.0, heightRatio: 0.60, lean: -0.18, thickness: 0.012, color: '#090307', seed: 137, phase: 2.1, sway: 1.15, spriteW: 0.58, spriteH: 1.30 }
+    ];
+    var palm = configs[index];
+    if (!palm) return;
+    var sprite = bakePalmSprite(geom, {
+      spriteW: palm.spriteW, spriteH: palm.spriteH, anchorX: palm.anchorX, anchorY: palm.anchorY,
+      heightRatio: palm.heightRatio, lean: palm.lean, thickness: palm.thickness,
+      color: palm.color, seed: palm.seed, phase: palm.phase, sway: palm.sway
+    });
+    foregroundPalms[index] = { sprite: sprite, baseX: 0, baseY: 0, config: palm, phase: palm.phase };
+  }
+
+  function bakeOverlay() {
+    var layer = makeLayer();
+    if (!layer.ctx) return;
+    var paint = layer.ctx;
+    var geom = sceneGeom();
+
+    /* 歌词区压暗，保证奶油色字压得住暖天光 */
+    var scrim = paint.createRadialGradient(geom.width * 0.26, geom.height * 0.34, geom.height * 0.05, geom.width * 0.26, geom.height * 0.34, geom.width * 0.62);
+    gradStop(scrim, 0, 'rgba(18,7,13,0.52)');
+    gradStop(scrim, 0.45, 'rgba(18,7,13,0.26)');
+    gradStop(scrim, 1, 'rgba(18,7,13,0)');
+    paint.fillStyle = scrim;
+    paint.fillRect(0, 0, geom.width, geom.height);
+
+    var leftShade = paint.createLinearGradient(0, 0, geom.width * 0.42, 0);
+    gradStop(leftShade, 0, 'rgba(12,4,9,0.42)');
+    gradStop(leftShade, 1, 'rgba(12,4,9,0)');
+    paint.fillStyle = leftShade;
+    paint.fillRect(0, 0, geom.width * 0.42, geom.height);
+
+    /* 四角压暗 + 底部压暗 */
+    var vignette = paint.createRadialGradient(geom.width * 0.5, geom.height * 0.52, Math.min(geom.width, geom.height) * 0.32, geom.width * 0.5, geom.height * 0.52, Math.max(geom.width, geom.height) * 0.82);
+    gradStop(vignette, 0, 'rgba(10,4,8,0)');
+    gradStop(vignette, 0.62, 'rgba(10,4,8,0.12)');
+    gradStop(vignette, 1, 'rgba(8,3,6,0.62)');
+    paint.fillStyle = vignette;
+    paint.fillRect(0, 0, geom.width, geom.height);
+
+    var floorShade = paint.createLinearGradient(0, geom.height * 0.82, 0, geom.height);
+    gradStop(floorShade, 0, 'rgba(8,3,6,0)');
+    gradStop(floorShade, 1, 'rgba(8,3,6,0.55)');
+    paint.fillStyle = floorShade;
+    paint.fillRect(0, geom.height * 0.82, geom.width, geom.height * 0.18);
+
+    overlayLayer = layer.canvas;
+  }
+
+  function bakeGrain() {
+    var size = 128;
+    var tile = document.createElement('canvas');
+    tile.width = size;
+    tile.height = size;
+    var paint = tile.getContext('2d');
+    if (!paint) return;
+    var img = paint.createImageData(size, size);
+    var rng = seededRandom(2064);
+    for (var i = 0; i < img.data.length; i += 4) {
+      var value = 120 + Math.floor(rng() * 135);
+      img.data[i] = value;
+      img.data[i + 1] = value;
+      img.data[i + 2] = value;
+      img.data[i + 3] = 26 + Math.floor(rng() * 30);
+    }
+    paint.putImageData(img, 0, 0);
+    grainTile = tile;
+  }
+
+  function resetBake() {
+    bakeScale = renderScale();
+    staleBaseLayer = baseLayer && baseLayer.width > 1 ? baseLayer : null;
+    var layer = makeLayer();
+    baseLayer = layer.canvas;
+    baseCtx = layer.ctx;
+    overlayLayer = null;
+    grainTile = null;
+    grainPattern = null;
+    foregroundPalms = [];
+    bakeSteps = [
+      bakeSky,
+      bakeCity,
+      bakeMidPalms,
+      function () { bakeForegroundPalm(0); },
+      function () { bakeForegroundPalm(1); },
+      bakeCarSprite,
+      bakeOverlay,
+      bakeGrain
+    ];
+    bakeIndex = 0;
+  }
+
+  function runBake() {
+    if (bakeIndex >= bakeSteps.length) return;
+    var step = bakeSteps[bakeIndex];
+    bakeIndex += 1;
+    if (bakeIndex >= bakeSteps.length) staleBaseLayer = null;
+    try {
+      if (typeof step === 'function') step();
+    } catch (err) {
+      reportError('bake', err);
+    }
+  }
+
+  /* ================= 动态层 ================= */
+
+  var sunPulse = 0;
+  var carHop = 0;
+  var carVel = 0;
+  var beatFlash = 0;
+
+  function drawScene(sceneGeometry) {
+    var geom = sceneGeometry || sceneGeom();
+    if (!canPath(ctx)) return;
+    ctx.fillStyle = '#0d0509';
+    ctx.fillRect(0, 0, viewW, viewH);
+    if (bakeIndex > 2 || !staleBaseLayer) {
+      if (baseLayer && baseLayer.width > 0) blit(ctx, baseLayer, 0, 0, viewW, viewH);
+    } else if (staleBaseLayer.width > 0) {
+      blit(ctx, staleBaseLayer, 0, 0, viewW, viewH);
+    }
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    var breath = 0.05 + sunPulse * 0.2 + liveBass * 0.06;
+    var pulseR = geom.sunR * (1.5 + sunPulse * 0.7);
+    var pulse = ctx.createRadialGradient(geom.sunX, geom.sunY, geom.sunR * 0.4, geom.sunX, geom.sunY, pulseR);
+    gradStop(pulse, 0, 'rgba(255,214,150,' + clampNum(breath, 0, 0.45).toFixed(3) + ')');
+    gradStop(pulse, 1, 'rgba(255,150,80,0)');
+    ctx.fillStyle = pulse;
+    ctx.fillRect(geom.sunX - pulseR, geom.sunY - pulseR, pulseR * 2, pulseR * 2);
+    ctx.restore();
+
+    drawForegroundPalms(geom);
+
+    if (overlayLayer && overlayLayer.width > 0) blit(ctx, overlayLayer, 0, 0, viewW, viewH);
+    drawCar(geom);
+    drawDust(geom);
+    drawGrain(geom);
+  }
+
+  function drawForegroundPalms(geom) {
+    if (!canPath(ctx)) return;
+    for (var i = 0; i < foregroundPalms.length; i++) {
+      var item = foregroundPalms[i];
+      var sprite = item.sprite;
+      if (!sprite || !sprite.canvas || !sprite.canvas.width) continue;
+      var baseX;
+      var baseY;
+      if (i === 0) { baseX = geom.width * 0.005; baseY = geom.height * 1.02; }
+      else { baseX = geom.width * 0.995; baseY = geom.height * 1.04; }
+      var swayAngle = Math.sin(time * 0.42 + item.phase) * 0.0045 * item.config.sway + carHop * 0.01;
+      ctx.save();
+      ctx.translate(baseX, baseY);
+      ctx.rotate(swayAngle);
+      ctx.globalAlpha = 0.96;
+      blit(ctx, sprite.canvas, -sprite.baseX, -sprite.baseY, sprite.width, sprite.height);
+      ctx.restore();
+    }
+  }
+
+  var grainPattern = null;
+  var liteMode = false;
+
+  function ensureGrainPattern() {
+    if (grainPattern || !grainTile) return grainPattern;
+    try {
+      grainPattern = ctx.createPattern(grainTile, 'repeat');
+    } catch (err) {
+      reportError('grain', err);
+      grainPattern = null;
+    }
+    return grainPattern;
+  }
+
+  function drawGrain(geom) {
+    if (state.rm || liteMode || !grainTile || !grainTile.width) return;
+    var pattern = ensureGrainPattern();
+    if (!pattern || typeof pattern.setTransform !== 'function') return;
+    if (typeof DOMMatrix !== 'function') return;
+    var offsetX = Math.floor((time * 41) % 128);
+    var offsetY = Math.floor((time * 29) % 128);
+    try {
+      pattern.setTransform(new DOMMatrix([1, 0, 0, 1, offsetX, offsetY]));
+    } catch (err) {
+      reportError('grain-matrix', err);
+      return;
+    }
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = pattern;
+    ctx.fillRect(0, 0, geom.width, geom.height);
+    ctx.restore();
+  }
+
+  /* ================= 空气里的尘埃 ================= */
+
+  var dustMotes = [];
+
+  function initDust() {
+    var rng = seededRandom(8081);
+    dustMotes = [];
+    for (var i = 0; i < 26; i++) {
+      dustMotes.push({
+        x: rng(),
+        y: rng(),
+        radius: 0.4 + rng() * 1.6,
+        speed: 0.004 + rng() * 0.012,
+        phase: rng() * Math.PI * 2
+      });
+    }
+  }
+
+  function drawDust(geom) {
+    if (!canPath(ctx) || state.rm || liteMode || !dustMotes.length) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (var i = 0; i < dustMotes.length; i++) {
+      var mote = dustMotes[i];
+      var driftY = ((mote.y - time * mote.speed) % 1 + 1) % 1;
+      var driftX = mote.x + Math.sin(time * 0.25 + mote.phase) * 0.004;
+      var alpha = 0.08 + 0.10 * (0.5 + 0.5 * Math.sin(time * 1.7 + mote.phase));
+      ctx.fillStyle = 'rgba(255,222,176,' + clampNum(alpha, 0, 0.3).toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.arc(driftX * geom.width, driftY * geom.height, mote.radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /* ================= 低趴 Impala ================= */
+
+  var carSprite = null;
+  var carSpriteW = 0;
+  var carSpriteH = 0;
+  var carGroundY = 0;
+  var wheelSpin = 0;
+
+  function traceCarBody(paint, cw, groundY) {
+    if (!canPath(paint)) return;
+    function px(x) { return x * cw; }
+    function py(y) { return groundY - y * cw; }
+    function bez(x1, y1, x2, y2, x3, y3) {
+      paint.bezierCurveTo(px(x1), py(y1), px(x2), py(y2), px(x3), py(y3));
+    }
+    paint.beginPath();
+    paint.moveTo(px(0.032), py(0.05));
+    bez(0.010, 0.062, 0.004, 0.118, 0.020, 0.152);
+    bez(0.030, 0.180, 0.046, 0.192, 0.068, 0.196);
+    bez(0.140, 0.203, 0.300, 0.199, 0.400, 0.190);
+    bez(0.470, 0.184, 0.545, 0.182, 0.596, 0.192);
+    bez(0.622, 0.236, 0.652, 0.272, 0.680, 0.290);
+    paint.lineTo(px(0.702), py(0.292));
+    bez(0.716, 0.258, 0.722, 0.226, 0.736, 0.204);
+    bez(0.800, 0.196, 0.875, 0.180, 0.933, 0.164);
+    bez(0.963, 0.152, 0.984, 0.130, 0.995, 0.104);
+    paint.lineTo(px(0.986), py(0.058));
+    paint.lineTo(px(0.966), py(0.046));
+    paint.lineTo(px(0.032), py(0.046));
+    paint.closePath();
+  }
+
+  function traceCarTopEdge(paint, cw, groundY) {
+    if (!canPath(paint)) return;
+    function px(x) { return x * cw; }
+    function py(y) { return groundY - y * cw; }
+    function bez(x1, y1, x2, y2, x3, y3) {
+      paint.bezierCurveTo(px(x1), py(y1), px(x2), py(y2), px(x3), py(y3));
+    }
+    paint.beginPath();
+    paint.moveTo(px(0.020), py(0.152));
+    bez(0.030, 0.180, 0.046, 0.192, 0.068, 0.196);
+    bez(0.140, 0.203, 0.300, 0.199, 0.400, 0.190);
+    bez(0.470, 0.184, 0.545, 0.182, 0.596, 0.192);
+    bez(0.622, 0.236, 0.652, 0.272, 0.680, 0.290);
+    paint.lineTo(px(0.702), py(0.292));
+    bez(0.716, 0.258, 0.722, 0.226, 0.736, 0.204);
+    bez(0.800, 0.196, 0.875, 0.180, 0.933, 0.164);
+    bez(0.963, 0.152, 0.984, 0.130, 0.995, 0.104);
+  }
+
+  /* 哥特式窗贴：抽象黑体字笔画，远看是 Old English 字标 */
+  function drawGothicSticker(paint, cw, groundY, seed) {
+    if (!canPath(paint)) return;
+    var rng = seededRandom(seed);
+    var bandX = 0.300;
+    var bandY = 0.128;
+    var bandW = 0.200;
+    var bandH = 0.040;
+    var left = bandX * cw;
+    var top = groundY - (bandY + bandH) * cw;
+    var wide = bandW * cw;
+    var high = bandH * cw;
+
+    paint.save();
+    paint.beginPath();
+    paint.moveTo(left, top + high * 0.06);
+    paint.lineTo(left + wide, top);
+    paint.lineTo(left + wide - wide * 0.02, top + high);
+    paint.lineTo(left - wide * 0.02, top + high * 0.94);
+    paint.closePath();
+    paint.fillStyle = 'rgba(240,224,192,0.88)';
+    paint.fill();
+    paint.strokeStyle = 'rgba(120,60,42,0.35)';
+    paint.lineWidth = Math.max(0.6, cw * 0.0012);
+    paint.stroke();
+
+    paint.strokeStyle = 'rgba(38,14,20,0.9)';
+    paint.lineCap = 'butt';
+    var slots = 7;
+    var slotW = wide / slots;
+    for (var slot = 0; slot < slots; slot++) {
+      var baseX = left + slotW * (slot + 0.22);
+      var stemW = Math.max(0.9, slotW * 0.17);
+      var stemTop = top + high * 0.14;
+      var stemBottom = top + high * 0.86;
+      paint.lineWidth = stemW;
+      paint.beginPath();
+      paint.moveTo(baseX, stemBottom);
+      paint.lineTo(baseX, stemTop + high * 0.05);
+      paint.stroke();
+      paint.beginPath();
+      paint.moveTo(baseX + stemW * 0.9, stemBottom);
+      paint.lineTo(baseX + stemW * 0.9, stemTop + high * 0.12);
+      paint.stroke();
+      paint.lineWidth = Math.max(0.7, stemW * 0.55);
+      paint.beginPath();
+      paint.moveTo(baseX, stemTop + high * 0.1);
+      paint.lineTo(baseX + slotW * (0.4 + rng() * 0.2), stemBottom - high * 0.05);
+      paint.stroke();
+      paint.beginPath();
+      paint.moveTo(baseX + stemW * 0.9, stemTop + high * 0.18);
+      paint.lineTo(baseX - slotW * 0.12, stemBottom - high * 0.12);
+      paint.stroke();
+    }
+    paint.restore();
+  }
+
+  function bakeCarSprite() {
+    var geom = sceneGeom();
+    var spriteScale = renderScale();
+    var cssW = geom.carW * 1.05;
+    var cssH = geom.carW * 0.44;
+    var sprite = document.createElement('canvas');
+    sprite.width = Math.max(1, Math.round(cssW * spriteScale));
+    sprite.height = Math.max(1, Math.round(cssH * spriteScale));
+    var paint = sprite.getContext('2d');
+    if (!paint) return;
+    paint.setTransform(spriteScale, 0, 0, spriteScale, 0, 0);
+
+    var cw = geom.carW;
+    var groundY = cssH - cw * 0.045;
+    var padX = (cssW - cw) * 0.5;
+    paint.translate(padX, 0);
+
+    /* 车身 */
+    traceCarBody(paint, cw, groundY);
+    var bodyFill = paint.createLinearGradient(0, groundY - cw * 0.30, 0, groundY);
+    gradStop(bodyFill, 0, '#5c2426');
+    gradStop(bodyFill, 0.22, '#37131c');
+    gradStop(bodyFill, 0.5, '#200d14');
+    gradStop(bodyFill, 0.78, '#150810');
+    gradStop(bodyFill, 1, '#0c0409');
+    paint.fillStyle = bodyFill;
+    paint.fill();
+
+    /* 轮拱开洞 */
+    paint.save();
+    paint.globalCompositeOperation = 'destination-out';
+    var archR = cw * 0.079;
+    paint.beginPath();
+    paint.arc(cw * 0.83, groundY - cw * 0.062, archR, 0, Math.PI * 2);
+    paint.fill();
+    paint.beginPath();
+    paint.arc(cw * 0.17, groundY - cw * 0.062, archR * 1.04, 0, Math.PI * 2);
+    paint.fill();
+    paint.restore();
+
+    /* 驾驶舱里的坐姿剪影（只在腰线以上露出一颗头，避免糊在车门上） */
+    paint.fillStyle = '#150810';
+    paint.beginPath();
+    paint.ellipse(cw * 0.512, groundY - cw * 0.212, cw * 0.024, cw * 0.026, -0.1, 0, Math.PI * 2);
+    paint.fill();
+    paint.beginPath();
+    paint.moveTo(cw * 0.466, groundY - cw * 0.192);
+    paint.quadraticCurveTo(cw * 0.512, groundY - cw * 0.222, cw * 0.558, groundY - cw * 0.192);
+    paint.lineTo(cw * 0.558, groundY - cw * 0.190);
+    paint.lineTo(cw * 0.466, groundY - cw * 0.190);
+    paint.closePath();
+    paint.fill();
+
+    /* 挡风玻璃上的落日反光 */
+    paint.beginPath();
+    paint.moveTo(cw * 0.604, groundY - cw * 0.196);
+    paint.lineTo(cw * 0.674, groundY - cw * 0.286);
+    paint.lineTo(cw * 0.700, groundY - cw * 0.290);
+    paint.lineTo(cw * 0.730, groundY - cw * 0.208);
+    paint.closePath();
+    var glass = paint.createLinearGradient(cw * 0.60, groundY - cw * 0.29, cw * 0.73, groundY - cw * 0.20);
+    gradStop(glass, 0, 'rgba(255,222,170,0.30)');
+    gradStop(glass, 0.55, 'rgba(255,176,110,0.12)');
+    gradStop(glass, 1, 'rgba(120,50,44,0.10)');
+    paint.fillStyle = glass;
+    paint.fill();
+
+    /* 侧窗玻璃 / 后视镜位置的一点暖光 */
+    paint.strokeStyle = 'rgba(255,214,160,0.5)';
+    paint.lineWidth = Math.max(1, cw * 0.0018);
+    paint.beginPath();
+    paint.moveTo(cw * 0.596, groundY - cw * 0.196);
+    paint.bezierCurveTo(cw * 0.622, groundY - cw * 0.238, cw * 0.652, groundY - cw * 0.274, cw * 0.680, groundY - cw * 0.292);
+    paint.stroke();
+
+    /* 镀铬腰带 */
+    var spear = paint.createLinearGradient(cw * 0.05, 0, cw * 0.96, 0);
+    gradStop(spear, 0, 'rgba(255,206,140,0)');
+    gradStop(spear, 0.16, 'rgba(255,214,158,0.55)');
+    gradStop(spear, 0.55, 'rgba(255,232,190,0.8)');
+    gradStop(spear, 0.86, 'rgba(255,206,140,0.45)');
+    gradStop(spear, 1, 'rgba(255,206,140,0)');
+    paint.strokeStyle = spear;
+    paint.lineWidth = Math.max(1, cw * 0.0035);
+    paint.beginPath();
+    paint.moveTo(cw * 0.06, groundY - cw * 0.176);
+    paint.bezierCurveTo(cw * 0.34, groundY - cw * 0.180, cw * 0.62, groundY - cw * 0.176, cw * 0.90, groundY - cw * 0.166);
+    paint.stroke();
+    paint.strokeStyle = 'rgba(255,196,132,0.22)';
+    paint.lineWidth = Math.max(0.8, cw * 0.0014);
+    paint.beginPath();
+    paint.moveTo(cw * 0.08, groundY - cw * 0.163);
+    paint.bezierCurveTo(cw * 0.36, groundY - cw * 0.166, cw * 0.64, groundY - cw * 0.162, cw * 0.92, groundY - cw * 0.153);
+    paint.stroke();
+
+    drawGothicSticker(paint, cw, groundY, 7717);
+
+    /* 前翼子板的交叉旗徽 */
+    paint.save();
+    paint.translate(cw * 0.665, groundY - cw * 0.118);
+    paint.rotate(-0.06);
+    paint.strokeStyle = 'rgba(255,232,196,0.66)';
+    paint.lineWidth = Math.max(1, cw * 0.0022);
+    paint.beginPath();
+    paint.moveTo(-cw * 0.014, -cw * 0.010);
+    paint.lineTo(cw * 0.012, cw * 0.012);
+    paint.moveTo(-cw * 0.012, cw * 0.012);
+    paint.lineTo(cw * 0.013, -cw * 0.009);
+    paint.stroke();
+    paint.lineWidth = Math.max(0.8, cw * 0.0011);
+    paint.beginPath();
+    paint.moveTo(-cw * 0.021, -cw * 0.014);
+    paint.lineTo(cw * 0.021, -cw * 0.014);
+    paint.stroke();
+    paint.restore();
+
+    /* 下裙边的镀铬反光 */
+    paint.strokeStyle = 'rgba(255,206,148,0.30)';
+    paint.lineWidth = Math.max(0.8, cw * 0.0018);
+    paint.beginPath();
+    paint.moveTo(cw * 0.262, groundY - cw * 0.052);
+    paint.lineTo(cw * 0.742, groundY - cw * 0.050);
+    paint.stroke();
+
+    /* 地面反弹光，让车从黑路面里分离出来 */
+    paint.save();
+    paint.globalCompositeOperation = 'source-atop';
+    var bounce = paint.createLinearGradient(0, groundY - cw * 0.09, 0, groundY - cw * 0.046);
+    gradStop(bounce, 0, 'rgba(255,150,86,0)');
+    gradStop(bounce, 1, 'rgba(255,162,98,0.26)');
+    paint.fillStyle = bounce;
+    paint.fillRect(0, groundY - cw * 0.09, cw, cw * 0.05);
+    paint.restore();
+
+    /* 顶面逆光轮廓 */
+    traceCarTopEdge(paint, cw, groundY);
+    var rim = paint.createLinearGradient(0, groundY - cw * 0.30, 0, groundY - cw * 0.14);
+    gradStop(rim, 0, 'rgba(255,226,176,0.85)');
+    gradStop(rim, 0.5, 'rgba(255,190,120,0.55)');
+    gradStop(rim, 1, 'rgba(255,170,100,0.12)');
+    paint.strokeStyle = rim;
+    paint.lineWidth = Math.max(1.2, cw * 0.0045);
+    paint.stroke();
+
+    /* 保险杠与车头反光 */
+    paint.fillStyle = 'rgba(255,222,170,0.55)';
+    paint.beginPath();
+    paint.moveTo(cw * 0.975, groundY - cw * 0.062);
+    paint.lineTo(cw * 0.996, groundY - cw * 0.104);
+    paint.lineTo(cw * 0.988, groundY - cw * 0.058);
+    paint.closePath();
+    paint.fill();
+
+    carSprite = sprite;
+    carSpriteW = cssW;
+    carSpriteH = cssH;
+    carGroundY = groundY;
+    carSpritePadX = padX;
+  }
+
+  var carSpritePadX = 0;
+
+  function drawWheel(paint, cx, cy, radius, spin) {
+    if (!canPath(paint)) return;
+    paint.save();
+    paint.beginPath();
+    paint.arc(cx, cy, radius, 0, Math.PI * 2);
+    paint.fillStyle = '#100709';
+    paint.fill();
+    paint.strokeStyle = 'rgba(255,186,120,0.32)';
+    paint.lineWidth = Math.max(1, radius * 0.06);
+    paint.stroke();
+
+    paint.beginPath();
+    paint.arc(cx, cy, radius * 0.76, 0, Math.PI * 2);
+    paint.strokeStyle = 'rgba(238,226,204,0.82)';
+    paint.lineWidth = Math.max(1, radius * 0.14);
+    paint.stroke();
+
+    paint.save();
+    paint.translate(cx, cy);
+    paint.rotate(spin);
+    paint.beginPath();
+    paint.arc(0, 0, radius * 0.6, 0, Math.PI * 2);
+    var hub = paint.createRadialGradient(-radius * 0.2, -radius * 0.2, radius * 0.05, 0, 0, radius * 0.62);
+    gradStop(hub, 0, 'rgba(255,236,200,0.95)');
+    gradStop(hub, 0.55, 'rgba(206,170,116,0.9)');
+    gradStop(hub, 1, 'rgba(92,62,44,0.9)');
+    paint.fillStyle = hub;
+    paint.fill();
+
+    paint.strokeStyle = 'rgba(60,32,26,0.55)';
+    paint.lineWidth = Math.max(0.7, radius * 0.035);
+    for (var spoke = 0; spoke < 14; spoke++) {
+      var angle = (spoke / 14) * Math.PI * 2;
+      paint.beginPath();
+      paint.moveTo(Math.cos(angle) * radius * 0.16, Math.sin(angle) * radius * 0.16);
+      paint.lineTo(Math.cos(angle) * radius * 0.55, Math.sin(angle) * radius * 0.55);
+      paint.stroke();
+    }
+    paint.beginPath();
+    paint.arc(0, 0, radius * 0.12, 0, Math.PI * 2);
+    paint.fillStyle = 'rgba(255,242,214,0.95)';
+    paint.fill();
+    paint.restore();
+    paint.restore();
+  }
+
+  function drawCar(geom) {
+    if (!canPath(ctx)) return;
+    var cw = geom.carW;
+    var hop = carHop;
+    var pivotX = geom.carX + cw * 0.17;
+    var pivotY = geom.carY - cw * 0.062;
+
+    /* 地面阴影 */
+    var shadowW = cw * (0.46 - hop * 0.06);
+    ctx.save();
+    ctx.globalAlpha = clampNum(0.52 - hop * 0.16, 0.16, 0.6);
+    ctx.fillStyle = '#08030a';
+    ctx.beginPath();
+    ctx.ellipse(geom.carX + cw * 0.5, geom.carY - cw * 0.006, shadowW, cw * 0.018, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = clampNum(0.30 - hop * 0.12, 0.08, 0.34);
+    ctx.fillStyle = 'rgba(255,168,92,1)';
+    ctx.beginPath();
+    ctx.ellipse(geom.carX + cw * 0.56, geom.carY - cw * 0.004, cw * 0.3, cw * 0.012, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(pivotX, pivotY);
+    ctx.rotate(-hop * 0.035);
+    ctx.translate(-pivotX, -pivotY);
+    ctx.translate(0, -hop * cw * 0.06);
+
+    drawWheel(ctx, geom.carX + cw * 0.17, geom.carY - cw * 0.062, cw * 0.062, wheelSpin);
+    drawWheel(ctx, geom.carX + cw * 0.83, geom.carY - cw * 0.062, cw * 0.062, wheelSpin);
+
+    if (carSprite && carSprite.width > 0) {
+      var spriteX = geom.carX - carSpritePadX;
+      var spriteY = geom.carY - carGroundY;
+      blit(ctx, carSprite, spriteX, spriteY, carSpriteW, carSpriteH);
+    }
+
+    /* 铬件随高频闪一下 */
+    ctx.save();
+    var glint = ctx.createLinearGradient(geom.carX, 0, geom.carX + cw, 0);
+    gradStop(glint, 0, 'rgba(255,220,166,0)');
+    gradStop(glint, 0.45, 'rgba(255,236,196,' + clampNum(0.10 + liveTreble * 0.34, 0, 0.5).toFixed(3) + ')');
+    gradStop(glint, 1, 'rgba(255,220,166,0)');
+    ctx.strokeStyle = glint;
+    ctx.lineWidth = Math.max(1, cw * 0.0026);
+    ctx.beginPath();
+    ctx.moveTo(geom.carX + cw * 0.07, geom.carY - cw * 0.182);
+    ctx.bezierCurveTo(geom.carX + cw * 0.35, geom.carY - cw * 0.186, geom.carX + cw * 0.63, geom.carY - cw * 0.182, geom.carX + cw * 0.91, geom.carY - cw * 0.172);
+    ctx.stroke();
+    ctx.restore();
+    ctx.restore();
+  }
+
+  var lastFrameAt = 0;
+  var frameDelta = 0.016;
+  var slowFrames = 0;
+
+  function frame(now) {
+    var started = (typeof now === 'number' && isFinite(now)) ? now : Date.now();
+    requestAnimationFrame(frame);
+    var measuredDelta = lastFrameAt > 0 ? (started - lastFrameAt) / 1000 : 0.016;
+    frameDelta = clampNum(measuredDelta, 0.001, 0.1);
+    try {
+      state.frames += 1;
+      if (bakeIndex < bakeSteps.length) runBake();
+      var geom = sceneGeom();
+      var motion = state.rm ? 0.3 : 1;
+      state.t = time;
+      state.idx = findIndex(time);
+      state.playing = playing;
+      sunPulse += (beatFlash * motion - sunPulse) * 0.12;
+      beatFlash *= 0.9;
+      carVel = clampNum(carVel + (-carHop * 0.3 - carVel * 0.18), -1.2, 1.2);
+      carHop = clampNum(carHop + carVel * motion, -0.45, 0.9);
+      wheelSpin += playing ? 0.006 * motion : 0.002;
+      drawScene(geom);
+      drawHud(geom);
+      drawLyricBlock(geom);
+      drawTimecode(geom);
+    } catch (err) {
+      reportError('frame', err);
+    }
+    lastFrameAt = started;
+    var cost = Math.max(0, Math.min(50, (typeof performance !== 'undefined' ? performance.now() : Date.now()) - started));
+    state.js = cost;
+    if (cost > 11) slowFrames += 1; else slowFrames = Math.max(0, slowFrames - 1);
+    if (!liteMode && slowFrames > 50) liteMode = true;
+  }
+
+  /* ================= 歌词层 ================= */
+
+  var LYRIC_FONT = '"Songti SC","Noto Serif SC","Source Han Serif SC","Times New Roman",Georgia,serif';
+  var MONO_FONT = '"SF Mono",Menlo,Consolas,"Courier New",monospace';
+  var lyricCache = { key: '', size: 0, rows: [], times: [] };
+  var lineAge = 9;
+  var lastIdx = -2;
+  var hasInit = false;
+
+  function ellipsize(paint, text, maxWidth) {
+    var chars = Array.from(String(text));
+    if (paint.measureText(chars.join('')).width <= maxWidth) return chars.join('');
+    var out = [];
+    var total = 0;
+    for (var i = 0; i < chars.length && i < 120; i++) {
+      var charWidth = paint.measureText(chars[i]).width;
+      if (total + charWidth > maxWidth - paint.measureText('…').width) break;
+      out.push(chars[i]);
+      total += charWidth;
+    }
+    return out.join('') + '…';
+  }
+
+  function buildCharTimes(line, chars) {
+    var count = chars.length;
+    var times = [];
+    var duration = (typeof line.dur === 'number' && line.dur > 0) ? line.dur : Math.max(1.4, count * 0.2);
+    var charData = line.chars;
+    var hasYrc = Array.isArray(charData) && charData.length > 0;
+    for (var i = 0; i < count; i++) {
+      var at = null;
+      if (hasYrc) {
+        var entry = charData[i];
+        if (entry && typeof entry.t === 'number' && isFinite(entry.t)) at = entry.t;
+      }
+      if (at === null) {
+        if (hasYrc && i > 0 && typeof times[i - 1] === 'number') {
+          at = times[i - 1] + duration / count;
+        } else if (hasYrc && i > 0) {
+          at = line.t + (duration * i) / count;
+        } else {
+          at = line.t + (duration * 0.72 * i) / Math.max(1, count);
+        }
+      }
+      times.push(at);
+    }
+    return times;
+  }
+
+  function prepareLyric(text, maxWidth, baseSize) {
+    var chars = Array.from(String(text)).slice(0, 240);
+    var raw = chars.join('');
+    var key = viewW + '|' + viewH + '|' + raw.length + '|' + raw;
+    if (lyricCache.key === key && lyricCache.rows.length) return lyricCache;
+
+    ctx.save();
+    ctx.font = '600 ' + baseSize + 'px ' + LYRIC_FONT;
+    var fullWidth = ctx.measureText(raw).width || 1;
+    var size = baseSize;
+    if (fullWidth > maxWidth) size = Math.max(baseSize * 0.56, (baseSize * maxWidth) / fullWidth);
+    size = clampNum(size, 15, baseSize);
+    ctx.font = '600 ' + size + 'px ' + LYRIC_FONT;
+    var gap = ctx.measureText('国').width * 0.02;
+
+    var rows = [];
+    var cursor = 0;
+    var maxRows = 2;
+    while (cursor < chars.length && rows.length < maxRows) {
+      var rowChars = [];
+      var rowWidth = 0;
+      var startIndex = cursor;
+      while (cursor < chars.length) {
+        var charWidth = ctx.measureText(chars[cursor]).width + gap;
+        if (rowChars.length > 0 && rowWidth + charWidth > maxWidth) break;
+        rowChars.push(chars[cursor]);
+        rowWidth += charWidth;
+        cursor += 1;
+      }
+      rows.push({ chars: rowChars, start: startIndex });
+      if (rowChars.length === 0) break;
+    }
+    if (cursor < chars.length && rows.length > 0) {
+      var lastRow = rows[rows.length - 1];
+      while (lastRow.chars.length > 1) {
+        lastRow.chars.pop();
+        if (ctx.measureText(lastRow.chars.join('') + '…').width <= maxWidth) break;
+      }
+      lastRow.chars.push('…');
+    }
+    ctx.restore();
+
+    lyricCache = { key: key, size: size, rows: rows, times: [] };
+    return lyricCache;
+  }
+
+  function ensureCharTimes(line) {
+    var chars = Array.from(String(line.text || '')).slice(0, 240);
+    if (!lyricCache.times.length || lyricCache.times.length !== chars.length) {
+      lyricCache.times = buildCharTimes(line, chars);
+    }
+    return lyricCache.times;
+  }
+
+  function drawTimecode(geom) {
+    if (!canPath(ctx) || !hasInit) return;
+    var current = Math.max(0, state.t);
+    var minutes = Math.floor(current / 60);
+    var seconds = Math.floor(current % 60);
+    var label = (minutes < 10 ? '0' : '') + minutes + ':' + (seconds < 10 ? '0' : '') + seconds;
+    if (state.duration > 1) {
+      var total = Math.floor(state.duration);
+      var totalLabel = Math.floor(total / 60) + ':' + (total % 60 < 10 ? '0' : '') + (total % 60);
+      label += ' / ' + totalLabel;
+    }
+    ctx.save();
+    ctx.font = '400 ' + Math.max(10, Math.round(geom.height * 0.0135)) + 'px ' + MONO_FONT;
+    ctx.fillStyle = 'rgba(248,226,196,0.38)';
+    ctx.textAlign = 'right';
+    ctx.fillText(label, geom.width * 0.928, geom.height * 0.955);
+    ctx.restore();
+  }
+
+  function drawHud(geom) {
+    if (!canPath(ctx)) return;
+    var padX = geom.width * (geom.width < geom.height ? 0.085 : 0.072);
+    var topY = geom.height * (geom.width < geom.height ? 0.095 : 0.088);
+    ctx.save();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+
+    ctx.font = '500 ' + Math.max(9, Math.round(geom.height * 0.0125)) + 'px ' + MONO_FONT;
+    ctx.fillStyle = 'rgba(255,214,168,0.5)';
+    ctx.fillText('COMPTON  ·  LONG BEACH', padX, topY);
+
+    if (state.songName) {
+      ctx.font = '600 ' + Math.round(geom.height * 0.024) + 'px ' + LYRIC_FONT;
+      ctx.fillStyle = 'rgba(250,231,204,0.9)';
+      ctx.fillText(ellipsize(ctx, state.songName, geom.width * 0.5), padX, topY + geom.height * 0.04);
+    }
+    if (state.artist) {
+      ctx.font = '400 ' + Math.round(geom.height * 0.0145) + 'px ' + MONO_FONT;
+      ctx.fillStyle = 'rgba(255,220,180,0.52)';
+      ctx.fillText(ellipsize(ctx, state.artist, geom.width * 0.5), padX, topY + geom.height * 0.065);
+    }
+
+    /* 细框与角标 */
+    var frameX = geom.width * 0.032;
+    var frameY = geom.height * 0.038;
+    var frameW = geom.width - frameX * 2;
+    var frameH = geom.height - frameY * 2;
+    ctx.strokeStyle = 'rgba(255,226,190,0.12)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(frameX, frameY, frameW, frameH);
+
+    var tick = Math.min(22, geom.width * 0.02);
+    ctx.strokeStyle = 'rgba(255,224,182,0.42)';
+    ctx.lineWidth = 1.2;
+    var corners = [
+      [frameX, frameY, 1, 1], [frameX + frameW, frameY, -1, 1],
+      [frameX, frameY + frameH, 1, -1], [frameX + frameW, frameY + frameH, -1, -1]
+    ];
+    for (var cornerIndex = 0; cornerIndex < corners.length; cornerIndex++) {
+      var corner = corners[cornerIndex];
+      ctx.beginPath();
+      ctx.moveTo(corner[0] + corner[2] * tick, corner[1]);
+      ctx.lineTo(corner[0], corner[1]);
+      ctx.lineTo(corner[0], corner[1] + corner[3] * tick);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawEmptyState(geom) {
+    if (!canPath(ctx)) return;
+    var padX = geom.width * (geom.width < geom.height ? 0.085 : 0.072);
+    var topY = geom.height * (geom.width < geom.height ? 0.255 : 0.30);
+    var ruleW = Math.min(70, geom.width * 0.07);
+    ctx.save();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+
+    ctx.fillStyle = 'rgba(255,214,168,0.55)';
+    ctx.fillRect(padX, topY - geom.height * 0.052, ruleW, Math.max(1, geom.height * 0.0016));
+
+    ctx.font = '500 ' + Math.max(9, Math.round(geom.height * 0.0135)) + 'px ' + MONO_FONT;
+    ctx.fillStyle = 'rgba(255,214,168,0.5)';
+    ctx.fillText('INSTRUMENTAL', padX, topY);
+
+    ctx.font = '600 ' + Math.round(geom.height * 0.040) + 'px ' + LYRIC_FONT;
+    ctx.fillStyle = 'rgba(250,234,208,0.92)';
+    ctx.fillText('这首歌没有词', padX, topY + geom.height * 0.078);
+
+    ctx.font = '400 ' + Math.round(geom.height * 0.021) + 'px ' + LYRIC_FONT;
+    ctx.fillStyle = 'rgba(240,208,172,0.6)';
+    ctx.fillText('让落日和怠速替他说话', padX, topY + geom.height * 0.118);
+    ctx.restore();
+  }
+
+  function drawLyricBlock(geom) {
+    if (!canPath(ctx) || !hasInit) return;
+    var lines = state.lines;
+    if (!lines.length) {
+      state.text = '';
+      drawEmptyState(geom);
+      return;
+    }
+
+    var idx = state.idx;
+    var current = idx >= 0 ? lines[idx] : lines[0];
+    if (!current) return;
+    var text = typeof current.text === 'string' ? current.text : '';
+    state.text = text;
+
+    if (idx !== lastIdx) {
+      lastIdx = idx;
+      lineAge = 0;
+      lyricCache.key = '';
+      lyricCache.times = [];
+    }
+    lineAge += clampNum(frameDelta, 0.001, 0.1);
+
+    var padX = geom.width * (geom.width < geom.height ? 0.085 : 0.072);
+    var maxWidth = Math.min(geom.width * (geom.width < geom.height ? 0.82 : 0.60), geom.height * 1.45);
+    var baseSize = clampNum(geom.height * 0.052, 20, 56);
+    var fade = clampNum(lineAge / 0.42, 0, 1);
+    var eased = 1 - Math.pow(1 - fade, 2);
+    var rise = (1 - eased) * geom.height * 0.018;
+    var topY = geom.height * (geom.width < geom.height ? 0.255 : 0.30) + rise;
+
+    ctx.save();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.globalAlpha = clampNum(0.25 + eased * 0.75, 0, 1);
+
+    ctx.fillStyle = 'rgba(255,214,168,0.42)';
+    ctx.fillRect(padX, topY - baseSize * 1.34, Math.min(58, geom.width * 0.06), Math.max(1, geom.height * 0.0016));
+
+    if (!text.trim()) {
+      /* 纯器乐空行：不编词，只画呼吸点 */
+      ctx.font = '600 ' + Math.round(baseSize * 0.7) + 'px ' + LYRIC_FONT;
+      ctx.fillStyle = 'rgba(250,230,198,0.5)';
+      ctx.fillText('·  ·  ·', padX, topY);
+      ctx.restore();
+      return;
+    }
+
+    var prep = prepareLyric(text, maxWidth, baseSize);
+    ensureCharTimes(current);
+    var times = lyricCache.times;
+    var lit = 0;
+    for (var i = 0; i < times.length; i++) {
+      if (times[i] <= time + 0.0001) lit = i + 1;
+    }
+    if (idx < 0) lit = 0;
+
+    var lineHeight = prep.size * 1.32;
+    var fontSize = Math.round(prep.size * 10) / 10;
+    ctx.font = '600 ' + fontSize + 'px ' + LYRIC_FONT;
+
+    for (var rowIndex = 0; rowIndex < prep.rows.length; rowIndex++) {
+      var row = prep.rows[rowIndex];
+      var rowText = row.chars.join('');
+      var rowY = topY + rowIndex * lineHeight;
+      var litCount = clampNum(lit - row.start, 0, row.chars.length);
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(240,206,168,0.36)';
+      ctx.fillText(rowText, padX, rowY);
+
+      if (litCount > 0) {
+        var litText = row.chars.slice(0, litCount).join('');
+        var textGrad = ctx.createLinearGradient(0, rowY - fontSize, 0, rowY + fontSize * 0.22);
+        gradStop(textGrad, 0, '#fff7e4');
+        gradStop(textGrad, 0.55, '#ffe3b6');
+        gradStop(textGrad, 1, '#f3bd80');
+        ctx.fillStyle = textGrad;
+        if (!liteMode) {
+          ctx.shadowColor = accentGlow(0.55);
+          ctx.shadowBlur = fontSize * 0.34;
+        }
+        ctx.fillText(litText, padX, rowY);
+      }
+      ctx.restore();
+    }
+
+    /* 下一句预告 */
+    var nextLine = lines[(idx >= 0 ? idx : 0) + 1];
+    if (nextLine && typeof nextLine.text === 'string' && nextLine.text.trim()) {
+      var previewSize = Math.round(prep.size * 0.58);
+      ctx.font = '600 ' + previewSize + 'px ' + LYRIC_FONT;
+      ctx.fillStyle = 'rgba(238,200,160,0.34)';
+      var previewY = topY + prep.rows.length * lineHeight + prep.size * 0.34;
+      ctx.fillText(ellipsize(ctx, nextLine.text, maxWidth * 0.68), padX, previewY);
+    }
+    ctx.restore();
+  }
+
+  function normalizeLines(rawLines) {
+    var out = [];
+    if (!Array.isArray(rawLines)) return out;
+    var limit = Math.min(rawLines.length, 400);
+    for (var i = 0; i < limit; i++) {
+      var item = rawLines[i];
+      if (!item || typeof item !== 'object') continue;
+      var text = item.text === null || item.text === undefined ? '' : String(item.text);
+      var t = typeof item.t === 'number' && isFinite(item.t) ? item.t : 0;
+      var dur = typeof item.dur === 'number' && isFinite(item.dur) && item.dur > 0 ? item.dur : 0;
+      out.push({ t: t, dur: dur, text: text, chars: Array.isArray(item.chars) ? item.chars : null });
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    return out;
+  }
+
+  function init(payload) {
+    try {
+      var data = payload && typeof payload === 'object' ? payload : {};
+      var song = data.song && typeof data.song === 'object' ? data.song : {};
+      state.lines = normalizeLines(data.lines);
+      state.idx = -1;
+      state.text = '';
+      state.songName = song.name ? String(song.name) : '';
+      state.artist = Array.isArray(song.artists) ? song.artists.filter(Boolean).join(' / ') : (song.artists ? String(song.artists) : '');
+      state.duration = clampNum(data.duration, 0, 100000);
+      hasInit = true;
+      lastIdx = -2;
+      lineAge = 9;
+      lyricCache.key = '';
+      lyricCache.times = [];
+      var accent = Array.isArray(data.accent) ? data.accent : null;
+      if (accent && accent.length >= 3) {
+        state.accent = [roundColor(accent[0]), roundColor(accent[1]), roundColor(accent[2])];
+      }
+      playing = true;
+    } catch (err) { reportError('init', err); }
+  }
+
+  function onMessage(event) {
+    var data = event && event.data;
+    if (!data || typeof data !== 'object' || data.__c100 !== 1) return;
+    try {
+      if (data.type === 'init') init(data.payload);
+      else if (data.type === 'tick') {
+        var tick = data.payload || {};
+        if (typeof tick.time === 'number' && isFinite(tick.time)) { time = tick.time; state.t = tick.time; }
+        if (typeof tick.playing === 'boolean') playing = tick.playing;
+      } else if (data.type === 'beat') {
+        var beat = data.payload || {};
+        var level = clampNum(beat.level, 0, 1);
+        lastBeatLevel = level;
+        beatFlash = Math.max(beatFlash, level);
+        carVel += level * 0.55;
+      } else if (data.type === 'live') {
+        var live = data.payload || {};
+        liveLevel = clampNum(live.level, 0, 1);
+        liveBass = clampNum(live.bass, 0, 1);
+        liveMid = clampNum(live.mid, 0, 1);
+        liveTreble = clampNum(live.treble, 0, 1);
+      }
+    } catch (err) { reportError('message', err); }
+  }
+
+  var lastBeatLevel = 0, liveLevel = 0, liveBass = 0, liveMid = 0, liveTreble = 0;
+
+  boot = function () {
+    initDust();
+    if (!ctx) {
+      reportError('canvas', new Error('canvas 2d context unavailable'));
+      return;
+    }
+    resize();
+    window.addEventListener('resize', function () { try { resize(); } catch (err) { reportError('resize', err); } });
+    window.addEventListener('message', onMessage);
+    state.rm = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    requestAnimationFrame(frame);
+  };
+
+  try {
+    boot();
+  } catch (err) {
+    reportError('boot', err);
+    requestAnimationFrame(function () { sendReady(); });
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>磁轨列车</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070b;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(118% 96% at 50% 46%,transparent 34%,rgba(3,5,10,.52) 74%,rgba(1,2,5,.95))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(198,210,235,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   Lyra 通用骨架（构建期拼进每个 stage 的自包含 HTML，不是外部依赖）
+   ----------------------------------------------------------------------------
+   机制文件需要实现（名字固定）：
+     mechResize()                   resize 之后调用一次（此时 W/H 有效）
+     mechAssign(use)                换句时调用；use = {g, spans, at, cc, lineT, lineDur}
+     mechUpdate(dt, T)              每帧物理（dt 已经扣掉顿帧）
+     mechDraw(T, z, pjX, pjY)       每帧绘制（背景已画好，直接在 ctx 上画）
+   可选钩子：
+     mechInit()                     模块初始化（W/H 还是 0，别在这里用 W/H 撒点）
+     mechEvent(k, first)            词团命中后调用（默认的顿帧/白闪/变焦/震动已经做了）
+   可直接用：
+     W H DPR ctx cv hint
+     cam {x,y,ox,oy,z,tz,vz,rot,vrot,sh,shx,shy}   ox/oy 是镜头平移偏移（甩镜/环绕用）
+     AE {freeze,flash}
+     lines curIdx L spans charChars charGlow blockGx blockGy lineT lineDur accent
+     rnd(a,b) clamp01(v) hitStop(s) flash(v) camShake(dx,dy,amp)
+   ========================================================================== */
+
+/* ============================ 0 · 画布 ============================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+let W = 0, H = 0, DPR = 1;
+let bgCv = null;
+let L = null, curIdx = -1;
+
+/* ============================ 1 · 时钟 ============================ */
+let lines = [];
+let accent = [186, 206, 255];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* ============================ 2 · 分词 ============================ */
+let DICT = null;
+fetch('/segdict.bin').then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); }).catch(() => {});
+const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+function isWord(s, i, Ln) {
+  if (!DICT) return false;
+  const h = fnv(s.substr(i, Ln));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) { const m = (lo + hi) >> 1, v = DICT[m]; if (v === h) return true; if (v < h) lo = m + 1; else hi = m - 1; }
+  return false;
+}
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, text.length - i); Ln >= 2; Ln--) if (isWord(text, i, Ln)) { hit = Ln; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, j); Ln >= 2; Ln--) if (isWord(text, j - Ln, Ln)) { hit = Ln; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+function isLatin(text) { let la = 0, cjk = 0; for (let i = 0; i < text.length; i++) { const c = text[i]; if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++; else if (c >= '\u4e00' && c <= '\u9fff') cjk++; } return la > cjk; }
+function latinSpans(text) {
+  const out = []; let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i; while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j }); i = j;
+  }
+  return out;
+}
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+const countChars = (s) => { let n = 0; for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++; return n; };
+function groupByWords(text) {
+  const words = segWords(text), out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos; pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; } else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+function groupByRule(text) {
+  const out = []; let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const s = PUNCT.test(text[i]) || SPACE.test(text[i]);
+    if (!s) chars++;
+    if (s && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!s && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+const spansForLine = (t) => (isLatin(t) ? latinSpans(t) : (DICT ? groupByWords(t) : groupByRule(t)));
+
+/* ============================ 3 · 字形采样 ============================ */
+const offCv = document.createElement('canvas');
+const octx = offCv.getContext('2d', { willReadFrequently: true });
+const FONT = (px, wt) => `${wt || 800} ${px}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+function wrapText(text, fs, maxW, wt) {
+  octx.font = FONT(fs, wt);
+  const latin = isLatin(text);
+  const rows = []; let start = 0, w = 0;
+  for (let i = 0; i < text.length; i++) {
+    const cw = octx.measureText(text[i]).width;
+    if (!cw) continue;
+    if (w + cw > maxW && i > start) {
+      let brk = i;
+      if (latin) { let j = i; while (j > start && !SPACE.test(text[j])) j--; if (j > start) brk = j; }
+      rows.push({ i0: start, i1: brk, w: octx.measureText(text.slice(start, brk)).width });
+      start = brk; w = 0;
+      while (start < text.length && SPACE.test(text[start])) start++;
+      if (start >= text.length) break;
+      i = start - 1; continue;
+    }
+    w += cw;
+  }
+  if (start < text.length) rows.push({ i0: start, i1: text.length, w: octx.measureText(text.slice(start)).width });
+  for (const r of rows) while (r.i1 - r.i0 > 1 && SPACE.test(text[r.i0])) r.i0++;
+  return rows.length ? rows : [{ i0: 0, i1: text.length, w: octx.measureText(text).width }];
+}
+function sampleGlyph(text, opt) {
+  opt = opt || {};
+  const wt = opt.weight || 800;
+  let fs = opt.fs || 92;
+  const maxW = opt.maxW || Math.min(W * 0.78, 1180);
+  const maxH = opt.maxH || H * 0.52;
+  let rows = wrapText(text, fs, maxW, wt);
+  let lh = fs * 1.16;
+  if (rows.length * lh > maxH) { fs *= maxH / (rows.length * lh); rows = wrapText(text, fs, maxW, wt); lh = fs * 1.16; }
+  octx.font = FONT(fs, wt);
+  const widest = Math.max(1, ...rows.map((r) => octx.measureText(text.slice(r.i0, r.i1)).width));
+  const padW = Math.ceil(widest) + 24, padH = Math.ceil(lh * rows.length) + 12;
+  offCv.width = padW; offCv.height = padH;
+  octx.font = FONT(fs, wt);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.clearRect(0, 0, padW, padH);
+  const n = text.length;
+  const charCx = new Float32Array(n), charCy = new Float32Array(n);
+  const rowMaps = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r], str = text.slice(row.i0, row.i1);
+    const cy = padH / 2 + (r - (rows.length - 1) / 2) * lh;
+    octx.fillText(str, padW / 2, cy);
+    const x0 = (padW - row.w) / 2, map = new Int16Array(padW).fill(-1);
+    let acc = 0;
+    for (let i = row.i0; i < row.i1; i++) {
+      const cw = octx.measureText(text[i]).width;
+      charCx[i] = x0 + acc + cw / 2 - padW / 2; charCy[i] = cy - padH / 2;
+      for (let x = Math.max(0, Math.floor(x0 + acc)); x < Math.min(padW, Math.ceil(x0 + acc + cw)); x++) map[x] = i;
+      acc += cw;
+    }
+    rowMaps.push({ y0: cy - lh / 2, y1: cy + lh / 2, map });
+  }
+  const d = octx.getImageData(0, 0, padW, padH).data;
+  const pxA = [], pyA = [], ownA = [];
+  const step = opt.step || 2;
+  for (let y = 0; y < padH; y += step) {
+    let rm = null;
+    for (let r = 0; r < rowMaps.length; r++) { const m = rowMaps[r]; if (y >= m.y0 && y < m.y1) { rm = m; break; } }
+    if (!rm) continue;
+    const map = rm.map, base = y * padW;
+    for (let x = 0; x < padW; x += step) {
+      if (d[(base + x) * 4 + 3] <= 128) continue;
+      const c = map[x]; if (c < 0) continue;
+      pxA.push(x - padW / 2); pyA.push(y - padH / 2); ownA.push(c);
+    }
+  }
+  return { px: Float32Array.from(pxA), py: Float32Array.from(pyA), own: Int16Array.from(ownA),
+           pc: pxA.length, n, charCx, charCy, fs, w: widest, h: lh * rows.length, rows: rows.length, padW, padH };
+}
+
+/* ============================ 4 · 句索引 / 预取 ============================ */
+let brewIdx = -1, lastT = -1;
+let prep = null, spans = [], charChars = null, charGlow = new Float32Array(0);
+let blockGx = 0, blockGy = 0, lineT = 0, lineDur = 4;
+const hintShow = (s, o) => { hint.textContent = s; hint.style.opacity = o; };
+
+function prepLine(idx) {
+  const line = lines[idx];
+  if (!line || !line.text) return null;
+  const text = line.text;
+  const latin = isLatin(text);
+  const lab = typeof mechFs === 'function' ? mechFs(text, latin) : (latin ? 92 : (text.length <= 10 ? 112 : text.length <= 16 ? 96 : 82));
+  const g = sampleGlyph(text, { fs: lab, step: typeof mechStep === 'function' ? mechStep(text) : 2,
+    maxW: Math.min(W * 0.78, 1180), maxH: H * 0.52 });
+  if (!g.pc) return null;
+  g.text = text;
+  const cc = line.chars && line.chars.length === text.length ? line.chars : null;
+  const dur = line.dur || 4;
+  const at = new Float32Array(g.n);
+  const cap = line.t + dur * 0.86;   /* YRC 溢出句长时压缩进句内，保证整句都能唱完 */
+  for (let c = 0; c < g.n; c++) {
+    const raw = cc && cc[c] && typeof cc[c].t === 'number' ? cc[c].t : line.t + dur * (c / Math.max(1, g.n));
+    at[c] = Math.min(raw, cap);
+  }
+  const raw = spansForLine(text);
+  const spanOf = new Int16Array(g.n).fill(-1);
+  const spList = [];
+  for (let k = 0; k < raw.length; k++) {
+    const s = raw[k];
+    if (!s || s.i1 <= s.i0) continue;
+    spList.push({ i0: s.i0, i1: s.i1, t: at[Math.min(g.n - 1, s.i0)], hit: 0 });
+    for (let c = s.i0; c < s.i1; c++) spanOf[c] = spList.length - 1;
+  }
+  if (!spList.length) return null;
+  for (let k = 1; k < spList.length; k++) if (spList[k].t < spList[k - 1].t) spList[k].t = spList[k - 1].t;
+  return { idx, g, spans: spList, spanOf, cc, at, text, lineT: line.t, lineDur: dur };
+}
+
+function assignLine(idx) {
+  const use = (prep && prep.idx === idx) ? prep : prepLine(idx);
+  if (!use) { L = null; return; }
+  L = use.g; spans = use.spans; charChars = use.cc;
+  charGlow = new Float32Array(L.n);
+  blockGx = W / 2; blockGy = H * 0.46;
+  lineT = use.lineT; lineDur = use.lineDur;
+  cam.tz = 1.0; cam.ox = 0; cam.oy = 0;
+  if (typeof mechAssign === 'function') mechAssign(use);
+}
+
+/* ============================ 5 · 相机 / 事件 ============================ */
+const cam = { x: 0, y: 0, ox: 0, oy: 0, z: 1, tz: 1, vz: 0, sh: 0, dirx: 0, diry: 0, shx: 0, shy: 0, rot: 0, vrot: 0 };
+const AE = { freeze: 0, flash: 0 };
+const hitStop = (s) => { AE.freeze = Math.max(AE.freeze, s); };
+const flash = (v) => { AE.flash = Math.max(AE.flash, v); };
+function camShake(dx, dy, amp) {
+  const l = Math.hypot(dx, dy) || 1;
+  cam.dirx = dx / l; cam.diry = dy / l;
+  cam.sh = Math.min(26, Math.max(cam.sh, amp));
+}
+function camUpdate(dt, T) {
+  const ke = 1 - Math.pow(0.0016, dt);
+  cam.tx = W / 2 + cam.ox;
+  cam.ty = H * 0.48 + cam.oy;
+  cam.x += (cam.tx - cam.x) * ke;
+  cam.y += (cam.ty - cam.y) * ke;
+  cam.vz += ((cam.tz - cam.z) * 185 - cam.vz * 22) * dt;
+  cam.z += cam.vz * dt;
+  cam.vrot += (-cam.rot * 240 - cam.vrot * 21) * dt;
+  cam.rot += cam.vrot * dt;
+  cam.sh *= Math.pow(0.00004, dt);
+  const wob = Math.sin(T * 59.3) * 0.62 + Math.sin(T * 40.1 + 1.2) * 0.38;
+  cam.shx = cam.dirx * cam.sh * wob;
+  cam.shy = cam.diry * cam.sh * wob;
+}
+
+/* ============================ 6 · 背景 ============================ */
+function buildBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  const bw = Math.max(2, Math.round(W / 2)), bh = Math.max(2, Math.round(H / 2));
+  bgCv.width = bw; bgCv.height = bh;
+  const g = bgCv.getContext('2d');
+  const grd = g.createRadialGradient(bw * 0.5, bh * 0.44, 0, bw * 0.5, bh * 0.5, Math.max(bw, bh) * 0.8);
+  grd.addColorStop(0, '#11161f');
+  grd.addColorStop(0.55, '#0a0e16');
+  grd.addColorStop(1, '#030509');
+  g.fillStyle = grd; g.fillRect(0, 0, bw, bh);
+}
+
+/* ============================ 7 · 主循环 ============================ */
+let last = performance.now();
+let T0 = 0;
+
+function frame(nowMs) {
+  const dtReal = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; T0 += dtReal;
+  if (AE.freeze > 0) AE.freeze -= dtReal;
+  const dt = AE.freeze > 0 ? 0 : dtReal;
+
+  const T = now();
+  timing(T);
+
+  if (L) {
+    if (charChars) for (let c = 0; c < L.n; c++) charGlow[c] = charChars[c] ? clamp01((T - charChars[c].t) / 0.22) : 0;
+    else for (let c = 0; c < L.n; c++) charGlow[c] = clamp01((T - lineT - lineDur * 0.85 * c / L.n) / 0.3);
+  }
+
+  if (L && spans.length) {
+    for (let k = 0; k < spans.length; k++) {
+      const s = spans[k];
+      if (s.hit || T < s.t || T > s.t + 0.4) continue;
+      s.hit = 1;
+      const first = k === 0;
+      hitStop(first ? 0.05 : 0.024);
+      flash(first ? 0.36 : 0.15);
+      cam.tz = first ? 1.06 : 1.03;
+      camShake(1, 0.18, first ? 11 : 5.5);
+      cam.vrot += (k % 2 ? 1 : -1) * (first ? 0.55 : 0.28);
+      if (typeof mechEvent === 'function') mechEvent(k, first);
+    }
+    cam.tz += (1.0 - cam.tz) * Math.min(1, dtReal * 2.4);
+  }
+
+  camUpdate(dtReal, T0);
+  const z = cam.z;
+  const cosR = Math.cos(cam.rot), sinR = Math.sin(cam.rot);
+  const pjX = (x, y) => { const dx = (x - cam.x) * z, dy = (y - cam.y) * z; return W / 2 + cam.shx + dx * cosR - dy * sinR; };
+  const pjY = (x, y) => { const dx = (x - cam.x) * z, dy = (y - cam.y) * z; return H / 2 + cam.shy + dx * sinR + dy * cosR; };
+
+  if (typeof mechUpdate === 'function') mechUpdate(dt, T);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#05070b';
+  ctx.fillRect(0, 0, W, H);
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+  if (typeof mechDraw === 'function') mechDraw(T, z, pjX, pjY);
+
+  ctx.globalCompositeOperation = 'source-over';
+  if (AE.flash > 0.012) {
+    ctx.fillStyle = `rgba(232,240,250,${(AE.flash * 0.05).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    AE.flash *= Math.pow(0.000004, dtReal);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ============================ 8 · 节奏 ============================ */
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; L = null; prep = null; }
+  lastT = T;
+  let c = curIdx;
+  while (c + 1 < lines.length && T >= lines[c + 1].t) c++;
+  if (c !== curIdx) {
+    curIdx = c; brewIdx = -1; prep = null;
+    if (curIdx >= 0) { assignLine(curIdx); hintShow('', 0); }
+    else hintShow(lines.length ? '等待第一句…' : '这首没有歌词', 0.5);
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    if (T >= lines[nx].t - Math.min(1.5, Math.max(0.55, gap * 0.5))) { brewIdx = nx; prep = prepLine(nx); }
+  }
+}
+
+/* ============================ 9 · 通信协议 ============================ */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length >= 3) accent = p.accent;
+    curIdx = -1; brewIdx = -1; lastT = -1; L = null; prep = null; spans = [];
+    clockT = 0; clockAt = performance.now();
+    if (typeof mechInitLine === 'function') mechInitLine();
+    hintShow(lines.length ? '等待第一句…' : '这首没有歌词', lines.length ? 1 : 0.5);
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.6;
+    camShake(1, 0.2, 1.4 + lv * 2.2);
+    cam.tz = Math.max(cam.tz, 1.02 + lv * 0.02);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  curIdx, n: lines.length, pc: L ? L.pc : 0, spans: spans.length,
+  z: +cam.z.toFixed(3), t: +now().toFixed(2),
+});
+
+/* ============================ 10 · 启动 ============================ */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.max(2, Math.round(W * DPR));
+  cv.height = Math.max(2, Math.round(H * DPR));
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBg();
+  cam.x = W / 2; cam.y = H * 0.48; cam.tx = cam.x; cam.ty = cam.y;
+  if (typeof mechResize === 'function') mechResize();
+  if (L && curIdx >= 0) {
+    const p2 = prepLine(curIdx);
+    if (p2) { prep = p2; assignLine(curIdx); }
+  }
+}
+addEventListener('resize', resize);
+
+
+
+
+/* ===== MECH · 磁轨列车 ===== */
+/* ============================================================
+   v2 起手模板（lyra51-100 重做用）· rev4
+   用法：整段拷到你 tools/mech/lyraNN.js 的顶部，把 PHYSICS 段改成本形态的机制。
+   变量全部 v 前缀，避免和 lyra-base.js 的 cam/L/ctx/spans 撞名。
+   只允许在 mechResize / mechAssign / mechUpdate / mechDraw / mechEvent 里活动。
+
+   这一版给了：实心三档笔画 + 暗影厚度 + 光晕 + 扫光 + 3D 环绕 + 逐字点亮。
+   改机制时：只动 mechUpdate（运动学）和 mechDraw 里粒子的组织方式；
+   下面的 vBands / 暗影 / 光晕 / 扫光 不要删，那就是「有厚度有打光」的来源。
+   ============================================================ */
+
+const VN = 8000;                                   /* 2000~9000 */
+const vx = new Float32Array(VN), vy = new Float32Array(VN);
+const vz = new Float32Array(VN), vsc = new Float32Array(VN);
+const vtx = new Float32Array(VN), vty = new Float32Array(VN);
+const von = new Int16Array(VN);
+const vlum = new Float32Array(VN);
+const vsx = new Float32Array(VN), vsy = new Float32Array(VN), vss = new Float32Array(VN);
+let vn = 0, vYaw = 0, vPit = 0, vPulse = 0, vLightCv = null;
+let vCore = 'rgb(240,244,252)', vMid = 'rgb(180,205,245)', vDim = 'rgb(70,90,120)';
+
+function mechResize() {
+  /* 扫光贴图：径向柔光，没有硬边；每帧只 blit 一次 */
+  vLightCv = document.createElement('canvas');
+  vLightCv.width = 512; vLightCv.height = 512;
+  const g = vLightCv.getContext('2d');
+  const gr = g.createRadialGradient(256, 256, 10, 256, 256, 250);
+  gr.addColorStop(0, 'rgba(255,255,255,0.60)');
+  gr.addColorStop(0.45, 'rgba(255,255,255,0.18)');
+  gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 512, 512);
+  vn = 0;
+}
+
+function mechAssign(use) {
+  const g = use.g, pc = g.pc;
+  if (!pc) { vn = 0; return; }
+  vn = Math.min(VN, Math.max(3200, Math.round(pc * 1.05)));
+  for (let i = 0; i < vn; i++) {
+    const pi = (i * pc / vn) | 0;
+    vtx[i] = g.px[pi]; vty[i] = g.py[pi];
+    von[i] = g.own[pi];
+    vz[i] = (Math.random() - 0.5) * 26;
+    vsc[i] = 1;
+    vx[i] = vtx[i]; vy[i] = vty[i];
+  }
+  const a = accent || [186, 206, 255];
+  vCore = `rgb(${Math.min(255, 205 + a[0] * 0.20) | 0},${Math.min(255, 212 + a[1] * 0.17) | 0},${Math.min(255, 226 + a[2] * 0.11) | 0})`;
+  vMid = `rgb(${(120 + a[0] * 0.55) | 0},${(150 + a[1] * 0.42) | 0},${Math.min(255, 170 + a[2] * 0.32) | 0})`;
+  vDim = `rgb(${(66 + a[0] * 0.30) | 0},${(84 + a[1] * 0.26) | 0},${(110 + a[2] * 0.22) | 0})`;
+  vPulse = 1;
+}
+
+function vBands(rBase) {
+  const lo = [0.56, 0.26, -1], al = [1.0, 0.80, 0.58], kk = [1.0, 0.90, 0.76];
+  const cols = [vCore, vMid, vDim];
+  for (let b = 0; b < 3; b++) {
+    const hi = b === 0 ? 1.01 : lo[b - 1];
+    ctx.globalAlpha = al[b];
+    ctx.fillStyle = cols[b];
+    ctx.beginPath();
+    let any = 0;
+    for (let i = 0; i < vn; i++) {
+      const l = vlum[i];
+      if (l < lo[b] || l >= hi) continue;
+      const rr = rBase * kk[b] * vss[i];
+      ctx.rect(vsx[i] - rr, vsy[i] - rr, rr * 2, rr * 2);
+      any++;
+    }
+    if (any) ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ===== lyra66 · 磁轨列车 · maglev —— PHYSICS =====
+   光点像列车一样从左侧沿轨道飞驰，**到自己的字位那一格减速停住**，停住的光点连成字。
+   速度拉伸成横条尾迹（拖影），停下的位置留下短亮条；命中时全线闪一下 + 轻微横向震动。
+   轨道是两条极淡的横向线（描边），让"列车"有路可走。                              */
+
+const v66v = new Float32Array(VN), v66run = new Float32Array(VN);
+let m66init = 0, m66hit = 0;
+
+function mechAssign(use) {
+  const g = use.g, pc = g.pc;
+  if (!pc) { vn = 0; return; }
+  vn = Math.min(VN, Math.max(2400, Math.round(pc * 0.8)));
+  for (let i = 0; i < vn; i++) {
+    const pi = (i * pc / vn) | 0;
+    vtx[i] = g.px[pi]; vty[i] = g.py[pi];
+    von[i] = g.own[pi];
+    vx[i] = -900 - Math.random() * 700;
+    vy[i] = vty[i] + rnd(-4, 4);
+    vz[i] = (Math.random() - 0.5) * 16;
+    v66v[i] = 900 + Math.random() * 900;
+    v66run[i] = 0;
+  }
+  vCore = 'rgb(240,250,255)';
+  vMid = 'rgb(130,200,245)';
+  vDim = 'rgb(28,60,92)';
+  vPulse = 1;
+}
+
+function mechUpdate(dt, T) {
+  if (m66hit > 0) m66hit = Math.max(0, m66hit - dt * 2.8);
+  for (let i = 0; i < vn; i++) {
+    const gl = charGlow[von[i]] || 0;
+    const target = vtx[i];
+    if (vx[i] < target - 1) {
+      /* 巡航 → 临近目标按 gap 减速（缓急变速） */
+      const gap = target - vx[i];
+      const brake = clamp01(gap / 260);
+      let sp = v66v[i] * (0.16 + 0.84 * brake);
+      if (gl > 0.02) sp *= 1.45;                     /* 被唱到的车先冲一下 */
+      vx[i] = Math.min(target, vx[i] + sp * dt);
+      v66run[i] = sp;
+    } else {
+      vx[i] = target;
+      v66run[i] *= 0.86;
+    }
+    vy[i] += (vty[i] - vy[i]) * Math.min(1, dt * 11);
+  }
+  if (vPulse > 0) vPulse = Math.max(0, vPulse - dt * 2.4);
+}
+
+function mechEvent(k, first) { m66hit = 1; vPulse = 1; if (first) camShake(1, 0.1, 7); }
+
+function mechDraw(T, z, pjX, pjY) {
+  if (!vn) return;
+  /* 轨道：两条淡线 */
+  ctx.strokeStyle = 'rgba(90,150,200,0.18)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  const y1 = pjY(blockGx - 700, blockGy - 96), y2 = pjY(blockGx - 700, blockGy + 96);
+  ctx.moveTo(pjX(blockGx - 720, blockGy - 96), y1);
+  ctx.lineTo(pjX(blockGx + 720, blockGy - 96), pjY(blockGx + 720, blockGy - 96));
+  ctx.moveTo(pjX(blockGx - 720, blockGy + 96), y2);
+  ctx.lineTo(pjX(blockGx + 720, blockGy + 96), pjY(blockGx + 720, blockGy + 96));
+  ctx.stroke();
+
+  /* 尾迹：按速度拉伸的横条（三档亮度：远/中/近） */
+  for (let band = 0; band < 3; band++) {
+    ctx.globalAlpha = [0.28, 0.55, 0.92][band];
+    ctx.fillStyle = [vDim, vMid, vCore][band];
+    ctx.beginPath();
+    let any = 0;
+    for (let i = 0; i < vn; i++) {
+      const sp = v66run[i];
+      const len = Math.min(78, 3 + sp * 0.045);
+      const lv = sp > 420 ? 2 : sp > 120 ? 1 : 0;
+      if (lv !== band) continue;
+      const px = pjX(blockGx + vx[i], blockGy + vy[i]);
+      const py = pjY(blockGx + vx[i], blockGy + vy[i]);
+      ctx.rect(px - len, py - 1.4, len, 2.8);
+      any++;
+    }
+    if (any) ctx.fill();
+  }
+  /* 停住的光点：核心亮点 */
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.95; ctx.fillStyle = vCore;
+  ctx.beginPath();
+  for (let i = 0; i < vn; i++) {
+    if (v66run[i] > 60) continue;
+    const px = pjX(blockGx + vx[i], blockGy + vy[i]);
+    const py = pjY(blockGx + vx[i], blockGy + vy[i]);
+    const r = 1.9;
+    ctx.rect(px - r, py - r, r * 2, r * 2);
+  }
+  ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 0.06 + m66hit * 0.06;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.drawImage(vLightCv, W * 0.5 - 900, H * 0.45 - 500, 1800, 1000);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+}
+
+
+
+
+/* 启动必须在机制片段之后：机制里的 const/let 在此之前还处于暂时性死区 */
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

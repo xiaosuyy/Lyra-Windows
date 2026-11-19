@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>磁粉带</title>
+<!--
+  机制：十万颗磁粉颗粒被一块看不见的磁场「对」在带面上，读写头扫过时它们被磁化、翻转、发亮 ——
+        字不是画上去的，是**被写进带子的一段磁记录**：字区里的粉粒排成数据纹，读头经过才把这块区域点亮。
+  用了：WebGL2 实例化（drawArraysInstanced，10 万颗粒子 = 10 万个实例，每帧 CPU 只发 11 个 uniform）；
+        每颗的走向/亮度在顶点着色器里由 seed + 时间算出，CPU 每帧不碰任何粒子数据。
+        无 getImageData / 无字形采样：字是真 DOM 文字，只被磁场的读写头「读」。
+  最像的三个：007 磁力线铁屑（字形采样出磁力线） / 091 畴壁（磁畴转向） / 235 帷幕投影（光被表面接住）
+  差在哪：前面这些是「字形驱动粒子」——先有字再让粒子去描；这里反过来，字只是磁带上的一段记录，
+        粒子场自己有一套走带/磁畴/读写头的物理，字被这套物理照亮或被盖过去。
+-->
+<style>
+  html,body{margin:0;height:100%;background:#07080a;overflow:hidden}
+  body{font-family:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;
+       color:#fff4e4}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #type{position:fixed;inset:0;pointer-events:none;overflow:hidden}
+  #type{position:fixed;inset:0;pointer-events:none;overflow:hidden;--lit:.25}
+  .slot{position:absolute;left:50%;top:47%;width:min(88vw,1220px);transform:translate(-50%,-50%);
+        text-align:center;opacity:0;filter:blur(6px);z-index:2;isolation:isolate}
+  .slot::before{content:'';position:absolute;inset:-96% -18%;z-index:-1;pointer-events:none;
+        background:radial-gradient(44% 34% at 50% 50%,rgba(5,6,8,.80) 0%,rgba(5,6,8,.40) 46%,rgba(5,6,8,0) 72%)}
+  .slot .in{display:block;font-weight:900;font-size:clamp(34px,6.2vh,88px);line-height:1.30;
+        letter-spacing:.10em;color:#fff8ec;text-wrap:balance;white-space:pre-wrap;
+        text-shadow:0 0 46px rgba(0,0,0,.94),0 4px 24px rgba(0,0,0,.95),0 1px 3px rgba(0,0,0,.9),
+                    0 0 80px rgba(255,146,52,calc(var(--lit) * .30))}
+  .slot .in span{display:inline-block;will-change:transform,opacity}
+  #vig{position:fixed;inset:0;pointer-events:none;
+       background:radial-gradient(118% 92% at 50% 46%,rgba(0,0,0,0) 34%,rgba(0,0,0,.62) 100%)}
+  #hint{position:fixed;left:50%;bottom:15px;transform:translateX(-50%);pointer-events:none;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(255,196,132,.36);transition:opacity .8s;white-space:nowrap}
+  html.fb #c{display:none}
+  html.fb body{background:radial-gradient(120% 90% at 50% 54%,#241a12 0%,#0a0a0c 62%,#050506 100%)}
+  html.fb #type{z-index:1}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="type"></div>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ══════════════════════════════════════════════════════════════════════
+   A 车道内核（单文件内联，每个形态自带一份）
+   协议 / 时钟 / 两句槽位（前奏·进场·余韵）/ 暂停冻结 / resize / RM / 降级
+   形态只提供：片元与顶点着色器、配色、以及 stage 钩子
+   ══════════════════════════════════════════════════════════════════════ */
+const cv = document.getElementById('c');
+const typeBox = document.getElementById('type');
+const hint = document.getElementById('hint');
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+
+const N = 100000;                 /* 10 万颗粒子，全部住在 GPU 上 */
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, beatN = 0, bass = 0, treb = 0, beatAt = -9;
+let frames = 0, jsMs = 0, errMsg = '';
+let readySent = false, hintOn = true;
+let inAmt = 0, preAmt = 0, act = 0, pol = 0, sweep = 1;
+let cur = null, ghost = null, ghostAt = 0, slotFlip = 0, ghostStartV = 0;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+const ease3 = (x) => 1 - Math.pow(1 - x, 3);
+
+/* prefers-reduced-motion：随时切换都要跟得上 */
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const onMQ = (e) => { RM = !!e.matches; skipToEnd(); };
+    if (mq.addEventListener) mq.addEventListener('change', onMQ);
+    else if (mq.addListener) mq.addListener(onMQ);
+  }
+} catch (_) {}
+function skipToEnd() { if (cur && cur.chars) for (const c of cur.chars) { c.style.opacity = '1'; c.style.transform = 'none'; } }
+
+/* ---------------- 文字槽位：两句交替，旧句留残影 ---------------- */
+function mkSlot() {
+  const el = document.createElement('div'); el.className = 'slot';
+  const inner = document.createElement('div'); inner.className = 'in';
+  el.appendChild(inner); typeBox.appendChild(el);
+  return { el, inner, chars: [], cx: [], t0: 0, voice: 0, dir: 1, noanim: false, text: '' };
+}
+const slots = [mkSlot(), mkSlot()];
+
+function fillSlot(slot, text) {
+  slot.inner.textContent = '';
+  slot.chars = [];
+  slot.cx = [];
+  const arr = Array.from(text);
+  for (let i = 0; i < arr.length; i++) {
+    const sp = document.createElement('span');
+    sp.textContent = arr[i];
+    sp.style.opacity = '0';
+    slot.inner.appendChild(sp);
+    slot.chars.push(sp);
+  }
+  slot.text = text;
+  /* 每个字在画面里的 x（NDC）：读写头扫到哪儿，字才亮到哪儿 */
+  for (const sp of slot.chars) {
+    const r = sp.getBoundingClientRect();
+    slot.cx.push((r.left + r.width / 2) / W * 2 - 1);
+  }
+}
+
+function showLine(ci, instant) {
+  const s = slots[slotFlip]; slotFlip ^= 1;
+  if (cur && cur !== s) { ghost = cur; ghostAt = now(); ghostStartV = vT; }
+  cur = s; ghost === s && (ghost = null);
+  s.el.style.transform = 'translate(-50%,-50%)';
+  fillSlot(s, (lines[ci] || {}).text || '');
+  s.noanim = true;
+  s.t0 = instant ? now() - 2 : lines[ci].t;
+  s.voice = ci % 3;
+  s.dir = (ci % 2) ? 1 : -1;
+  s.amb = ci % 2;
+  s.el.style.zIndex = '3';
+  if (ghost) ghost.el.style.zIndex = '2';
+  s.el.style.opacity = '1';
+  s.el.style.filter = 'none';
+  for (const c of s.chars) { c.style.opacity = instant ? '1' : '0'; c.style.transform = instant ? 'none' : ''; }
+  hintOn = false; hint.style.opacity = '0';
+}
+
+function hideAll() {
+  cur = null; ghost = null;
+  for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; }
+  hintOn = true; hint.style.opacity = '0.9';
+}
+
+/* ---------------- 时钟：空歌词 / seek / 句首 ---------------- */
+function timing(T) {
+  if (!lines.length) { if (idx !== -1) { idx = -1; hideAll(); } lastT = T; return; }
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) {
+    const jump = (lastT > -1e8 && (Math.abs(T - lastT) > 0.9 || ci > idx + 1 || ci < idx));
+    idx = ci;
+    if (ci < 0) { hideAll(); }
+    else showLine(ci, jump);
+  }
+  lastT = T;
+}
+
+/* ---------------- 每帧：uniform 状态 ---------------- */
+function state(T) {
+  if (idx >= 0 && lines[idx]) {
+    const lt = lines[idx].t;
+    inAmt = clamp01((T - lt) / 1.10);
+    const nx = lines[idx + 1];
+    preAmt = nx ? clamp01(1 - (nx.t - T) / 0.30) : 0;
+  } else { inAmt = 0; preAmt = 0; }
+  act = (vT > 8.6 && vT < 12.4) ? 1 : 0;
+  pol = beatN % 2;
+  /* 读头：这一句从左边读过去；前奏 280ms 里读头先到位 */
+  sweep = idx >= 0 ? clamp01((inAmt * 1.10 - 0.02) / 0.95) : 0;
+  sweep = clamp01(sweep + preAmt * 0.02);
+  typeBox.style.setProperty('--lit', (0.22 + 0.78 * Math.max(beatPulse, inAmt * 0.7)).toFixed(3));
+}
+
+/* ---------------- 文字：逐字进场 / 残影 ---------------- */
+function updDom(T) {
+  if (cur) {
+    const stg = 0.030, dur = 0.50;
+    for (let i = 0; i < cur.chars.length; i++) {
+      const p = cur.noanim ? 1 : clamp01((T - (cur.t0 + i * stg)) / dur);
+      const e = ease3(p);
+      const c = cur.chars[i];
+      /* 读头扫到之前，字不出现：字是被"读"出来的，不是淡入的 */
+      const vis = RM ? 1 : clamp01((sweep * 1.92 - 0.96 - (cur.cx[i] || 0)) / 0.055);
+      if (cur.voice === 0) c.style.transform = 'translateY(' + ((1 - e) * 20).toFixed(2) + 'px) scale(' + (0.965 + 0.035 * e).toFixed(3) + ')';
+      else if (cur.voice === 1) c.style.transform = 'translateX(' + ((1 - e) * -34 * cur.dir).toFixed(2) + 'px)';
+      else c.style.transform = 'translateY(' + ((1 - e) * -14).toFixed(2) + 'px) scale(' + (0.88 + 0.12 * e).toFixed(3) + ')';
+      c.style.opacity = (p * vis).toFixed(3);
+    }
+    cur.el.style.filter = 'blur(' + ((1 - clamp01((T - cur.t0) / 0.38)) * 4.5).toFixed(2) + 'px)';
+    /* 前景层以 2.5× 跟着读头走，拍上被顶一下 */
+    const px = (sweep * 2 - 1) * 6, py = -beatPulse * 7;
+    cur.el.style.transform = 'translate(-50%,-50%) translate(' + px.toFixed(2) + 'px,' + py.toFixed(2) + 'px)';
+  }
+  if (ghost) {
+    const q = clamp01((T - ghostAt) / 0.78);
+    if (q >= 1) { ghost.el.style.opacity = '0'; ghost = null; }
+    else {
+      ghost.el.style.opacity = (0.30 * (1 - q) * (1 - q)).toFixed(3);
+      ghost.el.style.filter = 'blur(' + (q * 13).toFixed(2) + 'px)';
+      ghost.el.style.transform = 'translate(-50%,-50%) translateY(' + (-q * 22).toFixed(2) + 'px) scale(' + (1 + q * 0.05).toFixed(3) + ')';
+    }
+  }
+}
+
+/* ══════════════════════════════ GPU ══════════════════════════════ */
+const GL_OPT = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false };
+let gl = null, P = null, U = {}, bgP = null, bgU = {}, pVao = null, bgVao = null, glOk = false;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'shader');
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link');
+  return p;
+}
+function locs(p, names) { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; }
+
+/* —— 背景：一张全屏暗场（0.3× 速度的第一层） —— */
+const BG_VS = `#version 300 es
+in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+/* —— 背景片元：形态改这里 —— */
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform float uT; uniform vec2 uRes;
+void main(){
+  vec2 p = vUV;
+  vec3 c = mix(vec3(0.009,0.010,0.015), vec3(0.037,0.026,0.017), smoothstep(0.02,0.92,p.y));
+  float halo = exp(-pow((p.y-0.50)*3.1,2.0)) * exp(-pow((p.x-0.50)*1.15,2.0));
+  c += vec3(0.028,0.016,0.007) * halo * (0.75 + 0.25*sin(p.x*2.2 + uT*0.05));
+  c += vec3(0.006,0.006,0.009) * (0.5 + 0.5*sin(p.y*17.0 - uT*0.11));
+  o = vec4(c,1.0);
+}`;
+
+/* —— 粒子（形态改这里）—— */
+const P_VS = `#version 300 es
+precision highp float;
+in vec2 aQ; in vec4 aSeed;
+uniform float uT, uBass, uTre, uBeat, uPre, uIn, uPol, uAct;
+uniform vec2 uRes;
+uniform vec4 uText;
+out vec2 vQ; out vec3 vCol; out float vA;
+
+float h21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+
+void main(){
+  float asp = uRes.x / uRes.y;
+  float act1 = step(0.5, uAct);
+  vec2 wp, lq; vec3 col; float a;
+  if (aSeed.z > 0.962) {
+    /* 前层：机器里的浮尘（2.5× 速度，跟带子不同层） */
+    float dx = fract(aSeed.x + uT*0.0055) * 2.0 - 1.0;
+    float dy = (fract(aSeed.y + uT*0.0032 + 0.31) * 2.0 - 1.0) * 0.86;
+    float r = 0.0028 + aSeed.w*0.0046;
+    wp = vec2(dx, dy);
+    lq = (aQ - 0.5) * r * 2.0; lq.x /= asp;
+    a = 0.015 + 0.030*aSeed.w;
+    col = vec3(1.0, 0.70, 0.42);
+  } else {
+    float tilt = mix(-0.235, 0.150, act1);        /* 带子斜穿画面；倒带时反着斜 */
+    float ct = cos(tilt), st = sin(tilt);
+    /* 走带：沿带长 u 匀速滑，粉粒住在带子坐标系里 */
+    float u0 = (aSeed.x - 0.5) * 2.70 + uT * (0.010 + 0.0065*uBass) * (1.0 + act1*2.2);
+    u0 = mod(u0 + 1.35, 2.70) - 1.35;
+    float v0 = (aSeed.y - 0.5) * 0.66;
+    v0 += 0.045 * sin(u0*1.9 + uT*0.16);          /* 带面被拉得微微起伏 */
+    float av = abs(v0) / 0.33;
+    float dens = smoothstep(1.0, 0.76, av);
+    if (aSeed.z > dens * 0.985 + 0.015) { gl_Position = vec4(3.0,3.0,3.0,1.0); vA = 0.0; vCol = vec3(0.0); vQ = aQ; return; }
+    float edge = smoothstep(0.035, 0.0, abs(av - 0.955));   /* 带子的两条边 */
+    float sheen = exp(-pow((av - 0.80) * 2.7, 2.0));        /* 带面反光的一条 */
+
+    float x = u0*ct - v0*st;
+    float y = u0*st + v0*ct;
+
+    float n = vn(vec2(u0*2.0, v0*9.0) + vec2(uT*0.02, 0.0));
+    float dom = sin(u0*3.4 + n*2.6 + v0*4.0);
+    float ang = tilt + 0.78*(dom/(1.0+abs(dom)))*2.6 + uPol*1.5708;
+
+    vec2 td = vec2((x-uText.x)/(uText.z+0.02), (y-uText.y)/(uText.w+0.020));
+    float inside = smoothstep(1.20, 0.68, length(td*vec2(0.80,1.0))) * smoothstep(1.10, 0.75, av);
+    /* 字区 = 写进带子的一段数据：粉粒咬死带向，纹更细 */
+    ang = mix(ang, tilt + sin(v0*260.0)*0.05, inside);
+
+    /* 读写头：固定在机器上的那道缝（缝里没有磁粉，两侧被磁化发亮） */
+    float du = u0 - 0.115;
+    float gap = smoothstep(0.026, 0.0, abs(du));
+    float rim = smoothstep(0.070, 0.030, abs(du)) * smoothstep(0.46, 0.30, abs(v0));
+    float glow = exp(-pow(du * 1.9, 2.0));
+    /* 倒带：一条横向噪声条顺带刷过去 */
+    float bx = fract(uT*0.30) * 2.70 - 1.35;
+    float bar = act1 * exp(-pow((u0 - bx) * 5.0, 2.0)) * smoothstep(0.44, 0.28, abs(v0));
+
+    vec2 dir = vec2(cos(ang), sin(ang));
+    float lit = abs(dot(dir, normalize(vec2(0.28,0.96))));
+    float b = 0.035 + 0.95*pow(lit, 4.0) + sheen*1.7 + edge*0.9 + rim*(0.55 + 0.9*uPre + 0.7*uBeat) + glow*0.26 + bar*1.25;
+    b *= 0.78 + 0.55*vn(vec2(u0*70.0, v0*180.0) + uT*2.0) * uTre;
+    b *= 1.0 + inside*1.20 + uBeat*0.75;
+    b *= 1.0 - gap * 0.92;
+
+    float len = (0.010 + aSeed.w*0.021) * (1.0 + inside*0.6 + rim*0.4);
+    float wid = 0.0013 + aSeed.w*0.0020;
+    vec2 q = vec2((aQ.x-0.5)*len, (aQ.y-0.5)*wid);
+    float c = cos(ang), s = sin(ang);
+    lq = vec2(q.x*c - q.y*s, q.x*s + q.y*c); lq.x /= asp;
+    wp = vec2(x, y);
+    a = b * 0.108;
+    col = mix(vec3(1.0,0.38,0.07), vec3(1.0,0.90,0.72), pow(clamp(b,0.0,1.0), 3.0))
+        + vec3(0.10,0.04,0.0)*inside;
+    col = mix(col, vec3(0.64,0.79,1.0), act1*0.26);
+  }
+  gl_Position = vec4(wp + lq, 0.0, 1.0);
+  vQ = aQ; vA = a; vCol = col;
+}`;
+
+const P_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec3 vCol; in float vA; out vec4 o;
+void main(){
+  vec2 d = vQ - 0.5;
+  float f = 1.0 - smoothstep(0.18, 0.52, length(d*vec2(1.0,1.15)));
+  o = vec4(vCol * vA * f, 1.0);
+}`;
+
+function initGL() {
+  try { gl = cv.getContext('webgl2', GL_OPT); } catch (_) { gl = null; }
+  if (!gl) { document.documentElement.classList.add('fb'); return false; }
+  P = program(P_VS, P_FS);
+  U = locs(P, ['uT','uBass','uTre','uBeat','uPre','uIn','uPol','uAct','uRes','uText']);
+  bgP = program(BG_VS, BG_FS);
+  bgU = locs(bgP, ['uT','uRes']);
+
+  const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  /* 分层抽样（Halton）保证 10 万颗铺得均匀，不结块 */
+  const hal = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+  let sd = 20260236;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  const seeds = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    seeds[i*4] = hal(i + 1, 2); seeds[i*4+1] = hal(i + 1, 3);
+    seeds[i*4+2] = rnd(); seeds[i*4+3] = rnd();
+  }
+  const sb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+
+  pVao = gl.createVertexArray(); gl.bindVertexArray(pVao);
+  const aQ = gl.getAttribLocation(P, 'aQ'), aS = gl.getAttribLocation(P, 'aSeed');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(aQ); gl.vertexAttribPointer(aQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(aS, 1);
+
+  bgVao = gl.createVertexArray(); gl.bindVertexArray(bgVao);
+  const bQ = gl.getAttribLocation(bgP, 'aQ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(bQ); gl.vertexAttribPointer(bQ, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(null);
+  gl.clearColor(0.02, 0.021, 0.026, 1);
+  gl.disable(gl.DEPTH_TEST);
+  glOk = true;
+  return true;
+}
+
+let uTextV = [0, 0, 0.3, 0.1];
+function draw() {
+  if (!glOk) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.BLEND);
+  gl.useProgram(bgP); gl.bindVertexArray(bgVao);
+  gl.uniform1f(bgU.uT, vT); gl.uniform2f(bgU.uRes, W, H);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.useProgram(P); gl.bindVertexArray(pVao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniform1f(U.uT, vT); gl.uniform1f(U.uBass, bass); gl.uniform1f(U.uTre, treb);
+  gl.uniform1f(U.uBeat, beatPulse); gl.uniform1f(U.uPre, preAmt); gl.uniform1f(U.uIn, inAmt);
+  gl.uniform1f(U.uPol, pol); gl.uniform1f(U.uAct, act);
+  gl.uniform2f(U.uRes, W, H); gl.uniform4f(U.uText, uTextV[0], uTextV[1], uTextV[2], uTextV[3]);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+  gl.bindVertexArray(null);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  if (glOk) { gl.viewport(0, 0, cv.width, cv.height); }
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+function textRect() {
+  if (!cur || !cur.chars.length) return [0, 0, 0.34, 0.09];
+  const r = cur.el.getBoundingClientRect();
+  return [ (r.left + r.width/2) / W * 2 - 1, 1 - (r.top + r.height/2) / H * 2,
+           Math.max(0.02, r.width / W), Math.max(0.02, r.height / H) ];
+}
+
+/* ══════════════════════════════ 主循环 ══════════════════════════════ */
+let last = performance.now(), raf = 0, dirty = true;
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  /* 视觉时钟 = 歌词时钟（seek 时画面与字一起重建；暂停时一起冻住） */
+  vT = RM ? T * 0.24 : T;
+  if (playing) {
+    beatPulse *= Math.exp(-dt * 3.6);
+    bass *= Math.exp(-dt * 0.08);
+    treb *= Math.exp(-dt * 0.10);
+  }
+  try { timing(T); } catch (e) { errMsg = 'timing: ' + (e && e.message ? e.message : e); }
+  state(T);
+  if (!RM && cur) uTextV = textRect();
+  try {
+    if (playing || dirty) { draw(); updDom(T); dirty = false; }
+  } catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------- 协议 ---------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9;
+    cur = null; ghost = null;
+    for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; s.el.style.transform = 'translate(-50%,-50%)'; }
+    vT = 0; beatPulse = 0; bass = 0; treb = 0; beatN = 0; beatAt = -9;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    inAmt = 0; preAmt = 0;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now();
+    playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5);
+    beatN++; dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, clamp01(l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, clamp01(l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+/* ---------------- 自查 ---------------- */
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx]) ? lines[idx].text : '',
+  gl: glOk, rm: RM, vT: +vT.toFixed(2)
+});
+
+/* ---------------- 启动 ---------------- */
+resize();
+try { initGL(); } catch (e) { errMsg = 'gl: ' + (e && e.message ? e.message : e); document.documentElement.classList.add('fb'); }
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,980 @@
+
+"use strict";
+
+/* __stage 必须在脚本最外层无条件赋值 */
+var stageState = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "", text: "", gl: false, rm: false };
+window.__stage = function () {
+  return {
+    lines: stageState.lines.length, idx: stageState.idx, t: stageState.t,
+    playing: stageState.playing, frames: stageState.frames, js: stageState.js,
+    err: stageState.err, text: stageState.text, gl: stageState.gl, rm: stageState.rm
+  };
+};
+
+var lastErrorSecond = -1;
+function reportError(where, err) {
+  try {
+    var second = Math.floor(performance.now() / 1000);
+    if (second !== lastErrorSecond) {
+      lastErrorSecond = second;
+      console.error("[stage-400] " + where, err);
+    }
+  } catch (ignored) { }
+}
+
+var readySent = false;
+function sendReady() {
+  if (readySent) { return; }
+  readySent = true;
+  try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); }
+  catch (err) { reportError("ready", err); }
+}
+
+/* 先排 rAF + ready 兜底，再做任何 boot 准备 */
+requestAnimationFrame(firstFrame);
+setTimeout(sendReady, 700);
+
+var canvasNode = document.getElementById("stage");
+var lyricNode = document.getElementById("lyricLine");
+var emptyNode = document.getElementById("emptyState");
+var hudSongNode = document.getElementById("hudSong");
+var hudArtistNode = document.getElementById("hudArtist");
+var hudBpmNode = document.getElementById("hudBpm");
+var ctx = null;
+var view = { w: 1440, h: 900, dpr: 1, cx: 720, cy: 450, focal: 855 };
+var accentColor = [95, 242, 255];
+var readyToDraw = false;
+
+function firstFrame() {
+  sendReady();
+  try {
+    ensureCanvas();
+    resizeCanvas();
+    readyToDraw = true;
+  } catch (err) {
+    reportError("boot", err);
+  }
+  requestAnimationFrame(loop);
+}
+
+function ensureCanvas() {
+  if (!canvasNode) { throw new Error("canvas missing"); }
+  if (!ctx) {
+    ctx = canvasNode.getContext("2d", { alpha: false });
+    if (!ctx) { throw new Error("2d context unavailable"); }
+    updatePalette();
+    seedStars();
+  }
+}
+
+function resizeCanvas() {
+  var width = window.innerWidth;
+  var height = window.innerHeight;
+  if (!isFinite(width) || !isFinite(height) || width <= 0 || height <= 0) { width = 1440; height = 900; }
+  var ratio = window.devicePixelRatio || 1;
+  if (!isFinite(ratio) || ratio <= 0) { ratio = 1; }
+  ratio = Math.min(ratio, 2);
+  view.w = width; view.h = height; view.dpr = ratio;
+  view.cx = width / 2; view.cy = height / 2;
+  view.focal = Math.min(height * 0.95, width * 1.1);
+  /* 竖屏退后取景，保证机械臂与拱门仍在画面内 */
+  var aspect = width / height;
+  CAMERA.z = aspect < 0.82 ? 9.4 : (aspect < 1.25 ? 7.0 : 5.6);
+  view.aspect = aspect;
+  if (!canvasNode || !ctx) { return; }
+  canvasNode.width = Math.round(width * ratio);
+  canvasNode.height = Math.round(height * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  backdropGradient = null;
+}
+
+var sceneTime = 0;
+var lastFrameAt = 0;
+var lastFrameDelta = 0.016;
+
+function loop(now) {
+  try {
+    var startedAt = now || performance.now();
+    var delta = lastFrameAt > 0 ? Math.min((startedAt - lastFrameAt) / 1000, 0.1) : 0.016;
+    if (!isFinite(delta) || delta <= 0) { delta = 0.016; }
+    lastFrameAt = startedAt;
+    lastFrameDelta = delta;
+    var motionFactor = stageState.rm ? 0.32 : 1;
+    sceneTime += (stageState.playing ? delta : delta * 0.22) * motionFactor;
+    stageState.frames++;
+    if (readyToDraw) { draw(); }
+    stageState.js = Math.round((performance.now() - startedAt) * 100) / 100;
+  } catch (err) {
+    reportError("loop", err);
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ================= 3D 投影基座 ================= */
+
+var CAMERA = { x: 0, y: 2.0, z: 5.6 };
+var NEAR_PLANE = 0.5;
+var palette = { cool: [95, 242, 255], warm: [255, 62, 165], core: [255, 244, 226] };
+
+var projA = { x: 0, y: 0, scale: 0, ok: false };
+var projB = { x: 0, y: 0, scale: 0, ok: false };
+
+function clamp01(value) {
+  if (!isFinite(value)) { return 0; }
+  return value < 0 ? 0 : (value > 1 ? 1 : value);
+}
+
+function mixColor(baseColor, tintColor, amount) {
+  var ratio = clamp01(amount);
+  return [
+    Math.round(clamp255(baseColor[0] + (tintColor[0] - baseColor[0]) * ratio)),
+    Math.round(clamp255(baseColor[1] + (tintColor[1] - baseColor[1]) * ratio)),
+    Math.round(clamp255(baseColor[2] + (tintColor[2] - baseColor[2]) * ratio))
+  ];
+}
+
+function rgba(color, alpha) {
+  var red = Math.round(clamp255(Number(color[0]) || 0));
+  var green = Math.round(clamp255(Number(color[1]) || 0));
+  var blue = Math.round(clamp255(Number(color[2]) || 0));
+  return "rgba(" + red + "," + green + "," + blue + "," + clamp01(alpha).toFixed(3) + ")";
+}
+
+function updatePalette() {
+  palette.cool = mixColor(accentColor, [104, 238, 255], 0.58);
+  palette.warm = mixColor(accentColor, [255, 58, 168], 0.22);
+  palette.core = mixColor([255, 246, 228], accentColor, 0.12);
+}
+
+function projectPoint(worldX, worldY, worldZ, out) {
+  var depth = worldZ - CAMERA.z;
+  if (!isFinite(worldX) || !isFinite(worldY) || !isFinite(worldZ) || depth > -NEAR_PLANE) {
+    out.ok = false;
+    return out;
+  }
+  var scale = view.focal / -depth;
+  if (!isFinite(scale) || scale <= 0 || scale > 20000) { out.ok = false; return out; }
+  out.x = view.cx + (worldX - CAMERA.x) * scale;
+  out.y = view.cy + (CAMERA.y - worldY) * scale;
+  out.scale = scale;
+  out.ok = isFinite(out.x) && isFinite(out.y);
+  return out;
+}
+
+function safeBegin(target) {
+  if (!target || typeof target.beginPath !== "function") { return false; }
+  target.beginPath();
+  return true;
+}
+
+function safeStroke(target) {
+  if (!target || typeof target.stroke !== "function") { return false; }
+  target.stroke();
+  return true;
+}
+
+function addStop(gradient, position, color) {
+  try {
+    if (gradient && typeof gradient.addColorStop === "function") {
+      gradient.addColorStop(clamp01(position), color);
+    }
+  } catch (err) {
+    reportError("addColorStop", err);
+  }
+}
+
+/* ================= 背景 ================= */
+
+var backdropGradient = null;
+var hazeGradient = null;
+var stars = [];
+
+function buildBackdrop() {
+  backdropGradient = null;
+  hazeGradient = null;
+  try {
+    var vertical = ctx.createLinearGradient(0, 0, 0, view.h);
+    addStop(vertical, 0, "#010309");
+    addStop(vertical, 0.42, "#03081a");
+    addStop(vertical, 0.615, "#08102e");
+    addStop(vertical, 0.72, "#03060f");
+    addStop(vertical, 1, "#010206");
+    backdropGradient = vertical;
+  } catch (err) { reportError("backdrop", err); }
+  try {
+    var radius = Math.max(260, view.w * 0.6);
+    var haze = ctx.createRadialGradient(view.cx, view.cy, 0, view.cx, view.cy, radius);
+    addStop(haze, 0, rgba(palette.warm, 0.26));
+    addStop(haze, 0.3, rgba(palette.cool, 0.10));
+    addStop(haze, 1, "rgba(0,0,0,0)");
+    hazeGradient = haze;
+  } catch (err) { reportError("haze", err); }
+}
+
+function seedStars() {
+  stars.length = 0;
+  var seed = 20260400;
+  for (var index = 0; index < 120; index++) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    var ux = (seed % 10000) / 10000;
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    var uy = (seed % 10000) / 10000;
+    stars.push({ ux: ux, uy: uy * 0.6, size: 0.6 + ux * 1.5, phase: uy * 6.28 });
+  }
+}
+
+function drawBackdrop() {
+  ctx.globalCompositeOperation = "source-over";
+  if (backdropGradient) { ctx.fillStyle = backdropGradient; }
+  else { ctx.fillStyle = "#01030a"; }
+  ctx.fillRect(0, 0, view.w, view.h);
+
+  var index;
+  ctx.globalCompositeOperation = "lighter";
+  for (index = 0; index < stars.length; index++) {
+    var star = stars[index];
+    var twinkle = 0.35 + 0.35 * Math.sin(sceneTime * 0.9 + star.phase);
+    ctx.fillStyle = rgba(palette.cool, twinkle * 0.5);
+    var sx = star.ux * view.w;
+    var sy = star.uy * view.h * 0.82;
+    var ssize = star.size * 1.2;
+    ctx.fillRect(sx, sy, ssize, ssize);
+  }
+  if (hazeGradient) {
+    ctx.fillStyle = hazeGradient;
+    ctx.fillRect(0, 0, view.w, view.h);
+  }
+}
+
+/* ================= 地面网格 ================= */
+
+var GRID = { spacing: 2, halfWidth: 24, nearZ: 4, rows: 52, scroll: 0, speed: 7.2 };
+
+function drawFloorGrid(delta) {
+  var floorY = -1.75;
+  var scroll = (GRID.scroll % GRID.spacing + GRID.spacing) % GRID.spacing;
+  var index;
+
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "butt";
+  ctx.lineWidth = 1;
+
+  ctx.strokeStyle = rgba(palette.cool, 0.17);
+  if (safeBegin(ctx)) {
+    for (index = -GRID.halfWidth; index <= GRID.halfWidth; index += GRID.spacing) {
+      projectPoint(index, floorY, GRID.nearZ, projA);
+      projectPoint(index, floorY, GRID.nearZ - GRID.rows * GRID.spacing, projB);
+      if (!projA.ok || !projB.ok) { continue; }
+      ctx.moveTo(projA.x, projA.y);
+      ctx.lineTo(projB.x, projB.y);
+    }
+    safeStroke(ctx);
+  }
+
+  ctx.strokeStyle = rgba(palette.cool, 0.13);
+  if (safeBegin(ctx)) {
+    for (index = 0; index < GRID.rows; index++) {
+      var depthZ = GRID.nearZ - index * GRID.spacing + scroll;
+      projectPoint(-GRID.halfWidth, floorY, depthZ, projA);
+      projectPoint(GRID.halfWidth, floorY, depthZ, projB);
+      if (!projA.ok || !projB.ok) { continue; }
+      ctx.moveTo(projA.x, projA.y);
+      ctx.lineTo(projB.x, projB.y);
+    }
+    safeStroke(ctx);
+  }
+
+  /* 沿地面向镜头行进的脉冲带 */
+  for (index = 0; index < 3; index++) {
+    var bandZ = GRID.nearZ - (((sceneTime * 12 + index * 16) % 46) + 0.5);
+    projectPoint(-GRID.halfWidth, floorY, bandZ, projA);
+    projectPoint(GRID.halfWidth, floorY, bandZ, projB);
+    if (!projA.ok || !projB.ok) { continue; }
+    ctx.strokeStyle = rgba(palette.cool, 0.42);
+    ctx.lineWidth = 1.4;
+    if (safeBegin(ctx)) {
+      ctx.moveTo(projA.x, projA.y);
+      ctx.lineTo(projB.x, projB.y);
+      safeStroke(ctx);
+    }
+  }
+
+  /* 近景地面辉光 */
+  try {
+    var glowRadius = Math.max(180, view.w * 0.5);
+    var floorGlow = ctx.createRadialGradient(view.cx, view.h * 0.93, 0, view.cx, view.h * 0.93, glowRadius);
+    addStop(floorGlow, 0, rgba(palette.cool, 0.14));
+    addStop(floorGlow, 1, "rgba(0,0,0,0)");
+    ctx.fillStyle = floorGlow;
+    ctx.fillRect(0, view.h * 0.55, view.w, view.h * 0.45);
+  } catch (err) { reportError("floorGlow", err); }
+}
+
+/* ================= 地平线拱门 ================= */
+
+var GATE = { z: -52, centerY: 3.1, radius: 14 };
+
+function drawGate() {
+  var rings = [1, 0.72, 0.47];
+  var ringIndex;
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round";
+
+  for (ringIndex = 0; ringIndex < rings.length; ringIndex++) {
+    var ringRadius = GATE.radius * rings[ringIndex];
+    var segments = 64;
+    ctx.strokeStyle = rgba(ringIndex === 0 ? palette.warm : palette.cool, ringIndex === 0 ? 0.5 : 0.3);
+    ctx.lineWidth = ringIndex === 0 ? 1.5 : 1;
+    if (!safeBegin(ctx)) { return; }
+    var stepIndex;
+    for (stepIndex = 0; stepIndex <= segments; stepIndex++) {
+      var angle = (stepIndex / segments) * Math.PI * 2;
+      projectPoint(Math.cos(angle) * ringRadius, GATE.centerY + Math.sin(angle) * ringRadius, GATE.z, projA);
+      if (!projA.ok) { continue; }
+      if (stepIndex === 0) { ctx.moveTo(projA.x, projA.y); } else { ctx.lineTo(projA.x, projA.y); }
+    }
+    safeStroke(ctx);
+  }
+
+  /* 旋转的量表刻度 */
+  var tickCount = 36;
+  var tickIndex;
+  ctx.strokeStyle = rgba(palette.warm, 0.34);
+  ctx.lineWidth = 1;
+  if (safeBegin(ctx)) {
+    for (tickIndex = 0; tickIndex < tickCount; tickIndex++) {
+      var tickAngle = (tickIndex / tickCount) * Math.PI * 2 + sceneTime * 0.12;
+      var innerRadius = GATE.radius * (tickIndex % 3 === 0 ? 1.0 : 1.05);
+      var outerRadius = GATE.radius * (tickIndex % 3 === 0 ? 1.1 : 1.08);
+      projectPoint(Math.cos(tickAngle) * innerRadius, GATE.centerY + Math.sin(tickAngle) * innerRadius, GATE.z, projA);
+      projectPoint(Math.cos(tickAngle) * outerRadius, GATE.centerY + Math.sin(tickAngle) * outerRadius, GATE.z, projB);
+      if (!projA.ok || !projB.ok) { continue; }
+      ctx.moveTo(projA.x, projA.y);
+      ctx.lineTo(projB.x, projB.y);
+    }
+    safeStroke(ctx);
+  }
+}
+
+/* ================= 音频驱动状态 ================= */
+
+var audioState = { bpm: 0, level: 0, bass: 0, mid: 0, treble: 0, pulse: 0, beatIndex: 0 };
+var lastShownBpm = -1;
+
+function decayPulse(frameDelta) {
+  var decay = Math.exp(-frameDelta * 3.2);
+  audioState.pulse *= decay;
+  if (!isFinite(audioState.pulse) || audioState.pulse < 0.0001) { audioState.pulse = 0; }
+}
+
+function applyBeat(payload) {
+  if (!payload) { return; }
+  var level = Number(payload.level);
+  if (isFinite(level)) {
+    audioState.pulse = Math.max(audioState.pulse, clamp01(level));
+  }
+  var index = Number(payload.index);
+  if (isFinite(index)) { audioState.beatIndex = index; }
+}
+
+function applyLive(payload) {
+  if (!payload) { return; }
+  var bpm = Number(payload.bpm);
+  if (isFinite(bpm) && bpm > 0) { audioState.bpm = bpm; }
+  var smooth = function (current, incoming) {
+    var value = Number(incoming);
+    if (!isFinite(value)) { return current; }
+    return current + (clamp01(value) - current) * 0.24;
+  };
+  audioState.level = smooth(audioState.level, payload.level);
+  audioState.bass = smooth(audioState.bass, payload.bass);
+  audioState.mid = smooth(audioState.mid, payload.mid);
+  audioState.treble = smooth(audioState.treble, payload.treble);
+  if (typeof payload.playing === "boolean") { stageState.playing = payload.playing; }
+}
+
+/* ================= 线框工具 ================= */
+
+function strokeWorldSegment(ax, ay, az, bx, by, bz, color, alpha, width) {
+  projectPoint(ax, ay, az, projA);
+  projectPoint(bx, by, bz, projB);
+  if (!projA.ok || !projB.ok) { return; }
+  ctx.strokeStyle = rgba(color, alpha);
+  ctx.lineWidth = width;
+  if (!safeBegin(ctx)) { return; }
+  ctx.moveTo(projA.x, projA.y);
+  ctx.lineTo(projB.x, projB.y);
+  safeStroke(ctx);
+}
+
+function drawWorldDot(worldX, worldY, worldZ, radius, color, alpha) {
+  projectPoint(worldX, worldY, worldZ, projA);
+  if (!projA.ok) { return; }
+  var size = Math.max(0.8, radius * Math.min(projA.scale, 3));
+  ctx.fillStyle = rgba(color, alpha);
+  if (!safeBegin(ctx)) { return; }
+  ctx.arc(projA.x, projA.y, size, 0, 6.2832);
+  ctx.fill();
+}
+
+/* ================= 流水线龙门架 + 机械臂 ================= */
+
+var GANTRY_Y = 5.1;
+var GANTRY_Z = -8.6;
+
+function drawGantry() {
+  var halfSpan = 13.5;
+  var railColor = palette.cool;
+
+  strokeWorldSegment(-halfSpan, GANTRY_Y, GANTRY_Z, halfSpan, GANTRY_Y, GANTRY_Z, railColor, 0.55, 1.6);
+  strokeWorldSegment(-halfSpan, GANTRY_Y - 3.4, GANTRY_Z, halfSpan, GANTRY_Y - 3.4, GANTRY_Z, railColor, 0.22, 1);
+  strokeWorldSegment(-halfSpan, GANTRY_Y, GANTRY_Z - 5.5, halfSpan, GANTRY_Y, GANTRY_Z - 5.5, railColor, 0.2, 1);
+  strokeWorldSegment(-halfSpan, GANTRY_Y, GANTRY_Z, -halfSpan, GANTRY_Y, GANTRY_Z - 5.5, railColor, 0.2, 1);
+  strokeWorldSegment(halfSpan, GANTRY_Y, GANTRY_Z, halfSpan, GANTRY_Y, GANTRY_Z - 5.5, railColor, 0.2, 1);
+
+  /* 吊挂在横梁上的竖向支撑 */
+  var postIndex;
+  for (postIndex = -2; postIndex <= 2; postIndex++) {
+    var postX = postIndex * 4.5;
+    strokeWorldSegment(postX, GANTRY_Y, GANTRY_Z, postX, GANTRY_Y + 2.6, GANTRY_Z, railColor, 0.16, 1);
+  }
+
+  /* 传送带 */
+  var conveyorY = -1.45;
+  strokeWorldSegment(-11, conveyorY, -4.4, 11, conveyorY, -4.4, palette.warm, 0.28, 1.2);
+  strokeWorldSegment(-11, conveyorY, -2.2, 11, conveyorY, -2.2, palette.warm, 0.16, 1);
+  var rungIndex;
+  var travel = (sceneTime * 1.6) % 1.2;
+  for (rungIndex = -9; rungIndex <= 9; rungIndex++) {
+    var rungX = rungIndex * 1.2 + travel;
+    strokeWorldSegment(rungX, conveyorY, -4.4, rungX, conveyorY, -2.2, palette.warm, 0.13, 1);
+  }
+}
+
+var ARM_LINKS = [
+  { x: -6.9, phase: 0.4, reach: 1, z: -8.4 },
+  { x: 7.0, phase: 2.6, reach: -1, z: -9.4 }
+];
+
+function drawRoboticArm(arm) {
+  var pivotY = 3.6;
+  var swing = Math.sin(sceneTime * 0.62 + arm.phase) * 0.34 + audioState.pulse * 0.16;
+  var shoulder = -0.72 - swing;
+  var elbowDelta = 1.05 + Math.sin(sceneTime * 0.83 + arm.phase + 1.1) * 0.26;
+  var upperLength = 2.5;
+  var foreLength = 2.05;
+
+  var j0x = arm.x, j0y = pivotY, j0z = arm.z;
+  var j1x = j0x + Math.sin(shoulder) * upperLength * arm.reach;
+  var j1y = j0y - Math.cos(shoulder) * upperLength;
+  var j2x = j1x + Math.sin(shoulder + elbowDelta * 0.8) * foreLength * arm.reach;
+  var j2y = j1y - Math.cos(shoulder + elbowDelta * 0.8) * foreLength;
+
+  /* 立柱 */
+  strokeWorldSegment(arm.x, GANTRY_Y, arm.z, j0x, j0y, j0z, palette.cool, 0.5, 2);
+  strokeWorldSegment(arm.x - 0.34, GANTRY_Y, arm.z, j0x - 0.34, j0y, j0z, palette.cool, 0.24, 1);
+  strokeWorldSegment(arm.x + 0.34, GANTRY_Y, arm.z, j0x + 0.34, j0y, j0z, palette.cool, 0.24, 1);
+
+  /* 大小臂（双线 + 辉光） */
+  strokeWorldSegment(j0x - 0.16, j0y, j0z - 0.16, j1x - 0.13, j1y, j0z - 0.16, palette.cool, 0.62, 1.5);
+  strokeWorldSegment(j0x + 0.16, j0y, j0z + 0.16, j1x + 0.13, j1y, j0z + 0.16, palette.cool, 0.62, 1.5);
+  strokeWorldSegment(j1x - 0.13, j1y, arm.z - 0.14, j2x - 0.11, j2y, arm.z - 0.14, palette.cool, 0.62, 1.5);
+  strokeWorldSegment(j1x + 0.13, j1y, arm.z + 0.16, j2x + 0.11, j2y, arm.z + 0.16, palette.cool, 0.62, 1.5);
+  strokeWorldSegment(j0x, j0y, j0z, j2x, j2y, arm.z, palette.cool, 0.14, 7);
+
+  /* 腕部夹具 */
+  var gripTip = 0.62;
+  strokeWorldSegment(j2x, j2y, arm.z, j2x + gripTip * arm.reach, j2y - 0.5, arm.z, palette.warm, 0.66, 2);
+  strokeWorldSegment(j2x, j2y, arm.z, j2x - gripTip * 0.55 * arm.reach, j2y - 0.42, arm.z - 0.2, palette.warm, 0.5, 1.6);
+  strokeWorldSegment(j2x, j2y, arm.z, j2x - 0.05 * arm.reach, j2y - 0.55, arm.z + 0.24, palette.warm, 0.5, 1.6);
+
+  drawWorldDot(j0x, j0y, j0z, 2.6, palette.core, 0.85);
+  drawWorldDot(j1x, j1y, arm.z, 2.2, palette.core, 0.7);
+  drawWorldDot(j2x, j2y, arm.z, 2.2, palette.warm, 0.85);
+}
+
+function drawArms() {
+  var index;
+  for (index = 0; index < ARM_LINKS.length; index++) {
+    drawRoboticArm(ARM_LINKS[index]);
+  }
+}
+
+/* ================= 合成器音序矩阵 ================= */
+
+function hashNoise(seedValue) {
+  var raw = Math.sin(seedValue * 12.9898) * 43758.5453;
+  return raw - Math.floor(raw);
+}
+
+function drawSequencerWall() {
+  var barCount = 21;
+  var spacing = 0.92;
+  var startX = -((barCount - 1) * spacing) / 2;
+  var floorY = -1.72;
+  var wallZ = -15.5;
+  var energy = audioState.bass * 0.62 + audioState.mid * 0.38;
+  var rate = audioState.bpm > 0 ? audioState.bpm : 124;
+  var stepCount = Math.floor(sceneTime * (rate / 60) * 2.2);
+  var activeStep = ((stepCount % barCount) + barCount) % barCount;
+  var index;
+
+  strokeWorldSegment(startX - 0.5, floorY, wallZ, -startX + 0.5, floorY, wallZ, palette.cool, 0.35, 1.2);
+
+  for (index = 0; index < barCount; index++) {
+    var barX = startX + index * spacing;
+    var wobble = hashNoise(index * 3.31 + Math.floor(sceneTime * 0.7) * 0.13);
+    var height = 0.42 + hashNoise(index * 7.7) * 0.55 + energy * 2.1 * (0.35 + wobble * 0.75);
+    if (index === activeStep) { height += 0.55 + audioState.pulse * 0.7; }
+    height = Math.min(Math.max(height, 0.3), 4.6);
+    var alpha = index === activeStep ? 0.85 : 0.26 + wobble * 0.18;
+    var barColor = index === activeStep ? palette.warm : palette.cool;
+    strokeWorldSegment(barX, floorY, wallZ, barX, floorY + height, wallZ, barColor, alpha, index === activeStep ? 1.8 : 1.1);
+    drawWorldDot(barX, floorY + height, wallZ, index === activeStep ? 2.6 : 1.5,
+      index === activeStep ? palette.core : palette.cool, index === activeStep ? 0.95 : 0.45);
+  }
+}
+
+/* ================= 悬浮棱体 ================= */
+
+var SOLIDS = [
+  { x: -3.5, y: 3.7, z: -10.2, radius: 1.05, spin: 0.42, tilt: 0.5, tone: "cool" },
+  { x: 3.7, y: 4.4, z: -12.6, radius: 0.78, spin: -0.63, tilt: 1.15, tone: "warm" },
+  { x: -0.4, y: 6.1, z: -17.5, radius: 0.62, spin: 0.9, tilt: 0.2, tone: "cool" }
+];
+
+var OCTA_FACES = [
+  [0, 2], [0, 3], [0, 4], [0, 5],
+  [1, 2], [1, 3], [1, 4], [1, 5],
+  [2, 4], [4, 3], [3, 5], [5, 2]
+];
+
+var OCTA_VERTS = [
+  [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]
+];
+
+var solidPoints = [];
+
+function drawFloatingSolids() {
+  var solidIndex;
+  for (solidIndex = 0; solidIndex < SOLIDS.length; solidIndex++) {
+    var solid = SOLIDS[solidIndex];
+    var spinAngle = sceneTime * solid.spin + solidIndex * 1.7;
+    var bob = Math.sin(sceneTime * 0.7 + solidIndex) * 0.22;
+    var cosSpin = Math.cos(spinAngle), sinSpin = Math.sin(spinAngle);
+    var cosTilt = Math.cos(solid.tilt + sceneTime * 0.18), sinTilt = Math.sin(solid.tilt + sceneTime * 0.18);
+    var vertIndex;
+
+    for (vertIndex = 0; vertIndex < OCTA_VERTS.length; vertIndex++) {
+      var vertex = OCTA_VERTS[vertIndex];
+      var vx = vertex[0] * solid.radius;
+      var vy = vertex[1] * solid.radius;
+      var vz = vertex[2] * solid.radius;
+      var rx = vx * cosSpin - vz * sinSpin;
+      var rz = vx * sinSpin + vz * cosSpin;
+      var ry = vy * cosTilt - rz * sinTilt;
+      var rz2 = vy * sinTilt + rz * cosTilt;
+      solidPoints[vertIndex] = [solid.x + rx, solid.y + bob + ry, solid.z + rz2];
+    }
+
+    var lineColor = solid.tone === "warm" ? palette.warm : palette.cool;
+    var edgeIndex;
+    for (edgeIndex = 0; edgeIndex < OCTA_FACES.length; edgeIndex++) {
+      var pair = OCTA_FACES[edgeIndex];
+      var fromPoint = solidPoints[pair[0]];
+      var toPoint = solidPoints[pair[1]];
+      strokeWorldSegment(fromPoint[0], fromPoint[1], fromPoint[2],
+        toPoint[0], toPoint[1], toPoint[2], lineColor, 0.62, 1.3);
+    }
+    /* 棱体内部的能量核 */
+    drawWorldDot(solid.x, solid.y + bob, solid.z, 2.2, palette.core, 0.35 + audioState.pulse * 0.4);
+  }
+}
+
+/* ================= 机器灵魂核心 ================= */
+
+function drawSoulCore() {
+  var coreX = 0, coreY = 2.55, coreZ = -13.2;
+  var pulse = audioState.pulse;
+  var breath = 0.6 + 0.4 * Math.sin(sceneTime * 1.5);
+
+  projectPoint(coreX, coreY, coreZ, projA);
+  if (!projA.ok) { return; }
+  var coreScale = Math.min(projA.scale, 90);
+
+  try {
+    var haloRadius = Math.max(24, coreScale * (1.35 + pulse * 0.9 + breath * 0.18));
+    var halo = ctx.createRadialGradient(projA.x, projA.y, 0, projA.x, projA.y, haloRadius);
+    addStop(halo, 0, rgba(palette.core, 0.55));
+    addStop(halo, 0.18, rgba(palette.warm, 0.3 + pulse * 0.2));
+    addStop(halo, 0.55, rgba(palette.cool, 0.1));
+    addStop(halo, 1, "rgba(0,0,0,0)");
+    ctx.fillStyle = halo;
+    ctx.beginPath();
+    ctx.arc(projA.x, projA.y, haloRadius, 0, 6.2832);
+    ctx.fill();
+  } catch (err) { reportError("coreHalo", err); }
+
+  /* 轨道环 */
+  var orbitIndex;
+  for (orbitIndex = 0; orbitIndex < 2; orbitIndex++) {
+    var orbitRadius = (0.95 + orbitIndex * 0.45) * (1 + pulse * 0.18);
+    var orbitTilt = 0.62 + orbitIndex * 0.9;
+    var orbitSpin = sceneTime * (0.55 + orbitIndex * 0.3);
+    var segments = 40;
+    var stepIndex;
+    ctx.strokeStyle = rgba(orbitIndex === 0 ? palette.cool : palette.warm, 0.34);
+    ctx.lineWidth = 1.1;
+    if (!safeBegin(ctx)) { return; }
+    for (stepIndex = 0; stepIndex <= segments; stepIndex++) {
+      var orbitAngle = (stepIndex / segments) * Math.PI * 2;
+      var ox = Math.cos(orbitAngle) * orbitRadius;
+      var oy = Math.sin(orbitAngle) * orbitRadius * Math.cos(orbitTilt);
+      var oz = Math.sin(orbitAngle) * orbitRadius * Math.sin(orbitTilt);
+      var rx = ox * Math.cos(orbitSpin) - oz * Math.sin(orbitSpin);
+      var rz = ox * Math.sin(orbitSpin) + oz * Math.cos(orbitSpin);
+      projectPoint(coreX + rx, coreY + oy, coreZ + rz, projB);
+      if (!projB.ok) { continue; }
+      if (stepIndex === 0) { ctx.moveTo(projB.x, projB.y); } else { ctx.lineTo(projB.x, projB.y); }
+    }
+    safeStroke(ctx);
+  }
+
+  drawWorldDot(coreX, coreY, coreZ, 3.4, palette.core, 0.95);
+}
+
+/* ================= 渲染主序 ================= */
+
+function draw() {
+  var width = view.w, height = view.h;
+  if (!ctx || !isFinite(width) || !isFinite(height) || width <= 0 || height <= 0) { return; }
+  if (!backdropGradient) { buildBackdrop(); }
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+
+  var frameDelta = lastFrameDelta;
+  GRID.scroll += frameDelta * GRID.speed * (stageState.playing ? 1 : 0.25) * (stageState.rm ? 0.35 : 1);
+  decayPulse(frameDelta);
+  updateHudMeta();
+
+  drawBackdrop();
+  drawGate();
+  drawFloorGrid(frameDelta);
+  drawSequencerWall();
+  drawGantry();
+  drawArms();
+  drawFloatingSolids();
+  drawSoulCore();
+}
+
+/* ---------- 消息 ---------- */
+function handleMessage(event) {
+  var data = event && event.data;
+  if (!data || data.__c100 !== 1) { return; }
+  try {
+    if (data.type === "init") { applyInit(data.payload); }
+    else if (data.type === "tick") { applyTick(data.payload); }
+    else if (data.type === "beat") { applyBeat(data.payload); }
+    else if (data.type === "live") { applyLive(data.payload); }
+  } catch (err) {
+    reportError("message:" + (data && data.type), err);
+  }
+}
+
+/* ================= 歌词引擎 ================= */
+
+var lyricState = { lineIndex: -2, litCount: -1, nodes: [], tokens: [] };
+
+function applyInit(payload) {
+  var song = (payload && payload.song) || {};
+  var incoming = payload && Array.isArray(payload.lines) ? payload.lines : [];
+  var lines = [];
+  var count = Math.min(incoming.length, 800);
+  var index;
+  for (index = 0; index < count; index++) {
+    var parsed = parseLyricLine(incoming[index]);
+    if (parsed) { lines.push(parsed); }
+  }
+
+  stageState.lines = lines;
+  stageState.t = 0;
+  stageState.idx = -1;
+  stageState.text = "";
+  if (payload && typeof payload.playing === "boolean") { stageState.playing = payload.playing; }
+  else { stageState.playing = true; }
+
+  try {
+    accentColor = resolveAccent(payload && payload.accent);
+    updatePalette();
+    if (ctx) { buildBackdrop(); }
+  } catch (err) {
+    reportError("initPainter", err);
+  }
+
+  /* 歌词层单独兜住，绝不让画面异常打断 init */
+  try {
+    updateHud(song);
+    resetLyricView();
+    syncLyric(true);
+  } catch (err) {
+    reportError("initLyric", err);
+  }
+}
+
+function parseLyricLine(raw) {
+  if (!raw || typeof raw !== "object") { return null; }
+  var text = raw.text == null ? "" : String(raw.text);
+  text = text.replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").replace(/^ | $/g, "");
+  if (!text) { return null; }
+  if (text.length > 360) { text = text.slice(0, 360); }
+
+  var at = Number(raw.t);
+  if (!isFinite(at) || at < 0) { at = 0; }
+  var span = Number(raw.dur);
+  if (!isFinite(span) || span <= 0) {
+    span = Math.max(1.8, Math.min(12, text.length * 0.2));
+  }
+
+  var glyphs = Array.from(text);
+  var times = buildCharTimes(raw.chars, glyphs.length, at, span);
+  var tokens = buildTokens(glyphs, times);
+  return { t: at, dur: span, text: text, glyphs: glyphs, times: times, tokens: tokens };
+}
+
+function buildCharTimes(chars, glyphCount, lineStart, span) {
+  var times = new Array(glyphCount);
+  var source = Array.isArray(chars) ? chars : null;
+  var index;
+  for (index = 0; index < glyphCount; index++) {
+    var entry = source && index < source.length ? source[index] : null;
+    var value = entry ? Number(entry.t) : NaN;
+    times[index] = isFinite(value) && value >= 0 ? value : NaN;
+  }
+  /* 缺失 / 长度不符 / 纯 LRC：按句长均分补齐 */
+  var step = span / Math.max(1, glyphCount);
+  for (index = 0; index < glyphCount; index++) {
+    if (!isFinite(times[index])) { times[index] = lineStart + index * step; }
+  }
+  for (index = 1; index < glyphCount; index++) {
+    if (times[index] < times[index - 1]) { times[index] = times[index - 1]; }
+  }
+  return times;
+}
+
+function isCjkGlyph(glyph) {
+  var code = glyph.codePointAt(0) || 0;
+  return (code >= 0x2e80 && code <= 0x9fff) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xff00 && code <= 0xffef) ||
+    (code >= 0x3000 && code <= 0x303f);
+}
+
+function buildTokens(glyphs, times) {
+  var tokens = [];
+  var buffer = "";
+  var bufferStart = 0;
+  var index;
+  for (index = 0; index < glyphs.length; index++) {
+    var glyph = glyphs[index];
+    if (glyph === " ") {
+      if (buffer) {
+        tokens.push({ text: buffer, start: bufferStart, end: index - 1, space: false });
+        buffer = "";
+      }
+      tokens.push({ text: " ", start: index, end: index, space: true });
+      continue;
+    }
+    if (isCjkGlyph(glyph)) {
+      if (buffer) {
+        tokens.push({ text: buffer, start: bufferStart, end: index - 1, space: false });
+        buffer = "";
+      }
+      tokens.push({ text: glyph, start: index, end: index, space: false });
+    } else {
+      if (!buffer) { bufferStart = index; }
+      buffer += glyph;
+    }
+  }
+  if (buffer) {
+    tokens.push({ text: buffer, start: bufferStart, end: glyphs.length - 1, space: false });
+  }
+  return tokens.slice(0, 280);
+}
+
+function findLineIndex(lines, time) {
+  var low = 0;
+  var high = lines.length - 1;
+  var result = -1;
+  while (low <= high) {
+    var mid = (low + high) >> 1;
+    if (lines[mid].t <= time + 0.001) { result = mid; low = mid + 1; }
+    else { high = mid - 1; }
+  }
+  return result;
+}
+
+function resetLyricView() {
+  lyricState.lineIndex = -2;
+  lyricState.litCount = -1;
+  lyricState.nodes = [];
+  lyricState.tokens = [];
+  if (lyricNode) {
+    while (lyricNode.firstChild) { lyricNode.removeChild(lyricNode.firstChild); }
+    lyricNode.className = "";
+  }
+  if (emptyNode) { emptyNode.hidden = stageState.lines.length > 0; }
+}
+
+function buildLyricDom(line) {
+  lyricState.litCount = -1;
+  lyricState.nodes = [];
+  lyricState.tokens = [];
+  if (!lyricNode) { return; }
+  while (lyricNode.firstChild) { lyricNode.removeChild(lyricNode.firstChild); }
+  if (!line) { lyricNode.className = ""; return; }
+
+  var sizeClass = line.text.length > 64 ? "xlong" : (line.text.length > 30 ? "long" : "");
+  var fragment = document.createDocumentFragment();
+  var index;
+  for (index = 0; index < line.tokens.length; index++) {
+    var token = line.tokens[index];
+    lyricState.tokens.push(token);
+    if (token.space) {
+      fragment.appendChild(document.createTextNode(" "));
+      lyricState.nodes.push(null);
+      continue;
+    }
+    var span = document.createElement("span");
+    span.className = "glyph";
+    span.textContent = token.text;
+    lyricState.nodes.push(span);
+    fragment.appendChild(span);
+  }
+  lyricNode.appendChild(fragment);
+  lyricNode.className = sizeClass;
+  lyricNode.setAttribute("data-line", String(stageState.idx));
+  void lyricNode.offsetWidth;
+  lyricNode.className = (sizeClass ? sizeClass + " show" : "show");
+}
+
+function applyLit(litCount) {
+  if (litCount === lyricState.litCount) { return; }
+  lyricState.litCount = litCount;
+  var nodes = lyricState.nodes;
+  var tokens = lyricState.tokens;
+  for (var index = 0; index < nodes.length; index++) {
+    var node = nodes[index];
+    if (!node) { continue; }
+    var token = tokens[index];
+    var stateClass = "";
+    if (token.start < litCount) {
+      stateClass = token.end >= litCount ? "cur" : "lit";
+    }
+    if (node.getAttribute("data-state") === stateClass) { continue; }
+    node.setAttribute("data-state", stateClass);
+    node.className = stateClass ? "glyph " + stateClass : "glyph";
+  }
+}
+
+function paintLyricProgress() {
+  var lines = stageState.lines;
+  var index = stageState.idx;
+  if (index < 0 || index >= lines.length) { return; }
+  var times = lines[index].times;
+  var time = stageState.t;
+  var litCount = 0;
+  var scan = 0;
+  while (scan < times.length && times[scan] <= time + 0.02) { scan++; }
+  litCount = scan;
+  applyLit(litCount);
+}
+
+function syncLyric(force) {
+  var lines = stageState.lines;
+  if (!lines.length) {
+    /* 真没歌词：清空并保留体面的空状态 */
+    if (stageState.idx !== -1 || force) {
+      stageState.idx = -1;
+      stageState.text = "";
+      lyricState.lineIndex = -1;
+      buildLyricDom(null);
+      if (emptyNode) { emptyNode.hidden = false; }
+    }
+    return;
+  }
+  if (emptyNode && !emptyNode.hidden) { emptyNode.hidden = true; }
+  var found = findLineIndex(lines, stageState.t);
+  if (found !== stageState.idx || force) {
+    stageState.idx = found;
+    stageState.text = found >= 0 ? lines[found].text : "";
+    buildLyricDom(found >= 0 ? lines[found] : null);
+  }
+  paintLyricProgress();
+}
+
+function updateHudMeta() {
+  if (!hudBpmNode) { return; }
+  var bpm = audioState.bpm > 0 ? Math.round(audioState.bpm) : 124;
+  if (bpm === lastShownBpm) { return; }
+  lastShownBpm = bpm;
+  hudBpmNode.textContent = String(bpm);
+}
+
+function updateHud(song) {
+  var title = song && song.name != null ? String(song.name) : "";
+  var artists = song ? song.artists : null;
+  var artistText = "";
+  if (Array.isArray(artists)) {
+    var parts = [];
+    var limit = Math.min(artists.length, 4);
+    for (var index = 0; index < limit; index++) {
+      if (artists[index] != null && String(artists[index])) { parts.push(String(artists[index])); }
+    }
+    artistText = parts.join(" / ");
+  } else if (artists != null) {
+    artistText = String(artists);
+  }
+  if (hudSongNode) { hudSongNode.textContent = title || "UNTITLED SIGNAL"; }
+  if (hudArtistNode) { hudArtistNode.textContent = artistText || "DETROIT 313"; }
+}
+
+function resolveAccent(candidate) {
+  if (Array.isArray(candidate) && candidate.length >= 3) {
+    var red = Math.round(Number(candidate[0]));
+    var green = Math.round(Number(candidate[1]));
+    var blue = Math.round(Number(candidate[2]));
+    if (isFinite(red) && isFinite(green) && isFinite(blue)) {
+      return [clamp255(red), clamp255(green), clamp255(blue)];
+    }
+  }
+  return [95, 242, 255];
+}
+
+function clamp255(value) {
+  if (!isFinite(value)) { return 0; }
+  return value < 0 ? 0 : (value > 255 ? 255 : Math.round(value));
+}
+
+function applyTick(payload) {
+  if (!payload) { return; }
+  var at = Number(payload.time);
+  if (isFinite(at) && at >= 0) { stageState.t = at; }
+  if (typeof payload.playing === "boolean") { stageState.playing = payload.playing; }
+  syncLyric();
+}
+
+if (!window.matchMedia) { stageState.rm = false; }
+else {
+  try {
+    var motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    stageState.rm = !!(motionQuery && motionQuery.matches);
+  } catch (err) { reportError("motion", err); }
+}
+
+window.addEventListener("message", handleMessage);
+window.addEventListener("resize", function () {
+  try { resizeCanvas(); } catch (err) { reportError("resize", err); }
+});
+window.addEventListener("error", function (event) {
+  reportError("window", (event && event.message) || "unknown");
+});
+

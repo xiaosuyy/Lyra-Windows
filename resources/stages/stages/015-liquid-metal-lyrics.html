@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>液态金属歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:2;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(180,205,235,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="gl"></canvas>
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   015 · 液态金属歌词 —— 字形的**有符号距离场**就是这块金属的浮雕高度场
+   ----------------------------------------------------------------------------
+   和已有 10 个的区别：
+   007 靠朝向对齐显形（铁屑）、004 靠重力堆积（沙）、005 沿直线重构（粒子）——
+   它们改的都是粒子的**位置**。这里粒子的位置几乎不动（就钉在笔画上），
+   变的是**表面法线**：
+        sdf = 字形距离场（每句一次，两遍 chamfer，之后 O(1) 查表）
+        h   = smoothstep(−sdf) + 两层低频起伏     // 金属表面的高度
+        n   = normalize(−∇h·AMP, 1)              // 法线
+        r   = reflect(−v, n)                     // 参考里那套反射带
+        band1/band2/fresnel/spec → 每个粒子的金属色
+   于是笔画轮廓仍然锐利（粒子没动），但**光影在字上流**：
+   两层起伏让高光扫过整个字面，熔化时起伏变大、法线压平，字就"淌"下去；
+   换句时粒子目标改成新字，追赶速度被 melt 拖慢 —— 旧的化开、新的凝固。
+   背景的 WebGL 液态金属和前景共用 u_time / u_stir，
+   所以鼠标搅动时，池子和字面上流动的是同一片金属。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const glc = document.getElementById('gl');
+let W = 1, H = 1, MN = 1, DPR = 1;
+
+let gl = null;
+try {
+  gl = glc.getContext('webgl', { antialias: false, alpha: false, depth: false })
+    || glc.getContext('experimental-webgl', { antialias: false, alpha: false, depth: false });
+} catch (_) { gl = null; }
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(1, window.innerWidth);
+  H = Math.max(1, window.innerHeight);
+  MN = Math.min(W, H);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (gl) {
+    /* 背景是平静的一整片金属，不需要高分：低一档既省 GPU，也让镜面更"润" */
+    const s = Math.min(0.30, 640 / W, 420 / H);
+    glc.width = Math.max(1, Math.round(W * s));
+    glc.height = Math.max(1, Math.round(H * s));
+    gl.viewport(0, 0, glc.width, glc.height);
+  }
+}
+
+/* ---------------------------- 背景：液态金属 ---------------------------- */
+const VS = 'attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }';
+/* 背景 = 一池**静着**的液态金属。
+   静息面里没有任何随时间流动的分量（只有极慢的呼吸），所以它看起来是"停住的"；
+   唯一的动是 u_rip：每唱一个字，从那个字的位置荡开一圈涟漪，慢慢歇掉 —— 
+   金属是被歌词挑起来的，不是自己在流。
+   u_text 是字带遮罩：字所在的那一横条压暗约 80%，字幕因此永远压得住背景。 */
+const FS = [
+  'precision mediump float;',
+  'uniform vec2 u_res;',
+  'uniform vec2 u_mouse;',
+  'uniform float u_time;',
+  'uniform float u_stir;',
+  'uniform float u_lyr;',
+  'uniform vec4 u_text;',
+  'uniform vec4 u_rip[8];',
+  'uniform vec4 u_char;      // 正在唱的那个字：x, y, 强度, 半径（uv 空间）',
+  'float hash21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }',
+  'float vnoise(vec2 p){',
+  '  vec2 i = floor(p), f = fract(p);',
+  '  vec2 u = f*f*(3.0-2.0*f);',
+  '  return mix(mix(hash21(i), hash21(i+vec2(1.0,0.0)), u.x),',
+  '             mix(hash21(i+vec2(0.0,1.0)), hash21(i+vec2(1.0,1.0)), u.x), u.y);',
+  '}',
+  'float fbm2(vec2 p){',
+  '  float v = 0.5*vnoise(p);',
+  '  v += 0.25*vnoise(p*2.07 + vec2(5.2,1.7));',
+  '  return v;',
+  '}',
+  'float pond(vec2 p){',
+  '  float h = fbm2(p*0.62 + vec2(2.7,1.3))*0.055;',
+  '  h += sin(p.x*1.05 + 0.6)*sin(p.y*1.25 - 1.1)*0.016;',
+  '  return h*(0.90 + 0.10*sin(u_time*0.19));',
+  '}',
+  'void main(){',
+  '  float mn = min(u_res.x, u_res.y);',
+  '  vec2 uv = (gl_FragCoord.xy*2.0 - u_res)/mn;',
+  '  float e = 0.02;',
+  '  float h0 = pond(uv);',
+  '  vec2 gp = vec2((pond(uv + vec2(e,0.0)) - h0)/e, (pond(uv + vec2(0.0,e)) - h0)/e);',
+  '  float hr = 0.0; vec2 gr = vec2(0.0);',
+  '  for (int i = 0; i < 8; i++){',
+  '    vec4 R = u_rip[i];',
+  '    float age = u_time - R.z;',
+  '    if (R.w < 0.004 || age < 0.0 || age > 2.6) continue;',
+  '    vec2 d = uv - R.xy;',
+  '    d.x *= 0.45;                       // 横向压扁：像一整张金属片被顶起来，不是水滴',
+  '    float r = max(length(d), 0.002);',
+  '    float rad = 0.08 + age*0.46;',
+  '    float wd = 0.12 + age*0.05;',
+  '    float k = (r - rad)/wd;',
+  '    float env = exp(-k*k*0.70)*R.w*exp(-age*1.45);',
+  '    float ph = k*2.0;',
+  '    float s = sin(ph), c = cos(ph);',
+  '    hr += env*s;',
+  '    gr += ((env*2.0*c - 1.4*k*env*s)/wd)*(d/r);',
+  '  }',
+  '  gr.x *= 0.45;',
+  '  /* 唱到的那个字：金属被它顶起一小块，反射带在这里弯一下 */',
+  '  vec2 cd = uv - u_char.xy;',
+  '  float spot = exp(-dot(cd, cd)/max(1e-4, u_char.w*u_char.w))*u_char.z;',
+  '  gr += cd*(spot*2.0/max(1e-4, u_char.w*u_char.w))*0.28;',
+  '  vec3 n = normalize(vec3(-(gp.x*2.6 + gr.x*0.085), -(gp.y*2.6 + gr.y*0.085), 1.0));',
+  '  vec3 v = normalize(vec3(uv*0.80, 1.8));',
+  '  float fres = pow(1.0 - max(dot(n,v),0.0), 3.0);',
+  '  vec3 r = reflect(-v, n);',
+  '  float band1 = smoothstep(0.10, 0.98, sin(r.y*1.55 + r.x*0.70 + 0.40));',
+  '  float band2 = smoothstep(0.55, 1.00, sin(r.y*3.00 - r.x*1.10 - 0.80));',
+  '  vec3 col = vec3(0.012,0.015,0.022);',
+  '  /* 暗铬底色：一团很宽的柔光罩在池子上，四周沉下去 */',
+  '  float sheen = exp(-length(vec2(uv.x*0.55, uv.y*0.80 - 0.10))*1.5);',
+  '  col += vec3(0.105,0.120,0.150)*sheen*0.80;',
+  '  /* 低频刷丝：几乎不动，只在掠光处露一点银 */',
+  '  float brush = sin(uv.x*2.3 + uv.y*1.1 + 1.7)*sin(uv.y*3.1 - uv.x*0.8);',
+  '  col += vec3(0.050,0.058,0.074)*smoothstep(0.35, 1.0, brush)*0.70;',
+  '  col += vec3(0.55,0.62,0.72)*band1*0.205;',
+  '  col += vec3(0.35,0.42,0.52)*band2*0.115;',
+  '  col += vec3(0.30,0.80,1.00)*fres*0.070;',
+  '  float sp = pow(max(dot(r, normalize(vec3(0.4,0.7,0.6))), 0.0), 48.0);',
+  '  col += vec3(0.70,0.80,0.94)*sp*0.20;',
+  '  /* 浪脊不额外打光：让反射带自己在波面上弯折，才是金属 */',
+  '  float crest = smoothstep(0.02, 0.34, abs(hr));',
+  '  col += vec3(0.58,0.70,0.86)*crest*0.04*u_lyr;',
+  '  col += vec3(0.50,0.66,0.90)*spot*0.12;',
+  '  vec2 tp = uv - u_text.xy;',
+  '  float mx = 1.0 - smoothstep(u_text.z*0.70, u_text.z*1.75, abs(tp.x));',
+  '  float my = 1.0 - smoothstep(u_text.w*1.20, u_text.w*3.40, abs(tp.y));',
+  '  col *= 1.0 - 0.52*mx*my;',
+  '  col *= 1.0 - clamp(length(uv)*0.20, 0.0, 0.5);',
+  '  col = mix(col, vec3(0.010,0.013,0.018), smoothstep(1.25, 1.95, length(uv)));',
+  '  gl_FragColor = vec4(col, 1.0);',
+  '}'
+].join('\n');
+
+let uRes = null, uMouse = null, uTime = null, uStir = null, uLyr = null, uText = null, uRip = null, uChar = null;
+const mArr = new Float32Array(2);
+const ripArr = new Float32Array(8 * 4);   // x, y, startTime, amp（uv 空间）
+if (gl) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    gl = null;
+  } else {
+    gl.useProgram(prog);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'a');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    uRes = gl.getUniformLocation(prog, 'u_res');
+    uMouse = gl.getUniformLocation(prog, 'u_mouse');
+    uTime = gl.getUniformLocation(prog, 'u_time');
+    uStir = gl.getUniformLocation(prog, 'u_stir');
+    uLyr = gl.getUniformLocation(prog, 'u_lyr');
+    uText = gl.getUniformLocation(prog, 'u_text');
+    uRip = gl.getUniformLocation(prog, 'u_rip');
+    uChar = gl.getUniformLocation(prog, 'u_char');
+    gl.clearColor(0.02, 0.025, 0.04, 1);
+  }
+}
+
+/* ---------------------------- 字形点 + 距离场 ---------------------------- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const CS = 5;                    // 距离场单元边长（局部像素）
+/* 字身画布双缓冲：prepare 写另一块，正在显示的那块不受影响 */
+const bodyPool = [document.createElement('canvas'), document.createElement('canvas')];
+let bodyTurn = 0;
+
+function chamfer(d, gw, gh) {
+  const D1 = 1, D2 = 1.41421356;
+  for (let j = 0; j < gh; j++) {
+    for (let i = 0; i < gw; i++) {
+      const o = j * gw + i;
+      let v = d[o];
+      if (i > 0) { const w = d[o - 1] + D1; if (w < v) v = w; }
+      if (j > 0) {
+        const w = d[o - gw] + D1; if (w < v) v = w;
+        if (i > 0) { const w2 = d[o - gw - 1] + D2; if (w2 < v) v = w2; }
+        if (i < gw - 1) { const w3 = d[o - gw + 1] + D2; if (w3 < v) v = w3; }
+      }
+      d[o] = v;
+    }
+  }
+  for (let j = gh - 1; j >= 0; j--) {
+    for (let i = gw - 1; i >= 0; i--) {
+      const o = j * gw + i;
+      let v = d[o];
+      if (i < gw - 1) { const w = d[o + 1] + D1; if (w < v) v = w; }
+      if (j < gh - 1) {
+        const w = d[o + gw] + D1; if (w < v) v = w;
+        if (i < gw - 1) { const w2 = d[o + gw + 1] + D2; if (w2 < v) v = w2; }
+        if (i > 0) { const w3 = d[o + gw - 1] + D2; if (w3 < v) v = w3; }
+      }
+      d[o] = v;
+    }
+  }
+}
+
+/* 一次扫描同时拿到：粒子要用的字形点云 + 浮雕要用的有符号距离场。
+   距离场只在酝酿期算一遍（两遍 chamfer，O(格数)），之后每帧只是查表。 */
+function buildGlyph(text, wantMax) {
+  const F = 104;
+  const maxW = Math.min(W * 0.84, 1360);
+  const font = (s) => '800 ' + s + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  octx.font = font(F);
+  let w = Math.ceil(octx.measureText(text).width) + 12;
+  const fs = w > maxW ? F * (maxW / w) : F;
+  octx.font = font(fs);
+  w = Math.ceil(octx.measureText(text).width) + 12;
+  const h = Math.ceil(fs * 1.35);
+  off.width = Math.max(16, w); off.height = Math.max(16, h);
+  octx.clearRect(0, 0, off.width, off.height);
+  octx.font = font(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(text, off.width / 2, off.height / 2);
+  const ox = off.width, oy = off.height;
+  const d = octx.getImageData(0, 0, ox, oy).data;
+
+  /* --- 点云（等间隔抽稀，步长 ≤ 颗粒直径） --- */
+  const rawX = [], rawY = [];
+  for (let y = 0; y < oy; y += 2)
+    for (let x = 0; x < ox; x += 2)
+      if (d[(y * ox + x) * 4 + 3] > 128) { rawX.push(x); rawY.push(y); }
+  const pc0 = rawX.length;
+  if (!pc0) return null;
+  let f = Math.ceil(Math.sqrt(pc0 / Math.max(1, wantMax)));
+  if (f < 1) f = 1;
+  const step = 2 * f;
+  const pts = [];
+  for (let i = 0; i < pc0; i++) {
+    if (f > 1 && ((rawX[i] % step) !== 0 || (rawY[i] % step) !== 0)) continue;
+    pts.push(rawX[i] - ox / 2, rawY[i] - oy / 2);
+  }
+  if (pts.length < 2) for (let i = 0; i < pc0; i++) pts.push(rawX[i] - ox / 2, rawY[i] - oy / 2);
+
+  /* --- 有符号距离场 --- */
+  const gw = Math.max(2, Math.ceil(ox / CS)), gh2 = Math.max(2, Math.ceil(oy / CS));
+  const dIn = new Float32Array(gw * gh2);
+  const dOut = new Float32Array(gw * gh2);
+  const BIG = 1e6;
+  for (let j = 0; j < gh2; j++) {
+    const y0 = j * CS, y1 = Math.min(oy, y0 + CS);
+    for (let i = 0; i < gw; i++) {
+      const x0 = i * CS, x1 = Math.min(ox, x0 + CS);
+      let inside = false;
+      for (let y = y0 | 0; y < y1 && !inside; y += 2) {
+        const row = y * ox;
+        for (let x = x0 | 0; x < x1; x += 2) {
+          if (d[(row + x) * 4 + 3] > 128) { inside = true; break; }
+        }
+      }
+      const o = j * gw + i;
+      dIn[o] = inside ? 0 : BIG;
+      dOut[o] = inside ? BIG : 0;
+    }
+  }
+  chamfer(dIn, gw, gh2);
+  chamfer(dOut, gw, gh2);
+  const sdf = new Float32Array(gw * gh2);
+  for (let o = 0; o < gw * gh2; o++) sdf[o] = (dIn[o] - dOut[o]) * CS;   // 正 = 字外
+  return { pts, pc: pts.length / 2, w: ox, h: oy, gw, gh: gh2, sdf, fs };
+}
+
+/* 距离场双线性查表（局部像素，正 = 字外） */
+function sdfLookup(lx, ly, g) {
+  const gw = g.gw, gh2 = g.gh, sdf = g.sdf;
+  let fx = lx / CS - 0.5, fy = ly / CS - 0.5;
+  if (fx < 0) fx = 0; else if (fx > gw - 1.001) fx = gw - 1.001;
+  if (fy < 0) fy = 0; else if (fy > gh2 - 1.001) fy = gh2 - 1.001;
+  const i0 = fx | 0, j0 = fy | 0, ax = fx - i0, ay = fy - j0;
+  const o = j0 * gw + i0, o2 = o + gw;
+  const a = sdf[o], b = sdf[o + 1], c = sdf[o2], d = sdf[o2 + 1];
+  const tA = a + (b - a) * ax, tB = c + (d - c) * ax;
+  return tA + (tB - tA) * ay;
+}
+const smooth01 = (t) => t * t * (3 - 2 * t);
+const profH = (s) => { let t = 0.5 - s / 18; t = t < 0 ? 0 : t > 1 ? 1 : t; return smooth01(t); };
+
+/* ---------------------------- 粒子 ---------------------------- */
+const N = 8500;
+const px = new Float32Array(N), py = new Float32Array(N);
+const slx = new Float32Array(N), sly = new Float32Array(N);   // 槽位（笔画采样点）
+const sd = new Float32Array(N);
+/* 静息时笔画剖面的坡度：每句算一次存在这里，主循环就用不着距离场了（省 12 次查表/颗） */
+const snx = new Float32Array(N), sny = new Float32Array(N);
+for (let i = 0; i < N; i++) { sd[i] = Math.random() * 6.2832; px[i] = Math.random() * W; py[i] = Math.random() * H; }
+
+/* ---------------------------- 锚点 ---------------------------- */
+const anchors = [];
+for (let i = 0; i < 96; i++) {
+  const g = i * 2.399963;
+  const rr = 0.30 + 0.70 * (((i * 37) % 97) / 97);
+  anchors.push({ nx: Math.cos(g) * rr, ny: Math.max(-0.34, Math.min(0.34, Math.sin(g) * rr * 0.58)) });
+}
+function placeAnchor(a, hw, hh, gcx, gcy) {
+  const M = 60;
+  const x0 = M + hw - gcx, x1 = W - M - hw - gcx;
+  const y0 = M + hh - gcy, y1 = H - M - hh - gcy;
+  return {
+    x: x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2 - gcx,
+    y: y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2 - gcy
+  };
+}
+
+/* ------------------- 显示与酝酿分离 ------------------- */
+let prep = null, cur = null;
+let gx0 = 0, gy0 = 0;          // 字形左上角在屏幕上的位置
+function prepare(i) {
+  if (i < 0 || !lines[i]) return null;
+  const g = buildGlyph(lines[i].text, N);
+  if (!g) return null;
+  /* 实体金属底：字形本体（上亮下暗的铬面 + 一道斜向镜面反光），粒子只负责细闪。
+     两块画布轮换复用（不能新建：每句一次会让换句那帧抖一下），直接在 DPR 上写字，retina 不虚。 */
+  const body = bodyPool[bodyTurn]; bodyTurn = 1 - bodyTurn;
+  body.width = Math.max(1, Math.ceil(g.w * DPR));
+  body.height = Math.max(1, Math.ceil(g.h * DPR));
+  const bc = body.getContext('2d');
+  bc.scale(DPR, DPR);
+  bc.font = '800 ' + g.fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  bc.textAlign = 'center'; bc.textBaseline = 'middle';
+  bc.fillStyle = '#fff';
+  bc.fillText((lines[i] || {}).text || '', g.w / 2, g.h / 2);
+  bc.globalCompositeOperation = 'source-in';
+  const grd = bc.createLinearGradient(0, g.h * 0.08, 0, g.h * 0.92);
+  grd.addColorStop(0.00, 'rgba(250,253,255,0.98)');
+  grd.addColorStop(0.18, 'rgba(222,236,255,0.95)');
+  grd.addColorStop(0.46, 'rgba(168,188,216,0.92)');
+  grd.addColorStop(0.60, 'rgba(104,122,150,0.90)');
+  grd.addColorStop(1.00, 'rgba(46,56,74,0.86)');
+  bc.fillStyle = grd; bc.fillRect(0, 0, g.w, g.h);
+  /* 斜向的一道镜面反光：只叠在已有的字身上（source-atop，别用 source-in 会把字擦掉） */
+  bc.globalCompositeOperation = 'source-atop';
+  const g2 = bc.createLinearGradient(0, g.h, g.w * 0.55, 0);
+  g2.addColorStop(0.00, 'rgba(210,228,255,0)');
+  g2.addColorStop(0.40, 'rgba(200,220,255,0)');
+  g2.addColorStop(0.49, 'rgba(232,244,255,0.50)');
+  g2.addColorStop(0.56, 'rgba(205,225,255,0.16)');
+  g2.addColorStop(0.66, 'rgba(190,210,245,0)');
+  g2.addColorStop(1.00, 'rgba(190,210,245,0)');
+  bc.fillStyle = g2; bc.fillRect(0, 0, g.w, g.h);
+  bc.globalCompositeOperation = 'source-over';
+  let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9;
+  for (let k = 0; k < g.pts.length; k += 2) {
+    if (g.pts[k] < bx0) bx0 = g.pts[k];
+    if (g.pts[k] > bx1) bx1 = g.pts[k];
+    if (g.pts[k + 1] < by0) by0 = g.pts[k + 1];
+    if (g.pts[k + 1] > by1) by1 = g.pts[k + 1];
+  }
+  return { i: i, g: g, bx0, bx1, by0, by1, body };
+}
+function commit(p) {
+  if (!p) { cur = null; return; }
+  /* 上一句的字身留一份：换句时它慢慢沉下去淡掉，不是硬切 */
+  if (cur && cur.body) {
+    prevBody = cur.body;
+    prevBX = gx0; prevBY = gy0;
+    prevBW = cur.g.w; prevBH = cur.g.h; prevA = 1;
+  }
+  cur = p;
+  enterK = 0;          // 新句从液面浮起来
+  meltWas = 0;
+  const g = p.g;
+  const hw = (p.bx1 - p.bx0) / 2, hh = (p.by1 - p.by0) / 2;
+  const A = placeAnchor(anchors[((p.i % anchors.length) + anchors.length) % anchors.length],
+    hw, hh, (p.bx0 + p.bx1) / 2, (p.by0 + p.by1) / 2);
+  gx0 = A.x - g.w / 2; gy0 = A.y - g.h / 2;
+  p.ax = A.x; p.ay = A.y; p.hw = hw; p.hh = hh;
+  /* 字带遮罩：字幕所在那一横条在 uv 空间的位置（主循环缓动过去） */
+  txT = (2 * A.x - W) / MN;
+  tyT = (H - 2 * A.y) / MN;
+  twT = Math.max(0.02, (hw * 1.04 * 2) / MN);
+  thT = Math.max(0.02, (hh * 1.15 * 2) / MN);
+  /* 逐字屏幕位置：涟漪从"正在唱的那个字"旁边荡开 */
+  const L = lines[p.i] || {};
+  const chs = (L.chars && L.chars.length) ? L.chars : null;
+  if (chs) {
+    octx.textAlign = 'left'; octx.textBaseline = 'middle';
+    octx.font = '800 ' + g.fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+    const totalW = octx.measureText(L.text || '').width;
+    p.ccx = new Float32Array(chs.length); p.ccw = new Float32Array(chs.length);
+    let acc = 0;
+    for (let k = 0; k < chs.length; k++) {
+      const cw = octx.measureText(chs[k].c || ' ').width || g.fs * 0.5;
+      p.ccw[k] = cw; p.ccx[k] = A.x + acc + cw / 2 - totalW / 2;
+      acc += cw;
+    }
+  } else { p.ccx = null; p.ccw = null; }
+  const pc = g.pc, e = 3.2;
+  for (let i = 0; i < N; i++) {
+    /* 等间隔取样（坑⑥）：按扫描顺序取会把字压成一条带 */
+    const q = (Math.floor(i * pc / N) % pc) * 2;
+    slx[i] = A.x + g.pts[q];
+    sly[i] = A.y + g.pts[q + 1];
+    /* 笔画剖面坡度：每句算一次，存下来给主循环当静息法线（省掉 12 次距离场查表/颗） */
+    const lx = slx[i] - gx0, ly = sly[i] - gy0;
+    snx[i] = (profH(sdfLookup(lx + e, ly, g)) - profH(sdfLookup(lx - e, ly, g))) / (2 * e);
+    sny[i] = (profH(sdfLookup(lx, ly + e, g)) - profH(sdfLookup(lx, ly - e, g))) / (2 * e);
+  }
+}
+function clearParticles() {
+  for (let i = 0; i < N; i++) {
+    slx[i] = Math.random() * W; sly[i] = Math.random() * H;
+    px[i] = slx[i]; py[i] = sly[i];
+    snx[i] = 0; sny[i] = 0;      // 没有字的时候金属面是平的
+  }
+  prep = null; cur = null;
+  txT = 0; tyT = 0; twT = 0.001; thT = 0.02;
+  clS = 0;
+  prevA = 0; prevBody = null;
+  clearRips();
+}
+
+/* ---------------------------- 节奏 ---------------------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、 tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+const hint = document.getElementById('hint');
+function lineDur(i) {
+  if (!lines[i]) return 4;
+  const d = lines[i].dur;
+  if (d && d > 0.2) return d;
+  const nx = lines[i + 1];
+  const g = nx ? nx.t - lines[i].t : 4;
+  return g > 0.4 ? g : 4;
+}
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; prep = null;
+    clearParticles();
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    commit(prep && prep.i === ci ? prep : prepare(ci));
+    prep = null;
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      prep = prepare(nx);          // 只算点云和距离场（坑①）
+    }
+  }
+}
+
+/* ---------------------------- 输入 ---------------------------- */
+const mouse = { x: 0.5, y: 0.5, sx: 0.5, sy: 0.5, lx: 0.5, ly: 0.5 };
+addEventListener('pointermove', (e) => {
+  mouse.x = e.clientX / Math.max(1, window.innerWidth);
+  mouse.y = e.clientY / Math.max(1, window.innerHeight);
+}, { passive: true });
+
+/* ---------------------------- 颜色档 ---------------------------- */
+/* 3 色相 × 3 亮度 = 9 档，颜色表只在 init 时拼一次；
+   逐颗拼 rgba 字符串是 1-5 里把 003 压到 18fps 的元凶（坑⑨）。 */
+const COLS = [];
+let accentMix = [0.72, 0.75, 0.82];
+function buildCols() {
+  COLS.length = 0;
+  /* 三档：本体是主亮度，粒子只在上面铺一层细闪（alpha 低才不会花） */
+  const lv = [0.65, 0.85, 1.05];
+  const al = [0.09, 0.15, 0.24];
+  for (let tg = 0; tg < 3; tg++) {
+    for (let l = 0; l < 3; l++) {
+      const b = lv[l];
+      let r = accentMix[0] * b, g = accentMix[1] * b, bl = accentMix[2] * b;
+      if (tg === 0) { r += 0.35 * 0.18 * b; g += 0.95 * 0.18 * b; bl += 1.0 * 0.18 * b; }
+      else if (tg === 2) { r += 0.62 * 0.26 * b; g += 0.45 * 0.26 * b; bl += 1.0 * 0.26 * b; }
+      else { r += 0.10 * b; g += 0.10 * b; bl += 0.10 * b; }
+      COLS.push('rgba(' + Math.round(Math.min(255, r * 255)) + ',' +
+        Math.round(Math.min(255, g * 255)) + ',' +
+        Math.round(Math.min(255, bl * 255)) + ',' + al[l].toFixed(2) + ')');
+    }
+  }
+}
+buildCols();
+
+/* ---------------------------- 涟漪：歌词挑金属 ---------------------------- */
+/* 金属池子是静的；只有"字被唱出来"这一个事件会往外挑一圈波。
+   每一圈的起点就是那个字的屏幕位置，所以看上去是歌词在挑动金属。 */
+const RIPN = 6;
+const ripX = new Float32Array(RIPN), ripY = new Float32Array(RIPN);
+const ripT = new Float32Array(RIPN), ripA = new Float32Array(RIPN);
+let ripHead = 0, ripLast = -9;
+function spawnRip(sx, sy, amp) {
+  const i = ripHead; ripHead = (ripHead + 1) % RIPN;
+  ripX[i] = (2 * sx - W) / MN;
+  ripY[i] = (H - 2 * sy) / MN;
+  ripT[i] = t0; ripA[i] = amp;
+  ripArr[i * 4] = ripX[i]; ripArr[i * 4 + 1] = ripY[i];
+  ripArr[i * 4 + 2] = t0; ripArr[i * 4 + 3] = amp;
+}
+function clearRips() {
+  for (let i = 0; i < RIPN; i++) { ripA[i] = 0; ripArr[i * 4 + 3] = 0; }
+  ripHead = 0; ripLast = -9;
+}
+
+/* 字带（字幕所在那一横条）在 uv 空间的目标，换句时缓动过去 */
+let txT = 0, tyT = 0, twT = 0.001, thT = 0.02;
+let bx0u = 0, by0u = 0, bwU = 0.001, bhU = 0.02, maskInit = false;
+
+/* 正在唱的那个字在金属上顶出来的一块光 */
+let clX = 0, clY = 0, clS = 0;
+const CLR = 0.24;                       // uv 半径
+function setCharLight(sx, sy, power) {
+  clX = (2 * sx - W) / MN;
+  clY = (H - 2 * sy) / MN;
+  clS = power;
+}
+
+/* ---------------------------- 绘制清单 ---------------------------- */
+const ddx = new Float32Array(N), ddy = new Float32Array(N);
+const dds = new Float32Array(N), ddb = new Uint8Array(N);
+let dn = 0;
+
+/* 进场：字身自下而上从液面浮起 + 一道掠光扫过
+   出场：整句往下沉、拖两道液态残影（句子结束后交给下一句） */
+let enterK = 1;                    // 0 → 1
+let prevBody = null, prevBX = 0, prevBY = 0, prevBW = 1, prevBH = 1, prevA = 0;
+let meltWas = 0;
+
+/* ---------------------------- 主循环 ---------------------------- */
+let last = performance.now();
+let t0 = 0, dtEma = 16, bgTick = 0;
+let melt = 0, stir = 0, kick = 0, lyr = 0;
+let chIdx = -99, chLine = -99, chX = 0, chW = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  dtEma += (dt * 1000 - dtEma) * 0.05;
+  timing(now());
+
+  mouse.sx += (mouse.x - mouse.sx) * Math.min(1, dt * 3.0);
+  mouse.sy += (mouse.y - mouse.sy) * Math.min(1, dt * 3.0);
+
+  /* 搅动：鼠标移动速度 → 全局搅拌强度（指针也能挑一下金属，但比歌词轻得多） */
+  const sp = Math.hypot(mouse.sx - mouse.lx, mouse.sy - mouse.ly);
+  mouse.lx = mouse.sx; mouse.ly = mouse.sy;
+  stir = Math.min(1.6, stir + sp * 26);
+  stir *= Math.exp(-dt * 1.9);
+  kick *= Math.exp(-dt * 3.0);
+
+  const hasLine = curIdx >= 0 && cur !== null;
+  const T = now();
+
+  /* ---- 歌词挑动：每唱出一个新字，就从那个字上荡开一圈涟漪 ---- */
+  if (hasLine) {
+    const L = lines[curIdx] || {};
+    const chs = (cur.ccx && L.chars) ? L.chars : null;
+    let ci = -1;
+    if (chs) for (let k = 0; k < chs.length; k++) { if (T >= chs[k].t) ci = k; else break; }
+    if (curIdx !== chLine) {
+      chLine = curIdx; chIdx = ci; chW = 0;
+      melt = 0;                                 // 新句一上来就是凝好的，别再"灰"半秒
+      /* 换句的波从字幕下沿外面起，免得在字后面留一块"聚光灯" */
+      spawnRip(cur.ax, cur.ay + Math.max(46, cur.hh * 1.15), 0.75);
+      setCharLight(cur.ax, cur.ay, 0.9);
+      if (ci >= 0 && cur.ccx) { chX = cur.ccx[ci]; chW = cur.ccw[ci]; setCharLight(chX, cur.ay, 0.8); }
+      lyr = 1;
+    } else if (ci !== chIdx) {
+      if (ci > chIdx && ci >= 0 && cur.ccx) {  // 只在新字出现时挑，seek 回退不挑
+        chX = cur.ccx[ci]; chW = cur.ccw[ci];
+        setCharLight(chX, cur.ay + Math.sin(ci * 1.7) * 9, 0.8);
+        if (t0 - ripLast > 0.18) {
+          spawnRip(chX, cur.ay + Math.sin(ci * 1.7) * 9, 0.50);
+          ripLast = t0;
+        }
+        lyr = Math.min(1, lyr + 0.55);
+      }
+      chIdx = ci;
+    }
+  } else if (chLine !== -99) { chLine = -99; chIdx = -99; chW = 0; }
+  lyr *= Math.exp(-dt * 1.6);
+  clS *= Math.exp(-dt * 2.1);
+
+  /* 进场进度；上一句的残影同时淡出 */
+  enterK = Math.min(1, enterK + dt * 3.8);
+  if (prevA > 0) { prevA *= Math.exp(-dt * 11.0); if (prevA < 0.015) prevA = 0; }
+  if (hasLine) lyr = Math.max(lyr, 0.18 + 0.10 * Math.sin(t0 * 1.7));
+
+  /* 熔化：只在句子最后 15% 轻轻塌一下（不是整句瘫掉），换句后自己凝回去。
+     字必须始终读得完，所以位移只有几像素。 */
+  let prog = 0;
+  if (hasLine && lines[curIdx]) prog = Math.min(1, Math.max(0, (T - lines[curIdx].t) / lineDur(curIdx)));
+  const meltT = hasLine ? Math.max(0, (prog - 0.86) / 0.14) : 0;
+  melt += (meltT - melt) * Math.min(1, dt * 1.9);
+  /* 开始往下沉的那一瞬：整句把液面带起一圈 */
+  if (hasLine && melt > 0.55 && meltWas <= 0.55) spawnRip(cur.ax, cur.ay + cur.hh * 1.1, 0.70);
+  meltWas = melt;
+
+  /* 字带遮罩缓动 */
+  const mk = maskInit ? Math.min(1, dt * 3.4) : 1;
+  bx0u += (txT - bx0u) * mk; by0u += (tyT - by0u) * mk;
+  bwU += (twT - bwU) * mk; bhU += (thT - bhU) * mk;
+  maskInit = true;
+
+  const warm = 1 + (stir * 0.22 + kick * 0.30);
+  const amp = 5.6 * (1 - melt * 0.35) + 0.6;
+  const uAmp = 1 + melt * 1.2;
+  const fl = 1 - melt * 0.35;
+  const sweepOn = hasLine && chW > 0;
+  /* 进场掠光：一道亮带从左扫到右，粒子跟着提亮 */
+  const sweepRun = hasLine && cur.body && enterK < 1;
+  const sweepX = sweepRun ? gx0 - 150 + (cur.g.w + 300) * enterK : -1e9;
+
+  dn = 0;
+  if (hasLine) {
+    /* 追赶速度：熔化时慢（旧的化开），凝固时快（新的立刻成形） */
+    const ease = Math.min(1, dt * (0.55 + (1 - melt) * 9));
+    const sx0 = chX - chW * 0.55, sx1 = chX + chW * 0.55;
+    for (let i = 0; i < N; i++) {
+      /* 位置：静息恰好钉在笔画上；熔化时向下跌落 + 横向淌开 */
+      const ttx = slx[i] + melt * Math.sin(sd[i] * 1.7) * 5;
+      const tty = sly[i] + melt * (5 + 13 * (0.5 + 0.5 * Math.sin(sd[i] * 2.7)));
+      px[i] += (ttx - px[i]) * ease;
+      py[i] += (tty - py[i]) * ease;
+      /* 还在飞的粒子先不画：几万颗叠在一起会糊成一团白雾（换句那一下最明显） */
+      const dxp = px[i] - slx[i], dyp = py[i] - sly[i];
+      if (dxp * dxp + dyp * dyp > 484) continue;
+
+      /* 两层低频起伏：只取梯度（cos），让高光在字面上流 */
+      const a1 = px[i] * 0.030 + py[i] * 0.014 + t0 * 0.55 * uAmp;
+      const a2 = py[i] * 0.038 - px[i] * 0.011 - t0 * 0.42 * uAmp;
+      const c1 = Math.cos(a1), c2 = Math.cos(a2);
+      const UG = 1.15 * uAmp;
+      /* 静息法线（每句预算）+ 起伏梯度；熔化时压平 → 金属瘫成一片平镜 */
+      const nx = -(snx[i] + UG * (0.030 * c1 - 0.011 * c2)) * amp * fl;
+      const ny = -(sny[i] + UG * (0.014 * c1 + 0.038 * c2)) * amp * fl;
+      const inv = 1 / (1 + (nx * nx + ny * ny) * 0.5);      // 快速归一化（nz=1）
+
+      /* 视线与反射（和参考的 u/v/reflect 一致） */
+      const ux2 = (2 * px[i] - W) / MN, uy2 = (H - 2 * py[i]) / MN;
+      let vx = ux2 * 0.9, vy = uy2 * 0.9, vz = 1.6;
+      const vl = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1;
+      vx /= vl; vy /= vl; vz /= vl;
+      const dnv = (nx * vx + ny * vy + vz) * inv;
+      const rx = -vx + 2 * dnv * nx * inv;
+      const ry = -vy + 2 * dnv * ny * inv;
+      const rz = -vz + 2 * dnv * inv;
+
+      const band1 = Math.sin(ry * 2.6 + rx * 1.7);
+      const band2 = Math.sin(ry * 5.3 + rx * 2.3 - 1.2);
+      const b1 = band1 < 0.15 ? 0 : band1 > 0.45 ? 1 : (band1 - 0.15) / 0.30;
+      const b2 = band2 < 0.25 ? 0 : band2 > 0.60 ? 1 : (band2 - 0.25) / 0.35;
+      /* dot(r, normalize(0.4,0.7,0.6)) —— 必须带 rz，否则会算出 >1 的假高光 */
+      let sp2 = rx * 0.381 + ry * 0.667 + rz * 0.572; if (sp2 < 0) sp2 = 0;
+      const sp4 = sp2 * sp2; const sp8 = sp4 * sp4; const sp16 = sp8 * sp8; const sp32 = sp16 * sp16;
+      const spec = sp32 * sp16;                              // pow(...,48) 用平方代替
+      const f1 = 1 - dnv; const fres = f1 * f1 * f1;
+      /* 底色抬起来：整句始终够亮，金属的暗部也留得住层次 */
+      let lum = (0.36 + b1 * 0.40 + b2 * 0.24 + spec * 0.55 + fres * 0.20) * warm * (1 + melt * 0.32);
+      /* 正在唱的那个字再挑亮一档 —— 读点跟着唱走 */
+      if (sweepOn && px[i] > sx0 && px[i] < sx1) lum *= 1.12;
+      if (sweepRun && px[i] > sweepX - 72 && px[i] < sweepX + 72) lum *= 1.34;
+      /* 三档明暗：先夹再取整，spec 很大也不会回绕 */
+      const lvv = lum <= 0.62 ? 0 : (lum < 1.05 ? 1 : 2);
+      const tg = ry < -0.05 ? 0 : (ry < 0.25 ? 1 : 2);
+      ddx[dn] = px[i]; ddy[dn] = py[i];
+      dds[dn] = 3.4 + lvv * 1.20 + melt * 0.4;
+      ddb[dn] = tg * 3 + lvv;
+      dn++;
+    }
+  }
+
+  /* ---- 背景 ---- */
+  bgTick++;
+  const skipBg = dtEma > 26 && (bgTick & 1);
+  if (gl && !skipBg) {
+    gl.uniform2f(uRes, glc.width, glc.height);
+    mArr[0] = mouse.sx * glc.width;
+    mArr[1] = (1 - mouse.sy) * glc.height;
+    gl.uniform2fv(uMouse, mArr);
+    gl.uniform1f(uTime, t0);
+    gl.uniform1f(uStir, stir);
+    gl.uniform1f(uLyr, lyr);
+    gl.uniform4f(uText, bx0u, by0u, Math.max(0.002, bwU), Math.max(0.02, bhU));
+    gl.uniform4fv(uRip, ripArr);
+    gl.uniform4f(uChar, clX, clY, Math.min(1, clS), CLR);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    ctx.clearRect(0, 0, W, H);
+  } else if (!gl) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#04050a';
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    ctx.clearRect(0, 0, W, H);
+  }
+
+  /* 慢镜呼吸：画面像被一只手端着，差几像素的视差 */
+  const camX = Math.sin(t0 * 0.23) * 6 + stir * 5;
+  const camY = Math.sin(t0 * 0.31 + 1.1) * 4;
+
+  /* ---- 上一句的字身：往下沉 + 淡出（液态溶解，不留硬切） ---- */
+  if (prevA > 0 && prevBody) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = prevA * 0.42;
+    ctx.drawImage(prevBody, prevBX + camX, prevBY + camY + (1 - prevA) * 24, prevBW, prevBH);
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---- 当前字身：自下而上从液面浮起，句尾再沉回去 ---- */
+  if (hasLine && cur.body) {
+    const ek = enterK * enterK * (3 - 2 * enterK);            // 平滑
+    const riseY = (1 - ek) * 24 + melt * 15;
+    const bx = gx0 + camX, by = gy0 + camY + riseY;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = Math.max(0, (0.20 + 0.74 * ek) * (1 - melt * 0.42));
+    if (ek < 0.999) {
+      ctx.save();
+      ctx.beginPath();
+      /* 按**字的墨迹范围**自下而上揭开；揭开的边界是一条起伏的液面（不是直尺） */
+      const inkTop = by + cur.g.h / 2 + cur.by0 - 4;
+      const inkBot = by + cur.g.h / 2 + cur.by1 + 4;
+      const cut = inkBot - (inkBot - inkTop) * ek;
+      const waveAmp = (1 - ek) * 7;
+      ctx.moveTo(bx - 10, inkBot + 10);
+      for (let wx = bx - 10; wx <= bx + cur.g.w + 10; wx += 12) {
+        const wy = cut
+          + Math.sin((wx - bx) * 0.048 + t0 * 4.4) * waveAmp
+          + Math.sin((wx - bx) * 0.135 - t0 * 6.3) * waveAmp * 0.42;
+        ctx.lineTo(wx, wy);
+      }
+      ctx.lineTo(bx + cur.g.w + 10, inkBot + 10);
+      ctx.closePath();
+      ctx.clip();
+      ctx.drawImage(cur.body, bx, by, cur.g.w, cur.g.h);
+      ctx.restore();
+    } else {
+      ctx.drawImage(cur.body, bx, by, cur.g.w, cur.g.h);
+    }
+
+    /* 掠光：一道亮带扫过字面（只在进场那 0.25 秒） */
+    if (ek < 1) {
+      const swX = bx - 150 + (cur.g.w + 300) * ek;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(swX - 78, by - 30, 156, cur.g.h + 60);
+      ctx.clip();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.50 * (1 - ek);
+      ctx.drawImage(cur.body, bx, by, cur.g.w, cur.g.h);
+      ctx.restore();
+    }
+
+    /* 出场：往下拖两道液态残影 */
+    if (melt > 0.05) {
+      ctx.globalCompositeOperation = 'lighter';
+      for (let s = 1; s <= 2; s++) {
+        ctx.globalAlpha = 0.20 * melt * (1 - s * 0.32);
+        ctx.drawImage(cur.body, bx, by + s * 10, cur.g.w, cur.g.h);
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---- 9 档互斥合批：每颗只画一次（坑⑨⑩） ---- */
+  ctx.globalCompositeOperation = 'lighter';
+  for (let b = 0; b < 9; b++) {
+    const col = COLS[b];
+    if (!col) continue;
+    ctx.fillStyle = col;
+    for (let m = 0; m < dn; m++) {
+      if (ddb[m] !== b) continue;
+      const sz = dds[m], h2 = sz / 2;
+      const x = ddx[m] + camX, y = ddy[m] + camY;
+      if (x < -16 || x > W + 16 || y < -16 || y > H + 16) continue;
+      ctx.fillRect(x - h2, y - h2, sz, sz);
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    /* p.accent 是从封面提取的主色 [r,g,b]：只轻轻掺进金属里，别毁掉银灰 */
+    if (p.accent && p.accent.length >= 3) {
+      const ar = p.accent[0] / 255, ag = p.accent[1] / 255, ab = p.accent[2] / 255;
+      accentMix = [
+        0.72 * 0.82 + ar * 0.18,
+        0.75 * 0.82 + ag * 0.18,
+        0.82 * 0.82 + ab * 0.18
+      ];
+      buildCols();
+    }
+    clearParticles();
+    melt = 1; stir = 0; kick = 0; lyr = 0;
+    chIdx = -99; chLine = -99; chW = 0;
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：一次全场的搅动 + 高光整体提亮 + 起伏变形加大。
+       逐颗随机踢会让浮雕面碎成噪点（坑⑬）。 */
+    const lv = d.payload.level || 0;
+    kick = Math.min(1, kick + 0.25 + lv * 0.45);
+    stir = Math.min(1.6, stir + 0.25 + lv * 0.4);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx, brewIdx, drawn: dn, pc: cur ? cur.g.pc : 0,
+  melt: +melt.toFixed(2), stir: +stir.toFixed(2), gl: !!gl, t: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

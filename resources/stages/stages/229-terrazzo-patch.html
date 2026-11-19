@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>水磨石补块</title>
+<style>
+  html,body{margin:0;height:100%;background:#07060a;overflow:hidden}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:2;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(226,208,178,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="gl"></canvas>
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   279 · 水磨石补块 —— 字是同一个平面上、用另一种级配的骨料补浇的一块
+
+   机制一句话：
+      水磨石是**骨料的横切面**：把石子拌进水泥、浇上、磨平、抛光 —— 磨到的那个面上，
+      每一颗石子被切出一个多边形截面，颜色就是那颗石子自己的颜色。
+      字是**补浇**的一块：把这一块凿掉、用另一种级配的骨料重新浇上（深色的石子多、
+      白的大理石少），和原地一起磨平、一起抛光 —— 所以字**没有高度差、没有光泽差**，
+      只有骨料的颜色和密度不一样；交界处是一道锯缝（切割机的刀口），比周围略深。
+
+   和前作的区别：
+      242 湿沥青的差别是**粗糙度**（干/湿两种表面的反光不同）；
+      279 这里两种区域的粗糙度、高度、光泽完全一样，只有**组成**不同：
+      一个是靠"表面怎么反光"，一个是靠"里面有什么"。
+      这是本组唯一一个"没有光影也能看见"的字 —— 把灯关了，它还在。
+
+   动态：换句时补块刚浇上、还没磨（u_st：骨料从模糊到清晰）；唱到的那一段被磨得更亮（u_front）；
+   拍点上抛光机的光扫过（u_kick）。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const glc = document.getElementById('gl');
+const hint = document.getElementById('hint');
+
+let W = 1, H = 1, MN = 1, DPR = 1, GW = 1, GH = 1;
+const FONT = '"PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif';
+const RMQ = matchMedia('(prefers-reduced-motion: reduce)');
+let rm = RMQ.matches ? 1 : 0;
+if (RMQ.addEventListener) RMQ.addEventListener('change', (e) => { rm = e.matches ? 1 : 0; });
+
+let gl = null;
+try {
+  gl = glc.getContext('webgl', { antialias: false, alpha: false, depth: false, premultipliedAlpha: false })
+    || glc.getContext('experimental-webgl', { antialias: false, alpha: false, depth: false });
+} catch (_) { gl = null; }
+
+/* ------------------------------- 着色器 ------------------------------- */
+const VS = 'attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }';
+const FS = [
+  "precision highp float;",
+  "uniform vec2 u_res;",
+  "uniform float u_t;",
+  "uniform float u_rm;",
+  "uniform sampler2D u_g;",
+  "uniform vec2 u_gc;",
+  "uniform vec2 u_gh;",
+  "uniform float u_gk;",
+  "uniform float u_st;",
+  "uniform float u_front;",
+  "uniform float u_kick;",
+  "uniform vec3 u_ac;",
+  "uniform float u_epx;",
+  "float h21(vec2 p){ p = fract(p*vec2(127.11,311.7)); p += dot(p,p+34.53); return fract(p.x*p.y); }",
+  "float vn(vec2 p){",
+  "  vec2 i = floor(p), f = fract(p);",
+  "  vec2 u = f*f*(3.0-2.0*f);",
+  "  return mix(mix(h21(i),h21(i+vec2(1.0,0.0)),u.x), mix(h21(i+vec2(0.0,1.0)),h21(i+vec2(1.0,1.0)),u.x), u.y);",
+  "}",
+  "float gsd(vec2 uv){",
+  "  vec2 tc = vec2(0.5 + (uv.x-u_gc.x)/(2.0*u_gh.x), 0.5 - (uv.y-u_gc.y)/(2.0*u_gh.y));",
+  "  if (tc.x < 0.002 || tc.x > 0.998 || tc.y < 0.002 || tc.y > 0.998) return 127.0*u_gk;",
+  "  return (texture2D(u_g, tc).r*255.0 - 128.0) * u_gk;",
+  "}",
+  "vec4 chip(vec2 p){",
+  "  vec2 ip = floor(p), fp = fract(p);",
+  "  float d1 = 8.0, d2 = 8.0;",
+  "  vec2 id1 = ip;",
+  "  for (int y = -1; y <= 1; y++) {",
+  "    for (int x = -1; x <= 1; x++) {",
+  "      vec2 g = vec2(float(x), float(y));",
+  "      vec2 o = vec2(h21(ip + g + 2.3), h21(ip + g + 6.1))*0.92 + 0.04;",
+  "      vec2 r = g + o - fp;",
+  "      float d = dot(r, r);",
+  "      if (d < d1) { d2 = d1; d1 = d; id1 = ip + g; } else if (d < d2) { d2 = d; }",
+  "    }",
+  "  }",
+  "  return vec4(id1, sqrt(d1), sqrt(d2) - sqrt(d1));",
+  "}",
+  "void main(){",
+  "  float mn = min(u_res.x, u_res.y);",
+  "  vec2 uv = (gl_FragCoord.xy*2.0 - u_res)/mn;",
+  "  float t = u_t;",
+  "  float ep = u_epx;",
+  "  float sd = gsd(uv);",
+  "  float g0 = 1.0 - smoothstep(-ep*1.6, ep*1.6, sd);",
+  "  float dist = abs(sd);",
+  "  vec4 A = chip(uv*30.0 + 3.0);",
+  "  vec2 idA = A.xy;",
+  "  vec2 idB = floor(uv*118.0 + 7.0);",
+  "  float ha = h21(idA + 0.7);",
+  "  float hb = h21(idA + 4.3);",
+  "  float hc = h21(idA + 8.9);",
+  "  float hd = h21(idB + 5.5);",
+  "  vec3 fchip = mix(vec3(0.80,0.775,0.715), vec3(0.60,0.578,0.530), ha);",
+  "  fchip = mix(fchip, vec3(0.36,0.345,0.325), step(0.88, hb));",
+  "  fchip = mix(fchip, vec3(0.80,0.775,0.715), step(0.92, hc));",
+  "  vec3 pchip = mix(vec3(0.095,0.092,0.090), vec3(0.235,0.222,0.208), ha);",
+  "  pchip = mix(pchip, vec3(0.72,0.700,0.640), step(0.72, hb));",
+  "  pchip = mix(pchip, u_ac*0.55, step(0.93, hc));",
+  "  float seam = smoothstep(0.013, 0.003, A.w);",
+  "  vec3 cementF = vec3(0.540,0.522,0.487)*(0.92 + 0.14*vn(uv*160.0));",
+  "  vec3 cementP = vec3(0.265,0.258,0.248)*(0.90 + 0.18*vn(uv*160.0));",
+  "  vec3 aggF = mix(fchip, cementF, seam*0.85);",
+  "  vec3 aggP = mix(pchip, cementP, seam*0.85);",
+  "  float fine = h21(idB + 1.9);",
+  "  aggF = mix(aggF, vec3(0.66,0.640,0.590), step(0.80, fine)*0.45);",
+  "  aggP = mix(aggP, vec3(0.34,0.330,0.315), step(0.72, fine)*0.45);",
+  "  vec3 alb = mix(aggF, aggP, g0);",
+  "  vec2 lq = uv - vec2(-0.30, 0.34);",
+  "  float sheen = exp(-(lq.x*lq.x*0.55 + lq.y*lq.y*1.10));",
+  "  float fineSheen = 0.5 + 0.5*vn(uv*22.0 + 3.0);",
+  "  vec3 col = alb*(0.62 + 0.55*sheen);",
+  "  col += vec3(0.34,0.34,0.35)*sheen*0.34*(0.6 + 0.4*fineSheen);",
+  "  float polish = vn(vec2(uv.x*260.0, uv.y*26.0))*0.5 + vn(vec2(uv.x*80.0, uv.y*9.0))*0.5;",
+  "  col *= 0.94 + 0.10*polish;",
+  "  float saw = exp(-pow(dist/0.0035, 2.0));",
+  "  col *= 1.0 - 0.38*saw;",
+  "  col *= 1.0 - 0.10*exp(-dist/0.020);",
+  "  float unpol = (1.0 - u_st);",
+  "  vec3 blur = mix(aggF, aggP, g0)*1.0;",
+  "  col = mix(col, blur*0.72 + vec3(0.10,0.10,0.10), unpol*0.55);",
+  "  float litFront = 1.0 - smoothstep(u_front-0.02, u_front+0.012, uv.x);",
+  "  col += vec3(0.10,0.10,0.11)*litFront*sheen*0.35;",
+  "  col *= 1.0 + 0.03*u_kick;",
+  "  float vig = 1.0 - smoothstep(0.30, 1.26, length(uv*vec2(0.60,0.92)));",
+  "  col *= 0.30 + 0.70*vig;",
+  "  col = 1.0 - exp(-col*1.65);",
+  "  col += (h21(gl_FragCoord.xy*0.9 + 121.0) - 0.5)*0.013;",
+  "  gl_FragColor = vec4(max(col,0.0), 1.0);",
+  "}"
+].join("\n");
+
+let uRes, uT, uRm, uG, uGc, uGh, uGk, uSt, uFront, uKick, uAc, uEpx;
+let shaderErr = '';
+let tex = null;
+
+/* ------------------------------- 排版 ------------------------------- */
+const bcv = document.createElement('canvas');
+const bctx = bcv.getContext('2d', { willReadFrequently: true });
+const fontStr = (sz) => '800 ' + sz + 'px ' + FONT;
+
+function layoutInfo(text) {
+  const arr = Array.from(text);
+  let fs = Math.min(H * 0.160, 124);
+  const maxW = W * 0.76;
+  bctx.font = fontStr(fs);
+  let tot = 0;
+  for (let i = 0; i < arr.length; i++) tot += bctx.measureText(arr[i]).width;
+  tot += fs * 0.032 * Math.max(0, arr.length - 1);
+  if (tot > maxW) fs *= maxW / tot;
+  fs = Math.max(20, Math.round(fs / 4) * 4);   /* 字号量化，别让 Chrome 每句重建字形图集 */
+  bctx.font = fontStr(fs);
+  const ws = new Array(arr.length);
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) { ws[i] = bctx.measureText(arr[i]).width; sum += ws[i]; }
+  const sp = fs * 0.032;
+  sum += sp * Math.max(0, arr.length - 1);
+  return { fs: fs, ws: ws, sp: sp, tot: sum, arr: arr, text: text };
+}
+
+function charCenters(L) {
+  const out = [];
+  let x = W / 2 - L.tot / 2;
+  for (let i = 0; i < L.arr.length; i++) { out.push(x + L.ws[i] / 2); x += L.ws[i] + L.sp; }
+  return out;
+}
+
+/* ------------------------------- 距离变换 ------------------------------- */
+function edt(d, wpx, hpx) {
+  for (let y = 0; y < hpx; y++) {
+    const row = y * wpx;
+    for (let x = 0; x < wpx; x++) {
+      let v = d[row + x];
+      if (y > 0) {
+        const up = row - wpx;
+        let c = d[up + x] + 1; if (c < v) v = c;
+        if (x > 0) { c = d[up + x - 1] + 1.4142; if (c < v) v = c; }
+        if (x < wpx - 1) { c = d[up + x + 1] + 1.4142; if (c < v) v = c; }
+      }
+      if (x > 0) { const c = d[row + x - 1] + 1; if (c < v) v = c; }
+      d[row + x] = v;
+    }
+  }
+  for (let y = hpx - 1; y >= 0; y--) {
+    const row = y * wpx;
+    for (let x = wpx - 1; x >= 0; x--) {
+      let v = d[row + x];
+      if (y < hpx - 1) {
+        const dn = row + wpx;
+        let c = d[dn + x] + 1; if (c < v) v = c;
+        if (x > 0) { c = d[dn + x - 1] + 1.4142; if (c < v) v = c; }
+        if (x < wpx - 1) { c = d[dn + x + 1] + 1.4142; if (c < v) v = c; }
+      }
+      if (x < wpx - 1) { const c = d[row + x + 1] + 1; if (c < v) v = c; }
+      d[row + x] = v;
+    }
+  }
+}
+
+/* sdf 贴图：只喂 GL 的投落影 / AO */
+function plateDims(L) {
+  const fs = L.fs;
+  return {
+    pw: Math.ceil(L.tot) + Math.ceil(fs * 0.42) * 2,
+    ph: Math.ceil(fs * 1.36) + Math.ceil(fs * 0.46) * 2
+  };
+}
+function bakeSDF(text, L, pw, ph) {
+  const k = Math.min(1, 1024 / Math.max(16, pw));
+  const ft = Math.max(10, L.fs * k);
+  const cw = Math.max(8, Math.round(pw * k));
+  const chh = Math.max(8, Math.round(ph * k));
+  bcv.width = cw; bcv.height = chh;
+  bctx.setTransform(1, 0, 0, 1, 0, 0);
+  bctx.clearRect(0, 0, cw, chh);
+  bctx.font = fontStr(ft);
+  bctx.textAlign = 'center';
+  bctx.textBaseline = 'middle';
+  bctx.fillStyle = '#fff';
+  bctx.fillText(text, cw / 2, chh / 2);
+  const a = bctx.getImageData(0, 0, cw, chh).data;
+  const n = cw * chh;
+  const outD = new Float32Array(n);
+  const inD = new Float32Array(n);
+  const INF = 1e6;
+  for (let i = 0; i < n; i++) {
+    const inside = a[i * 4 + 3] > 127;
+    outD[i] = inside ? 0 : INF;
+    inD[i] = inside ? INF : 0;
+  }
+  edt(outD, cw, chh);
+  edt(inD, cw, chh);
+  const spread = Math.max(6, Math.round(ft * 0.16));
+  const data = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const inside = inD[i] > 0;
+    const dpx = inside ? -Math.min(inD[i], spread) : Math.min(outD[i], spread);
+    let v = 128 + 127 * (dpx / spread);
+    if (v < 1) v = 1; else if (v > 255) v = 255;
+    const o = i * 4;
+    data[o] = v; data[o + 1] = v; data[o + 2] = v; data[o + 3] = 255;
+  }
+  return { data: data, cw: cw, chh: chh, cssW: pw, cssH: ph, spread: spread };
+}
+
+/* ------------------------------- 纸纹理（全分辨率，喂凸版填充） ------------------------------- */
+const paperCv = document.createElement('canvas');
+let paperPat = null;
+function bakePaperTex() {
+  const S = 320;
+  paperCv.width = S; paperCv.height = S;
+  const g = paperCv.getContext('2d');
+  g.fillStyle = '#ffffff';
+  g.fillRect(0, 0, S, S);
+  for (let i = 0; i < 340; i++) {
+    const x = Math.random() * S, y = Math.random() * S, r = 4 + Math.random() * 26;
+    const v = 196 + Math.random() * 58;
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, 'rgba(' + (v | 0) + ',' + (v | 0) + ',' + ((v * 0.99) | 0) + ',0.95)');
+    rg.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = rg;
+    g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.fill();
+  }
+  g.lineCap = 'round';
+  for (let i = 0; i < 1900; i++) {
+    const x = Math.random() * S, y = Math.random() * S;
+    const ang = Math.random() * 3.1416;
+    const len = 2 + Math.random() * 11;
+    g.strokeStyle = Math.random() < 0.5
+      ? 'rgba(178,168,152,' + (0.26 + Math.random() * 0.44) + ')'
+      : 'rgba(255,253,246,' + (0.30 + Math.random() * 0.5) + ')';
+    g.lineWidth = 0.8;
+    g.beginPath(); g.moveTo(x, y);
+    g.lineTo(x + Math.cos(ang) * len, y + Math.sin(ang) * len);
+    g.stroke();
+  }
+  paperPat = ctx.createPattern(paperCv, 'repeat');
+}
+
+/* ------------------------------- 凸版：每句烘一张 ------------------------------- */
+const maskCv2 = document.createElement('canvas');
+const texCv = document.createElement('canvas');
+function bakePlate(L) {
+  const fs = L.fs;
+  const d = plateDims(L);
+  const pw = d.pw, ph = d.ph;
+  const plateCv = document.createElement('canvas');
+  plateCv.width = pw; plateCv.height = ph;
+  const g = plateCv.getContext('2d');
+  g.clearRect(0, 0, pw, ph);
+  g.font = fontStr(fs);
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  const cx = pw / 2, cy = ph / 2;
+  /* 补块的那一块：深骨料的一层薄色，压一层很轻的水泥灰 */
+  const tg = g.createLinearGradient(0, cy - fs * 0.60, 0, cy + fs * 0.60);
+  tg.addColorStop(0.00, 'rgba(64,62,58,0.42)');
+  tg.addColorStop(0.30, 'rgba(56,54,50,0.36)');
+  tg.addColorStop(0.66, 'rgba(48,46,42,0.32)');
+  tg.addColorStop(1.00, 'rgba(40,38,35,0.30)');
+  g.fillStyle = tg;
+  g.fillText(L.text, cx, cy);
+
+  g.save();
+  g.globalCompositeOperation = 'source-atop';
+  /* 深色石子：一小块一小块的暗斑（切面） */
+  for (let i = 0; i < 700; i++) {
+    const x = Math.random() * pw, y = Math.random() * ph;
+    const rr = 1.5 + Math.random() * 7;
+    const dark = Math.random() < 0.7;
+    g.fillStyle = dark
+      ? 'rgba(26,25,23,' + (0.10 + Math.random() * 0.26).toFixed(3) + ')'
+      : 'rgba(206,200,186,' + (0.06 + Math.random() * 0.18).toFixed(3) + ')';
+    g.beginPath();
+    const n = 3 + (Math.random() * 3) | 0;
+    for (let k = 0; k < n; k++) {
+      const a = (k / n) * 6.2832 + Math.random() * 0.5;
+      const rr2 = rr * (0.7 + Math.random() * 0.5);
+      const px = x + Math.cos(a) * rr2, py = y + Math.sin(a) * rr2;
+      if (k === 0) g.moveTo(px, py); else g.lineTo(px, py);
+    }
+    g.closePath(); g.fill();
+  }
+  g.restore();
+  /* 锯缝：字的外缘一道很细的深 */
+  g.lineJoin = 'round';
+  g.strokeStyle = 'rgba(22,21,19,0.42)';
+  g.lineWidth = Math.max(1, fs * 0.010);
+  g.strokeText(L.text, cx, cy);
+  return { cv: plateCv, w: pw, h: ph };
+}
+
+/* ------------------------------- 状态 ------------------------------- */
+let glyph = null, prep = null, plate = null;
+let lines = [], curIdx = -1, brewIdx = -1, lastT = -1;
+let clockT = 0, clockAt = 0, playing = false;
+let kick = 0, settle = 0, lineAge0 = 0;
+let frames = 0, jsMs = 0, lastJs = 0;
+let accent = [0.9,0.72,0.46];
+const ST = { fibers: false, motes: false, plateBlend: 'source-over', plateAlpha: 0.12 };
+
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+function uploadSDF(g) {
+  if (!gl || !g) return;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, g.cw, g.chh, 0, gl.RGBA, gl.UNSIGNED_BYTE, g.data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function prepareLine(i) {
+  const L = lines[i];
+  if (!L || !L.text) return null;
+  const text = String(L.text);
+  const info = layoutInfo(text);
+  const d = plateDims(info);
+  const sdf = bakeSDF(text, info, d.pw, d.ph);
+  const pl = bakePlate(info);
+  return { i: i, sdf: sdf, plate: pl, cxs: charCenters(info), fs: info.fs, text: text };
+}
+
+function commit(g) {
+  if (!g) return;
+  uploadSDF(g.sdf);
+  const cy = H * 0.515;
+  glyph = {
+    i: g.i, cxs: g.cxs, ccx: g.cxs.map((x) => (x - W / 2) * 2 / MN),
+    gc: [0, (H / 2 - cy) * 2 / MN],
+    gh: [g.sdf.cssW / MN, g.sdf.cssH / MN],
+    gk: (g.sdf.spread / 127) * (2 / MN)
+  };
+  plate = g.plate;
+  settle = 0;
+  lineAge0 = now();
+  hint.style.opacity = '0';
+  bakeFibers();
+}
+
+/* ------------------------------- 全分辨率叠层 ------------------------------- */
+const grainCv = document.createElement('canvas');
+const maskCv = document.createElement('canvas');
+const fibCv = document.createElement('canvas');
+let grainPat = null;
+
+function bakeGrain() {
+  const S = 256;
+  grainCv.width = S; grainCv.height = S;
+  const g = grainCv.getContext('2d');
+  const im = g.createImageData(S, S);
+  const d = im.data;
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const i = (y * S + x) * 4;
+      const v = 128 + (Math.random() - 0.5) * 240;
+      d[i] = v; d[i + 1] = v * 0.985; d[i + 2] = v * 0.96;
+      d[i + 3] = 24;
+    }
+  }
+  g.putImageData(im, 0, 0);
+  grainPat = ctx.createPattern(grainCv, 'repeat');
+}
+
+function bakeFibers() {
+  fibCv.width = Math.max(2, Math.round(W));
+  fibCv.height = Math.max(2, Math.round(H));
+  const g = fibCv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, W, H);
+  g.lineCap = 'round';
+  const cx = W / 2, cy = H * 0.515;
+  const N = Math.round(Math.min(2200, (W * H) / 660));
+  for (let i = 0; i < N; i++) {
+    const a0 = Math.random() * 6.2832;
+    const rr = Math.pow(Math.random(), 0.5);
+    const x = cx + Math.cos(a0) * rr * W * 0.52;
+    const y = cy + Math.sin(a0) * rr * H * 0.40;
+    if (x < -30 || x > W + 30 || y < -30 || y > H + 30) continue;
+    const len = 5 + Math.random() * 46;
+    const ang = Math.random() < 0.66 ? (Math.random() - 0.5) * 0.42 : Math.random() * 3.1416;
+    const al = 0.03 + Math.random() * 0.13;
+    g.strokeStyle = 'rgba(255,242,218,' + al.toFixed(3) + ')';
+    g.lineWidth = Math.random() < 0.86 ? 0.8 : 1.3;
+    g.beginPath();
+    g.moveTo(x, y);
+    g.quadraticCurveTo(x + Math.cos(ang) * len * 0.5 + (Math.random() - 0.5) * 5,
+      y + Math.sin(ang) * len * 0.5 + (Math.random() - 0.5) * 5,
+      x + Math.cos(ang) * len, y + Math.sin(ang) * len);
+    g.stroke();
+  }
+  g.globalCompositeOperation = 'destination-in';
+  const rg = g.createRadialGradient(cx, cy, Math.min(W, H) * 0.10, cx, cy, Math.max(W, H) * 0.56);
+  rg.addColorStop(0, 'rgba(0,0,0,1)');
+  rg.addColorStop(0.55, 'rgba(0,0,0,0.55)');
+  rg.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = rg;
+  g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = 'source-over';
+}
+
+function bakeMask() {
+  maskCv.width = Math.max(2, Math.round(W));
+  maskCv.height = Math.max(2, Math.round(H));
+  const m = maskCv.getContext('2d');
+  m.clearRect(0, 0, W, H);
+  const vg = m.createRadialGradient(W / 2, H * 0.5, Math.min(W, H) * 0.20, W / 2, H * 0.5, Math.max(W, H) * 0.68);
+  vg.addColorStop(0, 'rgba(3,2,5,0)');
+  vg.addColorStop(0.55, 'rgba(3,2,5,0.26)');
+  vg.addColorStop(1, 'rgba(2,2,4,0.88)');
+  m.fillStyle = vg;
+  m.fillRect(0, 0, W, H);
+  const EM = Math.max(26, Math.min(64, Math.min(W, H) * 0.058));
+  const e = [[0, 0, W, EM, 0, 0, 0, EM], [0, H - EM, W, EM, 0, H, 0, H - EM],
+    [0, 0, EM, H, 0, 0, EM, 0], [W - EM, 0, EM, H, W, 0, W - EM, 0]];
+  for (let i = 0; i < 4; i++) {
+    const q = e[i];
+    const gg = m.createLinearGradient(q[4], q[5], q[6], q[7]);
+    gg.addColorStop(0, 'rgba(2,2,4,1)');
+    gg.addColorStop(0.70, 'rgba(2,2,4,0.55)');
+    gg.addColorStop(1, 'rgba(2,2,4,0)');
+    m.fillStyle = gg;
+    m.fillRect(q[0], q[1], q[2], q[3]);
+  }
+}
+
+const MOTES = 30;
+const mx = new Float32Array(MOTES), my = new Float32Array(MOTES),
+  mv = new Float32Array(MOTES), mr = new Float32Array(MOTES),
+  mph = new Float32Array(MOTES), ma = new Float32Array(MOTES);
+for (let i = 0; i < MOTES; i++) {
+  mx[i] = Math.random(); my[i] = Math.random();
+  mv[i] = 0.004 + Math.random() * 0.010;
+  mr[i] = 0.8 + Math.random() * 1.6;
+  mph[i] = Math.random() * 6.283;
+  ma[i] = 0.05 + Math.random() * 0.16;
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(1, window.innerWidth);
+  H = Math.max(1, window.innerHeight);
+  MN = Math.min(W, H);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (gl) {
+    const s = Math.min(0.6, 1100 / W, 680 / H);
+    GW = Math.max(1, Math.round(W * s));
+    GH = Math.max(1, Math.round(H * s));
+    glc.width = GW; glc.height = GH;
+    gl.viewport(0, 0, GW, GH);
+  }
+  bakeGrain();
+  bakeMask();
+  bakeFibers();
+  bakePaperTex();
+  if (curIdx >= 0 && lines[curIdx]) commit(prepareLine(curIdx));
+}
+
+/* ------------------------------- 时间线 ------------------------------- */
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; prep = null; glyph = null; plate = null; settle = 0; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) commit(prep && prep.i === ci ? prep : prepareLine(ci));
+    prep = null;
+    kick = Math.max(kick, 0.5);
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 3.2);
+    const lead = Math.min(1.3, Math.max(0.5, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prep = prepareLine(nx); }
+  }
+}
+
+/* ------------------------------- 主循环 ------------------------------- */
+let last = performance.now();
+function frame(ms) {
+  const jsA = performance.now();
+  const dt = Math.min(0.05, (ms - last) / 1000);
+  last = ms; frames++;
+  const T = now();
+  timing(T);
+
+  const hasLine = !!(curIdx >= 0 && glyph && glyph.i === curIdx && plate);
+  const age = hasLine ? Math.max(0, T - lineAge0) : 0;
+  if (hasLine) {
+    /* 用挂钟 dt 而不是播放时间：暂停/seek 落在句首时，凸版照样压到位 */
+    settle += (1 - settle) * Math.min(1, dt * 7.5);
+  } else {
+    settle *= 1 - Math.min(1, dt * 6);
+  }
+  kick *= Math.exp(-dt * 3.2);
+  /* 暂停：不收尾的过渡（settle/kick）会让画面在暂停时继续微动 —— 直接钉死 */
+  if (!playing) { settle = 1; kick = 0; }
+
+  let front = 9;
+  if (hasLine) {
+    const chs = lines[curIdx].chars;
+    let li = -1;
+    if (chs && chs.length) {
+      for (let i = 0; i < chs.length; i++) if (T >= chs[i].t) li = i;
+      if (li >= 0) {
+        front = glyph.ccx[Math.min(li, glyph.ccx.length - 1)];
+        if (li < chs.length - 1 && glyph.ccx[li + 1] != null) {
+          const a = chs[li].t, b = chs[li + 1].t;
+          const f = b > a ? Math.min(1, (T - a) / (b - a)) : 0;
+          front += (glyph.ccx[li + 1] - glyph.ccx[li]) * f;
+        }
+      }
+    }
+    front += 0.012;
+  }
+
+  if (gl && glyph) {
+    gl.uniform2f(uRes, GW, GH);
+    gl.uniform1f(uT, T * (rm ? 0.25 : 1));
+    gl.uniform1f(uRm, rm);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(uG, 0);
+    gl.uniform2f(uGc, glyph.gc[0], glyph.gc[1]);
+    gl.uniform2f(uGh, glyph.gh[0], glyph.gh[1]);
+    gl.uniform1f(uGk, glyph.gk);
+    gl.uniform1f(uSt, settle);
+    gl.uniform1f(uFront, front);
+    gl.uniform1f(uKick, Math.min(1.2, kick));
+    gl.uniform3f(uAc, accent[0], accent[1], accent[2]);
+    gl.uniform1f(uEpx, 2 / MN);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    ctx.clearRect(0, 0, W, H);
+  } else if (!gl) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#0a0809';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  /* ---- 凸版：全分辨率，按 settle 归位 ---- */
+  if (hasLine && plate) {
+    const cy = H * 0.515;
+    const drop = (1 - settle) * 3.5;
+    ctx.globalCompositeOperation = ST.plateBlend;
+    ctx.globalAlpha = ST.plateAlpha;
+    ctx.drawImage(plate.cv, W / 2 - plate.w / 2, cy - plate.h / 2 + drop, plate.w, plate.h);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  if (ST.fibers && gl && fibCv.width > 1) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.75;
+    ctx.drawImage(fibCv, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  if (ST.motes && hasLine && gl) {
+    ctx.globalCompositeOperation = 'lighter';
+    const sp = rm ? 0.25 : 1;
+    for (let i = 0; i < MOTES; i++) {
+      let x = (mx[i] + Math.sin(T * 0.13 * sp + mph[i]) * 0.02) % 1;
+      let y = (my[i] - T * mv[i] * sp) % 1;
+      if (x < 0) x += 1;
+      if (y < 0) y += 1;
+      const px = (0.12 + x * 0.76) * W, py = (0.18 + y * 0.64) * H;
+      const d2 = Math.pow((px - W / 2) / (W * 0.40), 2) + Math.pow((py - H * 0.5) / (H * 0.32), 2);
+      const a = ma[i] * Math.max(0, 1 - d2) * (0.55 + 0.45 * Math.sin(T * 0.9 + mph[i]));
+      if (a <= 0.004) continue;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = 'rgba(255,242,218,1)';
+      ctx.fillRect(px, py, mr[i], mr[i]);
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  if (grainPat) {
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = grainPat;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+  ctx.drawImage(maskCv, 0, 0, W, H);
+
+  lastJs = performance.now() - jsA;
+  jsMs += (lastJs - jsMs) * 0.08;
+  requestAnimationFrame(frame);
+}
+
+/* ------------------------------- 装配 ------------------------------- */
+if (gl) {
+  const mk = (t, src) => {
+    const s = gl.createShader(t);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) shaderErr += gl.getShaderInfoLog(s) + ' ';
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    shaderErr += gl.getProgramInfoLog(prog) || 'link failed';
+    gl = null;
+  } else {
+    gl.useProgram(prog);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'a');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    uRes = gl.getUniformLocation(prog, 'u_res');
+    uT = gl.getUniformLocation(prog, 'u_t');
+    uRm = gl.getUniformLocation(prog, 'u_rm');
+    uG = gl.getUniformLocation(prog, 'u_g');
+    uGc = gl.getUniformLocation(prog, 'u_gc');
+    uGh = gl.getUniformLocation(prog, 'u_gh');
+    uGk = gl.getUniformLocation(prog, 'u_gk');
+    uSt = gl.getUniformLocation(prog, 'u_st');
+    uFront = gl.getUniformLocation(prog, 'u_front');
+    uKick = gl.getUniformLocation(prog, 'u_kick');
+    uAc = gl.getUniformLocation(prog, 'u_ac');
+    uEpx = gl.getUniformLocation(prog, 'u_epx');
+    gl.clearColor(0.03, 0.026, 0.02, 1);
+    tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 0, 0, 255]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+
+resize();
+requestAnimationFrame(frame);
+
+let rzTimer = 0;
+addEventListener('resize', () => { clearTimeout(rzTimer); rzTimer = setTimeout(resize, 130); });
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; prep = null; glyph = null; plate = null; settle = 0;
+    if (p.accent && p.accent.length === 3) {
+      accent = [
+        Math.min(1, 0.52 + p.accent[0] / 255 * 0.55),
+        Math.min(1, 0.50 + p.accent[1] / 255 * 0.55),
+        Math.min(1, 0.46 + p.accent[2] / 255 * 0.55)
+      ];
+    }
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    kick = Math.min(1.2, kick + 0.25 + (d.payload.level || 0) * 0.4);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, idx: curIdx, curIdx: curIdx, brewIdx: brewIdx,
+  t: +now().toFixed(2), playing: playing, frames: frames,
+  text: curIdx >= 0 ? lines[curIdx].text : '', gl: !!gl, err: shaderErr,
+  glyph: !!glyph, plate: !!plate, js: +lastJs.toFixed(2), jsEma: +jsMs.toFixed(2)
+});
+</script>
+</body>
+</html>

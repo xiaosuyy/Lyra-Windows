@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CSS 日落</title>
+<style>
+  html,body{margin:0;height:100%;background:#0a0f2c;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(190,196,220,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   034 · CSS 日落 —— 整首歌就是一次日落，字落在水面上
+   ---------------------------------------------------------------------------
+   核心机制：**进度驱动的时间 + 字形的水面镜像倒影**。
+   参考文件是一条 200vh 的渐变天空在慢慢平移、一颗太阳沿弧线沉下去、
+   山是 clip-path 视差、海面上有一道反光、夜里星星淡入。
+   这里把它接到歌曲进度上：**太阳的高度、天空的暖色、夜的浓度，
+   全部由"当前播放秒数 / 这首歌的长度"驱动** —— 唱到一半正好是黄昏，
+   最后一句唱完天就黑透了。太阳是"缓慢下沉"的，不是循环的。
+   字写在地平线上方，同时在海面下生成一份**倒影**：
+     · 纵向压扁 0.62；
+     · 横向按深度做正弦摆动（越深摆幅越大）；
+     · 按海面横纹的明暗带**整段整段地掐掉**，倒影是断的，不是一块糊的；
+     · 踩拍时来一阵相干的风，整片倒影一起晃（不是逐颗乱踢）。
+
+   和已有 10 个的区别：003 的"长曝光显影"是时间累积，008 的"静雪"是接触粘附，
+   这里没有粒子物理 —— 唯一的运动来自**水面**和**太阳**，
+   字是被"照"在水上的。倒影这个机制前面 10 个一个都没用过。
+
+   性能：天空/海面/太阳光晕/水面反光全部预渲染成精灵，每帧只 blit；
+   海面横纹合成一条 path 一次 stroke；倒影按 4 档亮度合批。
+
+   精修记录：YRC 逐字点亮（每个采样点挂到所属字，点亮时刻压在 chars[k].t 上，
+   缺 chars 按 t+dur*i/n 均分；提前 0.3s 起预备亮斑）+ 长句自动折两行（30~40 字完整可见）
+   + 场景镜头缓慢横移（天空/海/山共享同一机位）+ beat 驱动的句心光晕与 accent 染色
+   + __stage 增加 yrc 字段。
+   分词：不使用。字形按 UTF-16 逐字采样，逐字时间已精确到字，分词没有收益。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1, hy = 0;
+const PI = Math.PI, TAU = PI * 2;
+const MAXP = 2800;
+
+let sky = null, sea = null, sunSpr = null, glintSpr = null, mntFar = null, mntNear = null, glowSpr = null;
+let stars = [];
+
+/* 两个缓冲：cur 正在显示，next 正在酝酿；换句交换，旧的当场释放 */
+const A = { x: new Float32Array(MAXP), y: new Float32Array(MAXP), ct: new Float32Array(MAXP), n: 0 };
+const B = { x: new Float32Array(MAXP), y: new Float32Array(MAXP), ct: new Float32Array(MAXP), n: 0 };
+let cur = A, nxt = B;
+let curText = '', nextText = '';
+let curLine = null, nextLine = null;      // 采样需要行对象（取 chars/时长）
+let curYrc = false, nextYrc = false;      // 当前句是否用了可信的逐字时间
+let textCX = 0;
+let accent = [255, 214, 150];
+let beatGlow = 0, litN = 0;
+
+/* 参考文件的天空渐变（取 200vh 循环里"白天→入夜"那一段） */
+const SKY_STOPS = [
+  [0.00, '#9ecdea'], [0.20, '#bfe4f4'], [0.46, '#cfe0ec'], [0.64, '#f0c9a0'],
+  [0.80, '#ff8a5e'], [0.92, '#e2685f'], [1.00, '#b8445f']
+];
+const FAR_POLY = [[0, 1], [0.05, 0.46], [0.11, 0.58], [0.18, 0.30], [0.25, 0.52], [0.33, 0.38],
+  [0.41, 0.60], [0.50, 0.40], [0.58, 0.58], [0.66, 0.32], [0.74, 0.54], [0.82, 0.44],
+  [0.90, 0.60], [0.96, 0.50], [1, 0.62], [1, 1]];
+const NEAR_POLY = [[0, 1], [0.07, 0.52], [0.15, 0.68], [0.24, 0.42], [0.32, 0.62], [0.40, 0.50],
+  [0.49, 0.70], [0.57, 0.46], [0.66, 0.64], [0.75, 0.50], [0.84, 0.68], [0.92, 0.56],
+  [1, 0.66], [1, 1]];
+
+/* ---- 字形采样 ---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+const LY_FONT = '800 %spx "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+/* 长句折两行：优先在空格/标点断，其次按字数均分；短句单行。
+   返回 { rows:[{text, chars:[UTF-16 起始索引]}], fs } */
+function wrapText(text) {
+  const F = 96;
+  octx.font = LY_FONT.replace('%s', F);
+  const maxW = Math.min(W * 0.72, 1100);
+  const w1 = octx.measureText(text).width;
+  const seg = (i0, i1) => text.slice(i0, i1);
+  const widthOf = (i0, i1) => octx.measureText(seg(i0, i1)).width;
+  if (w1 <= maxW) return { rows: [{ text: text, ci: 0 }], fs: F };
+  const n = text.length;
+  let mid = -1;
+  for (let i = 1; i < n; i++) {
+    const c = text[i];
+    if (c === ' ' || /[，。！？、；：…—,.!?;:]/.test(c)) mid = i;
+  }
+  if (mid < 0) mid = Math.round(n / 2);
+  let best = 1, dev = 1e9;
+  for (let i = Math.max(1, mid - n >> 2); i < Math.min(n, mid + (n >> 2) + 1); i++) {
+    const wA = widthOf(0, i), wB = widthOf(i, n);
+    const d = Math.abs(wA - wB);
+    if (d < dev) { dev = d; best = i; }
+  }
+  const rA = seg(0, best), rB = seg(best, n);
+  const wMax = Math.max(widthOf(0, best), widthOf(best, n));
+  const fs = wMax > maxW ? Math.max(30, F * (maxW / wMax)) : F;
+  return { rows: [{ text: rA, ci: 0 }, { text: rB, ci: best }], fs: fs };
+}
+
+function glyphPoints(text) {
+  const wr = wrapText(text);
+  const fs = wr.fs;
+  const rows = wr.rows;
+  const LH = fs * 1.18;
+  let wMax = 0;
+  for (let r = 0; r < rows.length; r++) {
+    octx.font = LY_FONT.replace('%s', fs);
+    const w = octx.measureText(rows[r].text).width;
+    rows[r].w = w;
+    if (w > wMax) wMax = w;
+  }
+  const w = Math.ceil(wMax) + 8;
+  const h = Math.ceil(LH * rows.length + fs * 0.3);
+  off.width = w; off.height = h;
+  octx.clearRect(0, 0, w, h);
+  octx.font = LY_FONT.replace('%s', fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  const charX = [];                        // 每个 UTF-16 字符的水平中心（相对画布中心）
+  const cy0 = h / 2 - (rows.length - 1) * LH / 2;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const y = cy0 + r * LH;
+    octx.fillText(row.text, w / 2, y);
+    /* 逐字符量横向位置：advance 累加（CJS 字符宽 = 字形宽，够用） */
+    let ax = w / 2 - row.w / 2;
+    for (let k = 0; k < row.text.length; k++) {
+      const cw = octx.measureText(row.text[k]).width;
+      charX[row.ci + k] = ax + cw / 2 - w / 2;
+      ax += cw;
+    }
+  }
+  const d = octx.getImageData(0, 0, w, h).data;
+  const pts = [];
+  const step = 2;
+  for (let y = 0; y < h; y += step)
+    for (let x = 0; x < w; x += step)
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - w / 2, y - h / 2);
+  return { pts: pts, charX: charX, fs: fs, rows: rows.length };
+}
+
+/* 字被摆在地平线上方的一条带里（带上留出空间，字不能被截断；两行时带子加高） */
+function fitBand(rows) {
+  const rowsN = rows || 1;
+  const bandH = rowsN > 1 ? hy * 0.52 : hy * 0.34;
+  return { cy: hy - 0.055 * H - bandH / 2, maxH: bandH, maxW: W * 0.72 };
+}
+
+function sampleInto(dst, text, line) {
+  const g = glyphPoints(text);
+  const pts = g.pts, pc = pts.length / 2;
+  dst.n = 0;
+  if (!pc || !line) return;
+  /* 逐字点亮时刻：chars 可信（长度 === text.length 且 t 有效）用它；
+     否则按 t + dur*i/n 均分。提前 0.3s 起预备（PREP），ct[k] 是"正式成立"时刻 */
+  const txt = line.text || text;
+  const chs = line.chars;
+  const dur = line.dur > 0 ? line.dur : 4;
+  const base = line.t;
+  const n2 = txt.length;
+  const ct = [];
+  let yrcOK = !!(chs && chs.length === n2);
+  if (yrcOK) {
+    for (let k = 0; k < n2; k++) {
+      const v = +chs[k].t;
+      if (!isFinite(v)) { yrcOK = false; break; }
+      ct.push(v);
+    }
+  }
+  if (!yrcOK) for (let k = 0; k < n2; k++) ct.push(base + dur * k / Math.max(1, n2));
+  for (let k = 1; k < n2; k++) if (ct[k] < ct[k - 1]) ct[k] = ct[k - 1];
+
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < pc; i++) {
+    const x = pts[i * 2], y = pts[i * 2 + 1];
+    if (x < mnX) mnX = x; if (x > mxX) mxX = x;
+    if (y < mnY) mnY = y; if (y > mxY) mxY = y;
+  }
+  const bw = Math.max(1, mxX - mnX), bh = Math.max(1, mxY - mnY);
+  const band = fitBand(g.rows);
+  /* 放大倍率封顶 1.9：短句放太大时点距会超过颗粒直径（坑 ④） */
+  const sc = Math.min(band.maxW / bw, band.maxH / bh, 1.9);
+  const ccx = (mnX + mxX) / 2, ccy = (mnY + mxY) / 2;
+  const n = Math.min(MAXP, pc);
+  for (let i = 0; i < n; i++) {
+    const p = (Math.floor(i * pc / n) % pc) * 2;   // 等间隔取样
+    dst.x[i] = textCX + (pts[p] - ccx) * sc;
+    dst.y[i] = band.cy + (pts[p + 1] - ccy) * sc;
+    /* 这颗点属于哪个字：按 charX 二分（px 相对画布中心，乘 sc 前同坐标系） */
+    const gx = pts[p];
+    let lo = 0, hi = g.charX.length - 1, ci = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (g.charX[mid] <= gx) { ci = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    dst.ct[i] = ct[Math.min(ci, n2 - 1)];
+  }
+  dst.n = n;
+  return yrcOK;
+}
+
+/* ---- 预渲染 ---- */
+function bakeSky() {
+  const h = Math.max(4, Math.round(hy));
+  sky = document.createElement('canvas'); sky.width = Math.max(4, Math.round(W)); sky.height = h;
+  const g = sky.getContext('2d');
+  const gr = g.createLinearGradient(0, 0, 0, h);
+  for (const s of SKY_STOPS) gr.addColorStop(s[0], s[1]);
+  g.fillStyle = gr; g.fillRect(0, 0, sky.width, h);
+  /* 参考文件里 90% 70% at 50% 18% 的顶部辉光 */
+  const r = g.createRadialGradient(sky.width * 0.5, h * 0.18, 0, sky.width * 0.5, h * 0.18, Math.max(sky.width, h) * 0.6);
+  r.addColorStop(0, 'rgba(255,255,255,0.16)'); r.addColorStop(0.6, 'rgba(255,255,255,0)');
+  g.fillStyle = r; g.fillRect(0, 0, sky.width, h);
+
+  const sh = Math.max(4, Math.round(H - hy));
+  sea = document.createElement('canvas'); sea.width = sky.width; sea.height = sh;
+  const q = sea.getContext('2d');
+  const sg = q.createLinearGradient(0, 0, 0, sh);
+  sg.addColorStop(0, '#16305e'); sg.addColorStop(0.40, '#0d1c3a'); sg.addColorStop(1, '#050b1c');
+  q.fillStyle = sg; q.fillRect(0, 0, sea.width, sh);
+
+  /* 太阳：radial-gradient(circle at 42% 38%, #fffbe8, #ffe7a8 42%, #ffb35c 78%, #ff8a3d) + 大光晕 */
+  const n = 256;
+  sunSpr = document.createElement('canvas'); sunSpr.width = n; sunSpr.height = n;
+  const s = sunSpr.getContext('2d');
+  const halo = s.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+  halo.addColorStop(0, 'rgba(255,240,200,1)');
+  halo.addColorStop(0.10, 'rgba(255,226,160,0.95)');
+  halo.addColorStop(0.20, 'rgba(255,190,110,0.55)');
+  halo.addColorStop(0.42, 'rgba(255,150,80,0.20)');
+  halo.addColorStop(0.72, 'rgba(255,130,70,0.06)');
+  halo.addColorStop(1, 'rgba(255,120,60,0)');
+  s.fillStyle = halo; s.fillRect(0, 0, n, n);
+  s.globalCompositeOperation = 'source-atop';
+  const disc = s.createRadialGradient(n * 0.44, n * 0.42, 0, n / 2, n / 2, n * 0.17);
+  disc.addColorStop(0, '#fffbe8'); disc.addColorStop(0.55, '#ffe7a8'); disc.addColorStop(1, '#ffb35c');
+  s.fillStyle = disc; s.beginPath(); s.arc(n / 2, n / 2, n * 0.165, 0, TAU); s.fill();
+
+  /* 水面反光：一竖条暖光 */
+  const gw = 128, gh = 256;
+  glintSpr = document.createElement('canvas'); glintSpr.width = gw; glintSpr.height = gh;
+  const gs = glintSpr.getContext('2d');
+  const gg = gs.createLinearGradient(0, 0, 0, gh);
+  gg.addColorStop(0, 'rgba(255,186,110,0.55)');
+  gg.addColorStop(0.30, 'rgba(255,150,80,0.22)');
+  gg.addColorStop(0.70, 'rgba(255,130,70,0.07)');
+  gg.addColorStop(1, 'rgba(255,140,70,0)');
+  gs.fillStyle = gg;
+  gs.beginPath(); gs.ellipse(gw / 2, gh / 2, gw * 0.30, gh / 2, 0, 0, TAU); gs.fill();
+  const gx = gs.createLinearGradient(0, 0, gw, 0);
+  gx.addColorStop(0, 'rgba(0,0,0,1)'); gx.addColorStop(0.5, 'rgba(0,0,0,0)'); gx.addColorStop(1, 'rgba(0,0,0,1)');
+  gs.globalCompositeOperation = 'destination-out';
+  gs.fillStyle = gx; gs.fillRect(0, 0, gw, gh);
+
+  /* 句心光晕：beat 时从字的中心亮一圈（accent 染色） */
+  glowSpr = document.createElement('canvas');
+  glowSpr.width = 256; glowSpr.height = 256;
+  const gl = glowSpr.getContext('2d');
+  const glr = gl.createRadialGradient(128, 128, 0, 128, 128, 128);
+  glr.addColorStop(0, 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',0.55)');
+  glr.addColorStop(0.5, 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',0.14)');
+  glr.addColorStop(1, 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',0)');
+  gl.fillStyle = glr; gl.fillRect(0, 0, 256, 256);
+}
+
+/* 山：预渲染成精灵（每帧只 blit，不造渐变），视差靠 drawImage 的偏移 */
+const MPAD = 60;
+function bakeMount(poly, hgt, c1, c2) {
+  const h = Math.max(4, Math.round(hgt));
+  const c = document.createElement('canvas');
+  c.width = Math.round(W + MPAD * 2); c.height = h;
+  const g = c.getContext('2d');
+  const gr = g.createLinearGradient(0, 0, 0, h);
+  gr.addColorStop(0, c1); gr.addColorStop(1, c2);
+  g.fillStyle = gr;
+  g.beginPath();
+  for (let i = 0; i < poly.length; i++) {
+    const X = MPAD + poly[i][0] * W, Y = poly[i][1] * h;
+    if (i === 0) g.moveTo(X, Y); else g.lineTo(X, Y);
+  }
+  g.closePath(); g.fill();
+  return c;
+}
+
+function bakeStars() {
+  stars = [];
+  let seed = 370;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  for (let i = 0; i < 90; i++) {
+    stars.push({
+      x: rnd() * W, y: rnd() * hy * 0.82,
+      s: 1 + rnd() * 1.6, a: 0.3 + rnd() * 0.7, ph: rnd() * TAU, sp: 2.4 + rnd() * 2.6
+    });
+  }
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  hy = Math.round(H * 0.60);
+  textCX = W / 2;
+  bakeSky(); bakeStars();
+  mntFar = bakeMount(FAR_POLY, 0.27 * H, '#1a2342', '#0e1530');
+  mntNear = bakeMount(NEAR_POLY, 0.23 * H, '#080d1e', '#04070f');
+  /* 尺寸变了，重新把当前句和正在酝酿的句子摆一遍 */
+  if (curText) sampleInto(cur, curText, curLine);
+  if (nextText) sampleInto(nxt, nextText, nextLine);
+}
+resize();
+addEventListener('resize', resize);
+
+/* ---- 节奏 ---- */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let songEnd = 70;
+let gust = 0, gustV = 0;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; cur.n = 0; nxt.n = 0; curText = ''; nextText = '';
+    curLine = null; nextLine = null;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      const tmp = cur; cur = nxt; nxt = tmp;   // 交换缓冲，旧的当场释放
+      const tt = curText; curText = nextText; nextText = tt;
+      const tl = curLine; curLine = nextLine; nextLine = tl;
+      const ty = curYrc; curYrc = nextYrc; nextYrc = false;
+      nxt.n = 0; nextText = '';
+      /* 拖进度条回来时这一句没酝酿过，这里补采样一次，否则整句空白 */
+      if (!cur.n) { curText = lines[ci].text; curLine = lines[ci]; curYrc = !!sampleInto(cur, curText, curLine); }
+    } else { cur.n = 0; curText = ''; curLine = null; }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      nextText = lines[nx].text;
+      nextLine = lines[nx];
+      nextYrc = !!sampleInto(nxt, nextText, nextLine);
+    }
+  }
+}
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let litCX = 0, litCY = 0;
+
+/* ---- 倒影分档 ---- */
+const NRB = 4;
+const rbX = [], rbY = [], rbL = [];
+for (let i = 0; i < NRB; i++) { rbX.push(new Float32Array(MAXP)); rbY.push(new Float32Array(MAXP)); rbL.push(new Float32Array(MAXP)); }
+const rbN = new Int32Array(NRB);
+
+const smooth = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+
+  /* 进度：整首歌 = 一次日落（没有歌词时按 70 秒慢循环） */
+  let p;
+  if (lines.length) { p = T / songEnd; }
+  else p = (t0 % 70) / 70;
+  if (p < 0) p = 0; else if (p > 1) p = 1;
+
+  const warm = smooth(0.22, 0.60, p) * (1 - smooth(0.58, 0.80, p));
+  const night = smooth(0.56, 0.88, p);
+  const setP = Math.min(1, p / 0.72);
+  const sunY = hy - 0.44 * H * (1 - Math.pow(setP, 1.6));
+  const sunX = W * 0.5 + setP * W * 0.16;
+  const sunA = p < 0.70 ? 1 : Math.max(0, 1 - (p - 0.70) / 0.09);
+  const sunR = Math.min(W, H) * (0.21 + 0.07 * (1 - setP));
+
+  /* 踩拍的相干阵风：整片水面一起晃 */
+  gustV += (-gust * 30 - gustV * 5.5) * dt;
+  gust += gustV * dt;
+  /* beat 光晕衰减 + 句心位置跟随（当前字的重心） */
+  beatGlow *= Math.pow(0.05, dt);
+
+  /* 镜头缓慢横移：整个机位（天空/山/海纹）共享一个相位，字段靠 drawImage 偏移 */
+  const camX = Math.sin(t0 * 0.042) * W * 0.035 + Math.sin(t0 * 0.013 + 2) * W * 0.02;
+
+  /* 天空 + 暖色罩（accent 染色：暖罩与地平线带一点主题色） */
+  ctx.drawImage(sky, camX * 0.35 - 40, -6, W + 80, hy + 6);
+  if (warm > 0.004) {
+    ctx.fillStyle = 'rgba(255,110,60,' + (warm * 0.30).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, hy);
+  }
+  ctx.fillStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',' + (0.05 + warm * 0.05).toFixed(3) + ')';
+  ctx.fillRect(0, 0, W, hy);
+
+  /* 星星 */
+  if (night > 0.02) {
+    ctx.globalAlpha = 1;
+    for (let b = 0; b < 3; b++) {
+      ctx.fillStyle = 'rgba(234,242,255,' + (night * (0.22 + b * 0.30)).toFixed(3) + ')';
+      for (let i = 0; i < stars.length; i++) {
+        const s = stars[i];
+        const tw = 0.5 + 0.5 * Math.sin(t0 * (TAU / s.sp) + s.ph);
+        const lv = s.a * tw;
+        const bi = lv < 0.35 ? 0 : lv < 0.7 ? 1 : 2;
+        if (bi !== b) continue;
+        ctx.fillRect(s.x, s.y, s.s, s.s);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* 太阳 */
+  if (sunA > 0.01) {
+    ctx.globalAlpha = sunA * 0.95;
+    ctx.drawImage(sunSpr, sunX - sunR, sunY - sunR, sunR * 2, sunR * 2);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 山（两段视差，预渲染精灵 + 偏移） */
+  const fx = camX * 0.7 + Math.sin(t0 * 0.05) * 7 + gust * 6;
+  const nx2 = camX * 1.25 + Math.sin(t0 * 0.07 + 1.2) * 11 + gust * 9;
+  ctx.globalAlpha = 0.92;
+  ctx.drawImage(mntFar, fx - MPAD, hy + 0.06 * H - 0.27 * H, W + MPAD * 2, 0.27 * H);
+  ctx.globalAlpha = 1;
+  ctx.drawImage(mntNear, nx2 - MPAD, hy + 0.09 * H - 0.23 * H, W + MPAD * 2, 0.23 * H);
+
+  /* 海 */
+  ctx.drawImage(sea, 0, hy, W, H - hy);
+  /* 海面横纹：合成一条 path，一次 stroke */
+  ctx.strokeStyle = 'rgba(255,255,255,0.055)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const drift = (t0 * 9) % 8;
+  for (let y = hy + 2 - drift; y < H; y += 8) {
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+  }
+  ctx.stroke();
+  /* 水面反光 */
+  const glintA = sunA * (0.35 + 0.5 * (1 - setP));
+  if (glintA > 0.02) {
+    ctx.globalAlpha = glintA;
+    ctx.drawImage(glintSpr, sunX - W * 0.045, hy, W * 0.09, (H - hy) * 0.92);
+    ctx.globalAlpha = 1;
+  }
+  /* 地平线（accent 染色） */
+  ctx.fillStyle = 'rgba(' + Math.min(255, accent[0] + 20) + ',' + Math.min(255, accent[1] + 6) + ',' + accent[2] + ',0.25)';
+  ctx.fillRect(0, hy - 1, W, 1.6);
+
+  /* 夜罩（盖在景物上，但字要留在最亮的一层） */
+  if (night > 0.004) {
+    ctx.fillStyle = 'rgba(8,12,40,' + (night * 0.60).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  /* 字 + 倒影（YRC 逐字点亮：未成立的字只有极暗的底，成立时亮起）
+     三趟合批：暗底（全部）/ 预备（未点亮但临近）/ 点亮，避免逐点切 fillStyle */
+  const n = cur.n;
+  if (n) {
+    const PREP = 0.3;
+    litN = 0;
+    let cxSum = 0, cySum = 0, litCnt = 0;
+    const xs = cur.x, ys = cur.y, cts = cur.ct;
+    /* 趟 1：暗底（构图完整，白天夜里都看得出字影） */
+    ctx.fillStyle = 'rgba(52,20,14,0.45)';
+    for (let i = 0; i < n; i++) ctx.fillRect(xs[i] - 2.1, ys[i] - 2.1, 4.2, 4.2);
+    /* 趟 2/3：预备浮起 + 点亮。点亮弹跳只维持 0.22s，过后回正常大小 */
+    ctx.fillStyle = 'rgba(255,220,170,0.38)';
+    for (let i = 0; i < n; i++) {
+      const dt2 = T - cts[i];
+      if (dt2 >= -PREP && dt2 < 0) {
+        const u = 1 + dt2 / PREP;
+        ctx.fillRect(xs[i] - 1.9, ys[i] - 1.9 - (1 - u) * 2.5, 3.8, 3.8);
+      }
+    }
+    ctx.fillStyle = 'rgba(255,236,190,0.97)';
+    for (let i = 0; i < n; i++) {
+      const dt2 = T - cts[i];
+      if (dt2 >= 0) {
+        const pop = dt2 < 0.22 ? 1 + (1 - dt2 / 0.22) * 0.45 : 1;
+        const r2 = 1.5 * pop;
+        ctx.fillRect(xs[i] - r2, ys[i] - r2, r2 * 2, r2 * 2);
+        litN++;
+        if ((i & 31) === 0) { cxSum += xs[i]; cySum += ys[i]; litCnt++; }
+      }
+    }
+    if (litCnt) { litCX = cxSum / litCnt; litCY = cySum / litCnt; }
+    else { litCX = textCX; litCY = hy * 0.72; }
+
+    /* beat 句心光晕：整个字面被 accent 光一起罩一下（相干，不逐字） */
+    if (beatGlow > 0.02) {
+      ctx.globalCompositeOperation = 'screen';
+      ctx.globalAlpha = Math.min(0.85, beatGlow);
+      const gr = Math.max(140, Math.min(W, H) * 0.42);
+      ctx.drawImage(glowSpr, litCX - gr, litCY - gr, gr * 2, gr * 2);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    /* 倒影：压扁 + 摆动 + 被横纹掐断（只反射已点亮的字） */
+    rbN.fill(0);
+    const amp0 = 0.085 + gust * 0.10;
+    const fadeH = (H - hy) * 1.15;
+    for (let i = 0; i < n; i++) {
+      if (T < cts[i]) continue;                         // 没唱到的字不在水里
+      const depth = hy - ys[i];
+      if (depth <= 0) continue;
+      const ry = hy + depth * 0.62;
+      if (ry > H - 2) continue;
+      const amp = Math.min(20, depth * amp0);
+      const rx = xs[i] + Math.sin(depth * 0.09 + t0 * 2.0) * amp;
+      const band = Math.sin(ry * 0.785 - t0 * 1.6);
+      if (band < -0.30) continue;                       // 暗带里掐掉 → 倒影是断的
+      let a = ((band + 0.30) / 1.30) * (1 - depth / fadeH);
+      if (a <= 0.03) continue;
+      if (a > 1) a = 1;
+      const bi = a < 0.30 ? 0 : a < 0.55 ? 1 : a < 0.78 ? 2 : 3;
+      const j = rbN[bi]++;
+      rbX[bi][j] = rx;
+      rbY[bi][j] = ry;
+      rbL[bi][j] = 3.0 + band * 4.6;
+    }
+    for (let b = 0; b < NRB; b++) {
+      const c = rbN[b];
+      if (!c) continue;
+      ctx.fillStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',' + (0.14 + b * 0.20).toFixed(3) + ')';
+      const xs2 = rbX[b], ys2 = rbY[b], ls = rbL[b];
+      for (let j = 0; j < c; j++) {
+        const l = ls[j];
+        ctx.fillRect(xs2[j] - l * 0.5, ys2[j], l, 1.5);
+      }
+    }
+  }
+
+  drawHUD(p, warm, night);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function drawHUD(p, warm, night) {
+  const x = W - 22, y = H - 30;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  ctx.font = '600 11px ui-monospace,"Cascadia Code",Consolas,monospace';
+  const label = p < 0.14 ? '破晓' : p < 0.30 ? '白昼' : p < 0.50 ? '斜阳'
+    : p < 0.66 ? '黄昏' : p < 0.82 ? '暮色' : '夜';
+  ctx.fillStyle = 'rgba(190,196,220,0.62)';
+  ctx.fillText('昼 → 黄昏 → 夜', x, y - 16);
+  ctx.fillStyle = 'rgba(255,214,150,' + (0.55 + warm * 0.4).toFixed(2) + ')';
+  ctx.fillText(label + '  ' + (p * 100).toFixed(1) + '%', x, y + 2);
+  void night;
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    /* 协议没给总时长，用最后一句的开唱时间 + 14 秒当"这首歌的长度" */
+    songEnd = lines.length ? Math.max(45, lines[lines.length - 1].t + 14) : 70;
+    cur.n = 0; nxt.n = 0; curText = ''; nextText = ''; gust = 0; gustV = 0;
+    curLine = null; nextLine = null; curYrc = false; nextYrc = false;
+    if (p.accent && p.accent.length === 3) {
+      accent = [p.accent[0] | 0, p.accent[1] | 0, p.accent[2] | 0];
+      bakeSky();     // 光晕/反光里烘了 accent 色，重新烤一次
+    }
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：一整阵风扫过水面，倒影整片一起晃；句心同时被 accent 光晕罩一下 */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    gustV += 0.55 + 0.75 * lv;
+    beatGlow = Math.min(1.1, beatGlow + 0.5 + lv * 0.55);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => {
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < cur.n; i++) {
+    if (cur.x[i] < mnX) mnX = cur.x[i]; if (cur.x[i] > mxX) mxX = cur.x[i];
+    if (cur.y[i] < mnY) mnY = cur.y[i]; if (cur.y[i] > mxY) mxY = cur.y[i];
+  }
+  return {
+    lines: lines.length, cur: curIdx, brew: brewIdx, t: +now().toFixed(2),
+    pts: cur.n, hy, songEnd, yrc: curYrc, lit: litN, rows: curText ? wrapText(curText).rows.length : 0,
+    scrBox: cur.n ? { x: mnX, y: mnY, w: mxX - mnX, h: mxY - mnY } : null
+  };
+};
+</script>
+</body>
+</html>

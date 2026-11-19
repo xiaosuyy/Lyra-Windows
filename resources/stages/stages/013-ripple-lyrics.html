@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>水波涟漪歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#04080b;overflow:hidden}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:2;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(140,235,230,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="gl"></canvas>
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   013 · 水波涟漪歌词 —— 封面沉在水下，字钉死在正中，水在字后面流
+   ----------------------------------------------------------------------------
+   按用户两轮反馈重做（旧版字被波揉碎、读不出来；后来又嫌字跟镜头一起往前跑）：
+   ① 背景不再是瓷砖 —— 专辑封面按 aspect-fill 铺满，当水底看；
+      水面用封面折射 + 焦散 + 高光 + 暗角，再加一条压暗的横带托住歌词。
+   ② 字完全静止 —— 粒子槽位就是最终位置，px/py 直接等于槽位（位移场整张删掉）；
+      位置也不再按句换锚点，整首都在画面正中，换句只换字形。
+   ③ 动的东西全给背景 —— 封面缓慢漂移 + 呼吸式微变焦（camDrift / camZoom）、
+      涌浪、以及从**字下方**落下的涟漪；踩拍的亮闪也只打在水面上（u_kick）。
+      于是字是离镜头最近的一层，水在它后面流 —— 视差 = 空间感。
+   ④ 字形加一层预烘的模糊黑影子/暗底，白封面上也能一眼读完。
+   ⑤ 涟漪相位 2.4rad/s（旧 8.5）、波长更长、落点不在字心 —— 慢、弱、不搅字。
+
+   波场（80×48 网格 + 双线性取样）现在只喂两件事：
+      · 背景水面的法线/高光（WebGL 片元里同一个公式、同一批涟漪）；
+      · 字的亮度 0.10 耦合（水路过时底子轻微亮暗，不产生位移）。
+   涟漪半径公式： h(d,age) = sin(d·k - age·ω) · amp / ((1+d·a)(1+age·b))
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const glc = document.getElementById('gl');
+let W = 1, H = 1, MN = 1, DPR = 1;
+
+let gl = null;
+try {
+  gl = glc.getContext('webgl', { antialias: false, alpha: false, depth: false })
+    || glc.getContext('experimental-webgl', { antialias: false, alpha: false, depth: false });
+} catch (_) { gl = null; }
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(1, window.innerWidth);
+  H = Math.max(1, window.innerHeight);
+  MN = Math.min(W, H);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (gl) {
+    /* 0.62：封面要能认出是什么，旧版 0.55 糊得像毛玻璃；再高就吃帧率 */
+    const s = Math.min(0.62, 1100 / W, 680 / H);
+    glc.width = Math.max(1, Math.round(W * s));
+    glc.height = Math.max(1, Math.round(H * s));
+    gl.viewport(0, 0, glc.width, glc.height);
+  }
+}
+
+/* ---------------------------- 背景：水面 ---------------------------- */
+const RMAX = 8;
+const VS = 'attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }';
+const FS = [
+  'precision mediump float;',
+  'uniform vec2 u_res;',
+  'uniform float u_time;',
+  'uniform sampler2D u_cover;',
+  'uniform float u_hasCover;',
+  'uniform vec2 u_coverScale;',
+  'uniform float u_kick;',
+  'uniform vec4 u_ripples[8];',
+  'float hash21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }',
+  /* 水面：环境涌浪很慢很浅；涟漪相位 2.4rad/s（旧版 8.5 —— 快得像鼓面，把字搅碎了）
+     注意：这里只驱动**背景**的起伏，字的位移耦合已经压到 1 像素级 */
+  'float surfaceHeight(vec2 p){',
+  '  float t = u_time;',
+  '  float h = sin(p.x*1.7 + t*0.30)*0.26',
+  '          + sin(p.y*2.2 - t*0.24)*0.22',
+  '          + sin((p.x+p.y)*1.1 + t*0.18)*0.16;',
+  '  for (int i = 0; i < 8; i++){',
+  '    vec4 r = u_ripples[i];',
+  '    float age = t - r.z;',
+  '    float act = step(0.0, age)*step(age, 6.5)*step(0.002, r.w);',
+  '    float d = distance(p, r.xy);',
+  '    h += sin(d*16.0 - age*2.4)*r.w*act/((1.0 + d*2.2)*(1.0 + age*0.8));',
+  '  }',
+  '  return h;',
+  '}',
+  /* 没有封面时的兜底：一片深水渐变（旧版是瓷砖，已经按需求去掉） */
+  'vec3 deepWater(vec2 p, float t){',
+  '  float g = 0.5 + 0.5*sin(p.x*0.9 + p.y*0.7 + t*0.05);',
+  '  vec3 col = mix(vec3(0.010,0.030,0.048), vec3(0.026,0.135,0.150), g);',
+  '  col += vec3(0.04,0.13,0.15)*pow(0.5 + 0.5*sin(p.y*2.2 - t*0.12), 4.0)*0.5;',
+  '  return col;',
+  '}',
+  /* 封面按比例铺满（aspect-fill），不拉伸、不留边 */
+  'vec3 coverColor(vec2 uv){',
+  '  vec2 tc = clamp(uv/u_coverScale*0.5 + 0.5, vec2(0.002), vec2(0.998));',
+  '  return texture2D(u_cover, tc).rgb;',
+  '}',
+  /* 镜头在水里慢慢浮：只作用于封面（背景），字不跟着走 —— 视差就是这么来的 */
+  'vec2 camDrift(float t){',
+  '  return vec2(0.011*sin(t*0.11), 0.009*sin(t*0.083 + 1.7));',
+  '}',
+  'float camZoom(float t){',
+  '  return 1.0 - 0.015*sin(t*0.07);',
+  '}',
+  'void main(){',
+  '  float mn = min(u_res.x, u_res.y);',
+  '  vec2 uv = (gl_FragCoord.xy*2.0 - u_res)/mn;',
+  '  vec2 p = uv*0.85;',
+  '  float e = 0.008;',
+  '  float h0 = surfaceHeight(p);',
+  '  vec3 n = normalize(vec3(',
+  '    -(surfaceHeight(p + vec2(e,0.0)) - h0)/e*0.030,',
+  '    -(surfaceHeight(p + vec2(0.0,e)) - h0)/e*0.030,',
+  '    1.0));',
+  /* 折射幅度压到旧版一半：封面可以轻微晃，字不能跟着散 */
+  '  vec2 refr = n.xy*0.024;',
+  '  vec3 under;',
+  '  if (u_hasCover > 0.5){',
+  '    vec2 cuv = (uv + camDrift(u_time))*camZoom(u_time);',
+  '    under.r = coverColor(cuv + refr*1.04).r;',
+  '    under.g = coverColor(cuv + refr).g;',
+  '    under.b = coverColor(cuv + refr*0.96).b;',
+  '    float lum = dot(under, vec3(0.299,0.587,0.114));',
+  '    under = mix(under, vec3(lum)*vec3(0.82,0.99,1.12), 0.18);',
+  '    under *= 0.62;',
+  '  } else {',
+  '    under = deepWater(p + refr, u_time);',
+  '  }',
+  '  float caustic = pow(0.5 + 0.5*sin(p.x*5.0 + u_time*0.30 + sin(p.y*4.0 - u_time*0.26)), 8.0);',
+  '  under += vec3(0.10,0.26,0.28)*caustic*0.14;',
+  '  vec3 L = normalize(vec3(-0.35,0.55,0.75));',
+  '  vec3 Hv = normalize(L + vec3(0.0,0.0,1.0));',
+  '  float spec = pow(max(dot(n,Hv),0.0), 80.0);',
+  '  under += vec3(0.62,0.86,0.95)*spec*(0.50 + 0.90*u_kick);',
+  '  float fres = pow(1.0 - max(n.z,0.0), 2.0);',
+  '  under += vec3(0.03,0.14,0.18)*fres*0.40;',
+  '  float d = length(uv*vec2(0.60,0.70));',
+  '  under *= 1.0 - 0.42*smoothstep(0.45,1.35,d);',
+  '  under *= 1.0 + 0.10*u_kick;',
+  /* 歌词那条水平带上再压一层暗：封面再亮，字也要能一眼读完 */
+  '  under *= 1.0 - 0.32*exp(-uv.y*uv.y*10.0);',
+  '  under *= 0.92;',
+  '  under += (hash21(gl_FragCoord.xy + u_time) - 0.5)*0.006;',
+  '  gl_FragColor = vec4(under, 1.0);',
+  '}'
+].join('\n');
+
+const uRip = new Float32Array(RMAX * 4);
+let uRes = null, uTime = null, uRipples = null;
+let uCover = null, uHasCover = null, uCoverScale = null, uKick = null;
+/* 封面：默认 1×1 深色，避免 sampler 拿到空纹理 */
+let coverTex = null, coverAR = 1, coverReady = false;
+let shaderErr = '';
+if (gl) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) shaderErr += gl.getShaderInfoLog(s) + ' ';
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    shaderErr += gl.getProgramInfoLog(prog) || 'link failed';
+    gl = null;
+  } else {
+    gl.useProgram(prog);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'a');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    uRes = gl.getUniformLocation(prog, 'u_res');
+    uTime = gl.getUniformLocation(prog, 'u_time');
+    uRipples = gl.getUniformLocation(prog, 'u_ripples[0]') || gl.getUniformLocation(prog, 'u_ripples');
+    uCover = gl.getUniformLocation(prog, 'u_cover');
+    uHasCover = gl.getUniformLocation(prog, 'u_hasCover');
+    uCoverScale = gl.getUniformLocation(prog, 'u_coverScale');
+    uKick = gl.getUniformLocation(prog, 'u_kick');
+    gl.clearColor(0.016, 0.055, 0.075, 1);
+    /* 占位纹理 */
+    coverTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, coverTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array([4, 14, 19]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+}
+
+/* 封面图：网易云外链有防盗链，走 /api/img 代理；同源图片直接用 */
+function coverSrc(u) {
+  if (!u) return '';
+  if (u.charAt(0) === '/') return u;
+  if (/^https?:\/\//i.test(u)) {
+    if (u.indexOf(location.origin) === 0) return u;
+    return '/api/img?url=' + encodeURIComponent(u.indexOf('?') >= 0 ? u : u + '?param=640y640');
+  }
+  return '';
+}
+function loadCover(u) {
+  const src = coverSrc(u);
+  if (!gl || !src) { coverReady = false; return; }
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    if (!gl || !coverTex) return;
+    gl.bindTexture(gl.TEXTURE_2D, coverTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    coverAR = (img.naturalWidth || img.width || 1) / (img.naturalHeight || img.height || 1);
+    coverReady = true;
+  };
+  img.onerror = () => { coverReady = false; };
+  img.src = src;
+}
+
+/* ---------------------------- 涟漪源（前景和背景共用） ---------------------------- */
+const rix = new Float32Array(RMAX), riy = new Float32Array(RMAX);
+const rit = new Float32Array(RMAX), ria = new Float32Array(RMAX);
+for (let i = 0; i < RMAX; i++) rit[i] = -99;
+let ripHead = 0, ripLast = -99, ripClock = 0;
+function addRipple(x, y, amp) {
+  rix[ripHead] = x; riy[ripHead] = y;
+  rit[ripHead] = ripClock; ria[ripHead] = amp;
+  ripHead = (ripHead + 1) % RMAX;
+}
+const toWorldX = (x) => ((2 * x - W) / MN) * 0.85;
+const toWorldY = (y) => ((H - 2 * y) / MN) * 0.85;
+
+/* 涟漪从哪儿起：字幕下方/两侧，**不从字心起**。
+   从画面正中扩散的圆环会被眼睛读成"镜头在往屏幕里飞"，字也就跟着往前跑了；
+   落点在字下面，水花只是从前景流过去，字是钉住的那一层。 */
+let ripSide = 1;
+function dropRipple(amp) {
+  ripSide = -ripSide;
+  const x = W * (0.5 + ripSide * (0.16 + Math.random() * 0.20));
+  const y = H * (0.70 + Math.random() * 0.22);
+  addRipple(x, y, amp);
+}
+
+/* ---------------------------- 波场网格 ---------------------------- */
+/* 只算"高度"一张表：字不再被波推着走（用户要的是字钉住、水在后头流），
+   所以位移场 gdx/gdy 整张删掉 —— 顺带省掉每帧 24000 次双线性取样。 */
+const DW = 80, DH = 48;
+let gcw = 1, gch = 1;
+const gh = new Float32Array(DW * DH);
+function buildWaveGrid(tw) {
+  gh.fill(0);
+  gcw = W / DW; gch = H / DH;
+  for (let r = 0; r < RMAX; r++) {
+    const amp = ria[r];
+    if (amp < 0.002) continue;
+    const age = tw - rit[r];
+    if (!(age >= 0 && age < 6.5)) continue;
+    const ax = rix[r], ay = riy[r];
+    /* 慢：2.6 rad/s（旧 8.5）；波长也更长（0.055 vs 0.085）—— 水面是缓的 */
+    const ph = -age * 2.6, envT = amp / (1 + age * 0.8);
+    for (let j = 0; j < DH; j++) {
+      const cy = (j + 0.5) * gch;
+      const dy0 = cy - ay;
+      const row = j * DW;
+      for (let i = 0; i < DW; i++) {
+        const dx0 = (i + 0.5) * gcw - ax;
+        const d = Math.sqrt(dx0 * dx0 + dy0 * dy0) + 1e-3;
+        gh[row + i] += Math.sin(d * 0.055 + ph) * envT / (1 + d * 0.0040);
+      }
+    }
+  }
+}
+function sampleGrid(arr, x, y) {
+  let fx = x / gcw - 0.5, fy = y / gch - 0.5;
+  if (fx < 0) fx = 0; else if (fx > DW - 1.001) fx = DW - 1.001;
+  if (fy < 0) fy = 0; else if (fy > DH - 1.001) fy = DH - 1.001;
+  const i0 = fx | 0, j0 = fy | 0, tx = fx - i0, ty = fy - j0;
+  const o = j0 * DW + i0, o2 = o + DW;
+  const a = arr[o], b = arr[o + 1], c = arr[o2], d = arr[o2 + 1];
+  const t0 = a + (b - a) * tx, t1 = c + (d - c) * tx;
+  return t0 + (t1 - t0) * ty;
+}
+
+/* ---------------------------- 粒子 ---------------------------- */
+const N = 12000;
+const px = new Float32Array(N), py = new Float32Array(N);
+const slx = new Float32Array(N), sly = new Float32Array(N);   // 静息槽位 = 字形
+const tint = new Float32Array(N);
+const cr2 = new Float32Array(N);                              // 每颗的明暗档位
+const cj = new Float32Array(N);                               // 静态景深抖动：让字有层次，不是一张平色卡
+for (let i = 0; i < N; i++) {
+  px[i] = Math.random() * W; py[i] = Math.random() * H;
+  cj[i] = (Math.random() * 0.30) - 0.06;
+}
+
+/* ---------------------------- 字形采样 ---------------------------- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+function glyphPoints(text, wantMax) {
+  const F = 96;
+  const maxW = Math.min(W * 0.78, 1300);
+  const font = (s) => '800 ' + s + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  octx.font = font(F);
+  let w = Math.ceil(octx.measureText(text).width) + 8;
+  const fs = w > maxW ? F * (maxW / w) : F;
+  octx.font = font(fs);
+  w = Math.ceil(octx.measureText(text).width) + 8;
+  const h = Math.ceil(fs * 1.35);
+  off.width = Math.max(8, w); off.height = Math.max(8, h);
+  octx.clearRect(0, 0, off.width, off.height);
+  octx.font = font(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(text, off.width / 2, off.height / 2);
+  /* 影子层：预烘一张模糊黑字。画在粒子下面，给字"压住"背景——
+     封面再亮（白色封面也有），字也有一圈暗底托着，读得清。一句只做一次。
+     模糊半径跟着字号走：长句字号小，影子也要小，否则糊成一片脏的。 */
+  const sc = document.createElement('canvas');
+  sc.width = off.width; sc.height = off.height;
+  const sctx = sc.getContext('2d');
+  sctx.font = font(fs);
+  sctx.textAlign = 'center'; sctx.textBaseline = 'middle';
+  sctx.filter = 'blur(' + Math.round(Math.min(26, Math.max(6, fs * 0.17))) + 'px)';
+  sctx.fillStyle = 'rgba(0,0,0,0.92)';
+  sctx.fillText(text, sc.width / 2, sc.height / 2);
+  sctx.filter = 'none';
+  const d = octx.getImageData(0, 0, off.width, off.height).data;
+  const ox = off.width, oy = off.height;
+  const rawX = [], rawY = [];
+  for (let y = 0; y < oy; y += 2)
+    for (let x = 0; x < ox; x += 2)
+      if (d[(y * ox + x) * 4 + 3] > 128) { rawX.push(x); rawY.push(y); }
+  const pc0 = rawX.length;
+  if (!pc0) return { pts: [], pc: 0, w: ox, h: oy };
+  let f = Math.ceil(Math.sqrt(pc0 / Math.max(1, wantMax)));
+  if (f < 1) f = 1;
+  const step = 2 * f;
+  const out = [];
+  for (let i = 0; i < pc0; i++) {
+    if (f > 1 && ((rawX[i] % step) !== 0 || (rawY[i] % step) !== 0)) continue;
+    out.push(rawX[i] - ox / 2, rawY[i] - oy / 2);
+  }
+  if (out.length < 2) for (let i = 0; i < pc0; i++) out.push(rawX[i] - ox / 2, rawY[i] - oy / 2);
+  return { pts: out, pc: out.length / 2, w: ox, h: oy, shadow: sc };
+}
+
+/* ---------------------------- 锚点：固定 ------------------------------------------------------------------
+   旧版每句从 96 个锚点里换一个位置，字在画面里跳来跳去，看几秒就晕。
+   现在整首就一个位置：画面正中。换句只是换字形，字形本身不挪窝。 */
+function centerAnchor(bx0, bx1, by0, by1) {
+  return {
+    x: W / 2 - (bx0 + bx1) / 2,
+    y: H / 2 - (by0 + by1) / 2
+  };
+}
+
+/* ------------------- 显示与酝酿分离 ------------------- */
+let prep = null;
+let glyphCX = 0, glyphCY = 0, glyphShadow = null;
+function prepare(i) {
+  if (i < 0 || !lines[i]) return null;
+  const g = glyphPoints(lines[i].text, N);
+  if (!g.pc) return null;
+  let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9;
+  for (let k = 0; k < g.pts.length; k += 2) {
+    if (g.pts[k] < bx0) bx0 = g.pts[k];
+    if (g.pts[k] > bx1) bx1 = g.pts[k];
+    if (g.pts[k + 1] < by0) by0 = g.pts[k + 1];
+    if (g.pts[k + 1] > by1) by1 = g.pts[k + 1];
+  }
+  return { i: i, pts: g.pts, pc: g.pc, bx0, bx1, by0, by1, shadow: g.shadow };
+}
+function commit(g) {
+  if (!g) return;
+  const A = centerAnchor(g.bx0, g.bx1, g.by0, g.by1);
+  glyphCX = A.x; glyphCY = A.y;
+  glyphShadow = g.shadow || null;
+  const pc = g.pc;
+  for (let i = 0; i < N; i++) {
+    /* 等间隔取样：i%pc 会把字压成一条带（坑⑥） */
+    const p = (Math.floor(i * pc / N) % pc) * 2;
+    slx[i] = A.x + g.pts[p];
+    sly[i] = A.y + g.pts[p + 1];
+    /* 一点点静态的深浅：水下不是均匀一片（幅度很小，别把字啃出洞） */
+    tint[i] = 0.045 * Math.sin(sly[i] * 0.010 + slx[i] * 0.004) + 0.030 * Math.cos(slx[i] * 0.013);
+  }
+  /* 句子落水：从字的下方激起一圈；幅度小到只当"呼吸" */
+  dropRipple(0.42);
+  kick = Math.max(kick, 0.16);
+}
+function clearParticles() {
+  for (let i = 0; i < N; i++) { slx[i] = Math.random() * W; sly[i] = Math.random() * H; px[i] = slx[i]; py[i] = sly[i]; }
+  prep = null;
+  glyphShadow = null;
+  for (let r = 0; r < RMAX; r++) ria[r] = 0;
+}
+
+/* ---------------------------- 节奏 ---------------------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+const hint = document.getElementById('hint');
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; prep = null;
+    clearParticles();
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    commit(prep && prep.i === ci ? prep : prepare(ci));   // 显示切换只发生在这里
+    prep = null;
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      prep = prepare(nx);                 // 只算字形点，不碰在演的粒子（坑①）
+    }
+  }
+}
+
+/* ---------------------------- 输入 ---------------------------- */
+let ptrX = -999, ptrY = -999, ptrDown = false, lastPX = -999, lastPY = -999;
+addEventListener('pointermove', (e) => {
+  ptrX = e.clientX; ptrY = e.clientY;
+}, { passive: true });
+addEventListener('pointerdown', (e) => {
+  ptrDown = true;
+  addRipple(e.clientX, e.clientY, 0.45);
+  ripLast = ripClock;
+}, { passive: true });
+addEventListener('pointerup', () => { ptrDown = false; }, { passive: true });
+
+let kick = 0;
+let rainTimer = 1.2;
+
+/* ---------------------------- 主循环 ---------------------------- */
+let last = performance.now();
+let t0 = 0, dtEma = 16, bgTick = 0;
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  dtEma += (dt * 1000 - dtEma) * 0.05;
+  ripClock = t0;
+  timing(now());
+  kick *= Math.exp(-dt * 3.0);
+
+  /* 手指/鼠标划过 → 连续造波（幅度很小，字不会跟着晃） */
+  if (ptrX > -900) {
+    if (ptrDown) {
+      if (t0 - ripLast > 0.20) { addRipple(ptrX, ptrY, 0.30); ripLast = t0; lastPX = ptrX; lastPY = ptrY; }
+    } else if (lastPX > -900 && Math.hypot(ptrX - lastPX, ptrY - lastPY) > 26 && t0 - ripLast > 0.18) {
+      addRipple(ptrX, ptrY, 0.14); ripLast = t0; lastPX = ptrX; lastPY = ptrY;
+    } else if (lastPX < -900) { lastPX = ptrX; lastPY = ptrY; }
+  }
+  /* 自己滴水：水面不能完全静下来；只在字幕下方落，字带保持安静 */
+  rainTimer -= dt;
+  if (rainTimer <= 0) {
+    rainTimer = 2.4 + Math.random() * 2.6;
+    addRipple(Math.random() * W, H * (0.64 + Math.random() * 0.32), 0.12 + Math.random() * 0.08);
+  }
+
+  buildWaveGrid(t0);
+
+  /* ---- 粒子：字钉死在槽位上，一像素都不挪 ----
+     用户要的是"字别跟镜头一起走"：动的东西全部交给后头的水面（封面漂移 +
+     涌浪 + 涟漪），字是离镜头最近的那一层，静止 = 空间感。
+     波场只留下 0.10 的亮度耦合，让水面路过时字底子有一点点亮暗起伏。 */
+  const breath = 0.02 * Math.sin(t0 * 0.45);
+  const hasLine = curIdx >= 0;
+  for (let i = 0; i < N; i++) {
+    const bx = slx[i], by = sly[i];
+    if (!hasLine) {
+      px[i] = bx + Math.sin(t0 * 0.6 + i) * 3;
+      py[i] = by + Math.cos(t0 * 0.5 + i) * 3;
+      continue;
+    }
+    px[i] = bx; py[i] = by;
+    const hh = sampleGrid(gh, bx, by);
+    /* 踩拍的亮度冲激不再打到字上（那是"字跟着鼓点闪"的来源），
+       全部交给背景水面的 u_kick —— 水闪、字不闪。 */
+    let v = 0.65 + cj[i] + hh * 0.10 + tint[i] + (glyphCY - by) * 0.0011 + breath;
+    cr2[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+  }
+
+  /* ---- 背景 ---- */
+  bgTick++;
+  const skipBg = dtEma > 21 && (bgTick & 1);
+  if (gl && !skipBg) {
+    for (let r = 0; r < RMAX; r++) {
+      const o = r * 4;
+      uRip[o] = toWorldX(rix[r]);
+      uRip[o + 1] = toWorldY(riy[r]);
+      uRip[o + 2] = rit[r];
+      const age = t0 - rit[r];
+      uRip[o + 3] = (age >= 0 && age < 5.5) ? ria[r] : 0;
+    }
+    gl.uniform2f(uRes, glc.width, glc.height);
+    gl.uniform1f(uTime, t0);
+    gl.uniform4fv(uRipples, uRip);
+    /* 封面按 aspect-fill 铺满：u_coverScale = 封面在 uv 空间里的半宽/半高 */
+    const sa = W / H, ca = coverAR || 1;
+    const cs = Math.max(1, sa / ca);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, coverTex);
+    gl.uniform1i(uCover, 0);
+    gl.uniform1f(uHasCover, coverReady ? 1 : 0);
+    gl.uniform2f(uCoverScale, ca * cs, cs);
+    gl.uniform1f(uKick, Math.min(1.4, kick * 2.2));
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    ctx.clearRect(0, 0, W, H);
+  } else if (!gl) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#04080b';
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    ctx.clearRect(0, 0, W, H);
+  }
+
+  /* ---- 影子：先压一层暗底，字才有重量、在亮封面上也读得清 ---- */
+  if (glyphShadow) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 0.30;
+    ctx.drawImage(glyphShadow, glyphCX - glyphShadow.width / 2, glyphCY - glyphShadow.height / 2);
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---- 绘制：6 档互斥合批（坑⑨⑩） ----
+     底档也抬到 0.26 不透明度：以前最暗那批几乎看不见，整句读不全。 */
+  ctx.globalCompositeOperation = 'lighter';
+  for (let b = 0; b < 6; b++) {
+    const q0 = b / 6, q1 = (b + 1) / 6;
+    const rr = Math.round(100 + q0 * 148);
+    const gg = Math.round(172 + q0 * 82);
+    const bb = Math.round(188 + q0 * 66);
+    const al = (0.42 + Math.pow(q0, 1.05) * 0.52).toFixed(3);
+    ctx.fillStyle = 'rgba(' + rr + ',' + gg + ',' + bb + ',' + al + ')';
+    const sz = 2.6 + q0 * 1.9;
+    const h2 = sz / 2;
+    for (let i = 0; i < N; i++) {
+      const c = cr2[i];
+      if (c < q0) continue;
+      if (b < 5 && c >= q1) continue;
+      const x = px[i], y = py[i];
+      if (x < -16 || x > W + 16 || y < -16 || y > H + 16) continue;
+      ctx.fillRect(x - h2, y - h2, sz, sz);
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+
+/* 窗口尺寸变了：槽位是按旧尺寸算的，重新按新尺寸排一次（换句才会重算） */
+let rzTimer = 0;
+addEventListener('resize', () => {
+  clearTimeout(rzTimer);
+  rzTimer = setTimeout(() => {
+    resize();
+    if (curIdx >= 0 && lines[curIdx]) commit(prepare(curIdx));
+  }, 140);
+});
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    clearParticles();
+    rainTimer = 0.9;
+    loadCover(p.song && p.song.cover);
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍落在字下方/侧边：水在动，字不动（逐颗随机踢会把字形打散，坑⑬） */
+    const lv = d.payload.level || 0;
+    if (curIdx >= 0) dropRipple(0.34 + lv * 0.20);
+    kick = Math.min(0.45, kick + 0.10 + lv * 0.18);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx, brewIdx, gl: !!gl, cover: coverReady, err: shaderErr, t: +now().toFixed(2),
+  rip: ria.filter((a, i) => t0 - rit[i] < 6.5).length
+});
+/* 调试用：字的亮度档位统计（验收时对一下"字自己会不会亮暗乱跳"） */
+window.__dbg = () => {
+  let s = 0, lo = 1, hi = 0;
+  for (let i = 0; i < N; i++) { s += cr2[i]; if (cr2[i] < lo) lo = cr2[i]; if (cr2[i] > hi) hi = cr2[i]; }
+  return { mean: +(s / N).toFixed(3), lo: +lo.toFixed(3), hi: +hi.toFixed(3), kick: +kick.toFixed(3), t0: +t0.toFixed(2) };
+};
+</script>
+</body>
+</html>

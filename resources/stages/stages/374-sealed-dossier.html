@@ -1,0 +1,1695 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>绝密批号</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#0e0c09; }
+  #stageCanvas { display:block; width:100%; height:100%; }
+</style>
+</head>
+<body>
+<canvas id="stageCanvas"></canvas>
+<script>
+"use strict";
+
+/* ===== 自检口：脚本最外层，无条件赋值，第一段 ===== */
+window.__stage = function () {
+  return {
+    lines: state.lines.length,
+    idx: state.currentIndex,
+    t: state.time,
+    playing: state.playing,
+    frames: state.frames,
+    js: state.frameCost,
+    err: "",
+    text: state.currentText,
+    gl: false,
+    rm: state.reducedMotion
+  };
+};
+
+var FONT_MONO = '"Courier New", "Consolas", ui-monospace, monospace';
+var FONT_CJK = '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif';
+var FONT_STAMP = '"Times New Roman", Georgia, serif';
+var FONT_MIX = '"Courier New", "Microsoft YaHei", "PingFang SC", monospace';
+
+var canvas = document.getElementById("stageCanvas");
+if (!canvas) {
+  canvas = document.createElement("canvas");
+  canvas.id = "stageCanvas";
+  document.body.appendChild(canvas);
+}
+var ctx = canvas.getContext("2d");
+if (!ctx) {
+  console.error("[374 sealed-dossier] 2D canvas context unavailable");
+}
+
+var state = {
+  lines: [],
+  currentIndex: -1,
+  currentText: "",
+  time: 0,
+  playing: true,
+  frames: 0,
+  frameCost: 0,
+  readySent: false,
+  accent: [188, 46, 34],
+  song: { name: "", artists: "", cover: "" },
+  duration: 0,
+  beatLevel: 0,
+  beatIndex: -1,
+  liveLevel: 0,
+  liveBass: 0,
+  reducedMotion: false,
+  hasInit: false
+};
+
+var view = { width: 1440, height: 900, dpr: 1 };
+var lastErrorAt = 0;
+
+var scene = {
+  step: 0,
+  paper: null,
+  print: null,
+  wire: null,
+  xray: null,
+  stamps: { secret: null, hazard: null, silent: null, received: null },
+  grainTile: null,
+  layout: null,
+  pulse: 0,
+  stampPulse: 0,
+  flicker: 0,
+  scanY: 0
+};
+
+var seedValue = 3741917;
+var layoutCache = {};
+
+function pseudoRandom() {
+  seedValue = (seedValue * 1664525 + 1013904223) % 4294967296;
+  return seedValue / 4294967296;
+}
+
+function resetSeed(value) {
+  seedValue = (value >>> 0) || 3741917;
+}
+
+function makeGrainTile(tileSize) {
+  var tile = document.createElement("canvas");
+  tile.width = tileSize;
+  tile.height = tileSize;
+  var tilePainter = tile.getContext("2d");
+  var image = tilePainter.createImageData(tileSize, tileSize);
+  var pixels = image.data;
+  for (var pixelIndex = 0; pixelIndex < tileSize * tileSize; pixelIndex++) {
+    var offset = pixelIndex * 4;
+    var grain = pseudoRandom();
+    pixels[offset] = 58 + grain * 96;
+    pixels[offset + 1] = 46 + grain * 84;
+    pixels[offset + 2] = 28 + grain * 62;
+    pixels[offset + 3] = 22 + grain * 40;
+  }
+  tilePainter.putImageData(image, 0, 0);
+  return tile;
+}
+
+function skyColor(alphaValue) {
+  return "rgba(46, 33, 16, " + Math.round(clamp01(alphaValue) * 1000) / 1000 + ")";
+}
+
+function paintStain(painter, centreX, centreY, radius, strength) {
+  if (!(radius > 1)) { return; }
+  try {
+    var gradient = painter.createRadialGradient(centreX, centreY, radius * 0.08, centreX, centreY, radius);
+    gradient.addColorStop(0, skyColor(0.11 * strength));
+    gradient.addColorStop(0.55, skyColor(0.07 * strength));
+    gradient.addColorStop(1, skyColor(0));
+    painter.fillStyle = gradient;
+    painter.beginPath();
+    painter.arc(centreX, centreY, radius, 0, Math.PI * 2);
+    painter.fill();
+  } catch (problem) {
+    reportError("paintStain", problem);
+  }
+}
+
+function computeLayout() {
+  var width = view.width;
+  var height = view.height;
+  var shortest = Math.min(width, height);
+  var margin = Math.max(14, Math.min(46, shortest * 0.042));
+  var narrow = width < 700;
+  var stripWidth = narrow ? 0 : Math.min(268, Math.max(152, width * 0.156));
+  var headerHeight = narrow ? 58 : 84;
+  var footerHeight = narrow ? 88 : 58;
+  var bodyTop = margin + headerHeight + 12;
+  var bodyBottom = height - margin - footerHeight;
+  var stripX = width - margin - stripWidth;
+  var textLeft = margin + (narrow ? 0 : 44);
+  var textRight = narrow ? width - margin : stripX - margin * 0.8;
+  var hazardSize = narrow ? Math.min(104, width * 0.24) : Math.min(138, width * 0.11);
+  var layout = {
+    width: width,
+    height: height,
+    margin: margin,
+    narrow: narrow,
+    stripWidth: stripWidth,
+    stripX: stripX,
+    headerHeight: headerHeight,
+    footerHeight: footerHeight,
+    textLeft: textLeft,
+    textRight: textRight,
+    bodyTop: bodyTop,
+    bodyBottom: bodyBottom
+  };
+  layout.secret = {
+    x: width * (narrow ? 0.5 : 0.52),
+    y: margin + headerHeight + (narrow ? 48 : 78),
+    width: Math.min(width * (narrow ? 0.74 : 0.34), narrow ? 420 : 560),
+    rotation: -0.1
+  };
+  layout.hazard = {
+    x: narrow ? width - margin - hazardSize * 0.52 : stripX + stripWidth * 0.52,
+    y: narrow ? height - margin - footerHeight - Math.min(118, height * 0.14) * 0.45 : bodyBottom - hazardSize * 0.42,
+    size: hazardSize,
+    rotation: 0.14
+  };
+  if (narrow) {
+    layout.xray = {
+      x: margin,
+      y: height - margin - footerHeight - Math.min(118, height * 0.14) - 6,
+      width: width - margin * 2,
+      height: Math.min(118, height * 0.14),
+      horizontal: true
+    };
+    layout.lyric = {
+      x: textLeft,
+      y: margin + headerHeight + 46,
+      width: textRight - textLeft,
+      height: Math.max(80, layout.xray.y - 22 - (margin + headerHeight + 46))
+    };
+  } else {
+    layout.xray = {
+      x: stripX,
+      y: bodyTop + 6,
+      width: stripWidth,
+      height: bodyBottom - bodyTop - 6,
+      horizontal: false
+    };
+    layout.lyric = {
+      x: textLeft,
+      y: bodyTop + 52,
+      width: textRight - textLeft,
+      height: Math.max(120, bodyBottom - bodyTop - 76)
+    };
+  }
+  layout.footer = {
+    x: margin,
+    y: height - margin - footerHeight + 10,
+    width: width - margin * 2
+  };
+  return layout;
+}
+
+function bakePaper(part) {
+  var ratio = view.dpr;
+  var layer = scene.paper;
+  if (part === "base" || !layer) {
+    layer = document.createElement("canvas");
+    layer.width = Math.max(1, Math.round(view.width * ratio));
+    layer.height = Math.max(1, Math.round(view.height * ratio));
+    scene.paper = layer;
+    scene.step = 1;
+  }
+  var painter = layer.getContext("2d");
+  painter.setTransform(ratio, 0, 0, ratio, 0, 0);
+  var width = view.width;
+  var height = view.height;
+
+  if (part === "base") {
+    resetSeed(3741917);
+    painter.fillStyle = "#b89b74";
+    painter.fillRect(0, 0, width, height);
+
+    try {
+      var baseWash = painter.createLinearGradient(0, 0, width * 0.6, height);
+      baseWash.addColorStop(0, "rgba(214, 190, 152, 0.55)");
+      baseWash.addColorStop(0.45, "rgba(184, 155, 116, 0.18)");
+      baseWash.addColorStop(1, "rgba(126, 99, 62, 0.42)");
+      painter.fillStyle = baseWash;
+      painter.fillRect(0, 0, width, height);
+    } catch (problem) {
+      reportError("bakePaper.wash", problem);
+    }
+
+    var stainCount = Math.min(14, Math.max(5, Math.round((width * height) / 190000)));
+    for (var stainIndex = 0; stainIndex < stainCount; stainIndex++) {
+      var stainRadius = Math.min(width, height) * (0.12 + pseudoRandom() * 0.4);
+      paintStain(painter, pseudoRandom() * width, pseudoRandom() * height, stainRadius, 0.6 + pseudoRandom());
+    }
+    scene.step = 1;
+    return;
+  }
+
+  if (!scene.grainTile) { scene.grainTile = makeGrainTile(128); }
+  try {
+    var grainPattern = painter.createPattern(scene.grainTile, "repeat");
+    if (grainPattern) {
+      painter.globalAlpha = 0.55;
+      painter.fillStyle = grainPattern;
+      painter.fillRect(0, 0, width, height);
+      painter.globalAlpha = 1;
+    }
+  } catch (problem) {
+    reportError("bakePaper.grain", problem);
+  }
+
+  var fiberCount = Math.min(1100, Math.max(320, Math.round((width * height) / 1600)));
+  painter.lineWidth = 1;
+  painter.globalAlpha = 0.16;
+  for (var fiberIndex = 0; fiberIndex < fiberCount; fiberIndex++) {
+    var fiberX = pseudoRandom() * width;
+    var fiberY = pseudoRandom() * height;
+    var fiberLength = 3 + pseudoRandom() * 16;
+    painter.strokeStyle = pseudoRandom() > 0.5 ? "rgba(84, 62, 33, 0.6)" : "rgba(226, 205, 170, 0.5)";
+    painter.beginPath();
+    painter.moveTo(fiberX, fiberY);
+    painter.lineTo(fiberX + fiberLength, fiberY + (pseudoRandom() - 0.5) * 3);
+    painter.stroke();
+  }
+  painter.globalAlpha = 1;
+
+  // 油污拖痕：一批斜向半透明条带
+  for (var smearIndex = 0; smearIndex < 6; smearIndex++) {
+    var smearX = pseudoRandom() * width;
+    var smearY = height * (0.1 + pseudoRandom() * 0.8);
+    var smearWidth = width * (0.16 + pseudoRandom() * 0.3);
+    var smearHeight = 6 + pseudoRandom() * 26;
+    painter.save();
+    painter.translate(smearX, smearY);
+    painter.rotate((pseudoRandom() - 0.5) * 0.9);
+    try {
+      var smear = painter.createLinearGradient(0, 0, smearWidth, 0);
+      smear.addColorStop(0, "rgba(58, 40, 18, 0)");
+      smear.addColorStop(0.4, "rgba(58, 40, 18, 0.13)");
+      smear.addColorStop(1, "rgba(58, 40, 18, 0)");
+      painter.fillStyle = smear;
+      painter.fillRect(0, 0, smearWidth, smearHeight);
+    } catch (problem) {
+      reportError("bakePaper.smear", problem);
+    }
+    painter.restore();
+  }
+
+  // 折痕：两条贯穿的明暗线
+  try {
+    var creaseY = height * 0.335;
+    var crease = painter.createLinearGradient(0, creaseY - 7, 0, creaseY + 7);
+    crease.addColorStop(0, "rgba(255, 245, 220, 0)");
+    crease.addColorStop(0.45, "rgba(255, 246, 224, 0.3)");
+    crease.addColorStop(0.55, "rgba(74, 53, 27, 0.22)");
+    crease.addColorStop(1, "rgba(74, 53, 27, 0)");
+    painter.fillStyle = crease;
+    painter.fillRect(0, creaseY - 7, width, 14);
+
+    var creaseX = width * 0.285;
+    var creaseV = painter.createLinearGradient(creaseX - 6, 0, creaseX + 6, 0);
+    creaseV.addColorStop(0, "rgba(255, 245, 220, 0)");
+    creaseV.addColorStop(0.45, "rgba(255, 246, 224, 0.22)");
+    creaseV.addColorStop(0.55, "rgba(74, 53, 27, 0.18)");
+    creaseV.addColorStop(1, "rgba(74, 53, 27, 0)");
+    painter.fillStyle = creaseV;
+    painter.fillRect(creaseX - 6, 0, 12, height);
+  } catch (problem) {
+    reportError("bakePaper.crease", problem);
+  }
+
+  // 边缘锈斑与暗角
+  try {
+    var edgeShade = painter.createRadialGradient(width * 0.5, height * 0.46, Math.min(width, height) * 0.22, width * 0.5, height * 0.5, Math.max(width, height) * 0.78);
+    edgeShade.addColorStop(0, "rgba(40, 26, 10, 0)");
+    edgeShade.addColorStop(0.72, "rgba(40, 26, 10, 0.18)");
+    edgeShade.addColorStop(1, "rgba(28, 18, 6, 0.55)");
+    painter.fillStyle = edgeShade;
+    painter.fillRect(0, 0, width, height);
+  } catch (problem) {
+    reportError("bakePaper.edge", problem);
+  }
+
+  var rustCount = Math.min(10, Math.max(4, Math.round(width / 260)));
+  for (var rustIndex = 0; rustIndex < rustCount; rustIndex++) {
+    var rustOnLeft = pseudoRandom() > 0.5;
+    var rustX = rustOnLeft ? pseudoRandom() * width * 0.12 : width - pseudoRandom() * width * 0.12;
+    var rustY = pseudoRandom() * height;
+    var rustRadius = Math.min(width, height) * (0.03 + pseudoRandom() * 0.1);
+    try {
+      var rustGradient = painter.createRadialGradient(rustX, rustY, rustRadius * 0.15, rustX, rustY, rustRadius);
+      rustGradient.addColorStop(0, "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", 0.26)");
+      rustGradient.addColorStop(0.5, "rgba(104, 54, 24, 0.2)");
+      rustGradient.addColorStop(1, "rgba(104, 54, 24, 0)");
+      painter.fillStyle = rustGradient;
+      painter.beginPath();
+      painter.arc(rustX, rustY, rustRadius, 0, Math.PI * 2);
+      painter.fill();
+    } catch (problem) {
+      reportError("bakePaper.rust", problem);
+    }
+  }
+  scene.step = 2;
+}
+
+function hashText(sourceText) {
+  var hash = 2166136261;
+  var safeText = String(sourceText || "");
+  for (var letterIndex = 0; letterIndex < safeText.length; letterIndex++) {
+    hash ^= safeText.charCodeAt(letterIndex);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function batchCode() {
+  var seedSource = (state.song.name || "") + "|" + (state.song.artists || "");
+  var hash = hashText(seedSource || "unknown-subject");
+  var digits = String(hash % 90000 + 10000);
+  var suffix = "ABCDEFGH"[hash % 8];
+  return "374-" + digits + "-" + suffix;
+}
+
+function drawTracked(painter, text, startX, baselineY, sizePx, trackingPx, colorText, weight) {
+  painter.font = (weight || "400") + " " + Math.round(sizePx) + "px " + FONT_MONO;
+  painter.fillStyle = colorText;
+  painter.textAlign = "left";
+  painter.textBaseline = "alphabetic";
+  var cursorX = startX;
+  var safeText = String(text || "");
+  for (var glyphIndex = 0; glyphIndex < safeText.length; glyphIndex++) {
+    var glyph = safeText.charAt(glyphIndex);
+    painter.fillText(glyph, cursorX, baselineY);
+    cursorX += painter.measureText(glyph).width + trackingPx;
+  }
+  return cursorX;
+}
+
+function fitToWidth(painter, text, maxWidth, fontSpec) {
+  painter.font = fontSpec;
+  var safeText = String(text || "");
+  if (painter.measureText(safeText).width <= maxWidth) { return safeText; }
+  var trimmed = safeText;
+  var guardCount = 0;
+  while (trimmed.length > 1 && painter.measureText(trimmed + "…").width > maxWidth && guardCount < 200) {
+    trimmed = trimmed.slice(0, -1);
+    guardCount += 1;
+  }
+  return trimmed + "…";
+}
+
+function paintBarcode(painter, originX, originY, totalWidth, barHeight, inkColor) {
+  var cursorX = originX;
+  painter.fillStyle = inkColor;
+  var guard = 0;
+  for (var barIndex = 0; barIndex < 90; barIndex++) {
+    if (cursorX > originX + totalWidth - 1 || guard > 400) { break; }
+    var barWidth = 1 + Math.floor(pseudoRandom() * 3);
+    var gapWidth = 1 + Math.floor(pseudoRandom() * 3);
+    if (barIndex % 7 === 0) { barWidth += 1; }
+    painter.fillRect(cursorX, originY, barWidth, barHeight);
+    cursorX += barWidth + gapWidth;
+    guard += barWidth + gapWidth;
+  }
+  painter.strokeStyle = inkColor;
+  painter.lineWidth = 1;
+  painter.strokeRect(originX - 4, originY - 4, totalWidth + 8, barHeight + 8);
+}
+
+function bakePrint() {
+  var layout = scene.layout;
+  var ratio = view.dpr;
+  var layer = document.createElement("canvas");
+  layer.width = Math.max(1, Math.round(layout.width * ratio));
+  layer.height = Math.max(1, Math.round(layout.height * ratio));
+  var painter = layer.getContext("2d");
+  painter.setTransform(ratio, 0, 0, ratio, 0, 0);
+  resetSeed(90210);
+
+  var shortest = Math.min(layout.width, layout.height);
+  var labelSize = Math.max(9.5, Math.min(14, shortest * 0.0135));
+  var ink = "rgba(38, 27, 15, 0.8)";
+  var faintInk = "rgba(38, 27, 15, 0.42)";
+  var accentInk = "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", 0.72)";
+  var headerTop = layout.margin;
+  var headerBottom = layout.margin + layout.headerHeight;
+  var textRight = layout.textRight;
+  var textLeft = layout.textLeft;
+
+  // 抬头：部门 / 表单号
+  drawTracked(painter, "DEPT. OF ACOUSTIC HYGIENE", textLeft, headerTop + labelSize, labelSize, labelSize * 0.16, ink, "700");
+  painter.font = "700 " + Math.round(labelSize) + "px " + FONT_MONO;
+  painter.fillStyle = faintInk;
+  painter.textAlign = "right";
+  painter.fillText("FORM 374-B  /  REV. 1963", textRight, headerTop + labelSize);
+
+  var subjectSize = Math.max(12, Math.min(19, shortest * 0.019));
+  var subjectBase = headerTop + (layout.narrow ? labelSize * 2.4 : labelSize * 2.2);
+  var subjectValue = (state.song.name || "UNIDENTIFIED SUBJECT").toUpperCase();
+  var subjectSuffix = layout.narrow ? "" : (state.song.artists ? "  /  " + state.song.artists.toUpperCase() : "");
+  var subjectRoom = (textRight - textLeft) * (layout.narrow ? 0.56 : 0.62);
+  painter.textAlign = "left";
+  painter.font = "400 " + Math.round(labelSize * 0.92) + "px " + FONT_MONO;
+  painter.fillStyle = faintInk;
+  if (!layout.narrow) {
+    painter.fillText("SUBJECT / 受检对象", textLeft, headerTop + labelSize * 2.15);
+    painter.textAlign = "right";
+    painter.fillStyle = accentInk;
+    painter.font = "700 " + Math.round(labelSize * 0.92) + "px " + FONT_MONO;
+    painter.fillText("CLASSIFIED // NO FOREIGN DISSEM", textRight, headerTop + labelSize * 2.15);
+  }
+
+  painter.textAlign = "left";
+  painter.font = "700 " + Math.round(subjectSize) + "px " + FONT_CJK;
+  painter.fillStyle = ink;
+  var subjectLine = fitToWidth(painter, subjectValue + subjectSuffix, subjectRoom, "700 " + Math.round(subjectSize) + "px " + FONT_CJK);
+  painter.fillText(subjectLine, textLeft, subjectBase + subjectSize);
+
+  painter.textAlign = "right";
+  painter.font = "700 " + Math.round(labelSize) + "px " + FONT_MONO;
+  painter.fillStyle = ink;
+  painter.fillText("BATCH " + batchCode(), textRight, subjectBase + subjectSize);
+
+  // 抬头下的双线
+  painter.strokeStyle = "rgba(52, 38, 20, 0.62)";
+  painter.lineWidth = 1.6;
+  painter.beginPath();
+  painter.moveTo(layout.margin, headerBottom);
+  painter.lineTo(layout.width - layout.margin, headerBottom);
+  painter.stroke();
+  painter.lineWidth = 0.8;
+  painter.beginPath();
+  painter.moveTo(layout.margin, headerBottom + 3.5);
+  painter.lineTo(layout.width - layout.margin, headerBottom + 3.5);
+  painter.stroke();
+
+  // 小节标题：VOICE TRANSCRIPT
+  var sectionSize = Math.max(13, Math.min(21, shortest * 0.021));
+  var sectionY = layout.bodyTop + sectionSize;
+  var sectionEndX = drawTracked(painter, "VOICE TRANSCRIPT", layout.lyric.x, sectionY, sectionSize, sectionSize * 0.16, ink, "700");
+  painter.textAlign = "left";
+  painter.font = "700 " + Math.round(sectionSize * 0.74) + "px " + FONT_CJK;
+  painter.fillStyle = faintInk;
+  painter.fillText("声纹转录 · 逐字对照", sectionEndX + sectionSize * 0.5, sectionY + 1);
+
+  painter.strokeStyle = "rgba(52, 38, 20, 0.4)";
+  painter.lineWidth = 1;
+  painter.beginPath();
+  painter.moveTo(layout.lyric.x, sectionY + sectionSize * 0.62);
+  painter.lineTo(layout.textRight, sectionY + sectionSize * 0.62);
+  painter.stroke();
+
+  // 左侧竖排标签
+  if (!layout.narrow) {
+    painter.save();
+    painter.translate(layout.margin + 14, layout.lyric.y + layout.lyric.height * 0.28);
+    painter.rotate(-Math.PI / 2);
+    drawTracked(painter, "EYES ONLY · 仅限本人", 0, 0, labelSize * 0.95, labelSize * 0.2, faintInk, "700");
+    painter.restore();
+  }
+
+  // 页脚：双线 + 销毁指令 + 条码
+  var footerY = layout.height - layout.margin - layout.footerHeight;
+  painter.strokeStyle = "rgba(52, 38, 20, 0.55)";
+  painter.lineWidth = 0.8;
+  painter.beginPath();
+  painter.moveTo(layout.margin, footerY);
+  painter.lineTo(layout.width - layout.margin, footerY);
+  painter.stroke();
+  painter.lineWidth = 1.6;
+  painter.beginPath();
+  painter.moveTo(layout.margin, footerY + 4);
+  painter.lineTo(layout.width - layout.margin, footerY + 4);
+  painter.stroke();
+
+  painter.textAlign = "left";
+  painter.font = "700 " + Math.round(labelSize) + "px " + FONT_MONO;
+  painter.fillStyle = ink;
+  painter.fillText("DESTROY AFTER READING", layout.margin, footerY + labelSize * 2);
+  painter.font = "700 " + Math.round(labelSize * 1.05) + "px " + FONT_CJK;
+  painter.fillStyle = accentInk;
+  painter.fillText("阅后即焚", layout.margin, footerY + labelSize * 3.4);
+
+  var barcodeWidth = Math.min(168, layout.width * 0.16);
+  var barcodeHeight = Math.max(16, Math.min(26, layout.footerHeight * 0.3));
+  paintBarcode(painter, layout.width - layout.margin - barcodeWidth, footerY + 14, barcodeWidth, barcodeHeight, "rgba(38, 27, 15, 0.7)");
+  painter.textAlign = "right";
+  painter.font = "400 " + Math.round(labelSize * 0.82) + "px " + FONT_MONO;
+  painter.fillStyle = faintInk;
+  painter.fillText(batchCode() + " · " + (state.lines.length || 0) + " LINES", layout.width - layout.margin, footerY + 14 + barcodeHeight + labelSize * 1.05);
+
+  // 正文与胶片栏之间的分栏线
+  if (!layout.narrow) {
+    var dividerX = layout.textRight + layout.margin * 0.24;
+    painter.strokeStyle = "rgba(52, 38, 20, 0.32)";
+    painter.lineWidth = 1;
+    painter.beginPath();
+    painter.moveTo(dividerX, layout.bodyTop + 8);
+    painter.lineTo(dividerX, layout.bodyBottom - 4);
+    painter.stroke();
+    painter.strokeStyle = "rgba(52, 38, 20, 0.16)";
+    painter.beginPath();
+    painter.moveTo(dividerX + 3, layout.bodyTop + 8);
+    painter.lineTo(dividerX + 3, layout.bodyBottom - 4);
+    painter.stroke();
+  }
+
+  scene.print = layer;
+  if (scene.step < 3) { scene.step = 3; }
+}
+
+function bakeWire() {
+  var layout = scene.layout;
+  var ratio = view.dpr;
+  var layer = document.createElement("canvas");
+  layer.width = Math.max(1, Math.round(layout.width * ratio));
+  layer.height = Math.max(1, Math.round(layout.height * ratio));
+  var painter = layer.getContext("2d");
+  painter.setTransform(ratio, 0, 0, ratio, 0, 0);
+  resetSeed(515151);
+
+  var wireHeight = layout.height * 0.135;
+  var segments = 54;
+  var points = [];
+  for (var stepIndex = 0; stepIndex <= segments; stepIndex++) {
+    var progress = stepIndex / segments;
+    var pointX = -8 + (layout.width + 16) * progress;
+    var sagCurve = Math.sin(Math.PI * progress) * wireHeight * 0.09;
+    var wobble = Math.sin(progress * Math.PI * 5.2) * 2.6 + Math.sin(progress * Math.PI * 13.0) * 0.9;
+    points.push({ x: pointX, y: wireHeight + sagCurve + wobble + (progress - 0.5) * wireHeight * 0.1 });
+  }
+
+  function strokeWire(pointsList, offsetX, offsetY, thickness, colorValue) {
+    painter.strokeStyle = colorValue;
+    painter.lineWidth = thickness;
+    painter.lineJoin = "round";
+    painter.lineCap = "round";
+    if (!beginPathSafely(painter)) { return; }
+    painter.moveTo(pointsList[0].x + offsetX, pointsList[0].y + offsetY);
+    for (var pointIndex = 1; pointIndex < pointsList.length; pointIndex++) {
+      painter.lineTo(pointsList[pointIndex].x + offsetX, pointsList[pointIndex].y + offsetY);
+    }
+    painter.stroke();
+  }
+
+  // 铁丝网：投影 → 锈色主体 → 高光
+  strokeWire(points, 2.5, 3.2, 5.2, "rgba(44, 28, 12, 0.3)");
+  strokeWire(points, 0, 0, 4.2, "rgba(86, 46, 22, 0.82)");
+  strokeWire(points, -0.6, -1.4, 1.5, "rgba(206, 168, 118, 0.6)");
+
+  // 倒刺：每 4 段一处，X 形交叉 + 扭转短线
+  for (var barbIndex = 5; barbIndex < segments - 3; barbIndex += 4) {
+    var anchor = points[barbIndex];
+    var nextAnchor = points[Math.min(barbIndex + 1, segments)];
+    var heading = Math.atan2(nextAnchor.y - anchor.y, nextAnchor.x - anchor.x);
+    painter.save();
+    painter.translate(anchor.x, anchor.y);
+    painter.rotate(heading);
+    painter.strokeStyle = "rgba(96, 52, 24, 0.88)";
+    painter.lineWidth = 2.1;
+    painter.lineCap = "round";
+    for (var spikeIndex = 0; spikeIndex < 4; spikeIndex++) {
+      var spikeAngle = -Math.PI * 0.75 + spikeIndex * (Math.PI * 0.5);
+      painter.beginPath();
+      painter.moveTo(Math.cos(spikeAngle) * 1.4, Math.sin(spikeAngle) * 1.4);
+      painter.lineTo(Math.cos(spikeAngle) * 8.4, Math.sin(spikeAngle) * 8.4);
+      painter.stroke();
+    }
+    painter.strokeStyle = "rgba(214, 178, 128, 0.42)";
+    painter.lineWidth = 0.9;
+    painter.beginPath();
+    painter.arc(0, 0, 2.6, 0.2, Math.PI * 1.7);
+    painter.stroke();
+    painter.restore();
+  }
+
+  // 右下角一小段跨界铁丝
+  var cornerPoints = [];
+  var cornerSegments = 26;
+  for (var cornerIndex = 0; cornerIndex <= cornerSegments; cornerIndex++) {
+    var cornerProgress = cornerIndex / cornerSegments;
+    cornerPoints.push({
+      x: layout.width * (0.56 + cornerProgress * 0.52),
+      y: layout.height * (0.955 - cornerProgress * 0.12) + Math.sin(cornerProgress * Math.PI) * 8
+    });
+  }
+  strokeWire(cornerPoints, 2, 2.4, 3.4, "rgba(44, 28, 12, 0.22)");
+  strokeWire(cornerPoints, 0, 0, 2.8, "rgba(86, 46, 22, 0.7)");
+  strokeWire(cornerPoints, -0.5, -1, 1.1, "rgba(206, 168, 118, 0.45)");
+
+  scene.wire = layer;
+  scene.step = 4;
+}
+
+function bakeXray() {
+  var layout = scene.layout;
+  var plateLayout = layout.xray;
+  var ratio = view.dpr;
+  var plate = document.createElement("canvas");
+  plate.width = Math.max(2, Math.round(plateLayout.width * ratio));
+  plate.height = Math.max(2, Math.round(plateLayout.height * ratio));
+  var painter = plate.getContext("2d");
+  painter.setTransform(ratio, 0, 0, ratio, 0, 0);
+  var plateWidth = plateLayout.width;
+  var plateHeight = plateLayout.height;
+  resetSeed(270270);
+
+  painter.fillStyle = "#0b0c0b";
+  painter.fillRect(0, 0, plateWidth, plateHeight);
+
+  try {
+    var filmWash = painter.createRadialGradient(plateWidth * 0.5, plateHeight * 0.42, plateWidth * 0.05, plateWidth * 0.5, plateHeight * 0.5, plateHeight * 0.8);
+    filmWash.addColorStop(0, "rgba(126, 148, 138, 0.3)");
+    filmWash.addColorStop(0.45, "rgba(44, 56, 52, 0.24)");
+    filmWash.addColorStop(1, "rgba(4, 5, 4, 0.9)");
+    painter.fillStyle = filmWash;
+    painter.fillRect(0, 0, plateWidth, plateHeight);
+  } catch (problem) {
+    reportError("bakeXray.wash", problem);
+  }
+
+  // 脊柱
+  var spineX = plateWidth * 0.5;
+  var boneColor = "rgba(226, 226, 205, 0.5)";
+  painter.strokeStyle = boneColor;
+  painter.lineCap = "round";
+  var vertebraCount = 11;
+  var vertebraGap = plateHeight / (vertebraCount + 1.5);
+  for (var vertebraIndex = 0; vertebraIndex < vertebraCount; vertebraIndex++) {
+    var vertebraY = plateHeight * 0.1 + vertebraIndex * vertebraGap;
+    var vertebraWidth = plateWidth * (0.11 + 0.02 * Math.sin(vertebraIndex * 0.8));
+    painter.lineWidth = Math.max(1.6, plateWidth * 0.012);
+    painter.beginPath();
+    painter.moveTo(spineX - vertebraWidth * 0.5, vertebraY);
+    painter.quadraticCurveTo(spineX, vertebraY - vertebraWidth * 0.34, spineX + vertebraWidth * 0.5, vertebraY);
+    painter.quadraticCurveTo(spineX, vertebraY + vertebraWidth * 0.34, spineX - vertebraWidth * 0.5, vertebraY);
+    painter.stroke();
+
+    // 肋骨：由脊柱向两侧弯出
+    painter.lineWidth = Math.max(1.4, plateWidth * 0.008);
+    for (var ribSide = -1; ribSide <= 1; ribSide += 2) {
+      painter.beginPath();
+      painter.moveTo(spineX + ribSide * vertebraWidth * 0.55, vertebraY + vertebraWidth * 0.1);
+      painter.quadraticCurveTo(
+        spineX + ribSide * plateWidth * 0.34,
+        vertebraY + vertebraGap * 0.42,
+        spineX + ribSide * plateWidth * 0.52,
+        vertebraY + vertebraGap * (0.88 + 0.12 * Math.cos(vertebraIndex))
+      );
+      painter.stroke();
+    }
+  }
+
+  // 锁骨 / 肩胛一带的散线
+  painter.lineWidth = Math.max(1.2, plateWidth * 0.006);
+  for (var traceIndex = 0; traceIndex < 9; traceIndex++) {
+    var traceStartY = plateHeight * (0.08 + traceIndex * 0.095);
+    painter.beginPath();
+    painter.moveTo(plateWidth * (0.06 + pseudoRandom() * 0.1), traceStartY);
+    painter.quadraticCurveTo(plateWidth * 0.3, traceStartY + 14, plateWidth * (0.86 - pseudoRandom() * 0.12), traceStartY + 22);
+    painter.stroke();
+  }
+
+  // 胶片颗粒
+  if (!scene.grainTile) { scene.grainTile = makeGrainTile(128); }
+  try {
+    var filmGrain = painter.createPattern(scene.grainTile, "repeat");
+    if (filmGrain) {
+      painter.globalAlpha = 0.7;
+      painter.fillStyle = filmGrain;
+      painter.fillRect(0, 0, plateWidth, plateHeight);
+      painter.globalAlpha = 1;
+    }
+  } catch (problem) {
+    reportError("bakeXray.grain", problem);
+  }
+
+  // 片边标记、烧片角、齿孔
+  painter.strokeStyle = "rgba(198, 202, 186, 0.24)";
+  painter.lineWidth = 1;
+  painter.strokeRect(3.5, 3.5, plateWidth - 7, plateHeight - 7);
+  painter.font = "700 " + Math.max(8, Math.round(plateWidth * 0.052)) + "px " + FONT_MONO;
+  painter.fillStyle = "rgba(206, 210, 192, 0.42)";
+  painter.textAlign = "left";
+  painter.fillText("X-RAY / LAT-07", Math.max(8, plateWidth * 0.09), Math.max(14, plateHeight * 0.05));
+  painter.save();
+  painter.translate(plateWidth * 0.16, plateHeight * 0.92);
+  painter.rotate(-Math.PI / 2);
+  painter.fillText("SUBJECT 374 // FILM 03", 0, 0);
+  painter.restore();
+
+  for (var notchIndex = 0; notchIndex < 6; notchIndex++) {
+    painter.fillStyle = "rgba(10, 10, 9, 0.9)";
+    painter.fillRect(plateWidth - 7, plateHeight * (0.08 + notchIndex * 0.15), 7, Math.max(8, plateHeight * 0.05));
+  }
+
+  try {
+    var burnCorner = painter.createRadialGradient(plateWidth * 0.06, plateHeight * 0.97, 1, plateWidth * 0.06, plateHeight * 0.97, plateWidth * 0.42);
+    burnCorner.addColorStop(0, "rgba(236, 224, 198, 0.3)");
+    burnCorner.addColorStop(0.5, "rgba(214, 160, 96, 0.12)");
+    burnCorner.addColorStop(1, "rgba(214, 160, 96, 0)");
+    painter.fillStyle = burnCorner;
+    painter.fillRect(0, 0, plateWidth, plateHeight);
+  } catch (problem) {
+    reportError("bakeXray.burn", problem);
+  }
+
+  scene.xray = { canvas: plate, layout: plateLayout };
+  scene.step = 5;
+}
+
+function drawXrayOverlay() {
+  var xray = scene.xray;
+  if (!xray || !isPaintableLayer(xray.canvas)) { return; }
+  var plateLayout = xray.layout;
+  blitLayer(xray.canvas, plateLayout.x, plateLayout.y, plateLayout.width, plateLayout.height);
+
+  var glow = clamp01(state.liveBass * 0.55 + scene.pulse * 0.35);
+  ctx.save();
+  ctx.globalCompositeOperation = "screen";
+  try {
+    var sweep = ctx.createLinearGradient(0, plateLayout.y, 0, plateLayout.y + plateLayout.height);
+    var scanPosition = clamp01(scene.scanY);
+    sweep.addColorStop(0, "rgba(180, 255, 226, 0)");
+    sweep.addColorStop(Math.max(0, Math.min(0.9, scanPosition - 0.08)), "rgba(180, 255, 226, 0)");
+    sweep.addColorStop(Math.max(0.001, Math.min(0.95, scanPosition)), "rgba(196, 255, 232, " + (0.1 + glow * 0.22) + ")");
+    sweep.addColorStop(1, "rgba(180, 255, 226, 0)");
+    ctx.fillStyle = sweep;
+    ctx.fillRect(plateLayout.x, plateLayout.y, plateLayout.width, plateLayout.height);
+  } catch (problem) {
+    reportError("drawXrayOverlay.sweep", problem);
+  }
+  ctx.restore();
+
+  ctx.strokeStyle = "rgba(12, 10, 7, 0.85)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(plateLayout.x - 1, plateLayout.y - 1, plateLayout.width + 2, plateLayout.height + 2);
+  ctx.strokeStyle = "rgba(214, 190, 150, 0.22)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateLayout.x + 4, plateLayout.y + 4, plateLayout.width - 8, plateLayout.height - 8);
+
+  // 胶片夹：两枚铁夹
+  ctx.fillStyle = "rgba(30, 24, 16, 0.9)";
+  ctx.fillRect(plateLayout.x + plateLayout.width * 0.4, plateLayout.y - 5, plateLayout.width * 0.2, 7);
+  ctx.fillRect(plateLayout.x + plateLayout.width * 0.4, plateLayout.y + plateLayout.height - 2, plateLayout.width * 0.2, 7);
+}
+
+function createStampSurface(designWidth, designHeight, scaleFactor) {
+  var surface = document.createElement("canvas");
+  surface.width = Math.max(2, Math.round(designWidth * scaleFactor));
+  surface.height = Math.max(2, Math.round(designHeight * scaleFactor));
+  var painter = surface.getContext("2d");
+  painter.setTransform(scaleFactor, 0, 0, scaleFactor, 0, 0);
+  return { canvas: surface, painter: painter };
+}
+
+function erodeStamp(surfaceCanvas, strength) {
+  var painter = surfaceCanvas.getContext("2d");
+  var pixelWidth = surfaceCanvas.width;
+  var pixelHeight = surfaceCanvas.height;
+  painter.save();
+  painter.globalCompositeOperation = "destination-out";
+  var spotCount = Math.min(560, Math.max(120, Math.round(pixelWidth / 2.2)));
+  for (var spotIndex = 0; spotIndex < spotCount; spotIndex++) {
+    var spotX = pseudoRandom() * pixelWidth;
+    var spotY = pseudoRandom() * pixelHeight;
+    var spotRadius = 0.6 + pseudoRandom() * 3.4;
+    painter.fillStyle = "rgba(0, 0, 0, " + (0.16 + pseudoRandom() * 0.68) * strength + ")";
+    painter.beginPath();
+    painter.arc(spotX, spotY, spotRadius, 0, Math.PI * 2);
+    painter.fill();
+  }
+  if (scene.grainTile) {
+    try {
+      var grainPattern = painter.createPattern(scene.grainTile, "repeat");
+      if (grainPattern) {
+        painter.globalAlpha = 0.5 * strength;
+        painter.fillStyle = grainPattern;
+        painter.fillRect(0, 0, pixelWidth, pixelHeight);
+      }
+    } catch (problem) {
+      reportError("erodeStamp.grain", problem);
+    }
+  }
+  painter.globalAlpha = 1;
+  painter.restore();
+}
+
+function drawRingText(painter, text, radiusPx, centreX, centreY, sizePx, colorText, startAngle) {
+  painter.font = "700 " + Math.round(sizePx) + "px " + FONT_MONO;
+  painter.fillStyle = colorText;
+  painter.textAlign = "center";
+  painter.textBaseline = "middle";
+  var safeText = String(text || "");
+  var angleCursor = startAngle;
+  for (var glyphIndex = 0; glyphIndex < safeText.length; glyphIndex++) {
+    var glyph = safeText.charAt(glyphIndex);
+    var glyphWidth = painter.measureText(glyph).width;
+    var stepAngle = glyphWidth / radiusPx;
+    if (glyph !== " ") {
+      painter.save();
+      painter.translate(centreX + Math.cos(angleCursor) * radiusPx, centreY + Math.sin(angleCursor) * radiusPx);
+      painter.rotate(angleCursor + Math.PI / 2);
+      painter.fillText(glyph, 0, 0);
+      painter.restore();
+    }
+    angleCursor += stepAngle;
+  }
+}
+
+function bakeStamps(stampName) {
+  var scaleFactor = Math.min(2.2, Math.max(1.2, view.dpr * 1.15));
+
+  if (stampName === "secret") {
+    var secret = createStampSurface(880, 268, scaleFactor);
+    var secretPainter = secret.painter;
+    var secretInk = "rgba(168, 32, 24, 0.9)";
+    resetSeed(880011);
+    secretPainter.strokeStyle = secretInk;
+    secretPainter.lineWidth = 11;
+    secretPainter.strokeRect(14, 14, 880 - 28, 268 - 28);
+    secretPainter.lineWidth = 3;
+    secretPainter.strokeRect(34, 34, 880 - 68, 268 - 68);
+    secretPainter.fillStyle = secretInk;
+    secretPainter.font = "700 138px " + FONT_STAMP;
+    secretPainter.textAlign = "center";
+    secretPainter.textBaseline = "middle";
+    secretPainter.save();
+    secretPainter.translate(440, 132);
+    secretPainter.scale(1.06, 1);
+    secretPainter.fillText("TOP SECRET", 0, 0);
+    secretPainter.restore();
+    secretPainter.font = "700 32px " + FONT_CJK;
+    secretPainter.fillText("绝 密 · 无 权 查 阅", 440, 214);
+    secretPainter.font = "700 22px " + FONT_MONO;
+    secretPainter.textAlign = "left";
+    secretPainter.fillText("NO.374-B", 44, 58);
+    secretPainter.textAlign = "right";
+    secretPainter.fillText("DO NOT COPY", 836, 58);
+    erodeStamp(secret.canvas, 0.85);
+    scene.stamps.secret = secret;
+    scene.step = 6;
+    return;
+  }
+
+  if (stampName === "hazard") {
+    var hazard = createStampSurface(420, 420, scaleFactor);
+    var hazardPainter = hazard.painter;
+    var hazardInk = "rgba(158, 36, 26, 0.92)";
+    resetSeed(420420);
+    hazardPainter.strokeStyle = hazardInk;
+    hazardPainter.lineWidth = 10;
+    if (beginPathSafely(hazardPainter)) {
+      hazardPainter.arc(210, 210, 194, 0, Math.PI * 2);
+      hazardPainter.stroke();
+    }
+    hazardPainter.lineWidth = 3;
+    if (beginPathSafely(hazardPainter)) {
+      hazardPainter.arc(210, 210, 174, 0, Math.PI * 2);
+      hazardPainter.stroke();
+    }
+    hazardPainter.lineWidth = 2;
+    if (beginPathSafely(hazardPainter)) {
+      hazardPainter.arc(210, 210, 116, 0, Math.PI * 2);
+      hazardPainter.stroke();
+    }
+    drawRingText(hazardPainter, "BIOHAZARD · CLASS 4 · DO NOT OPEN ·", 156, 210, 210, 29, hazardInk, -Math.PI * 0.72);
+    hazardPainter.fillStyle = hazardInk;
+    hazardPainter.textAlign = "center";
+    hazardPainter.textBaseline = "middle";
+    hazardPainter.font = "700 58px " + FONT_CJK;
+    hazardPainter.fillText("生物危害", 210, 186);
+    hazardPainter.font = "700 27px " + FONT_MONO;
+    hazardPainter.fillText("CLASS 4", 210, 236);
+    hazardPainter.font = "700 20px " + FONT_MONO;
+    hazardPainter.fillText("374 / A-11", 210, 268);
+    hazardPainter.save();
+    hazardPainter.translate(210, 210);
+    hazardPainter.rotate(-0.42);
+    hazardPainter.fillRect(-198, -4, 396, 8);
+    hazardPainter.restore();
+    erodeStamp(hazard.canvas, 0.95);
+    scene.stamps.hazard = hazard;
+    scene.step = 7;
+    return;
+  }
+
+  if (stampName === "silent") {
+    var silent = createStampSurface(760, 250, scaleFactor);
+    var silentPainter = silent.painter;
+    var silentInk = "rgba(120, 34, 28, 0.82)";
+    resetSeed(760760);
+    silentPainter.strokeStyle = silentInk;
+    silentPainter.lineWidth = 9;
+    silentPainter.strokeRect(12, 12, 760 - 24, 250 - 24);
+    silentPainter.lineWidth = 2.5;
+    silentPainter.strokeRect(30, 30, 760 - 60, 250 - 60);
+    silentPainter.fillStyle = silentInk;
+    silentPainter.font = "700 74px " + FONT_STAMP;
+    silentPainter.textAlign = "center";
+    silentPainter.textBaseline = "middle";
+    silentPainter.fillText("NO TRANSCRIPT", 380, 104);
+    silentPainter.font = "700 40px " + FONT_CJK;
+    silentPainter.fillText("本卷未附语音记录", 380, 176);
+    silentPainter.font = "700 19px " + FONT_MONO;
+    silentPainter.fillText("SEALED / 374-B / NOTHING RECORDED", 380, 218);
+    erodeStamp(silent.canvas, 0.8);
+    scene.stamps.silent = silent;
+    scene.step = 8;
+    return;
+  }
+
+  // 收件章（冷蓝色，与红色印章对撞）
+  var received = createStampSurface(520, 168, scaleFactor);
+  var receivedPainter = received.painter;
+  var receivedInk = "rgba(34, 44, 68, 0.8)";
+  resetSeed(520520);
+  receivedPainter.strokeStyle = receivedInk;
+  receivedPainter.lineWidth = 6;
+  receivedPainter.strokeRect(9, 9, 520 - 18, 168 - 18);
+  receivedPainter.lineWidth = 2;
+  receivedPainter.strokeRect(22, 22, 520 - 44, 168 - 44);
+  receivedPainter.fillStyle = receivedInk;
+  receivedPainter.textAlign = "left";
+  receivedPainter.textBaseline = "middle";
+  receivedPainter.font = "700 52px " + FONT_STAMP;
+  receivedPainter.fillText("RECEIVED", 40, 62);
+  receivedPainter.font = "700 21px " + FONT_MONO;
+  receivedPainter.fillText("19 NOV 1963  04:12", 40, 104);
+  receivedPainter.textAlign = "right";
+  receivedPainter.fillText("DEPT. 08 / ARCHIVE", 480, 132);
+  erodeStamp(received.canvas, 0.62);
+  scene.stamps.received = received;
+  scene.step = 9;
+}
+
+function blitStamp(stampSurface, centreX, centreY, targetWidth, targetHeight, rotation, alphaValue) {
+  if (!stampSurface || !isPaintableLayer(stampSurface.canvas)) { return; }
+  ctx.save();
+  ctx.translate(centreX, centreY);
+  ctx.rotate(rotation || 0);
+  ctx.globalAlpha = clamp01(alphaValue === undefined ? 0.9 : alphaValue);
+  ctx.drawImage(stampSurface.canvas, -targetWidth / 2, -targetHeight / 2, targetWidth, targetHeight);
+  ctx.restore();
+}
+
+function ensureScene() {
+  try {
+    if (!scene.layout) { scene.layout = computeLayout(); }
+    if (scene.step < 1) { bakePaper("base"); return; }
+    if (scene.step < 2) { bakePaper("detail"); return; }
+    if (scene.step < 3) { bakePrint(); return; }
+    if (scene.step < 4) { bakeWire(); return; }
+    if (scene.step < 5) { bakeXray(); return; }
+    if (scene.step < 6) { bakeStamps("secret"); return; }
+    if (scene.step < 7) { bakeStamps("hazard"); return; }
+    if (scene.step < 8) { bakeStamps("silent"); return; }
+    if (scene.step < 9) { bakeStamps("received"); return; }
+  } catch (problem) {
+    reportError("ensureScene", problem);
+    if (!scene.paper) { scene.paper = makeFlatPaper(); }
+    scene.step = Math.max(scene.step, 2);
+  }
+}
+
+function makeFlatPaper() {
+  var ratio = view.dpr;
+  var layer = document.createElement("canvas");
+  layer.width = Math.max(1, Math.round(view.width * ratio));
+  layer.height = Math.max(1, Math.round(view.height * ratio));
+  var painter = layer.getContext("2d");
+  painter.setTransform(ratio, 0, 0, ratio, 0, 0);
+  painter.fillStyle = "#b89b74";
+  painter.fillRect(0, 0, view.width, view.height);
+  return layer;
+}
+
+function reportError(scope, problem) {
+  var nowMs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  try {
+    if (nowMs - lastErrorAt < 1000) { return; }
+    lastErrorAt = nowMs;
+    console.error("[374 sealed-dossier] " + scope, problem);
+  } catch (ignoredProblem) { /* console 本身不可用时无处可写 */ }
+}
+
+function toNumber(value, fallback) {
+  var parsed = typeof value === "number" ? value : parseFloat(value);
+  return (isFinite(parsed) ? parsed : fallback);
+}
+
+function clamp01(value) {
+  return value < 0 ? 0 : (value > 1 ? 1 : value);
+}
+
+function beginPathSafely(target) {
+  if (!target || typeof target.beginPath !== "function") { return false; }
+  target.beginPath();
+  return true;
+}
+
+function artistText(rawArtists) {
+  if (Array.isArray(rawArtists)) {
+    return rawArtists.filter(function (entry) { return typeof entry === "string" && entry; }).join(" / ");
+  }
+  return typeof rawArtists === "string" ? rawArtists : "";
+}
+
+function sanitizeColor(rawAccent) {
+  var fallback = [188, 46, 34];
+  if (!Array.isArray(rawAccent) || rawAccent.length < 3) { return fallback; }
+  var rounds = [];
+  for (var channelIndex = 0; channelIndex < 3; channelIndex++) {
+    var channelValue = Math.round(toNumber(rawAccent[channelIndex], fallback[channelIndex]));
+    rounds.push(channelValue < 0 ? 0 : (channelValue > 255 ? 255 : channelValue));
+  }
+  return rounds;
+}
+
+function indexAtTime(timeSeconds) {
+  var foundIndex = -1;
+  var lines = state.lines;
+  for (var lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    if (lines[lineIndex].start <= timeSeconds + 0.02) { foundIndex = lineIndex; } else { break; }
+  }
+  return foundIndex;
+}
+
+function refreshCurrentLine() {
+  var activeIndex = indexAtTime(state.time);
+  state.currentIndex = activeIndex;
+  state.currentText = activeIndex >= 0 ? state.lines[activeIndex].text : "";
+}
+
+function applyInit(payload) {
+  try {
+    var safePayload = payload && typeof payload === "object" ? payload : {};
+    var song = safePayload.song && typeof safePayload.song === "object" ? safePayload.song : {};
+    state.song = {
+      name: typeof song.name === "string" ? song.name : "",
+      artists: artistText(song.artists),
+      cover: typeof song.cover === "string" ? song.cover : ""
+    };
+    state.accent = sanitizeColor(safePayload.accent);
+    state.duration = Math.max(0, toNumber(safePayload.duration, 0));
+    var rawLines = Array.isArray(safePayload.lines) ? safePayload.lines : [];
+    var cleaned = [];
+    for (var rawIndex = 0; rawIndex < rawLines.length; rawIndex++) {
+      var rawLine = rawLines[rawIndex];
+      if (!rawLine || typeof rawLine !== "object") { continue; }
+      var bodyText = typeof rawLine.text === "string" ? rawLine.text : "";
+      var startTime = toNumber(rawLine.t, 0);
+      var rawChars = Array.isArray(rawLine.chars) ? rawLine.chars : null;
+      var chars = null;
+      if (rawChars) {
+        chars = [];
+        for (var charIndex = 0; charIndex < rawChars.length; charIndex++) {
+          var rawChar = rawChars[charIndex];
+          if (!rawChar) { continue; }
+          chars.push({
+            c: typeof rawChar.c === "string" ? rawChar.c : "",
+            t: toNumber(rawChar.t, startTime)
+          });
+        }
+        if (chars.length === 0) { chars = null; }
+      }
+      cleaned.push({
+        start: startTime,
+        dur: Math.max(0.2, toNumber(rawLine.dur, 3)),
+        text: bodyText,
+        chars: chars
+      });
+    }
+    cleaned.sort(function (left, right) { return left.start - right.start; });
+    state.lines = cleaned;
+    state.hasInit = true;
+    if (cleaned.length === 0) { state.time = 0; }
+    refreshCurrentLine();
+    scene.print = null;
+    layoutCache = {};
+  } catch (problem) {
+    reportError("applyInit", problem);
+  }
+}
+
+function applyTick(payload) {
+  try {
+    var safePayload = payload && typeof payload === "object" ? payload : {};
+    var incomingTime = toNumber(safePayload.time, state.time);
+    state.time = incomingTime;
+    if (typeof safePayload.playing === "boolean") { state.playing = safePayload.playing; }
+    refreshCurrentLine();
+  } catch (problem) {
+    reportError("applyTick", problem);
+  }
+}
+
+function postReady() {
+  if (state.readySent) { return; }
+  state.readySent = true;
+  try {
+    parent.postMessage({ __c100: 1, type: "ready" }, "*");
+  } catch (problem) {
+    reportError("postReady", problem);
+  }
+}
+
+function handleMessage(event) {
+  var message = event && event.data;
+  if (!message || typeof message !== "object" || message.__c100 !== 1) { return; }
+  var kind = message.type;
+  if (kind === "init") { applyInit(message.payload); }
+  else if (kind === "tick") { applyTick(message.payload); }
+  else if (kind === "beat") {
+    var beatPayload = message.payload || {};
+    state.beatIndex = toNumber(beatPayload.index, state.beatIndex);
+    state.beatLevel = clamp01(toNumber(beatPayload.level, 0));
+    scene.pulse = Math.max(scene.pulse, state.beatLevel);
+    scene.stampPulse = 1;
+  }
+  else if (kind === "live") {
+    var livePayload = message.payload || {};
+    state.liveLevel = clamp01(toNumber(livePayload.level, 0));
+    state.liveBass = clamp01(toNumber(livePayload.bass, 0));
+    if (typeof livePayload.playing === "boolean") { state.playing = livePayload.playing; }
+  }
+}
+
+function resizeCanvas() {
+  var rawWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  var rawHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  if (!isFinite(rawWidth) || rawWidth <= 0) { rawWidth = 1440; }
+  if (!isFinite(rawHeight) || rawHeight <= 0) { rawHeight = 900; }
+  var ratio = Math.min(window.devicePixelRatio || 1, 2);
+  var pixels = rawWidth * rawHeight;
+  if (pixels > 2600000) { ratio = Math.min(ratio, 1.5); }
+  view.width = rawWidth;
+  view.height = rawHeight;
+  view.dpr = ratio;
+  canvas.width = Math.max(1, Math.round(rawWidth * ratio));
+  canvas.height = Math.max(1, Math.round(rawHeight * ratio));
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  scene.step = 0;
+  scene.paper = null;
+  scene.xray = null;
+  scene.print = null;
+  scene.wire = null;
+  scene.layout = null;
+  scene.stamps = { secret: null, hazard: null, silent: null, received: null };
+  layoutCache = {};
+}
+
+function drawStandby() {
+  var layout = scene.layout || computeLayout();
+  ctx.fillStyle = "#b89b74";
+  ctx.fillRect(0, 0, layout.width, layout.height);
+}
+
+function isPaintableLayer(sourceLayer) {
+  return !!sourceLayer &&
+    typeof HTMLCanvasElement !== "undefined" &&
+    sourceLayer instanceof HTMLCanvasElement &&
+    sourceLayer.width > 0 &&
+    sourceLayer.height > 0;
+}
+
+function blitLayer(sourceLayer, destX, destY, destWidth, destHeight) {
+  if (!isPaintableLayer(sourceLayer)) { return false; }
+  try {
+    ctx.drawImage(sourceLayer, destX, destY, destWidth, destHeight);
+    return true;
+  } catch (problem) {
+    reportError("blitLayer", problem);
+    return false;
+  }
+}
+
+function updateDynamics(nowMs) {
+  var previousMs = scene.lastFrameMs || nowMs;
+  var deltaMs = Math.max(0, Math.min(120, nowMs - previousMs));
+  scene.lastFrameMs = nowMs;
+  if (state.reducedMotion) {
+    scene.pulse *= Math.exp(-deltaMs / 120);
+    scene.stampPulse *= Math.exp(-deltaMs / 120);
+    scene.scanY = 0.45;
+    return;
+  }
+  scene.pulse *= Math.exp(-deltaMs / 240);
+  scene.stampPulse *= Math.exp(-deltaMs / 260);
+  scene.scanY = (scene.scanY + deltaMs / 3600) % 1;
+}
+
+function drawStamps() {
+  var layout = scene.layout;
+  if (scene.stamps.secret) {
+    var secretWidth = layout.secret.width * (1 + scene.stampPulse * 0.018);
+    var secretHeight = secretWidth * (268 / 880);
+    var secretWobble = state.reducedMotion ? 0 : Math.sin(performance.now() * 0.0011) * 0.006;
+    blitStamp(scene.stamps.secret, layout.secret.x, layout.secret.y, secretWidth, secretHeight, layout.secret.rotation + secretWobble, 0.9);
+  }
+  if (scene.stamps.hazard) {
+    var hazardSize = layout.hazard.size;
+    blitStamp(scene.stamps.hazard, layout.hazard.x, layout.hazard.y, hazardSize, hazardSize, layout.hazard.rotation, 0.86);
+  }
+  if (scene.stamps.received && !layout.narrow) {
+    var receivedWidth = Math.min(250, layout.width * 0.17);
+    blitStamp(scene.stamps.received, layout.margin + receivedWidth * 0.62, layout.bodyBottom - receivedWidth * 0.2, receivedWidth, receivedWidth * 0.323, 0.055, 0.78);
+  }
+}
+
+function formatClock(secondsValue) {
+  var safeSeconds = isFinite(secondsValue) && secondsValue > 0 ? secondsValue : 0;
+  var minutes = Math.floor(safeSeconds / 60);
+  var seconds = Math.floor(safeSeconds % 60);
+  var tenths = Math.floor((safeSeconds * 10) % 10);
+  return (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds + "." + tenths;
+}
+
+function drawHud() {
+  var layout = scene.layout;
+  var footerY = layout.height - layout.margin - layout.footerHeight;
+  var hudX = layout.margin + (layout.width - layout.margin * 2) * 0.44;
+  if (layout.narrow) { hudX = layout.margin; }
+  var size = Math.max(9.5, Math.min(13, layout.height * 0.0145));
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.font = "700 " + Math.round(size) + "px " + FONT_MONO;
+  ctx.fillStyle = "rgba(28, 20, 11, 0.78)";
+  var clockText = "T+ " + formatClock(state.time) + " / " + formatClock(state.duration);
+  var clockY = layout.narrow ? footerY + layout.footerHeight - 8 : footerY + 26;
+  ctx.fillText(clockText, hudX, clockY);
+  var clockWidth = ctx.measureText(clockText).width;
+
+  var dotAlpha = state.playing ? (state.reducedMotion ? 0.9 : (0.45 + 0.55 * Math.abs(Math.sin(performance.now() * 0.0028)))) : 0.25;
+  ctx.fillStyle = "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", " + dotAlpha + ")";
+  var dotX = hudX + clockWidth + Math.max(14, size * 1.4);
+  var dotY = clockY - size * 0.38;
+  ctx.beginPath();
+  ctx.arc(dotX, dotY, Math.max(2.4, size * 0.26), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "rgba(28, 20, 11, 0.62)";
+  ctx.font = "700 " + Math.round(size * 0.86) + "px " + FONT_MONO;
+  ctx.fillText(state.playing ? "REC" : "HOLD", dotX + size * 1.05, dotY + size * 0.34);
+
+  // 归档进度：页脚红线
+  var ratio = state.duration > 0 ? clamp01(state.time / state.duration) : 0;
+  var floorY = footerY + layout.footerHeight - 3;
+  if (!layout.narrow) {
+    ctx.fillStyle = "rgba(40, 28, 14, 0.2)";
+    ctx.fillRect(layout.margin, floorY, layout.width - layout.margin * 2, 2);
+    ctx.fillStyle = "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", 0.85)";
+    ctx.fillRect(layout.margin, floorY, (layout.width - layout.margin * 2) * ratio, 2);
+  }
+}
+
+function renderFrame() {
+  var ratio = view.dpr;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, view.width, view.height);
+  if (!scene.paper) {
+    drawStandby();
+    return;
+  }
+  blitLayer(scene.paper, 0, 0, view.width, view.height);
+  if (!scene.print && scene.step >= 3) {
+    try { bakePrint(); } catch (problem) { reportError("bakePrint.late", problem); }
+  }
+  blitLayer(scene.print, 0, 0, view.width, view.height);
+  drawXrayOverlay();
+  blitLayer(scene.wire, 0, 0, view.width, view.height);
+  drawStamps();
+  drawLyricBlock();
+  drawHud();
+  if (!state.reducedMotion && scene.pulse > 0.5) {
+    ctx.fillStyle = "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", " + (scene.pulse * 0.035) + ")";
+    ctx.fillRect(0, 0, view.width, view.height);
+  }
+}
+
+var WIDE_CHAR = /[\u2e80-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]/;
+
+function charFontSpec(glyph, sizePx) {
+  var family = WIDE_CHAR.test(glyph) ? FONT_CJK : FONT_MONO;
+  return "700 " + Math.round(sizePx) + "px " + family;
+}
+
+function measureGlyph(glyph, sizePx) {
+  ctx.font = charFontSpec(glyph, sizePx);
+  return ctx.measureText(glyph).width;
+}
+
+function wrapLineText(sourceText, maxWidth, sizePx, maxRows) {
+  var cleanText = String(sourceText || "").replace(/[\r\n\t]+/g, " ").replace(/ +/g, " ").trim();
+  var tracking = Math.max(0.4, sizePx * 0.018);
+  var rows = [];
+  var rowChars = [];
+  var rowWidth = 0;
+  var limit = Math.min(cleanText.length, 900);
+  for (var charIndex = 0; charIndex < limit; charIndex++) {
+    var glyph = cleanText.charAt(charIndex);
+    var glyphWidth = measureGlyph(glyph, sizePx);
+    if (rowWidth + glyphWidth > maxWidth && rowChars.length > 0) {
+      rows.push({ chars: rowChars, width: rowWidth });
+      rowChars = [];
+      rowWidth = 0;
+      if (glyph === " ") { continue; }
+    }
+    rowChars.push({ ch: glyph, x: rowWidth, w: glyphWidth });
+    rowWidth += glyphWidth + tracking;
+  }
+  if (rowChars.length > 0) { rows.push({ chars: rowChars, width: rowWidth }); }
+  if (rows.length === 0) { rows.push({ chars: [], width: 0 }); }
+  return { rows: rows, size: sizePx, tracking: tracking, totalChars: cleanText.length, text: cleanText };
+}
+
+function getLineLayout(activeLine) {
+  var layout = scene.layout;
+  var availableWidth = Math.max(120, layout.lyric.width);
+  var cacheKey = "L" + Math.round(activeLine.start * 100) + "_" + activeLine.text.length + "_" + Math.round(availableWidth) + "_" + Math.round(layout.height);
+  if (layoutCache[cacheKey]) { return layoutCache[cacheKey]; }
+
+  var charCount = Math.max(1, activeLine.text.trim().length);
+  var baseSize = Math.min(layout.lyric.height * 0.115, availableWidth / charCount * 1.62);
+  baseSize = Math.max(19, Math.min(76, baseSize));
+  var maxRows = layout.narrow ? 4 : 3;
+  var result = wrapLineText(activeLine.text, availableWidth, baseSize, maxRows);
+  for (var attemptIndex = 0; attemptIndex < 14; attemptIndex++) {
+    if (result.rows.length <= maxRows) { break; }
+    baseSize = Math.max(13, baseSize * 0.87);
+    result = wrapLineText(activeLine.text, availableWidth, baseSize, maxRows);
+  }
+  if (result.rows.length > maxRows) {
+    var keptRows = result.rows.slice(0, maxRows);
+    var lastRow = keptRows[keptRows.length - 1];
+    if (lastRow && lastRow.chars.length > 1) {
+      lastRow.chars[lastRow.chars.length - 1] = { ch: "…", x: lastRow.chars[lastRow.chars.length - 1].x, w: lastRow.chars[lastRow.chars.length - 1].w };
+    }
+    result.rows = keptRows;
+  }
+
+  var keyCount = 0;
+  for (var cacheProbe in layoutCache) {
+    if (Object.prototype.hasOwnProperty.call(layoutCache, cacheProbe)) {
+      keyCount += 1;
+      if (keyCount > 260) { break; }
+    }
+  }
+  if (keyCount > 260) { layoutCache = {}; }
+  layoutCache[cacheKey] = result;
+  return result;
+}
+
+function typedCharCount(activeLine, timeSeconds) {
+  var total = activeLine.text.length;
+  if (total <= 0) { return 0; }
+  if (activeLine.chars && activeLine.chars.length > 0) {
+    var counted = 0;
+    for (var charIndex = 0; charIndex < activeLine.chars.length; charIndex++) {
+      if (activeLine.chars[charIndex].t <= timeSeconds + 0.02) { counted += 1; } else { break; }
+    }
+    return Math.min(total, counted);
+  }
+  var progress = (timeSeconds - activeLine.start) / Math.max(0.24, activeLine.dur);
+  return Math.max(0, Math.min(total, Math.floor(progress * total)));
+}
+
+function drawGhostLine(textValue, baselineY, sizePx, alphaValue, prefixMark) {
+  var layout = scene.layout;
+  if (!textValue || baselineY < layout.lyric.y - 20 || baselineY > layout.bodyBottom + 10) { return; }
+  ctx.font = "700 " + Math.round(sizePx) + "px " + FONT_MIX;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  var shown = textValue;
+  var guardCount = 0;
+  while (shown.length > 2 && ctx.measureText(shown).width > layout.lyric.width - sizePx * 2.2 && guardCount < 300) {
+    shown = shown.slice(0, -1);
+    guardCount += 1;
+  }
+  if (guardCount >= 300) { shown = shown.slice(0, 40) + "…"; }
+  ctx.fillStyle = "rgba(32, 24, 14, " + alphaValue + ")";
+  ctx.fillText(shown, layout.lyric.x + sizePx * 2.2, baselineY);
+  if (prefixMark) {
+    ctx.fillStyle = "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", " + (alphaValue + 0.16) + ")";
+    ctx.fillRect(layout.lyric.x, baselineY - sizePx * 0.62, sizePx * 1.1, Math.max(2, sizePx * 0.12));
+  }
+}
+
+function drawLyricBlock() {
+  var layout = scene.layout;
+  if (!state.hasInit) {
+    drawAwaitingState();
+    return;
+  }
+  if (state.lines.length === 0) {
+    drawSilentState();
+    return;
+  }
+  var activeLine = state.currentIndex >= 0 ? state.lines[state.currentIndex] : null;
+  if (!activeLine) {
+    drawPendingState();
+    return;
+  }
+  if (!activeLine.text.trim()) {
+    drawGapState();
+    return;
+  }
+  var block = getLineLayout(activeLine);
+  var size = block.size;
+  var rowStep = size * 1.3;
+  var blockHeight = Math.max(rowStep, block.rows.length * rowStep);
+  var centreY = layout.lyric.y + layout.lyric.height * 0.52;
+  var firstBaseline = centreY - blockHeight / 2 + size * 0.82;
+  var typedTotal = Math.min(typedCharCount(activeLine, state.time), block.totalChars);
+  var pulse = clamp01(scene.pulse);
+  var accentRed = "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", 1)";
+  var nowMs = performance.now();
+
+  // 上一句（已归档）
+  if (state.currentIndex > 0 && layout.lyric.height > 220) {
+    drawGhostLine(state.lines[state.currentIndex - 1].text, firstBaseline - rowStep * 0.86, size * 0.42, 0.34, true);
+  }
+  // 下一句（待录）
+  if (state.currentIndex + 1 < state.lines.length && layout.lyric.height > 220) {
+    drawGhostLine(state.lines[state.currentIndex + 1].text, firstBaseline + blockHeight + rowStep * 0.32, size * 0.4, 0.2, false);
+  }
+
+  var consumed = 0;
+  for (var rowIndex = 0; rowIndex < block.rows.length; rowIndex++) {
+    var row = block.rows[rowIndex];
+    var baselineY = firstBaseline + rowIndex * rowStep;
+    var cursorX = layout.lyric.x;
+    var typedInRow = 0;
+    var lastTypedX = layout.lyric.x;
+
+    for (var charIndex = 0; charIndex < row.chars.length; charIndex++) {
+      var glyph = row.chars[charIndex];
+      var globalIndex = consumed + charIndex;
+      var isTyped = globalIndex < typedTotal;
+      var jitter = ((globalIndex * 37) % 5 - 2) * 0.55;
+      ctx.font = charFontSpec(glyph.ch, size);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      if (isTyped) {
+        ctx.fillStyle = "rgba(20, 15, 9, 0.93)";
+        ctx.fillText(glyph.ch, cursorX, baselineY + jitter);
+        if (globalIndex % 11 === 0) {
+          ctx.fillStyle = "rgba(20, 15, 9, 0.24)";
+          ctx.fillText(glyph.ch, cursorX + 1.2, baselineY + jitter + 0.8);
+        }
+        typedInRow = charIndex + 1;
+        lastTypedX = cursorX + glyph.w;
+      } else {
+        ctx.fillStyle = "rgba(32, 24, 14, 0.14)";
+        ctx.fillText(glyph.ch, cursorX, baselineY + jitter);
+      }
+      cursorX += glyph.w + block.tracking;
+    }
+
+    if (typedInRow > 0) {
+      var underlineY = baselineY + size * 0.17;
+      var underlineWidth = lastTypedX - layout.lyric.x + size * 0.1;
+      ctx.fillStyle = accentRed;
+      ctx.globalAlpha = 0.9;
+      var strokeThickness = Math.max(2.4, size * (0.042 + pulse * 0.03));
+      ctx.fillRect(layout.lyric.x, underlineY, underlineWidth, strokeThickness);
+      // 手写般的抖动痕迹
+      ctx.globalAlpha = 0.5;
+      ctx.fillRect(layout.lyric.x + underlineWidth * 0.1, underlineY + strokeThickness + 1.5, underlineWidth * 0.62, 1.2);
+      ctx.globalAlpha = 1;
+    }
+
+    // 光标：打字机回车块
+    if (rowIndex === block.rows.length - 1) {
+      var blink = state.reducedMotion ? 1 : (Math.sin(nowMs * 0.0062) > -0.25 ? 1 : 0.14);
+      ctx.globalAlpha = blink * (0.55 + pulse * 0.45);
+      ctx.fillStyle = accentRed;
+      var cursorTop = baselineY - size * 0.78;
+      ctx.fillRect(cursorX + size * 0.12, cursorTop, Math.max(3, size * 0.42), size * 0.86);
+      ctx.globalAlpha = 1;
+    }
+    consumed += row.chars.length;
+  }
+}
+
+function drawAwaitingState() {
+  var layout = scene.layout;
+  var labelSize = clampSize(layout.height * 0.017, 10, 17);
+  var centreX = layout.lyric.x + layout.lyric.width * 0.5;
+  var centreY = layout.lyric.y + layout.lyric.height * 0.5;
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.font = "700 " + Math.round(labelSize * 1.5) + "px " + FONT_MONO;
+  ctx.fillStyle = "rgba(30, 22, 12, 0.42)";
+  ctx.fillText("AWAITING DOSSIER", centreX, centreY);
+  ctx.font = "700 " + Math.round(labelSize) + "px " + FONT_CJK;
+  ctx.fillStyle = "rgba(30, 22, 12, 0.32)";
+  ctx.fillText("档案调取中", centreX, centreY + labelSize * 2.4);
+  ctx.restore();
+}
+
+function drawSilentState() {
+  var layout = scene.layout;
+  var blockWidth = Math.min(layout.lyric.width, 660);
+  var centreX = layout.lyric.x + blockWidth * 0.5;
+  var centreY = layout.lyric.y + layout.lyric.height * 0.45;
+  var labelSize = clampSize(layout.height * 0.016, 10, 16);
+
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  var trackedText = "NO VOCAL TRANSCRIPT ATTACHED";
+  ctx.font = "700 " + Math.round(labelSize) + "px " + FONT_MONO;
+  var trackedWidth = 0;
+  for (var glyphIndex = 0; glyphIndex < trackedText.length; glyphIndex++) {
+    trackedWidth += ctx.measureText(trackedText.charAt(glyphIndex)).width + labelSize * 0.22;
+  }
+  drawTracked(ctx, trackedText, centreX - trackedWidth / 2, centreY + 42, labelSize, labelSize * 0.22, "rgba(32, 23, 12, 0.7)", "700");
+  ctx.textAlign = "center";
+  ctx.font = "700 " + Math.round(labelSize * 2.8) + "px " + FONT_CJK;
+  ctx.fillStyle = "rgba(24, 18, 9, 0.82)";
+  ctx.fillText("本卷无语音记录", centreX, centreY - 12);
+  ctx.font = "400 " + Math.round(labelSize * 0.96) + "px " + FONT_MONO;
+  ctx.fillStyle = "rgba(32, 23, 12, 0.44)";
+  var subtitle = "SUBJECT REMAINED SILENT — SEAL UNOPENED";
+  while (ctx.measureText(subtitle).width > layout.lyric.width - 24 && subtitle.length > 8) {
+    subtitle = subtitle.slice(0, -1);
+  }
+  ctx.fillText(subtitle, centreX, centreY + 68);
+  ctx.restore();
+
+  if (scene.stamps.silent) {
+    var silentWidth = Math.min(360, layout.lyric.width * 0.74);
+    blitStamp(scene.stamps.silent, centreX, centreY + Math.min(180, layout.lyric.height * 0.3), silentWidth, silentWidth * 0.33, -0.037, 0.84);
+  }
+}
+
+function clampSize(value, minimum, maximum) {
+  if (!isFinite(value)) { return minimum; }
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+function drawPendingState() {
+  var layout = scene.layout;
+  var firstLine = state.lines[0];
+  var labelSize = clampSize(layout.height * 0.016, 10, 16);
+  var centreY = layout.lyric.y + layout.lyric.height * 0.5;
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.font = "700 " + Math.round(labelSize) + "px " + FONT_MONO;
+  ctx.fillStyle = "rgba(30, 22, 12, 0.52)";
+  ctx.fillText("TRANSCRIPT PENDING / 待录", layout.lyric.x, centreY - labelSize * 2.4);
+  ctx.fillRect(layout.lyric.x, centreY - labelSize * 1.9, Math.min(120, layout.lyric.width * 0.3), 2);
+
+  var preview = firstLine && firstLine.text ? firstLine.text : "";
+  if (preview) {
+    var previewSize = clampSize(layout.lyric.width / Math.max(8, preview.length) * 1.4, 15, 40);
+    ctx.font = "700 " + Math.round(previewSize) + "px " + FONT_CJK;
+    ctx.fillStyle = "rgba(30, 22, 12, 0.18)";
+    var previewShown = preview;
+    while (ctx.measureText(previewShown).width > layout.lyric.width && previewShown.length > 2) {
+      previewShown = previewShown.slice(0, -1);
+    }
+    ctx.fillText(previewShown, layout.lyric.x, centreY + previewSize * 0.4);
+  }
+  ctx.font = "700 " + Math.round(labelSize) + "px " + FONT_MONO;
+  ctx.fillStyle = "rgba(30, 22, 12, 0.4)";
+  ctx.fillText("STARTS " + formatClock(firstLine ? firstLine.start : 0), layout.lyric.x, centreY + labelSize * 3.4);
+  ctx.restore();
+}
+
+function drawGapState() {
+  var layout = scene.layout;
+  var labelSize = clampSize(layout.height * 0.018, 11, 18);
+  var centreY = layout.lyric.y + layout.lyric.height * 0.5;
+  var centreX = layout.lyric.x + layout.lyric.width * 0.5;
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.font = "700 " + Math.round(labelSize * 1.3) + "px " + FONT_MONO;
+  ctx.fillStyle = "rgba(30, 22, 12, 0.34)";
+  ctx.fillText("—  INSTRUMENTAL  —", centreX, centreY);
+  ctx.font = "700 " + Math.round(labelSize * 0.9) + "px " + FONT_MONO;
+  ctx.fillStyle = "rgba(30, 22, 12, 0.26)";
+  ctx.fillText("NO VOCAL ON THIS PASSAGE", centreX, centreY + labelSize * 2.1);
+  ctx.fillStyle = "rgba(" + state.accent[0] + ", " + state.accent[1] + ", " + state.accent[2] + ", 0.5)";
+  ctx.fillRect(centreX - layout.lyric.width * 0.16, centreY + labelSize * 3.2, layout.lyric.width * 0.32, 2);
+  ctx.restore();
+}
+
+function frameTick(nowMs) {
+  var frameStamp = typeof nowMs === "number" && isFinite(nowMs) ? nowMs : performance.now();
+  try {
+    var frameStart = performance.now();
+    ensureScene();
+    updateDynamics(frameStamp);
+    renderFrame();
+    state.frames += 1;
+    state.frameCost = Math.round((performance.now() - frameStart) * 100) / 100;
+  } catch (problem) {
+    reportError("frameTick", problem);
+  }
+  requestAnimationFrame(frameTick);
+}
+
+window.addEventListener("message", handleMessage);
+window.addEventListener("error", function (event) {
+  reportError("window", event && event.message ? event.message : "unknown error");
+});
+window.addEventListener("resize", function () {
+  try { resizeCanvas(); } catch (problem) { reportError("resize", problem); }
+});
+
+if (window.matchMedia) {
+  try {
+    var motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    state.reducedMotion = !!motionQuery.matches;
+    if (motionQuery.addEventListener) {
+      motionQuery.addEventListener("change", function (event) { state.reducedMotion = !!event.matches; });
+    }
+  } catch (problem) { reportError("motionQuery", problem); }
+}
+
+try {
+  resizeCanvas();
+} catch (problem) {
+  reportError("bootstrap.resize", problem);
+}
+requestAnimationFrame(function (firstFrameStamp) {
+  postReady();
+  frameTick(firstFrameStamp || performance.now());
+});
+setTimeout(postReady, 700);
+</script>
+</body>
+</html>

@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>双曲空间</title>
+<style>
+  html,body{margin:0;height:100%;background:#04050c;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(168,176,220,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   046 · 双曲空间 —— 这句话写在一个**负曲率的宇宙**里
+   ---------------------------------------------------------------------------
+   核心机制：**庞加莱圆盘里的 {7,3} 双曲镶嵌**。
+   参考作品是 CSS 叠出来的"同心套娃"盘面；这里换成真的双曲几何：
+     · {7,3} = 正七边形、每个顶点三条边。因为 1/7 + 1/3 < 1/2，
+       它在欧氏平面里铺不下 —— 只能铺在双曲平面上；
+     · 顶点半径由 cosh R = cot(π/p)·cot(π/q) 给出（p=7,q=3 → R≈0.63），
+       再按 ρ = tanh(R/2) 映进庞加莱圆盘（双曲距离 → 欧氏半径），
+       于是"越靠边越挤"是几何自带的，不是画出来的透视；
+     · 格子由**跨边的圆反演**生成：把七边形的顶点关于边所在的双曲测地圆
+       做反演 z' = c + r²/conj(z−c) 就得到邻居，BFS 铺开；
+       边长按指数收缩，任意放大都还是同样的结构 —— 这才是"无限"；
+     · 边不是直线而是**测地圆弧**（与单位圆正交的圆弧）。画直线的话
+       相邻格子会互相穿过（第一版就是这么错的），必须按圆弧采样；
+     · 整个盘面再走一个莫比乌斯变换 φ(z)=(z+t)/(1+tz)：t 缓慢摆动，
+       格子从中心漂向圆周再漂回来，永不停止，也永远跑不出边界。
+
+   歌词怎么演：圆心是一块"阅读台"（整句竖直排布、逐字点亮），
+   外圈格子里写着同一句的同一个字 —— 句子于是既是读的，也是这块空间的纹理；
+   格子漂向无穷远时那些小字跟着一起变淡，像回声。
+
+   和已有形态的区别：041/042/043/045 都是欧氏几何（万花尺/叶序/利萨如/泰森），
+   这里是**双曲几何**：三角形内角和小于 π、过直线外一点有无数条平行线。
+   它的分形感不是画出来的，是空间本来的样子。
+
+   精修记录：① 逐字时刻集中在 charTimes()——chars 与正文逐字对齐（长度相等、
+      时间可解析）才采信，并做单调钳位；否则按 line.t + dur*k/n 均分回退，
+      缺 chars 不报错。② 阅读台加"聚焦暗场"（预烘径向位图，每帧一次 drawImage）
+      + 字号上限提到 ~34px 且长句折 3 行，41 字不再压成细线。③ 进场动效：
+      句子在开唱那一刻 0.32s 淡入 + 从 1.05 缩到 1，当前字带 0.4s 的回弹；
+      踩拍时暗场加深（拉焦），盘面整体呼吸。
+      分词：不接 —— 这里的最小单位就是"字"（逐字点亮 + 每格一个回声字），
+      词边界对画面没有增益，省掉 segdict 的读取与调度。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1, S = 1, OX = 0, OY = 0;
+let accent = [150, 160, 255];
+const PI = Math.PI, TAU = PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rgba = (r, g, b, a) => 'rgba(' + (clamp(r, 0, 255) | 0) + ',' + (clamp(g, 0, 255) | 0) + ',' + (clamp(b, 0, 255) | 0) + ',' + a + ')';
+
+/* ================= 1. 生成双曲镶嵌（一次性） ================= */
+const P = 7, Q = 3, MAXC = 420;
+const cot = (x) => 1 / Math.tan(x);
+const RV = Math.tanh(0.5 * Math.acosh(cot(PI / P) * cot(PI / Q)));   // 顶点欧氏半径 ≈ 0.3007
+
+let cells = [];
+let echoCells = [];
+
+/* 一条边的双曲测地圆：过 a、b 且与单位圆正交 */
+function edgeCircle(ax, ay, bx, by) {
+  const ra = (ax * ax + ay * ay + 1) / 2;
+  const rb = (bx * bx + by * by + 1) / 2;
+  const det = ax * by - ay * bx;
+  if (Math.abs(det) < 1e-14) return null;
+  const u = (ra * by - ay * rb) / det;
+  const w = (ax * rb - ra * bx) / det;
+  const r2 = u * u + w * w - 1;
+  if (r2 <= 1e-10) return null;
+  return { u, w, r2 };
+}
+
+/* 把 p 边形采成一条折线：边是圆弧，按格子大小决定采样密度 */
+function samplePoly(v) {
+  let cx = 0, cy = 0;
+  for (let k = 0; k < P; k++) { cx += v[k * 2]; cy += v[k * 2 + 1]; }
+  cx /= P; cy /= P;
+  let rad = 0;
+  for (let k = 0; k < P; k++) rad = Math.max(rad, Math.hypot(v[k * 2] - cx, v[k * 2 + 1] - cy));
+  const seg = rad > 0.075 ? 5 : rad > 0.028 ? 3 : rad > 0.009 ? 2 : 1;
+  const out = [];
+  for (let e = 0; e < P; e++) {
+    const i = e * 2, j = ((e + 1) % P) * 2;
+    const ax = v[i], ay = v[i + 1], bxx = v[j], byy = v[j + 1];
+    const c = edgeCircle(ax, ay, bxx, byy);
+    if (!c) { out.push(ax, ay); continue; }
+    const r = Math.sqrt(c.r2);
+    const ta = Math.atan2(ay - c.w, ax - c.u);
+    let d = Math.atan2(byy - c.w, bxx - c.u) - ta;
+    while (d > PI) d -= TAU;
+    while (d < -PI) d += TAU;
+    for (let s = 0; s < seg; s++) {
+      const th = ta + d * (s / seg);
+      out.push(c.u + r * Math.cos(th), c.w + r * Math.sin(th));
+    }
+  }
+  return { pts: new Float64Array(out), cx, cy, rad, par: 0 };
+}
+
+function buildTiling() {
+  cells = []; echoCells = [];
+  const seen = new Set();
+  const key = (x, y) => (Math.round(x * 3e4) + '_' + Math.round(y * 3e4));
+  const base = new Float64Array(P * 2);
+  for (let k = 0; k < P; k++) {
+    const a = -PI / 2 + k * TAU / P;
+    base[k * 2] = RV * Math.cos(a);
+    base[k * 2 + 1] = RV * Math.sin(a);
+  }
+  /* 每个格子同时带两份坐标：verts = p 个顶点（反演用），pts = 按圆弧采样的折线（渲染用） */
+  const mkCell = (verts) => {
+    const sm = samplePoly(verts);
+    sm.verts = verts;
+    return sm;
+  };
+  const queue = [mkCell(base)];
+  seen.add(key(queue[0].cx, queue[0].cy));
+
+  while (queue.length && cells.length < MAXC) {
+    const cell = queue.shift();
+    if (cell.rad < 0.0028) continue;      // 比一个像素还小的格子就别铺了
+    cell.par = cells.length & 1;
+    cells.push(cell);
+    const v = cell.verts;
+    for (let e = 0; e < P; e++) {
+      const i = e * 2, j = ((e + 1) % P) * 2;
+      const c = edgeCircle(v[i], v[i + 1], v[j], v[j + 1]);
+      if (!c) continue;
+      /* 关于这条边反演 —— 反演是整个多边形的镜像，就是隔壁那格 */
+      const nv = new Float64Array(P * 2);
+      let bad = false;
+      for (let k = 0; k < P; k++) {
+        const dx = v[k * 2] - c.u, dy = v[k * 2 + 1] - c.w;
+        const dd = dx * dx + dy * dy;
+        if (dd < 1e-14) { bad = true; break; }
+        nv[k * 2] = c.u + c.r2 * dx / dd;
+        nv[k * 2 + 1] = c.w + c.r2 * dy / dd;
+      }
+      if (bad) continue;
+      const nb = mkCell(nv);
+      if (Math.abs(nb.cx) > 0.9995 || Math.abs(nb.cy) > 0.9995) continue;
+      const kk = key(nb.cx, nb.cy);
+      if (seen.has(kk)) continue;
+      seen.add(kk); queue.push(nb);
+    }
+    if (queue.length > 30000) break;
+  }
+
+  /* 由内到外 */
+  cells.sort((a, b) => (a.cx * a.cx + a.cy * a.cy) - (b.cx * b.cx + b.cy * b.cy));
+  /* 外围回声小字的落点：只放在外圈，避免和中间的阅读台撞在一起 */
+  for (let i = 0; i < cells.length && echoCells.length < 88; i++) {
+    const c = cells[i];
+    const r = Math.hypot(c.cx, c.cy);
+    if (r > 0.42 && r < 0.86 && (i % 2 === 0)) echoCells.push(c);
+  }
+}
+
+/* ================= 2. 歌词排版 ================= */
+const om = document.createElement('canvas').getContext('2d');
+const FONT = (fs) => '900 ' + fs.toFixed(1) + 'px ui-sans-serif,system-ui,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
+let lay = null;
+
+/* 折行：按宽度切，尽量断在空格上（中文没有空格就按字切） */
+function wrapAt(s, fs, availW) {
+  om.font = FONT(fs);
+  const out = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (cur && om.measureText(cur + ch).width > availW) {
+      const sp = cur.lastIndexOf(' ');
+      if (sp > cur.length * 0.45) { out.push(cur.slice(0, sp)); cur = cur.slice(sp + 1) + ch; }
+      else { out.push(cur); cur = ch; }
+    } else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/* 逐字时刻：chars 只在"和正文逐字对齐"时才可信（长度相等 + 时间可解析），
+   并且做一次单调钳位（倒序/重复的时间不会让字忽明忽暗）；否则均分回退。 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const txt = line ? (line.text || '') : '';
+  const chs = line ? line.chars : null;
+  const base = line ? line.t : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* 排版：**长句要折行**。真实歌词一行可能 30~40 字，
+   按单行硬缩会缩成蚂蚁（第一版就这样，在播放器里几乎读不出来）。
+   做法：先量出 fs=100 时整句的宽度，再枚举 1/2/3 行，
+   取"宽度和高度都放得下"的最大字号，最后按那个字号折行。 */
+function layout(text, line) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  const availW = Math.min(W * 0.62, S * 1.30);
+  const availH = Math.max(120, S * 0.66);
+  if (!s) return { lines: [], fs: 0, lh: 0, count: 0, flat: [], ct: new Float32Array(0), yrc: false };
+
+  om.font = FONT(100);
+  const w100 = Math.max(1, om.measureText(s).width);
+  let best = { fs: 0, n: 0 };
+  for (let nl = 1; nl <= 3; nl++) {
+    /* 宽度约束：整句总宽在 nl 行里铺开；高度约束：nl 行 × 行高 ≤ availH */
+    const fsW = availW * nl / (w100 / 100);
+    const fsH = availH / (nl * 1.18);
+    const fs = Math.min(fsW, fsH, 150);
+    if (fs > best.fs) best = { fs, n: nl };
+  }
+  let fs = clamp(best.fs, 12, 150);
+  let rows = wrapAt(s, fs, availW);
+  /* 折行结果超过 3 行就再缩一点 */
+  let guard = 0;
+  while (rows.length > 3 && fs > 12 && guard++ < 40) {
+    fs *= 0.92;
+    rows = wrapAt(s, fs, availW);
+  }
+  om.font = FONT(fs);
+  const lh = fs * 1.18;
+  const out = [];
+  let idx = 0;
+  for (const r of rows) {
+    const chars = [];
+    let x = 0;
+    for (const ch of r) {
+      const w = om.measureText(ch).width;
+      chars.push({ ch, x, w, i: idx++ });
+      x += w;
+    }
+    out.push({ chars, w: x });
+  }
+  const flat = [];
+  for (const L of out) for (const c of L.chars) flat.push(c);
+  const ct = charTimes(line, idx);
+  return { lines: out, fs, lh, count: idx, flat, ct: ct.t, yrc: ct.yrc };
+}
+
+/* ================= 3. 节奏 ================= */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let curLine = null, brewLine = null, pendLay = null;
+let pulse = 0, t0 = 0;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; curLine = null; brewLine = null; pendLay = null; lay = null; pulse = 0; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      curLine = lines[ci];
+      lay = (pendLay && brewLine === curLine) ? pendLay : layout(curLine.text || '', curLine);
+      pendLay = null;
+      hint.style.opacity = '0';
+    } else { curLine = null; lay = null; }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine = lines[nx]; pendLay = layout(brewLine.text || '', brewLine); }
+  }
+}
+
+/* ================= 4. 渲染 ================= */
+let rimCv = null, bgGrd = null, strokeGrd = null, fillGrd = null;
+let board = null, bctx = null;
+let focusSpr = null;
+
+function buildStatic() {
+  const R = S * 1.30;
+  /* 阅读台的"聚焦暗场"：预烘一张软径向位图，每帧只 drawImage 一次 —— 
+     圆盘中心虽然被渐变压暗过，但 41 字的阅读台会伸到格子最密的那一圈，
+     不垫一层暗场，字就被双曲网格吃掉了。 */
+  focusSpr = document.createElement('canvas');
+  focusSpr.width = focusSpr.height = 256;
+  const fg = focusSpr.getContext('2d');
+  const fr = fg.createRadialGradient(128, 128, 0, 128, 128, 128);
+  fr.addColorStop(0, 'rgba(2,3,8,0.90)');
+  fr.addColorStop(0.46, 'rgba(2,3,8,0.74)');
+  fr.addColorStop(0.80, 'rgba(3,4,10,0.26)');
+  fr.addColorStop(1, 'rgba(3,4,10,0)');
+  fg.fillStyle = fr;
+  fg.fillRect(0, 0, 256, 256);
+  rimCv = document.createElement('canvas');
+  rimCv.width = Math.max(2, Math.round(R * 2));
+  rimCv.height = Math.round(R * 2);
+  const g = rimCv.getContext('2d');
+  const grd = g.createRadialGradient(R, R, R * 0.70, R, R, R);
+  grd.addColorStop(0, rgba(accent[0], accent[1], accent[2], 0));
+  grd.addColorStop(0.78, rgba(accent[0], accent[1], accent[2], 0.035));
+  grd.addColorStop(0.93, rgba(accent[0] + 40, accent[1] + 40, 255, 0.085));
+  grd.addColorStop(1, rgba(accent[0], accent[1], accent[2], 0));
+  g.fillStyle = grd;
+  g.fillRect(0, 0, rimCv.width, rimCv.height);
+
+  /* 镶嵌层单独一张不透明画布：格子有近 6000 个采样点，
+     每帧重建路径 + 光栅化是这台最贵的一步。莫比乌斯流很慢（0.1Hz 量级），
+     所以这一层按 30Hz 重画、每帧只做一次不透明整块拷贝 —— 肉眼无差。 */
+  board = document.createElement('canvas');
+  board.width = Math.round(W * DPR); board.height = Math.round(H * DPR);
+  bctx = board.getContext('2d', { alpha: false });
+  bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  bgGrd = bctx.createRadialGradient(OX, OY, 0, OX, OY, Math.max(W, H) * 0.72);
+  bgGrd.addColorStop(0, '#0b0f20');
+  bgGrd.addColorStop(0.52, '#060814');
+  bgGrd.addColorStop(1, '#020308');
+
+  /* 径向渐变直接做"合批"：一次描边里，中心的格子自动淡出（给阅读台让位），
+     rim 处的格子自动变暗。否则每格一个 alpha 就要分几档、多铺几条路径。 */
+  strokeGrd = bctx.createRadialGradient(OX, OY, S * 0.20, OX, OY, S * 1.02);
+  strokeGrd.addColorStop(0, rgba(accent[0], accent[1], accent[2], 0));
+  strokeGrd.addColorStop(0.16, rgba(accent[0] + 30, accent[1] + 40, 255, 0.46));
+  strokeGrd.addColorStop(0.45, rgba(accent[0] + 16, accent[1] + 26, 250, 0.34));
+  strokeGrd.addColorStop(0.78, rgba(accent[0] + 6, accent[1] + 14, 240, 0.21));
+  strokeGrd.addColorStop(1, rgba(accent[0], accent[1], 230, 0));
+
+  fillGrd = bctx.createRadialGradient(OX, OY, S * 0.20, OX, OY, S * 1.02);
+  fillGrd.addColorStop(0, rgba(accent[0], accent[1], accent[2], 0));
+  fillGrd.addColorStop(0.5, rgba(accent[0], accent[1], accent[2], 0.060));
+  fillGrd.addColorStop(1, rgba(accent[0], accent[1], accent[2], 0.018));
+}
+
+/* 把镶嵌层画进 board（30Hz） */
+function renderBoard(flow, rot, cr, sr, Sc) {
+  const g = bctx;
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.fillStyle = '#04050c';
+  g.fillRect(0, 0, W, H);
+  if (bgGrd) { g.fillStyle = bgGrd; g.fillRect(0, 0, W, H); }
+
+  /* 全部格子合成一条路径，一次描边 + 一次填充 */
+  const path = new Path2D();
+  for (let c = 0; c < cells.length; c++) {
+    const pts = cells[c].pts;
+    for (let i = 0; i < pts.length; i += 2) {
+      const zx = pts[i], zy = pts[i + 1];
+      const dx = zx + flow, dy = zy;
+      const ax = 1 + flow * zx, ay = flow * zy;
+      const dd = ax * ax + ay * ay || 1;
+      const qx = (dx * ax + dy * ay) / dd;
+      const qy = (dy * ax - dx * ay) / dd;
+      const px = OX + (qx * cr - qy * sr) * Sc;
+      const py = OY + (qx * sr + qy * cr) * Sc;
+      if (i === 0) path.moveTo(px, py); else path.lineTo(px, py);
+    }
+    path.closePath();
+  }
+  g.lineWidth = 1;
+  g.strokeStyle = strokeGrd;
+  g.stroke(path);
+  g.fillStyle = fillGrd;
+  g.fill(path);
+
+  /* 圆周：双曲无穷远的边界 */
+  if (rimCv) g.drawImage(rimCv, OX - rimCv.width / 2, OY - rimCv.height / 2);
+  g.beginPath();
+  g.arc(OX, OY, Sc, 0, TAU);
+  g.strokeStyle = rgba(accent[0] + 60, accent[1] + 70, 255, 0.14 + pulse * 0.16);
+  g.lineWidth = 1.2;
+  g.stroke();
+
+  /* 外围回声：同一句的字跟着空间流漂向无穷远 */
+  if (lay && lay.flat && lay.flat.length && echoCells.length) {
+    const n = lay.flat.length;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    let lastFs = -1;
+    for (let i = 0; i < echoCells.length; i++) {
+      const cell = echoCells[i];
+      const r = Math.hypot(cell.cx, cell.cy);
+      const zx = cell.cx, zy = cell.cy;
+      const dx = zx + flow, dy = zy;
+      const ax = 1 + flow * zx, ay = flow * zy;
+      const dd = ax * ax + ay * ay || 1;
+      const qx = (dx * ax + dy * ay) / dd;
+      const qy = (dy * ax - dx * ay) / dd;
+      const px = OX + (qx * cr - qy * sr) * Sc;
+      const py = OY + (qx * sr + qy * cr) * Sc;
+      const fs = Math.round(clamp(cell.rad * Sc * 1.15, 9, 40));
+      const a = 0.36 * (1 - r / 0.84);
+      if (a <= 0.03) continue;
+      if (fs !== lastFs) { g.font = FONT(fs); lastFs = fs; }
+      g.fillStyle = rgba(accent[0] + 60, accent[1] + 70, 255, a);
+      g.fillText(lay.flat[(i * 2 + cell.par) % n].ch, px, py);
+    }
+  }
+}
+
+let boardAcc = 1;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  if (pulse > 0) { pulse *= Math.exp(-dt * 4.5); if (pulse < 0.004) pulse = 0; }
+
+  const flow = 0.235 * Math.sin(t0 * 0.115) + pulse * 0.010;
+  const rot = t0 * 0.052;
+  const cr = Math.cos(rot), sr = Math.sin(rot);
+  const Sc = S * (1 + Math.sin(t0 * 0.31) * 0.005 + pulse * 0.016);
+
+  boardAcc += dt;
+  if (boardAcc >= 0.033 && bctx) { boardAcc = 0; renderBoard(flow, rot, cr, sr, Sc); }
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (board) ctx.drawImage(board, 0, 0, W, H);
+  else { ctx.fillStyle = '#04050c'; ctx.fillRect(0, 0, W, H); }
+
+  /* 阅读台：整句竖直排布（长句自动折成 2~3 行），逐字点亮 */
+  if (lay && lay.lines.length) {
+    const n = lay.count;
+    const ct = lay.ct;
+    const app = curLine ? clamp((T - curLine.t) / 0.32, 0, 1) : 1;
+    const ease = app * app * (3 - 2 * app);
+    const blockH = lay.lines.length * lay.lh;
+    let blockW = 0;
+    for (const ln of lay.lines) if (ln.w > blockW) blockW = ln.w;
+
+    /* 聚焦：字落上去之前先压一块软暗场（踩拍时加深 = 拉焦） */
+    if (focusSpr) {
+      const fw = Math.min(W * 0.98, blockW * 1.62);
+      const fh = Math.min(H * 0.92, blockH * 3.0);
+      ctx.globalAlpha = 0.60 + 0.22 * clamp(pulse, 0, 1);
+      ctx.drawImage(focusSpr, OX - fw / 2, OY - fh / 2, fw, fh);
+      ctx.globalAlpha = 1;
+    }
+
+    /* 当前字：最后一句"已到时刻"的字（ct 已单调，缺 chars 时是均分时刻） */
+    let curCh = -1;
+    for (let i = 0; i < n; i++) if (T >= ct[i]) curCh = i;
+
+    const pop = 1 + 0.05 * (1 - ease);       // 进场：从 1.05 缩回 1
+    ctx.save();
+    ctx.translate(OX, OY); ctx.scale(pop, pop); ctx.translate(-OX, -OY);
+    ctx.globalAlpha = ease;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    let y = OY - blockH / 2 + lay.lh / 2;
+    let lastFs = -1;
+    for (const ln of lay.lines) {
+      const cx0 = OX - ln.w / 2;
+      for (const ch of ln.chars) {
+        const i = ch.i;
+        const isCur = i === curCh;
+        const since = T - ct[i];
+        const sung = since >= 0;
+        let sc = 1;
+        if (isCur) sc = 1 + 0.10 * (1 - clamp(since / 0.42, 0, 1));
+        const fsz = lay.fs * sc;
+        if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+        const w = ch.w * sc;
+        const x = cx0 + ch.x - (w - ch.w) / 2;
+        /* 没唱到的字也必须是"看得清但还没亮"，不是隐形的 */
+        ctx.fillStyle = isCur ? 'rgba(246,250,255,0.99)'
+          : sung ? rgba(accent[0] + 80, accent[1] + 90, 255, 0.86)
+          : rgba(152, 162, 206, 0.42);
+        ctx.fillText(ch.ch, x, y);
+      }
+      y += lay.lh;
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'center';
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ================= 5. 尺寸 / 通信 ================= */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  S = Math.min(W, H) * 0.475;
+  OX = W / 2; OY = H * 0.5;
+  buildStatic();
+  if (curLine) lay = layout(curLine.text || '', curLine);
+}
+addEventListener('resize', resize);
+
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent) { accent = p.accent; buildStatic(); }
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    curLine = null; brewLine = null; pendLay = null; lay = null; pulse = 0;
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：整个盘面一起"呼吸"一次（空间本身缩放），不是逐格乱抖 */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    pulse = 0.4 + lv * 0.6;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+let last = performance.now();
+buildTiling();
+resize();
+requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  cells: cells.length, echoes: echoCells.length, lines: lines.length,
+  curIdx, brewIdx, T: +now().toFixed(2), rv: +RV.toFixed(4),
+  yrc: !!(lay && lay.yrc), yrcLen: curLine && curLine.chars ? curLine.chars.length : 0,
+  rows: lay ? lay.lines.length : 0, fs: lay ? +lay.fs.toFixed(1) : 0, pulse: +pulse.toFixed(2)
+});
+</script>
+</body>
+</html>

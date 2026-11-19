@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>闪电歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#03050c;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(170,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   058 · 闪电歌词 —— 字本身就是那道放电通道
+
+   和 001-010 全都不同：这里**没有粒子，也没有"目标点云"**。
+   先按 6px 的间隔把字形采样成一张小掩膜，再用"保持方向的 8 邻域行走"
+   把掩膜串成**一条连续的蛇形折线** —— 它沿着笔画走，走到笔画尽头就跳到下一笔。
+   这条折线就是放电通道的骨架：从天空引一道主雷下来接住它，
+   再对整条折线做中点位移（递归细分）变成锯齿，于是**字是闪电自己缠出来的**。
+
+   生长用 setLineDash([总长*prog, 总长]) 只显示前一段 —— 每帧 O(1)，
+   不重建路径。雷击的"重击"（real lightning 会沿同一条通道反复放电）：
+   酝酿阶段预生成 3 组不同随机的锯齿变体，踩拍时切一组、prog 归零，
+   于是字在原地反复被劈亮，而不是换一个形状。
+
+   为什么快（实测定位后重写）：
+   主通道锯齿后是 10781 个点、全长 3.4 万像素，原来每帧要描 7 次
+   （5 条主通道 + 2 条分支，其中 5 条还带 setLineDash），实测单帧光栅化 127~162ms。
+   现在**每一"击"整根烘成一张离屏图**（7 条描边一次画完，~84ms，只在酝酿期做，
+   而且按点数切成 8 段、每帧一段，单帧只多 ~10ms），每帧只 drawImage（1.1ms）
+   再乘包络 globalAlpha；生长改成"一条 clip 矩形从上往下揭开"（原来靠 dash，
+   在 1 万点的路径上每帧要重新做一次虚线切分）。
+
+   精修记录：① YRC 逐字放电 —— 蛇形通道的每个点记下"自己属于第几个字"（排版表二分反查），
+   按字切成子路径；第 k 字在 chars[k].t - 0.10 那一刻**击穿**：先给一记短促的白芯
+   （0.42s 衰减的逐帧叠加 = "亮一下"），再把这一段的芯/辉光**烘进整根雷电图**
+   （累积式，每字只描一次 = 留下来的是辉光）。无 chars 按 t+dur*k/n 均分回退，__stage 增 yrc。
+   ② 长句折 1~3 行（41 字 = 14/14/13 @ ~86px），掩膜改成整屏 6px 栅格；
+   整句另烘一层极淡的冷光"字形底稿"（0.5 分辨率，每帧一次 drawImage），
+   没唱到的字也完整可读（旧版 41 字被压成一行 ~36px、只有半句可辨）。
+   ③ 镜头：天空/山/雷电一起缓慢推拉（1.01~1.03）；踩拍仍是沿同一通道重击（相干）。
+   分词：不使用。逐字时刻已到字，按词团只会让放电节奏变粗。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1, groundY = 0;
+
+/* ---------------- 天空（静态部分烘焙成两张图） ---------------- */
+const skyTop = document.createElement('canvas');     // 渐变
+const skyLand = document.createElement('canvas');    // 远山 + 地面 + 近山（透明底）
+const stx = skyTop.getContext('2d');
+const slx = skyLand.getContext('2d');
+let cloudDark = null, cloudLit = null, glowSprite = null, topSprite = null;
+const CLOUD_M = 32;                                  // 云图层左右留的位移余量
+
+const stars = [];
+const clouds = [];
+const rand = (() => { let s = 70707; return () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; }; })();
+for (let i = 0; i < 130; i++) stars.push({ x: rand(), y: rand() * 0.6, r: 0.5 + rand() * 1.2, p: rand() * 6.283 });
+for (let i = 0; i < 7; i++) clouds.push({ x: 0.06 + rand() * 0.9, y: 0.06 + rand() * 0.2, s: 60 + rand() * 100, a: 0.35 + rand() * 0.4 });
+
+function hash1(n) { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+function noise1(x) {
+  const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f);
+  return hash1(i) + (hash1(i + 1) - hash1(i)) * u;
+}
+function hillH(n, base, amp, ph) {
+  const v = noise1(n * 0.3 + ph) * 0.68 + noise1(n * 0.72 + ph * 3.1) * 0.2 + noise1(n * 1.8 + ph * 7.7) * 0.12;
+  return base + (v - 0.5) * 2 * amp;
+}
+function smooth2(a) {
+  let o = a.slice();
+  for (let p = 0; p < 2; p++) {
+    const t = o.slice();
+    for (let i = 1; i < t.length - 1; i++) o[i] = t[i - 1] * 0.25 + t[i] * 0.5 + t[i + 1] * 0.25;
+  }
+  return o;
+}
+const farH = smooth2(Array.from({ length: 97 }, (_, i) => hillH(i, 0.80, 0.075, 1.7)));
+const nearH = smooth2(Array.from({ length: 97 }, (_, i) => hillH(i, 0.895, 0.032, 5.9)));
+
+function blob(size, r, g, b, a0) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const x = c.getContext('2d');
+  const gr = x.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  gr.addColorStop(0, 'rgba(' + r + ',' + g + ',' + b + ',' + a0 + ')');
+  gr.addColorStop(0.45, 'rgba(' + r + ',' + g + ',' + b + ',' + (a0 * 0.35).toFixed(3) + ')');
+  gr.addColorStop(1, 'rgba(' + r + ',' + g + ',' + b + ',0)');
+  x.fillStyle = gr;
+  x.fillRect(0, 0, size, size);
+  return c;
+}
+
+function bakeSky() {
+  skyTop.width = Math.max(1, Math.round(W)); skyTop.height = Math.max(1, Math.round(H));
+  const g = stx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#03050c'); g.addColorStop(0.45, '#060c1c');
+  g.addColorStop(0.78, '#0a1626'); g.addColorStop(1, '#081018');
+  stx.fillStyle = g; stx.fillRect(0, 0, W, H);
+
+  skyLand.width = skyTop.width; skyLand.height = skyTop.height;
+  slx.clearRect(0, 0, W, H);
+  slx.fillStyle = '#040912';
+  slx.beginPath(); slx.moveTo(0, H);
+  for (let i = 0; i <= 96; i++) slx.lineTo((i / 96) * W, farH[i] * H);
+  slx.lineTo(W, H); slx.closePath(); slx.fill();
+  slx.strokeStyle = 'rgba(110,140,210,0.10)'; slx.lineWidth = 1;
+  slx.beginPath();
+  for (let i = 0; i <= 96; i++) { const x = (i / 96) * W; if (i === 0) slx.moveTo(x, farH[i] * H); else slx.lineTo(x, farH[i] * H); }
+  slx.stroke();
+
+  const gg = slx.createLinearGradient(0, groundY - 40, 0, H);
+  gg.addColorStop(0, 'rgba(10,22,32,0)'); gg.addColorStop(0.3, '#050b12'); gg.addColorStop(1, '#02050a');
+  slx.fillStyle = gg; slx.fillRect(0, groundY - 40, W, H - groundY + 40);
+
+  slx.fillStyle = '#03070d';
+  slx.beginPath(); slx.moveTo(0, H);
+  for (let i = 0; i <= 96; i++) slx.lineTo((i / 96) * W, nearH[i] * H);
+  slx.lineTo(W, H); slx.closePath(); slx.fill();
+  slx.strokeStyle = 'rgba(90,115,170,0.07)'; slx.lineWidth = 1;
+  slx.beginPath();
+  for (let i = 0; i <= 96; i++) { const x = (i / 96) * W; if (i === 0) slx.moveTo(x, nearH[i] * H); else slx.lineTo(x, nearH[i] * H); }
+  slx.stroke();
+
+  /* 云：烘成两张全屏图层（暗 / 被闪亮），每帧只两次 drawImage。
+     原来每帧 7~14 次大贴图（2.4~5.8ms）。云各自极慢的横移（0.06 rad/s、±12px）
+     改成整层整数位移，肉眼一样。 */
+  const cnvD = document.createElement('canvas'), cnvL = document.createElement('canvas');
+  cnvD.width = cnvL.width = Math.round((W + CLOUD_M * 2) * DPR);
+  cnvD.height = cnvL.height = Math.max(1, Math.round(H * DPR));
+  const cd = cnvD.getContext('2d'), cl = cnvL.getContext('2d');
+  cd.setTransform(DPR, 0, 0, DPR, 0, 0); cl.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cd.globalCompositeOperation = 'lighter'; cl.globalCompositeOperation = 'lighter';
+  const sprD = blob(256, 40, 50, 80, 0.30), sprL = blob(256, 190, 200, 255, 0.55);
+  for (let i = 0; i < clouds.length; i++) {
+    const c = clouds[i];
+    const x = CLOUD_M + c.x * W, y = c.y * H;
+    const sz = c.s * (W / 1400 + 0.55) * 2.6;
+    cd.globalAlpha = c.a * 0.85;
+    cd.drawImage(sprD, x - sz * 0.5, y - sz * 0.22, sz, sz * 0.45);
+    cl.globalAlpha = c.a * 0.9;
+    cl.drawImage(sprL, x - sz * 0.5, y - sz * 0.22, sz, sz * 0.45);
+  }
+  cloudDark = cnvD; cloudLit = cnvL;
+  glowSprite = blob(256, 190, 210, 255, 0.55);
+  topSprite = blob(512, 170, 180, 255, 0.30);
+}
+
+/* ---------------- 排版 / 逐字时间 ----------------
+   长句折 1~3 行；"每个通道点属于哪个字"用排版表二分反查，不做逐字读回。 */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+const ST = 6;
+const maskCv = document.createElement('canvas');
+const maskCtx = maskCv.getContext('2d', { willReadFrequently: true });
+
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+/* chars 必须与正文逐字等长、每个 t 有限才采信，并单调钳位；否则 t+dur*k/n 均分回退 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+function makeLayout(text, idx) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.84, 1500);
+  const maxH = H * 0.56;
+  octx.font = fontOf(100);
+  let widest = 1;
+  for (let r = 0; r < nr; r++) widest = Math.max(widest, octx.measureText(rows[r]).width);
+  let fs = Math.min(100 * maxW / widest, maxH / (nr * 1.24), 140);
+  fs = Math.max(22, Math.floor(fs));
+  octx.font = fontOf(fs);
+  const LH = fs * 1.24;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let minX = 1e9, maxX = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      if (x < minX) minX = x;
+      if (x + w > maxX) maxX = x + w;
+      x += w; gi++;
+    }
+    rowsOut.push({ y: y, g: gr, w: wsum });
+  }
+  const minY = y0 - fs * 0.52, maxY = y0 + (nr - 1) * LH + fs * 0.52;
+  const gcx = (minX + maxX) / 2, gcy = (minY + maxY) / 2;
+  const A = placeAnchor(anchors[idx % anchors.length], (maxX - minX) / 2, (maxY - minY) / 2, gcx, gcy);
+  const dx = Math.max(-W * 0.04, Math.min(W * 0.04, (A.x - gcx) * 0.5));
+  const dy = Math.max(-H * 0.05, Math.min(H * 0.05, (A.y - gcy) * 0.5));
+  for (let u = 0; u < glyphs.length; u++) { glyphs[u].x += dx; glyphs[u].y += dy; }
+  for (let r = 0; r < rowsOut.length; r++) {
+    rowsOut[r].y += dy;
+    for (let j = 0; j < rowsOut[r].g.length; j++) { rowsOut[r].g[j].x0 += dx; rowsOut[r].g[j].x1 += dx; }
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length,
+           font: fontOf(fs), cx: gcx + dx, cy: gcy + dy };
+}
+
+function charAt(L, x, y) {
+  if (!L || !L.rows.length) return 255;
+  let bi = 0, bd = 1e9;
+  for (let r = 0; r < L.rows.length; r++) {
+    const d = Math.abs(y - L.rows[r].y);
+    if (d < bd) { bd = d; bi = r; }
+  }
+  const g = L.rows[bi].g;
+  if (!g.length) return 255;
+  if (x <= g[0].x0) return g[0].i;
+  const last = g.length - 1;
+  if (x >= g[last].x1) return g[last].i;
+  let lo = 0, hi = last;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < x) lo = m + 1; else hi = m; }
+  return g[lo].i;
+}
+
+/* ---------------- 整屏 6px 掩膜（走子只认"笔画上"的格） ---------------- */
+function glyphMask(L) {
+  const mw = Math.ceil(W / ST) + 1, mh = Math.ceil(H / ST) + 1;
+  maskCv.width = mw; maskCv.height = mh;
+  maskCtx.setTransform(1 / ST, 0, 0, 1 / ST, 0, 0);
+  maskCtx.clearRect(0, 0, mw, mh);
+  maskCtx.font = L.font;
+  maskCtx.textAlign = 'center'; maskCtx.textBaseline = 'middle';
+  maskCtx.lineJoin = 'round'; maskCtx.lineCap = 'round';
+  maskCtx.fillStyle = '#fff'; maskCtx.strokeStyle = '#fff';
+  maskCtx.lineWidth = L.fs * 0.02;
+  for (let u = 0; u < L.glyphs.length; u++) {
+    const g = L.glyphs[u];
+    maskCtx.strokeText(g.ch, g.x, g.y);
+    maskCtx.fillText(g.ch, g.x, g.y);
+  }
+  const d = maskCtx.getImageData(0, 0, mw, mh).data;
+  const mask = new Uint8Array(mw * mh);
+  let n = 0;
+  for (let k = 0; k < mask.length; k++) if (d[k * 4 + 3] > 128) { mask[k] = 1; n++; }
+  return { mask: mask, mw: mw, mh: mh, n: n };
+}
+
+/* 每字的子路径：通道按字切成一段段（不连续的同一字就多画一次 moveTo） */
+function buildCharPaths(base, cpt, nchar) {
+  const arr = new Array(nchar);
+  const n = cpt.length;
+  let i = 0;
+  while (i < n) {
+    const c = cpt[i];
+    let j = i + 1;
+    while (j < n && cpt[j] === c) j++;
+    if (c !== 255 && j - i >= 2) {
+      let p = arr[c];
+      if (!p) { p = new Path2D(); arr[c] = p; }
+      p.moveTo(base[i * 2], base[i * 2 + 1]);
+      for (let q = i + 1; q < j; q++) p.lineTo(base[q * 2], base[q * 2 + 1]);
+    }
+    i = j;
+  }
+  return arr;
+}
+
+/* ---------------- 锚点 ---------------- */
+const anchors = [];
+for (let i = 0; i < 96; i++) {
+  const g = i * 2.399963;
+  const rr = 0.30 + 0.70 * (((i * 37) % 97) / 97);
+  anchors.push({ nx: Math.cos(g) * rr, ny: Math.sin(g) * rr * 0.66 });
+}
+function placeAnchor(a, hw, hh, gcx, gcy) {
+  const M = 60;
+  const x0 = M + hw - gcx, x1 = W - M - hw - gcx;
+  const y0 = M + hh - gcy, y1 = H - M - hh - gcy;
+  return {
+    x: x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2 - gcx,
+    y: y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2 - gcy,
+  };
+}
+
+/* ---------------- 掩膜 → 连续蛇形折线 ----------------
+   8 邻域行走 + "尽量保持上一步方向"的偏好：沿笔画直着走，走到头才拐。 */
+const DX8 = [1, 1, 0, -1, -1, -1, 0, 1], DY8 = [0, 1, 1, 1, 0, -1, -1, -1];
+
+function nearestUnvisited(mask, vis, mw, mh, cx, cy, rad) {
+  for (let r = 1; r <= rad; r++) {
+    let best = -1, bd = 1e9;
+    for (let dy = -r; dy <= r; dy++) {
+      const ny = cy + dy;
+      if (ny < 0 || ny >= mh) continue;
+      const edge = (dy === -r || dy === r);
+      for (let dx = -r; dx <= r; dx += edge ? 1 : 2 * r) {
+        const nx = cx + dx;
+        if (nx < 0 || nx >= mw) continue;
+        const k = ny * mw + nx;
+        if (!mask[k] || vis[k]) continue;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bd) { bd = d2; best = k; }
+      }
+    }
+    if (best >= 0) return best;
+  }
+  return -1;
+}
+
+function chainMask(mask, mw, mh, total) {
+  const vis = new Uint8Array(mw * mh);
+  const order = new Int32Array(total);
+  let start = -1;
+  for (let k = 0; k < mask.length; k++) if (mask[k]) { start = k; break; }
+  let cnt = 0, cur = start, pdx = 0, pdy = 1;
+  while (cur >= 0 && cnt < total) {
+    order[cnt++] = cur;
+    vis[cur] = 1;
+    const cx = cur % mw, cy = (cur / mw) | 0;
+    let best = -1, bs = -1e9;
+    for (let d = 0; d < 8; d++) {
+      const nx = cx + DX8[d], ny = cy + DY8[d];
+      if (nx < 0 || ny < 0 || nx >= mw || ny >= mh) continue;
+      const nk = ny * mw + nx;
+      if (!mask[nk] || vis[nk]) continue;
+      const sc = DX8[d] * pdx + DY8[d] * pdy;
+      if (sc > bs) { bs = sc; best = nk; }
+    }
+    if (best < 0) best = nearestUnvisited(mask, vis, mw, mh, cx, cy, 16);
+    if (best < 0) { for (let k = 0; k < mask.length; k++) if (mask[k] && !vis[k]) { best = k; break; } }
+    if (best >= 0) {
+      const bx = best % mw, by = (best / mw) | 0;
+      const ddx = bx - cx, ddy = by - cy;
+      const dl = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+      pdx = ddx / dl; pdy = ddy / dl;
+    }
+    cur = best;
+  }
+  return order;
+}
+
+/* ---------------- 中点位移（递归细分） ---------------- */
+function jagged(src, iters, rough) {
+  let arr = src;
+  for (let it = 0; it < iters; it++) {
+    const n = arr.length;
+    const out = new Float32Array(2 * n - 2);
+    out[0] = arr[0]; out[1] = arr[1];
+    let w = 2;
+    for (let i = 0; i < n - 2; i += 2) {
+      const ax = arr[i], ay = arr[i + 1], bx = arr[i + 2], by = arr[i + 3];
+      const dx = bx - ax, dy = by - ay;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const o = (Math.random() - 0.5) * len * rough;
+      out[w++] = (ax + bx) * 0.5 - (dy / len) * o;
+      out[w++] = (ay + by) * 0.5 + (dx / len) * o;
+      out[w++] = bx; out[w++] = by;
+    }
+    arr = out;
+  }
+  return arr;
+}
+
+function pathOf(arr) {
+  const p = new Path2D();
+  p.moveTo(arr[0], arr[1]);
+  for (let i = 2; i < arr.length; i += 2) p.lineTo(arr[i], arr[i + 1]);
+  return p;
+}
+/* 主通道按点数切 NB 段（烘焙时分帧用）。切点挑**最直的顶点**：
+   每段各自 round 端帽，在直线切点处两个半圆正好对拼 —— 不会叠出一颗亮点，也不会缺口。 */
+const NSEG = 8;
+function segCuts(arr, nb) {
+  const n = arr.length / 2, cuts = [0];
+  for (let b = 1; b < nb; b++) {
+    const want = Math.round(n * b / nb);
+    const lo = Math.max(1, want - 80), hi = Math.min(n - 2, want + 80);
+    let best = want, bs = 1e9;
+    for (let i = lo; i <= hi; i++) {
+      const ax = arr[i * 2] - arr[(i - 1) * 2], ay = arr[i * 2 + 1] - arr[(i - 1) * 2 + 1];
+      const bx = arr[(i + 1) * 2] - arr[i * 2], by = arr[(i + 1) * 2 + 1] - arr[i * 2 + 1];
+      const la = Math.sqrt(ax * ax + ay * ay) || 1, lb = Math.sqrt(bx * bx + by * by) || 1;
+      const s = Math.abs(ax * by - ay * bx) / (la * lb);
+      if (s < bs) { bs = s; best = i; }
+    }
+    cuts.push(best);
+  }
+  cuts.push(n - 1);
+  return cuts;
+}
+function pathRange(arr, i0, i1) {
+  const p = new Path2D();
+  p.moveTo(arr[i0 * 2], arr[i0 * 2 + 1]);
+  for (let i = i0 + 1; i <= i1; i++) p.lineTo(arr[i * 2], arr[i * 2 + 1]);
+  return p;
+}
+function lengthOf(arr) {
+  let L = 0;
+  for (let i = 0; i < arr.length - 2; i += 2) {
+    const dx = arr[i + 2] - arr[i], dy = arr[i + 3] - arr[i + 1];
+    L += Math.sqrt(dx * dx + dy * dy);
+  }
+  return L;
+}
+
+/* ---------------- 造一"击"：主通道 + 分支 + 落点 ----------------
+   主通道必须是**一条连续子路径**（天空引线 + 整条字形蛇线）。
+   实测：整根描边一次 = 10781 个点 × 5 条 ≈ 130ms，是真正的开销（光栅化按点数算，
+   跟线宽无关），所以：
+   · 主通道一整首句只造一条（3 击共用），真闪电本来就是沿同一条通道反复放电；
+   · 辉光层（13/6/9px）用**粗一档的同形折线**（jagged 1 层）—— 被 6~13px 的宽度糊掉，
+     肉眼看不出，但点数少一半；
+   · 分明暗"重掷"的是分支（那一堆横跨天空的细线）和落点，每击都重新甩一套。
+   （原本每击都换一条主通道，3 条各 10781 点 ⇒ 每句要烘 390ms，实测只有 45fps。） */
+function makeVariant(base, A, sh) {
+  const n = base.length / 2;
+  const p0x = base[0], p0y = base[1];
+  let all, allC, main, mainC, mainLen, segs, segsC, y0, y1;
+  if (sh) {
+    all = sh.all; allC = sh.allC; main = sh.main; mainC = sh.mainC; mainLen = sh.len;
+    segs = sh.segs; segsC = sh.segsC; y0 = sh.y0; y1 = sh.y1;
+  } else {
+    const sx = p0x + (Math.random() - 0.5) * W * 0.22;
+    const lead = jagged(new Float32Array([sx, -50, p0x, p0y]), 5, 0.30);
+    const body = jagged(base, 2, 1.15 * boltK);
+    const bodyC = jagged(base, 1, 1.15 * boltK);
+    all = new Float32Array(lead.length + body.length - 2);
+    all.set(lead, 0); all.set(body.subarray(2), lead.length);
+    allC = new Float32Array(lead.length + bodyC.length - 2);
+    allC.set(lead, 0); allC.set(bodyC.subarray(2), lead.length);
+    main = pathOf(all); mainC = pathOf(allC); mainLen = lengthOf(all);
+    const cuts = segCuts(all, NSEG);
+    segs = []; segsC = [];
+    const nC = allC.length / 2, r = (nC - 1) / (n - 1);
+    for (let k = 0; k < NSEG; k++) {
+      segs.push(pathRange(all, cuts[k], cuts[k + 1]));
+      segsC.push(pathRange(allC, Math.round(cuts[k] * r), Math.round(cuts[k + 1] * r)));
+    }
+    y0 = 1e9; y1 = -1e9;
+    for (let i = 1; i < all.length; i += 2) { if (all[i] < y0) y0 = all[i]; if (all[i] > y1) y1 = all[i]; }
+  }
+
+  /* 分支：沿主通道每隔一段抽一个点，往侧后方甩一道（每一击都重新掷） */
+  const brPts = [];
+  const brLens = [];
+  const step = Math.max(8, Math.floor(n / 9));
+  for (let i = step; i < n - step; i += step) {
+    if (Math.random() < 0.28) continue;
+    const bx = base[i * 2], by = base[i * 2 + 1];
+    const ang = Math.random() * 6.283;
+    const len = 70 + Math.random() * 190;
+    const seg = jagged(new Float32Array([bx, by, bx + Math.cos(ang) * len, by + Math.sin(ang) * len]), 3, 0.42);
+    for (let q = 0; q < seg.length; q++) brPts.push(seg[q]);
+    brLens.push(lengthOf(seg));
+    if (Math.random() < 0.35 && len > 120) {
+      const qx = bx + Math.cos(ang) * len * 0.5, qy = by + Math.sin(ang) * len * 0.5;
+      const a2 = ang + (Math.random() - 0.5) * 1.5, l2 = len * 0.42;
+      const s2 = jagged(new Float32Array([qx, qy, qx + Math.cos(a2) * l2, qy + Math.sin(a2) * l2]), 2, 0.5);
+      for (let q = 0; q < s2.length; q++) brPts.push(s2[q]);
+      brLens.push(lengthOf(s2));
+    }
+  }
+  /* 分支全部塞进一条 Path2D */
+  let brPath = null, brMax = 1;
+  if (brPts.length) {
+    brPath = new Path2D();
+    const ax = brPts[0], ay = brPts[1];
+    brPath.moveTo(ax, ay);
+    for (let i = 2; i < brPts.length; i += 2) {
+      brPath.lineTo(brPts[i], brPts[i + 1]);
+    }
+    brMax = 1;
+    for (let i = 0; i < brLens.length; i++) if (brLens[i] > brMax) brMax = brLens[i];
+    brMax *= 1.05;
+  }
+
+  /* 落点辉光：主通道上随机挑几处 */
+  const hits = [];
+  const hn = 3 + ((Math.random() * 3) | 0);
+  for (let i = 0; i < hn; i++) {
+    const idx = ((Math.random() * n) | 0) * 2;
+    hits.push({ x: base[idx], y: base[idx + 1] });
+  }
+
+  const share = sh || { all: all, allC: allC, main: main, mainC: mainC, len: mainLen,
+                        segs: segs, segsC: segsC, y0: y0, y1: y1, cache: null };
+  return { main: main, mainC: mainC, mainLen: mainLen, br: brPath, brMax: brMax, hits: hits, tx: p0x, ty: p0y,
+           segs: segs, segsC: segsC, y0: y0, y1: y1, sh: share, cache: share.cache };
+}
+
+/* ---------------- 状态 ---------------- */
+let lines = [];
+let set = null;            // {base, A, vars:[], i}
+let oldSet = null, oldAge = 99;
+let pendSet = null, pendIdx = -1;
+const buildQ = [];
+let prog = 0, strikeAge = 9, flash = 0, autoT = 1.4;
+let accent = [190, 205, 255];
+let boltK = 1;              // 线宽/锯齿幅度随字号收放：长句笔画细，辉光太粗会糊成一片
+let ctArr = null, curYrc = false, ampN = 0, lit = 0;
+const hot = [];            // 刚击穿的那几个字：逐帧叠一记白芯，0.42s 内衰减
+
+/* 第 k 字击穿：把这一段的芯 + 辉光烘进整根雷电图（累积式，每字只描一次） */
+function lightChar(s, k) {
+  const C = s && s.cache;
+  if (!C || !C.cv) return false;
+  if (!C.ready) return false;
+  const p = s.cp && s.cp[k];
+  if (!p) return true;
+  const x = C.bctx;
+  x.setTransform(DPR, 0, 0, DPR, 0, 0);
+  x.globalCompositeOperation = 'lighter';
+  x.globalAlpha = 1;
+  x.lineCap = 'round'; x.lineJoin = 'round';
+  x.strokeStyle = 'rgba(120,150,255,0.10)'; x.lineWidth = 9 * boltK; x.stroke(p);
+  x.strokeStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',0.14)'; x.lineWidth = 5 * boltK; x.stroke(p);
+  x.strokeStyle = 'hsla(214,100%,92%,0.15)'; x.lineWidth = 1.6; x.stroke(p);
+  x.strokeStyle = 'rgba(238,246,255,0.26)'; x.lineWidth = 0.8; x.stroke(p);
+  return true;
+}
+
+/* 一句的逐字时刻 */
+function setLine(s) {
+  ctArr = null; curYrc = false; ampN = 0; lit = 0; hot.length = 0;
+  if (s) s.drawn = 0;
+  if (!s || !s.lay || curIdx < 0 || !lines[curIdx]) return;
+  const ct = charTimes(lines[curIdx], s.lay.n);
+  ctArr = ct.t; curYrc = ct.ok; ampN = s.lay.n;
+}
+function updLit(T) {
+  if (!ctArr || !ampN) return;
+  let c = 0;
+  for (let k = 0; k < ampN; k++) if (T >= ctArr[k] - 0.10) c++;
+  if (c > lit) lit = c;
+}
+
+function makeSet(idx) {
+  const s = { base: null, A: null, vars: [], i: 0, q: false, cache: null,
+              lay: null, cp: null, nchar: 0, guide: null, drawn: 0 };
+  if (idx < 0 || !lines[idx] || !lines[idx].text) return s;
+  const L = makeLayout(lines[idx].text, idx);
+  if (!L) return s;
+  s.lay = L;
+  boltK = Math.max(0.45, Math.min(1.2, L.fs / 190));
+  const g = glyphMask(L);
+  if (!g.n) return s;
+  const order = chainMask(g.mask, g.mw, g.mh, g.n);
+  const base = new Float32Array(g.n * 2);
+  const cpt = new Uint8Array(g.n);
+  for (let i = 0; i < g.n; i++) {
+    const k = order[i];
+    const x = (k % g.mw) * ST + ST * 0.5, y = ((k / g.mw) | 0) * ST + ST * 0.5;
+    base[i * 2] = x; base[i * 2 + 1] = y;
+    cpt[i] = charAt(L, x, y);
+  }
+  s.base = base; s.nchar = L.n;
+  s.cp = buildCharPaths(base, cpt, L.n);
+  s.A = { x: L.cx, y: L.cy };
+  s.cache = { cv: null, bctx: null, baked: 0, ready: false };
+  s.vars.push(makeVariant(base, s.A, null));
+  s.vars[0].sh.cache = s.cache;
+  s.vars[0].cache = s.cache;
+  s.guide = bakeGuide(L);
+  return s;
+}
+
+/* 极淡的冷光字形底稿（0.5 分辨率，每句烘一次，每帧一次 drawImage） */
+function bakeGuide(L) {
+  const k = 0.5;
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * k * DPR)); c.height = Math.max(1, Math.round(H * k * DPR));
+  const x = c.getContext('2d');
+  x.setTransform(DPR * k, 0, 0, DPR * k, 0, 0);
+  x.font = L.font;
+  x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillStyle = 'rgba(226,236,255,1)';
+  for (let u = 0; u < L.glyphs.length; u++) x.fillText(L.glyphs[u].ch, L.glyphs[u].x, L.glyphs[u].y);
+  return c;
+}
+
+/* ---------------- 一道闪电烘成一张图 ----------------
+   viol 取"冷却后"的稳定值（strikeAge ≥ 0.61 之后就是它）—— 逐帧变色改成
+   在闪光色里带一点 viol，观感不变，但每帧省下 7 次 stroke。 */
+const BC0 = 'hsla(237,100%,72%,0.10)';
+const BC1 = 'hsla(280,100%,82%,0.28)';
+const BC2 = 'hsla(270,100%,70%,0.20)';
+const BC3 = 'hsla(234,100%,88%,0.62)';
+const BC4 = 'hsla(210,100%,97%,0.95)';
+function bakeBand(v, k) {
+  const C = v.cache;
+  if (!C || !C.cv) return;
+  const x = C.bctx;
+  x.setTransform(DPR, 0, 0, DPR, 0, 0);
+  x.globalCompositeOperation = 'lighter';
+  x.globalAlpha = 1;
+  x.lineCap = 'round'; x.lineJoin = 'round';
+  const segC = v.segsC[k];                 /* 辉光层：粗一档的同形折线 */
+  const k1 = boltK, k13 = 13 * k1, k6 = 6 * k1, k9 = 9 * k1;
+  x.strokeStyle = BC0; x.lineWidth = k13; x.stroke(segC);
+  x.strokeStyle = BC1; x.lineWidth = k6; x.stroke(segC);
+  x.strokeStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',0.20)'; x.lineWidth = k9; x.stroke(segC);
+  const seg = v.segs[k];                   /* 芯：完整锯齿细节 */
+  x.strokeStyle = BC3; x.lineWidth = 2.0; x.stroke(seg);
+  x.strokeStyle = BC4; x.lineWidth = 1.0; x.stroke(seg);
+  C.baked++;
+  if (C.baked >= NSEG) C.ready = true;
+}
+/* 分支每帧现画：只有 ~100 个点，实测 0.5ms，而且每一击都能重掷一套 */
+function strokeBranch(v, pr, a) {
+  if (!v || !v.br) return;
+  const dl = Math.max(0, Math.min(1, pr)) * v.brMax;
+  ctx.setLineDash([dl, v.brMax]);
+  ctx.strokeStyle = BC2; ctx.lineWidth = 3;
+  ctx.stroke(v.br);
+  ctx.strokeStyle = 'hsla(215,100%,92%,0.55)'; ctx.lineWidth = 0.9;
+  ctx.stroke(v.br);
+  ctx.setLineDash([]);
+}
+function queueBake(s, v) {
+  const C = v && v.cache;
+  if (!C || C.cv) return;
+  C.cv = document.createElement('canvas');
+  C.cv.width = cv.width; C.cv.height = cv.height;
+  C.bctx = C.cv.getContext('2d');
+  for (let k = 0; k < NSEG; k++) buildQ.push({ s: s, fn: () => bakeBand(v, k) });
+}
+/* 每帧画一道：整根已经烘好了，这里只给包络 alpha + 生长时揭开 */
+function blitBolt(v, pr, env) {
+  const C = v && v.cache;
+  if (!C || !C.ready) { drawBolt(v, pr, env); return; }    // 还没烘好：退回逐帧描边
+  const fl = 0.82 + 0.18 * Math.sin(strikeAge * 95);
+  const a = Math.max(0, Math.min(1, env * fl));
+  const grow = pr < 1;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (grow) {
+    const y = v.y0 + (v.y1 - v.y0) * Math.max(0, Math.min(1, pr));
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(-2, -2, W + 4, Math.round(y) + 2);
+    ctx.clip();
+  }
+  ctx.globalAlpha = a;
+  ctx.drawImage(C.cv, 0, 0, W, H);
+  strokeBranch(v, pr, a);
+  ctx.globalAlpha = 1;
+  if (grow) ctx.restore();
+
+  /* 落点辉光：预渲染光斑 + drawImage，不逐帧建渐变（坑⑪）。
+     半径只长到 strikeAge=0.5（再往后包络 k 已 < 0.3，肉眼看不出来），
+     否则后期每颗要贴 600×600、6 颗就是 6ms */
+  if (pr > 0.25) {
+    const k = Math.exp(-strikeAge * 2.2) * Math.min(1, (pr - 0.25) / 0.4);
+    if (k > 0.05) {
+      const rad = 90 + Math.min(0.5, strikeAge) * 70;
+      for (let i = 0; i < v.hits.length; i++) {
+        const h = v.hits[i];
+        ctx.globalAlpha = Math.min(1, k * 0.7);
+        ctx.drawImage(glowSprite, h.x - rad, h.y - rad, rad * 2, rad * 2);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------- 绘制 ---------------- */
+function draw() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  /* 镜头：天空/山/雷电一起缓慢横移（整像素平移 —— 只做整数位移，全屏贴图才不会退化成重采样） */
+  const panX = Math.round(Math.sin(t0 * 0.038) * W * 0.006);
+  const panY = Math.round(Math.cos(t0 * 0.031) * H * 0.004);
+  ctx.save();
+  ctx.translate(panX, panY);
+  ctx.drawImage(skyTop, 0, 0, W, H);
+
+  /* 星：两档合批 */
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = 'rgba(190,208,255,0.34)';
+  ctx.beginPath();
+  for (let i = 0; i < stars.length; i++) {
+    const s = stars[i];
+    const a = 0.5 + 0.5 * Math.sin(t0 * 0.7 + s.p);
+    if (a < 0.5) continue;
+    ctx.moveTo(s.x * W + s.r, s.y * H);
+    ctx.arc(s.x * W, s.y * H, s.r, 0, 6.283);
+  }
+  ctx.fill();
+  ctx.fillStyle = 'rgba(150,170,230,0.16)';
+  ctx.beginPath();
+  for (let i = 0; i < stars.length; i++) {
+    const s = stars[i];
+    const a = 0.5 + 0.5 * Math.sin(t0 * 0.7 + s.p);
+    if (a >= 0.5) continue;
+    ctx.moveTo(s.x * W + s.r, s.y * H);
+    ctx.arc(s.x * W, s.y * H, s.r, 0, 6.283);
+  }
+  ctx.fill();
+
+  /* 云：两张烘焙图层交叉淡入（闪的时候变亮），每帧两次 drawImage */
+  const lit = Math.min(1, flash);
+  const sway = Math.round(Math.sin(t0 * 0.06) * 10);
+  if (cloudDark) {
+    ctx.globalAlpha = 0.85 * (1 - lit * 0.6);
+    ctx.drawImage(cloudDark, -CLOUD_M + sway, 0, W + CLOUD_M * 2, H);
+    if (lit > 0.02) {
+      ctx.globalAlpha = lit * 0.9;
+      ctx.drawImage(cloudLit, -CLOUD_M + sway, 0, W + CLOUD_M * 2, H);
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+
+  ctx.drawImage(skyLand, 0, 0, W, H);
+  /* 极淡的字形底稿：没唱到的字也读得出来（旧版 4s 时后半句是黑的） */
+  if (set && set.guide) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.14;
+    ctx.drawImage(set.guide, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+
+  /* 全屏闪光 */
+  if (flash > 0.006) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'rgba(140,160,255,' + (flash * 0.09).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = Math.min(1, flash * 0.8);
+    /* 光晕尺寸跟着 flash 一起收（中心不动）：快灭的时候只剩一个小光斑，
+       视觉上就是"闪一下再收掉"，但省掉了后期那张 972×972 的全屏贴图 */
+    const bs = H * (0.55 + 0.65 * Math.min(1, flash));
+    ctx.drawImage(topSprite, W * 0.5 - bs * 0.5, H * 0.1 - bs * 0.5, bs, bs);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* 旧的通道：换句后 0.3 秒内淡掉，然后释放 */
+  if (oldSet && oldAge < 0.32) {
+    const f = 1 - oldAge / 0.32;
+    if (oldSet.vars.length) blitBolt(oldSet.vars[0], 1, f * 0.5);
+  }
+
+  if (set && set.vars.length) {
+    const v = set.vars[set.i % set.vars.length];
+    const env0 = strikeAge < 0.05 ? strikeAge / 0.05 : Math.pow(Math.max(0, 1 - (strikeAge - 0.05) / 1.15), 2.0);
+    /* 余辉：两拍之间不能全黑，否则字会消失 */
+    const env = Math.max(0.16, env0);
+    blitBolt(v, prog, env);
+  }
+
+  /* 刚击穿的那几个字：白芯逐帧叠一层，0.42s 内衰减 —— "先击穿、再留辉光" */
+  if (hot.length) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (let i = hot.length - 1; i >= 0; i--) {
+      const h = hot[i];
+      const age = t0 - h.t0;
+      if (age > 0.42 || !h.p) { hot.splice(i, 1); continue; }
+      const a = 1 - age / 0.42;
+      ctx.strokeStyle = 'rgba(160,190,255,' + (0.22 * a).toFixed(3) + ')';
+      ctx.lineWidth = 3.6 * boltK;
+      ctx.stroke(h.p);
+      ctx.strokeStyle = 'rgba(246,250,255,' + (0.45 * a).toFixed(3) + ')';
+      ctx.lineWidth = 1.1;
+      ctx.stroke(h.p);
+      if (glowSprite) {
+        const rad = 60 + (1 - a) * 120;
+        ctx.globalAlpha = a * 0.55;
+        ctx.drawImage(glowSprite, h.x - rad, h.y - rad, rad * 2, rad * 2);
+        ctx.globalAlpha = 1;
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.restore();
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawBolt(v, pr, env) {
+  const fl = 0.82 + 0.18 * Math.sin(strikeAge * 95);
+  const a = env * fl;
+  const viol = Math.min(55, strikeAge * 90);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  const dl = Math.max(0, Math.min(1, pr)) * v.mainLen;
+  ctx.setLineDash([dl, v.mainLen]);
+  ctx.strokeStyle = 'hsla(' + (248 - viol * 0.2).toFixed(0) + ',100%,72%,' + (0.10 * a).toFixed(3) + ')';
+  ctx.lineWidth = 13;
+  ctx.stroke(v.main);
+  ctx.strokeStyle = 'hsla(' + (225 + viol).toFixed(0) + ',100%,82%,' + (0.28 * a).toFixed(3) + ')';
+  ctx.lineWidth = 6;
+  ctx.stroke(v.main);
+  /* 中景层吃封面主色，雷柱的"体色"跟着歌走 */
+  ctx.strokeStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',' + (0.20 * a).toFixed(3) + ')';
+  ctx.lineWidth = 9;
+  ctx.stroke(v.main);
+  ctx.setLineDash([]);
+  if (v.br) {
+    ctx.setLineDash([Math.min(1, pr) * v.brMax, v.brMax]);
+    ctx.strokeStyle = 'hsla(' + (215 + viol).toFixed(0) + ',100%,70%,' + (0.20 * a).toFixed(3) + ')';
+    ctx.lineWidth = 3;
+    ctx.stroke(v.br);
+    ctx.setLineDash([]);
+  }
+
+  ctx.setLineDash([dl, v.mainLen]);
+  ctx.strokeStyle = 'hsla(' + (212 + viol * 0.4).toFixed(0) + ',100%,88%,' + (0.62 * a).toFixed(3) + ')';
+  ctx.lineWidth = 2.2;
+  ctx.stroke(v.main);
+  ctx.strokeStyle = 'hsla(210,100%,97%,' + (0.95 * a).toFixed(3) + ')';
+  ctx.lineWidth = 1.1;
+  ctx.stroke(v.main);
+  ctx.setLineDash([]);
+  if (v.br) {
+    ctx.setLineDash([Math.min(1, pr) * v.brMax, v.brMax]);
+    ctx.strokeStyle = 'hsla(215,100%,92%,' + (0.55 * a).toFixed(3) + ')';
+    ctx.lineWidth = 0.9;
+    ctx.stroke(v.br);
+    ctx.setLineDash([]);
+  }
+
+  /* 落点辉光：预渲染光斑 + drawImage，不逐帧建渐变（坑⑪） */
+  if (pr > 0.25) {
+    const k = Math.exp(-strikeAge * 2.2) * Math.min(1, (pr - 0.25) / 0.4);
+    if (k > 0.01) {
+      for (let i = 0; i < v.hits.length; i++) {
+        const h = v.hits[i];
+        const rad = 90 + strikeAge * 70;
+        ctx.globalAlpha = Math.min(1, k * 0.7);
+        ctx.drawImage(glowSprite, h.x - rad, h.y - rad, rad * 2, rad * 2);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------- 时间 ---------------- */
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pendSet = null; pendIdx = -1; buildQ.length = 0;
+    oldSet = set; oldAge = 99; set = null;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    /* 显示切到第 ci 句：旧通道挂到 oldSet 上淡出，0.32 秒后连同它的
+       Path2D/点数组/烘焙图一起丢掉 —— 上一句占的结构在这里释放（坑③） */
+    oldSet = set; oldAge = 0;
+    /* 队列里只留下属于新 set 的活（上一句没做完的建图任务直接丢） */
+    if (buildQ.length) {
+      const keep = [];
+      for (let i = 0; i < buildQ.length; i++) {
+        if (pendSet && pendIdx === ci && buildQ[i].s === pendSet) keep.push(buildQ[i]);
+      }
+      buildQ.length = 0;
+      for (let i = 0; i < keep.length; i++) buildQ.push(keep[i]);
+    }
+    if (pendSet && pendIdx === ci) { set = pendSet; }
+    else { set = makeSet(ci); queueSetBuild(set); }
+    setLine(set);
+    pendSet = null; pendIdx = -1;
+    set.i = 0; prog = 0; strikeAge = 0; flash = Math.min(1.3, flash + 0.95);
+    autoT = 1.5 + Math.random() * 2.0;
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      /* 提前把重活干完：栅格化字形 + 串链 + 造第 0 击。
+         第 1、2 击和每一击的"整根烘焙"都排进队列，一帧做一件，
+         所以酝酿期里没有任何一帧会卡（实测烘焙 8 段 × ~10ms） */
+      if (pendIdx !== nx) { pendSet = makeSet(nx); pendIdx = nx; queueSetBuild(pendSet); }
+    }
+  }
+}
+/* 一套词要 1 张烘焙图（主通道 3 击共用）+ 2 击的分支，全部排进队列，一帧一件 */
+function queueSetBuild(s) {
+  if (!s || !s.base || s.q) return;
+  s.q = true;
+  queueBake(s, s.vars[0]);
+  buildQ.push({ s: s, fn: () => { if (s.vars.length < 3) s.vars.push(makeVariant(s.base, s.A, s.vars[0].sh)); } });
+  buildQ.push({ s: s, fn: () => { if (s.vars.length < 3) s.vars.push(makeVariant(s.base, s.A, s.vars[0].sh)); } });
+}
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+
+  timing(T);
+
+  if (buildQ.length) { const job = buildQ.shift(); try { job.fn(); } catch (_) {} }
+
+  /* 逐字放电：整根雷电图烘好之后，每帧最多补两个字（seek 之后也不会一口气堆出上百次描边） */
+  updLit(T);
+  if (set && set.cp) {
+    let guard = 0;
+    while (set.drawn < lit && guard++ < 2) {
+      const k = set.drawn;
+      if (!lightChar(set, k)) break;
+      const g = set.lay ? set.lay.glyphs[k] : null;
+      hot.push({ p: set.cp[k], t0: t0, x: g ? g.x : W * 0.5, y: g ? g.y : H * 0.5 });
+      if (hot.length > 5) hot.shift();
+      flash = Math.min(1.3, flash + 0.20);
+      set.drawn++;
+    }
+  }
+
+  strikeAge += dt;
+  oldAge += dt;
+  if (oldSet && oldAge >= 0.32) oldSet = null;      // 释放
+  if (prog < 1) prog = Math.min(1, prog + dt / 0.34);
+  flash *= Math.exp(-dt * 3.4);
+
+  autoT -= dt;
+  if (autoT <= 0 && set && set.vars.length) {
+    /* 没有踩拍也要活着：隔一两秒自己重击一次 */
+    set.i = (set.i + 1) % set.vars.length;
+    prog = 0; strikeAge = 0;
+    flash = Math.min(1.3, flash + 0.7);
+    autoT = 1.6 + Math.random() * 2.6;
+  }
+
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  groundY = H * 0.9;
+  bakeSky();
+  if (curIdx >= 0) { set = makeSet(curIdx); prog = 1; strikeAge = 9; queueSetBuild(set); setLine(set); }
+}
+addEventListener('resize', resize);
+
+/* ---------------- 启动 ---------------- */
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) {
+      const a = p.accent;
+      accent = [
+        Math.round(a[0] * 0.35 + 190 * 0.65),
+        Math.round(a[1] * 0.35 + 205 * 0.65),
+        Math.round(a[2] * 0.35 + 255 * 0.65),
+      ];
+    }
+    /* 清掉所有粒子/结构 */
+    set = null; oldSet = null; oldAge = 99; pendSet = null; pendIdx = -1; buildQ.length = 0;
+    ctArr = null; curYrc = false; ampN = 0; lit = 0; hot.length = 0;
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：沿同一条通道重击一次（相干 —— 整场一起亮，不逐点乱踢，坑⑬） */
+    if (set && set.vars.length) {
+      set.i = (set.i + 1) % set.vars.length;
+      prog = 0; strikeAge = 0;
+      flash = Math.min(1.3, flash + 0.55 + (d.payload.level || 0) * 0.55);
+      autoT = 1.6 + Math.random() * 2.6;
+    }
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  hasSet: !!set, pts: set && set.base ? set.base.length / 2 : 0,
+  vars: set ? set.vars.length : 0, prog: +prog.toFixed(2),
+  strikeAge: +strikeAge.toFixed(2), q: buildQ.length, t: +now().toFixed(2),
+  yrc: curYrc, yrcLen: lines[curIdx] && lines[curIdx].chars ? lines[curIdx].chars.length : 0,
+  lit: lit, drawn: set ? set.drawn : 0, chars: ampN, hot: hot.length,
+  rows: set && set.lay ? set.lay.nr : 0, fs: set && set.lay ? +set.lay.fs.toFixed(1) : 0,
+  baked: set && set.cache ? set.cache.baked + (set.cache.ready ? 'R' : '-') : '',
+  len: set && set.vars[0] ? Math.round(set.vars[0].mainLen) : 0,
+});
+</script>
+</body>
+</html>

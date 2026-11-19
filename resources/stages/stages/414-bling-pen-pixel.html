@@ -1,0 +1,1281 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>414 · 金钻王座</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05030a; overflow: hidden; }
+  #stage { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* 自检口：脚本最外层无条件赋值，永远可用 */
+  var state = { lines: 0, idx: -1, time: 0, playing: true, frames: 0, js: 0, err: '', text: '' };
+  state.rm = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  window.__stage = function () {
+    return {
+      lines: state.lines, idx: state.idx, t: state.time, playing: state.playing,
+      frames: state.frames, js: state.js, err: state.err, text: state.text,
+      gl: false, rm: state.rm
+    };
+  };
+
+  /* ready：第一个 rAF 无条件发 + 定时兜底，只发一次；排在所有 boot 之前 */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) { return; }
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }
+    catch (readyError) { console.error('[414] ready 发送失败', readyError); }
+  }
+  requestAnimationFrame(function () { sendReady(); });
+  setTimeout(sendReady, 800);
+
+  /* 错误限流：每秒最多一条 */
+  var lastErrorAt = 0;
+  function noteError(where, error) {
+    var nowMs = Date.now();
+    if (nowMs - lastErrorAt < 1000) { return; }
+    lastErrorAt = nowMs;
+    console.error('[414] ' + where, error);
+  }
+
+  var canvas = document.getElementById('stage');
+  var ctx = canvas ? canvas.getContext('2d') : null;
+  if (!ctx) {
+    console.error('[414] 无法取得 2D 画布上下文');
+    return;
+  }
+  var view = { w: 1440, h: 900, dpr: 1 };
+  var song = { name: '', artists: '', cover: '' };
+  var lines = [];
+  var initialized = false;
+  var current = { idx: -1, text: '' };
+  var layout = { cx: 720, cy: 450, lyricWidth: 980, uiScale: 1 };
+
+  function toByte(value, fallback) {
+    var num = Number(value);
+    if (!isFinite(num)) { return fallback; }
+    return Math.round(Math.min(255, Math.max(0, num)));
+  }
+
+  /* 调色板：accent 可能缺失/脏，取用前一律回落 */
+  var palette = { base: [255, 176, 32], hot: [255, 92, 156], deep: [26, 8, 34] };
+
+  function adoptAccent(rawAccent) {
+    var source = Array.isArray(rawAccent) && rawAccent.length >= 3 ? rawAccent : null;
+    palette.base = source
+      ? [toByte(source[0], 255), toByte(source[1], 176), toByte(source[2], 32)]
+      : [255, 176, 32];
+    var base = palette.base;
+    palette.hot = [toByte(140 + base[0] * 0.45, 255), toByte(base[1] * 0.28, 80), toByte(120 + base[2] * 0.36, 200)];
+    palette.deep = [toByte(base[0] * 0.16 + 8, 22), toByte(base[1] * 0.1 + 4, 10), toByte(base[2] * 0.22 + 14, 30)];
+  }
+
+  function rgba(rgb, alpha) {
+    var safeAlpha = Number(alpha);
+    if (!isFinite(safeAlpha)) { safeAlpha = 1; }
+    safeAlpha = Math.min(1, Math.max(0, safeAlpha));
+    return 'rgba(' + toByte(rgb[0], 255) + ',' + toByte(rgb[1], 255) + ',' + toByte(rgb[2], 255) + ',' + safeAlpha.toFixed(3) + ')';
+  }
+
+  function addStop(gradient, offset, color) {
+    try { gradient.addColorStop(Math.min(1, Math.max(0, Number(offset) || 0)), color); }
+    catch (stopError) { noteError('addColorStop', stopError); }
+  }
+
+  function clampNumber(value, low, high, fallback) {
+    var num = Number(value);
+    if (!isFinite(num)) { return fallback; }
+    return Math.min(high, Math.max(low, num));
+  }
+
+  function makeLayer(width, height) {
+    var layer = document.createElement('canvas');
+    layer.width = Math.max(1, Math.round(width));
+    layer.height = Math.max(1, Math.round(height));
+    return layer;
+  }
+
+  function resize() {
+    var rawWidth = window.innerWidth || 0;
+    var rawHeight = window.innerHeight || 0;
+    view.w = rawWidth > 0 ? rawWidth : 1440;
+    view.h = rawHeight > 0 ? rawHeight : 900;
+    view.dpr = Math.min(1.6, window.devicePixelRatio || 1);
+    canvas.width = Math.round(view.w * view.dpr);
+    canvas.height = Math.round(view.h * view.dpr);
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    layout.cx = view.w / 2;
+    layout.cy = view.h * 0.5;
+    layout.lyricWidth = Math.min(view.w * 0.86, 1040);
+    layout.uiScale = clampNumber(Math.min(view.w / 1440, view.h / 900), 0.55, 2.2, 1);
+    requestBake();
+  }
+
+  /* 烘焙任务：一律在 ready 之后按帧预算执行 */
+  var bakeQueue = [];
+  function requestBake() {
+    if (bakeQueue.length === 0) { bakeQueue.push('backdrop'); }
+    else if (bakeQueue.indexOf('backdrop') < 0) { bakeQueue.unshift('backdrop'); }
+  }
+
+  function runBakes(budgetMs) {
+    var startedAt = performance.now();
+    var guard = 0;
+    while (bakeQueue.length > 0 && performance.now() - startedAt < budgetMs && guard < 8) {
+      guard += 1;
+      var job = bakeQueue.shift();
+      try {
+        if (job === 'backdrop') { bakeBackdrop(); }
+      } catch (bakeError) { noteError('bake:' + job, bakeError); }
+    }
+  }
+
+  var backdrop = { canvas: null, ready: false, key: '' };
+
+  function makeChainTile(bandHeight, linkRadius) {
+    var tileWidth = Math.max(8, Math.round(linkRadius * 4.6));
+    var tile = makeLayer(tileWidth, bandHeight);
+    var paint = tile.getContext('2d');
+    for (var link = 0; link < 2; link += 1) {
+      var linkX = linkRadius * 1.15 + link * linkRadius * 2.3;
+      var centerY = bandHeight / 2;
+      var lit = link === 0;
+      var gold = paint.createLinearGradient(linkX, centerY - linkRadius, linkX, centerY + linkRadius);
+      addStop(gold, 0, lit ? '#fff3c4' : '#b9862c');
+      addStop(gold, 0.45, lit ? '#ffcf4d' : '#8a5a14');
+      addStop(gold, 1, '#4a2a06');
+      paint.fillStyle = gold;
+      paint.beginPath();
+      paint.arc(linkX, centerY, linkRadius, 0, Math.PI * 2);
+      paint.fill();
+      paint.strokeStyle = 'rgba(60,34,6,0.85)';
+      paint.lineWidth = Math.max(1, bandHeight * 0.07);
+      paint.stroke();
+      paint.fillStyle = 'rgba(255,255,255,0.7)';
+      paint.beginPath();
+      paint.arc(linkX - linkRadius * 0.28, centerY - linkRadius * 0.3, linkRadius * 0.2, 0, Math.PI * 2);
+      paint.fill();
+    }
+    return tile;
+  }
+
+  function drawChainBand(paint, width, height) {
+    var bandHeight = Math.max(12, Math.round(20 * layout.uiScale));
+    var linkRadius = bandHeight * 0.6;
+    var tile = makeChainTile(bandHeight, linkRadius);
+    var pattern = paint.createPattern(tile, 'repeat');
+    if (!pattern) { return; }
+    paint.fillStyle = pattern;
+    paint.fillRect(0, 0, width, bandHeight);
+    paint.fillRect(0, height - bandHeight, width, bandHeight);
+    paint.fillStyle = 'rgba(40,22,4,0.5)';
+    paint.fillRect(0, bandHeight, width, 1);
+    paint.fillRect(0, height - bandHeight - 1, width, 1);
+  }
+
+  function drawGrille(paint, width, height) {
+    var grilleWidth = Math.min(width * 0.7, Math.max(300, height * 0.9));
+    var grilleHeight = Math.min(height * 0.26, grilleWidth * 0.3);
+    var left = width / 2 - grilleWidth / 2;
+    var top = height - grilleHeight * 0.72;
+    paint.save();
+    paint.globalAlpha = 0.62;
+    var frameGradient = paint.createLinearGradient(left, top, left, top + grilleHeight);
+    addStop(frameGradient, 0, '#ffe9a8');
+    addStop(frameGradient, 0.35, '#c9932f');
+    addStop(frameGradient, 1, '#2a1704');
+    paint.fillStyle = frameGradient;
+    paint.beginPath();
+    paint.moveTo(left, top);
+    paint.lineTo(left + grilleWidth, top);
+    paint.lineTo(left + grilleWidth * 0.93, top + grilleHeight);
+    paint.lineTo(left + grilleWidth * 0.07, top + grilleHeight);
+    paint.closePath();
+    paint.fill();
+
+    var bars = 15;
+    var innerLeft = left + grilleWidth * 0.09;
+    var innerWidth = grilleWidth * 0.82;
+    var barGap = innerWidth / bars;
+    for (var bar = 0; bar < bars; bar += 1) {
+      var barLeft = innerLeft + bar * barGap + barGap * 0.16;
+      var barWidth = barGap * 0.62;
+      var chromeBar = paint.createLinearGradient(barLeft, 0, barLeft + barWidth, 0);
+      addStop(chromeBar, 0, '#3a3a44');
+      addStop(chromeBar, 0.35, '#e8f0ff');
+      addStop(chromeBar, 0.55, '#8e97ad');
+      addStop(chromeBar, 1, '#23232c');
+      paint.fillStyle = chromeBar;
+      paint.fillRect(barLeft, top + grilleHeight * 0.16, barWidth, grilleHeight * 0.74);
+    }
+
+    var studCount = 11;
+    for (var stud = 0; stud < studCount; stud += 1) {
+      var studX = left + grilleWidth * (0.14 + 0.72 * (stud / (studCount - 1)));
+      var studY = top + grilleHeight * 0.08;
+      paint.fillStyle = 'rgba(255,255,255,0.85)';
+      paint.beginPath();
+      paint.arc(studX, studY, Math.max(1.5, grilleHeight * 0.022), 0, Math.PI * 2);
+      paint.fill();
+    }
+    paint.restore();
+  }
+
+  function bakeBackdrop() {
+    if (!(view.w > 0 && view.h > 0)) { return; }
+    var width = view.w;
+    var height = view.h;
+    var dpr = view.dpr;
+    var layer = makeLayer(width * dpr, height * dpr);
+    var paint = layer.getContext('2d');
+    paint.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var sky = paint.createLinearGradient(0, 0, 0, height);
+    addStop(sky, 0, '#070310');
+    addStop(sky, 0.34, rgba(palette.deep, 1));
+    addStop(sky, 0.7, '#1c0616');
+    addStop(sky, 1, '#050208');
+    paint.fillStyle = sky;
+    paint.fillRect(0, 0, width, height);
+
+    var glow = paint.createRadialGradient(width * 0.5, height * 0.45, 0, width * 0.5, height * 0.45, Math.max(width, height) * 0.66);
+    addStop(glow, 0, rgba(palette.base, 0.2));
+    addStop(glow, 0.4, rgba(palette.hot, 0.08));
+    addStop(glow, 1, 'rgba(0,0,0,0)');
+    paint.fillStyle = glow;
+    paint.fillRect(0, 0, width, height);
+
+    /* 静态碎钻尘 */
+    var dustCount = Math.min(140, Math.round((width * height) / 12000));
+    for (var dust = 0; dust < dustCount; dust += 1) {
+      var dustX = (dust * 79.19 % width + width * 0.013);
+      var dustY = (dust * 127.71 % height);
+      var dustSize = 1 + (dust % 3) * 0.7;
+      paint.fillStyle = dust % 4 === 0 ? rgba(palette.base, 0.5) : 'rgba(255,255,255,0.34)';
+      paint.beginPath();
+      paint.arc(dustX, dustY, dustSize, 0, Math.PI * 2);
+      paint.fill();
+    }
+
+    drawGrille(paint, width, height);
+
+    var vignette = paint.createRadialGradient(width * 0.5, height * 0.48, Math.min(width, height) * 0.2, width * 0.5, height * 0.48, Math.max(width, height) * 0.8);
+    addStop(vignette, 0, 'rgba(0,0,0,0)');
+    addStop(vignette, 0.68, 'rgba(2,1,5,0.28)');
+    addStop(vignette, 1, 'rgba(2,1,5,0.86)');
+    paint.fillStyle = vignette;
+    paint.fillRect(0, 0, width, height);
+
+    drawChainBand(paint, width, height);
+
+    bakeRayLayer();
+    backdrop.canvas = layer;
+    backdrop.ready = true;
+    backdrop.key = width + 'x' + height + ':' + palette.base.join(',');
+  }
+
+  var starSeeds = [];
+  function buildStarSeeds() {
+    starSeeds.length = 0;
+    var total = Math.min(34, Math.round(14 + layout.uiScale * 9));
+    for (var seed = 0; seed < total; seed += 1) {
+      starSeeds.push({
+        x: ((seed * 61.7) % 100) / 100,
+        y: ((seed * 37.3 + 11) % 100) / 100,
+        phase: (seed * 0.77) % (Math.PI * 2),
+        size: 3 + (seed % 4) * 2.4,
+        speed: 0.6 + (seed % 5) * 0.22
+      });
+    }
+  }
+  buildStarSeeds();
+
+  var rayLayer = { canvas: null, ready: false };
+
+  function bakeRayLayer() {
+    var size = 1024;
+    var layer = makeLayer(size, size);
+    var paint = layer.getContext('2d');
+    var wedges = 30;
+    paint.translate(size / 2, size / 2);
+    for (var wedge = 0; wedge < wedges; wedge += 1) {
+      var startAngle = (wedge / wedges) * Math.PI * 2;
+      var spread = (Math.PI * 2 / wedges) * 0.54;
+      paint.beginPath();
+      paint.moveTo(0, 0);
+      paint.arc(0, 0, size * 0.5, startAngle, startAngle + spread);
+      paint.closePath();
+      paint.fillStyle = rgba(palette.base, wedge % 2 === 0 ? 0.075 : 0.03);
+      paint.fill();
+    }
+    rayLayer.canvas = layer;
+    rayLayer.ready = true;
+  }
+
+  function drawRays(seconds) {
+    var centerX = view.w * 0.5;
+    var centerY = view.h * 0.46;
+    var span = Math.hypot(view.w, view.h) * 1.12;
+    var rotation = state.rm ? 0.2 : seconds * 0.035;
+    var layer = rayLayer.canvas;
+    var usable = rayLayer.ready && layer instanceof HTMLCanvasElement && layer.width > 0 && layer.height > 0;
+    ctx.save();
+    ctx.translate(centerX, centerY);
+    try {
+      ctx.rotate(rotation);
+      if (usable) {
+        ctx.drawImage(layer, -span / 2, -span / 2, span, span);
+      } else {
+        for (var wedge = 0; wedge < 24; wedge += 1) {
+          var startAngle = (wedge / 24) * Math.PI * 2;
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.arc(0, 0, span * 0.5, startAngle, startAngle + (Math.PI * 2 / 24) * 0.54);
+          ctx.closePath();
+          ctx.fillStyle = rgba(palette.base, wedge % 2 === 0 ? 0.06 : 0.025);
+          ctx.fill();
+        }
+      }
+    } catch (rayError) { noteError('drawRays', rayError); }
+    ctx.restore();
+  }
+
+  function drawDiamondHalo(seconds) {
+    var centerX = view.w * 0.5;
+    var centerY = view.h * 0.48;
+    var radius = Math.min(view.w, view.h) * (0.3 + energy.level * 0.02);
+    ctx.save();
+    ctx.translate(centerX, centerY);
+    ctx.strokeStyle = rgba(palette.base, 0.5);
+    ctx.lineWidth = Math.max(1, 2 * layout.uiScale);
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    var studs = 40;
+    for (var stud = 0; stud < studs; stud += 1) {
+      var angle = (stud / studs) * Math.PI * 2 - Math.PI / 2;
+      var twinkle = state.rm ? 0.6 : 0.45 + 0.55 * Math.abs(Math.sin(seconds * 1.9 + stud * 0.7));
+      var studX = Math.cos(angle) * radius;
+      var studY = Math.sin(angle) * radius;
+      ctx.fillStyle = rgba([255, 255, 255], 0.25 + twinkle * 0.7);
+      ctx.beginPath();
+      ctx.arc(studX, studY, Math.max(1.2, radius * 0.012 * (0.6 + twinkle)), 0, Math.PI * 2);
+      ctx.fill();
+      if (stud % 3 === 0) {
+        ctx.fillStyle = rgba(palette.base, twinkle * 0.55);
+        ctx.beginPath();
+        ctx.arc(studX, studY, Math.max(2, radius * 0.026 * twinkle), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawSparkleCross(atX, atY, size, strength) {
+    var flare = Math.max(0.5, size * clampNumber(strength, 0, 1, 1));
+    if (flare < 0.6) { return; }
+    var armWidth = Math.max(0.35, flare * 0.055);
+    ctx.save();
+    ctx.translate(atX, atY);
+    ctx.globalCompositeOperation = 'lighter';
+    for (var arm = 0; arm < 4; arm += 1) {
+      ctx.save();
+      ctx.rotate((arm / 4) * Math.PI * 2 + Math.PI / 4);
+      ctx.fillStyle = arm % 2 === 0 ? 'rgba(255,255,255,0.92)' : rgba(palette.base, 0.85);
+      ctx.beginPath();
+      ctx.moveTo(0, -armWidth);
+      ctx.lineTo(flare, 0);
+      ctx.lineTo(0, armWidth);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.beginPath();
+    ctx.arc(0, 0, Math.max(0.4, flare * 0.16), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = rgba(palette.base, 0.28);
+    ctx.beginPath();
+    ctx.arc(0, 0, Math.max(0.8, flare * 0.3), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawStarField(seconds) {
+    var total = qualityLevel > 0 ? starSeeds.length : Math.max(8, Math.floor(starSeeds.length * 0.45));
+    for (var star = 0; star < total; star += 1) {
+      var seed = starSeeds[star];
+      var twinkle = state.rm ? 0.5 : 0.3 + 0.7 * Math.abs(Math.sin(seconds * seed.speed + seed.phase));
+      drawSparkleCross(seed.x * view.w, seed.y * view.h, seed.size * layout.uiScale * (0.55 + twinkle), twinkle * 0.8);
+    }
+  }
+
+  function drawTitlePlate() {
+    var plateWidth = Math.min(view.w * 0.66, 520 * layout.uiScale);
+    var plateHeight = Math.max(30, 54 * layout.uiScale);
+    var plateY = Math.max(34, view.h * 0.055);
+    ctx.save();
+    ctx.translate(view.w / 2, plateY);
+    ctx.rotate(-0.012);
+    var plateGradient = ctx.createLinearGradient(0, -plateHeight / 2, 0, plateHeight / 2);
+    addStop(plateGradient, 0, '#fff6d0');
+    addStop(plateGradient, 0.42, '#f0b93c');
+    addStop(plateGradient, 0.56, '#8d5a0e');
+    addStop(plateGradient, 1, '#2c1702');
+    ctx.fillStyle = plateGradient;
+    ctx.strokeStyle = 'rgba(255,246,205,0.85)';
+    ctx.lineWidth = Math.max(1, 1.6 * layout.uiScale);
+    ctx.beginPath();
+    ctx.rect(-plateWidth / 2, -plateHeight / 2, plateWidth, plateHeight);
+    ctx.fill();
+    ctx.stroke();
+
+    var caption = song.name ? song.name : 'PLATINUM';
+    var artistsText = song.artists ? String(song.artists) : '';
+    var captionSize = Math.max(13, Math.min(26, plateHeight * 0.42));
+    ctx.font = '900 ' + Math.round(captionSize) + 'px Impact, "Arial Black", "Noto Sans SC", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = 'rgba(32,14,2,0.92)';
+    ctx.fillText(caption.slice(0, 28), 0, artistsText ? -captionSize * 0.28 : 0, plateWidth * 0.88);
+    if (artistsText) {
+      ctx.font = '700 ' + Math.round(captionSize * 0.55) + 'px "Arial Black", "Noto Sans SC", sans-serif';
+      ctx.fillStyle = 'rgba(48,22,2,0.82)';
+      ctx.fillText(artistsText.slice(0, 34), 0, captionSize * 0.48, plateWidth * 0.88);
+    }
+    ctx.restore();
+  }
+
+  var energy = { beatPulse: 0, level: 0, bass: 0, bpm: 0 };
+  var qualityLevel = 1;
+  var frameCostAverage = 8;
+  var coverImage = { node: null, url: '', failed: false, ready: false };
+
+  function loadCover(url) {
+    coverImage.failed = false;
+    coverImage.ready = false;
+    coverImage.url = url || '';
+    if (!url) { coverImage.node = null; return; }
+    try {
+      var nextImage = new Image();
+      nextImage.onload = function () {
+        if (nextImage.naturalWidth > 0 && nextImage.naturalHeight > 0) {
+          coverImage.node = nextImage;
+          coverImage.ready = true;
+        } else {
+          coverImage.failed = true;
+        }
+      };
+      nextImage.onerror = function () {
+        coverImage.failed = true;
+        coverImage.ready = false;
+        noteError('cover onerror', new Error('封面加载失败，改用钻石唱片占位'));
+      };
+      nextImage.src = url;
+      coverImage.node = nextImage;
+    } catch (coverError) {
+      noteError('loadCover', coverError);
+      coverImage.failed = true;
+    }
+  }
+
+  function drawCoverPendant(seconds) {
+    if (view.w < 560) { return; }
+    var radius = Math.max(26, 40 * layout.uiScale);
+    var centerX = Math.max(radius + 34, view.w * 0.088);
+    var centerY = Math.max(radius + 70, view.h * 0.2);
+    var bob = state.rm ? 0 : Math.sin(seconds * 0.9) * 3;
+
+    var chain = ctx.createLinearGradient(centerX - radius, centerY, centerX + radius, centerY);
+    addStop(chain, 0, '#5a3608');
+    addStop(chain, 0.5, '#ffd873');
+    addStop(chain, 1, '#5a3608');
+    ctx.strokeStyle = chain;
+    ctx.lineWidth = Math.max(2, 3.4 * layout.uiScale);
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius + 6 * layout.uiScale + bob, 0, Math.PI * 2);
+    ctx.stroke();
+
+    var hasCover = coverImage.ready && coverImage.node && coverImage.node.naturalWidth > 0;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(centerX, centerY + bob, radius, 0, Math.PI * 2);
+    ctx.clip();
+    if (hasCover) {
+      try { ctx.drawImage(coverImage.node, centerX - radius, centerY + bob - radius, radius * 2, radius * 2); }
+      catch (coverDrawError) { noteError('cover drawImage', coverDrawError); }
+    } else {
+      var blank = ctx.createLinearGradient(centerX - radius, centerY - radius, centerX + radius, centerY + radius);
+      addStop(blank, 0, rgba(palette.deep, 1));
+      addStop(blank, 0.5, rgba(palette.base, 0.5));
+      addStop(blank, 1, '#0a0410');
+      ctx.fillStyle = blank;
+      ctx.fillRect(centerX - radius, centerY + bob - radius, radius * 2, radius * 2);
+      ctx.fillStyle = 'rgba(255,246,214,0.8)';
+      ctx.font = '900 ' + Math.round(radius * 0.72) + 'px Impact, "Arial Black", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('$', centerX, centerY + bob);
+    }
+    ctx.restore();
+
+    var rim = ctx.createLinearGradient(centerX, centerY - radius, centerX, centerY + radius);
+    addStop(rim, 0, '#fff3c4');
+    addStop(rim, 0.5, '#d69a24');
+    addStop(rim, 1, '#4a2a06');
+    ctx.strokeStyle = rim;
+    ctx.lineWidth = Math.max(1.5, 2.6 * layout.uiScale);
+    ctx.beginPath();
+    ctx.arc(centerX, centerY + bob, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    drawSparkleCross(centerX + radius * 0.9, centerY + bob - radius * 0.72, radius * 0.34, 0.7);
+  }
+
+  function drawMoneyStacks(seconds) {
+    var stacks = [
+      { x: view.w * 0.1, y: view.h * 0.92, scale: layout.uiScale * 0.82, tilt: -0.08, phase: 0 },
+      { x: view.w * 0.19, y: view.h * 0.955, scale: layout.uiScale * 0.66, tilt: 0.06, phase: 1.7 },
+      { x: view.w * 0.9, y: view.h * 0.92, scale: layout.uiScale * 0.84, tilt: 0.07, phase: 3.1 },
+      { x: view.w * 0.81, y: view.h * 0.955, scale: layout.uiScale * 0.64, tilt: -0.05, phase: 4.4 }
+    ];
+    for (var stackIndex = 0; stackIndex < stacks.length; stackIndex += 1) {
+      var stack = stacks[stackIndex];
+      var bob = state.rm ? 0 : Math.sin(seconds * 0.8 + stack.phase) * 2.4;
+      drawMoneyStack(stack.x, stack.y + bob, stack.scale, stack.tilt);
+    }
+  }
+
+  function drawMoneyStack(centerX, baseY, scale, tilt) {
+    var billW = 132 * scale;
+    var billH = 46 * scale;
+    if (billW < 4 || billH < 4) { return; }
+    ctx.save();
+    ctx.translate(centerX, baseY);
+    ctx.rotate(tilt);
+    for (var layer = 4; layer >= 0; layer -= 1) {
+      var offsetY = -layer * billH * 0.46;
+      var offsetX = (layer % 2 === 0 ? -1 : 1) * billW * 0.045;
+      var billGradient = ctx.createLinearGradient(-billW / 2, offsetY - billH / 2, billW / 2, offsetY + billH / 2);
+      addStop(billGradient, 0, '#123a22');
+      addStop(billGradient, 0.35, '#3f9c5c');
+      addStop(billGradient, 0.62, '#2a7442');
+      addStop(billGradient, 1, '#0d2b19');
+      ctx.fillStyle = billGradient;
+      ctx.strokeStyle = 'rgba(255,240,190,0.55)';
+      ctx.lineWidth = Math.max(1, 1.1 * scale);
+      ctx.beginPath();
+      ctx.rect(-billW / 2 + offsetX, offsetY - billH / 2, billW, billH);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,214,92,0.9)';
+      ctx.fillRect(-billW * 0.13 + offsetX, offsetY - billH / 2, billW * 0.26, billH);
+      ctx.fillStyle = 'rgba(10,30,16,0.55)';
+      ctx.fillRect(-billW * 0.03 + offsetX, offsetY - billH / 2, billW * 0.06, billH);
+    }
+    ctx.restore();
+    drawSparkleCross(centerX + billW * 0.34, baseY - billH * 1.5, 4 * scale + 3, 0.55);
+  }
+
+  function drawBurningBills(seconds) {
+    var total = state.rm ? 5 : (qualityLevel > 0 ? 11 : 6);
+    for (var bill = 0; bill < total; bill += 1) {
+      var speed = 0.05 + (bill % 4) * 0.014;
+      var progress = ((seconds * speed + bill * 0.173) % 1 + 1) % 1;
+      var driftX = view.w * (0.1 + ((bill * 0.317) % 0.8)) + Math.sin(seconds * 0.7 + bill) * view.w * 0.018;
+      var driftY = view.h * (0.95 - progress * 0.8);
+      var fade = progress < 0.12 ? progress / 0.12 : Math.max(0, 1 - (progress - 0.12) / 0.88);
+      var billScale = (0.5 + (bill % 3) * 0.16) * layout.uiScale;
+      var width = 34 * billScale;
+      var height = 15 * billScale;
+      if (width < 2 || height < 2) { continue; }
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, fade) * 0.85;
+      ctx.translate(driftX, driftY);
+      ctx.rotate(Math.sin(seconds * 1.3 + bill) * 0.5);
+      var paper = ctx.createLinearGradient(-width / 2, 0, width / 2, 0);
+      addStop(paper, 0, '#1b3f28');
+      addStop(paper, 0.5, '#7fb98c');
+      addStop(paper, 1, '#173120');
+      ctx.fillStyle = paper;
+      ctx.beginPath();
+      ctx.rect(-width / 2, -height / 2, width, height);
+      ctx.fill();
+      var flame = ctx.createRadialGradient(0, -height * 0.4, 0, 0, -height * 0.4, width * 0.9);
+      addStop(flame, 0, 'rgba(255,246,190,0.95)');
+      addStop(flame, 0.35, 'rgba(255,156,40,0.6)');
+      addStop(flame, 1, 'rgba(255,60,0,0)');
+      ctx.fillStyle = flame;
+      ctx.beginPath();
+      ctx.arc(0, -height * 0.4, width * 0.9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBeatBurst() {
+    var strength = clampNumber(energy.beatPulse, 0, 1, 0);
+    if (strength <= 0.02) { return; }
+    var centerX = view.w * 0.5;
+    var centerY = view.h * 0.52;
+    var baseLength = Math.min(view.w, view.h) * 0.26;
+    var spikes = 22;
+    ctx.save();
+    ctx.translate(centerX, centerY);
+    ctx.globalCompositeOperation = 'lighter';
+    for (var spike = 0; spike < spikes; spike += 1) {
+      var angle = (spike / spikes) * Math.PI * 2 + 0.14;
+      var length = baseLength * (0.28 + strength * 0.9) * (spike % 2 === 0 ? 1 : 0.55);
+      var width = 0.02 + (spike % 3) * 0.006;
+      var burst = ctx.createLinearGradient(0, 0, Math.cos(angle) * length, Math.sin(angle) * length);
+      addStop(burst, 0, rgba(palette.base, 0.5 * strength));
+      addStop(burst, 1, 'rgba(255,255,255,0)');
+      ctx.strokeStyle = burst;
+      ctx.lineWidth = Math.max(1, baseLength * width);
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(angle) * baseLength * 0.16, Math.sin(angle) * baseLength * 0.16);
+      ctx.lineTo(Math.cos(angle) * length, Math.sin(angle) * length);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+
+  function acceptInit(payload) {
+    var data = payload && typeof payload === 'object' ? payload : {};
+    var incoming = Array.isArray(data.lines) ? data.lines : [];
+    var clean = [];
+    for (var row = 0; row < incoming.length; row += 1) {
+      var item = incoming[row];
+      if (!item || typeof item !== 'object') { continue; }
+      var text = typeof item.text === 'string' ? item.text : (item.text == null ? '' : String(item.text));
+      var startAt = Number(item.t);
+      var dur = Number(item.dur);
+      var chars = null;
+      if (Array.isArray(item.chars) && item.chars.length > 0) {
+        chars = [];
+        for (var charIndex = 0; charIndex < item.chars.length; charIndex += 1) {
+          var charItem = item.chars[charIndex];
+          if (!charItem || typeof charItem !== 'object') { continue; }
+          var charTime = Number(charItem.t);
+          chars.push({
+            c: typeof charItem.c === 'string' ? charItem.c : String(charItem.c == null ? '' : charItem.c),
+            t: isFinite(charTime) ? charTime : null
+          });
+        }
+        if (chars.length === 0) { chars = null; }
+      }
+      clean.push({
+        t: isFinite(startAt) ? startAt : 0,
+        dur: isFinite(dur) && dur > 0 ? dur : 0,
+        text: text,
+        chars: chars
+      });
+    }
+    clean.sort(function (first, second) { return first.t - second.t; });
+
+    var songInfo = data.song && typeof data.song === 'object' ? data.song : {};
+    song.name = songInfo.name == null ? '' : String(songInfo.name);
+    song.cover = songInfo.cover == null ? '' : String(songInfo.cover);
+    var artistValue = songInfo.artists;
+    if (Array.isArray(artistValue)) {
+      song.artists = artistValue.filter(function (name) { return name != null; }).join(' / ');
+    } else if (artistValue == null) {
+      song.artists = '';
+    } else {
+      song.artists = String(artistValue);
+    }
+
+    adoptAccent(data.accent);
+    lines = clean;
+    initialized = true;
+    state.lines = lines.length;
+    state.idx = -1;
+    state.text = '';
+    current.idx = -1;
+    state.time = 0;
+    energy.beatPulse = 0;
+    energy.level = 0;
+    if (coverImage.url !== song.cover) { loadCover(song.cover); }
+    resetLyricLayers();
+    if (typeof data.playing === 'boolean') { state.playing = data.playing; } else { state.playing = true; }
+    requestBake();
+  }
+
+  function findLineIndex(seconds) {
+    var found = -1;
+    for (var scan = 0; scan < lines.length; scan += 1) {
+      var startAt = Number(lines[scan].t);
+      if (isFinite(startAt) && startAt <= seconds + 0.001) { found = scan; } else { break; }
+    }
+    return found;
+  }
+
+  /* ---------------- 歌词引擎 ---------------- */
+  var lyricRows = {};
+  var lyricRowOrder = [];
+  var lyricLayouts = {};
+  var lyricLayoutOrder = [];
+
+  function resetLyricLayers() {
+    lyricRows = {};
+    lyricRowOrder = [];
+    lyricLayouts = {};
+    lyricLayoutOrder = [];
+  }
+
+  function mixRgb(from, to, amount) {
+    var ratio = clampNumber(amount, 0, 1, 0);
+    return [
+      toByte(from[0] + (to[0] - from[0]) * ratio, 128),
+      toByte(from[1] + (to[1] - from[1]) * ratio, 128),
+      toByte(from[2] + (to[2] - from[2]) * ratio, 128)
+    ];
+  }
+
+  function lyricFont(fontPx) {
+    return '900 ' + Math.round(fontPx) + 'px Impact, "Arial Black", "Noto Sans SC", "Microsoft YaHei", sans-serif';
+  }
+
+  function splitTokens(text) {
+    var tokens = [];
+    var wordBuffer = '';
+    for (var index = 0; index < text.length; index += 1) {
+      var character = text.charAt(index);
+      if (/[A-Za-z0-9'’\-]/.test(character)) {
+        wordBuffer += character;
+      } else {
+        if (wordBuffer) { tokens.push(wordBuffer); wordBuffer = ''; }
+        tokens.push(character);
+      }
+    }
+    if (wordBuffer) { tokens.push(wordBuffer); }
+    return tokens;
+  }
+
+  function textWidthOf(text, fontPx) {
+    ctx.font = lyricFont(fontPx);
+    return ctx.measureText(text).width;
+  }
+
+  function wrapLyricRows(text, fontPx, maxWidth) {
+    var source = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+    if (!source) { return [{ text: '', startIndex: 0 }]; }
+    var tokens = splitTokens(source);
+    var rows = [];
+    var line = '';
+    var cursor = 0;
+    ctx.font = lyricFont(fontPx);
+    for (var tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+      var token = tokens[tokenIndex];
+      var candidate = line + token;
+      var tooWide = ctx.measureText(candidate).width > maxWidth;
+      if (line && tooWide) {
+        var trimmed = line.replace(/\s+$/, '');
+        rows.push({ text: trimmed, startIndex: cursor });
+        cursor += trimmed.length;
+        line = token === ' ' ? '' : token;
+        if (rows.length >= 5) { break; }
+      } else if (!line && tooWide) {
+        var chunk = '';
+        for (var charPos = 0; charPos < token.length; charPos += 1) {
+          var nextChunk = chunk + token.charAt(charPos);
+          if (chunk && ctx.measureText(nextChunk).width > maxWidth) {
+            rows.push({ text: chunk, startIndex: cursor });
+            cursor += chunk.length;
+            chunk = token.charAt(charPos);
+          } else {
+            chunk = nextChunk;
+          }
+        }
+        line = chunk;
+      } else {
+        line = candidate;
+      }
+    }
+    if (rows.length < 6) {
+      var tail = line.replace(/\s+$/, '');
+      if (tail) { rows.push({ text: tail, startIndex: cursor }); }
+    }
+    if (rows.length === 0) { rows.push({ text: source.slice(0, 24), startIndex: 0 }); }
+    return rows;
+  }
+
+  function makeLyricRow(text, fontPx, startIndex) {
+    var depth = Math.min(14, Math.max(2, Math.round(fontPx * 0.12)));
+    var padX = Math.round(fontPx * 0.3);
+    var padY = Math.round(fontPx * 0.24);
+    var textX = padX + depth + 1;
+    var baseline = padY + Math.round(fontPx * 0.93);
+    var width = textWidthOf(text, fontPx);
+    var layerW = Math.max(2, Math.ceil(width + padX * 2 + depth + 2));
+    var layerH = Math.max(2, Math.ceil(fontPx * 1.18 + padY * 2 + depth + 2));
+    var layerDpr = Math.min(view.dpr, 1.5);
+    var layer = makeLayer(layerW * layerDpr, layerH * layerDpr);
+    var paint = layer.getContext('2d');
+    paint.setTransform(layerDpr, 0, 0, layerDpr, 0, 0);
+    paint.font = lyricFont(fontPx);
+    paint.textAlign = 'left';
+    paint.textBaseline = 'alphabetic';
+
+    for (var step = depth; step >= 1; step -= 1) {
+      var lit = 1 - step / (depth + 1);
+      paint.fillStyle = rgba(mixRgb([40, 19, 4], [196, 132, 30], lit * 0.9), 1);
+      paint.fillText(text, textX + step * 0.55, baseline + step * 0.78);
+    }
+    paint.strokeStyle = 'rgba(30,13,2,0.85)';
+    paint.lineWidth = Math.max(1, fontPx * 0.028);
+    paint.lineJoin = 'round';
+    paint.strokeText(text, textX, baseline);
+
+    var charX = [];
+    var walked = 0;
+    for (var charIndex = 0; charIndex < text.length; charIndex += 1) {
+      charX.push(walked);
+      walked += paint.measureText(text.charAt(charIndex)).width;
+    }
+
+    var glints = [];
+    var glintCount = Math.max(1, Math.min(4, Math.round(text.length / 7)));
+    for (var glint = 0; glint < glintCount; glint += 1) {
+      var slot = Math.round(((glint + 0.6) / (glintCount + 0.4)) * Math.max(0, text.length - 1));
+      glints.push({ slot: slot, phase: (glint * 1.9 + text.length * 0.13) % (Math.PI * 2) });
+    }
+
+    return {
+      text: text,
+      startIndex: startIndex,
+      width: width,
+      layer: layer,
+      layerW: layerW,
+      layerH: layerH,
+      textX: textX,
+      baseline: baseline,
+      fontPx: fontPx,
+      charX: charX,
+      glints: glints
+    };
+  }
+
+  function getLyricRow(text, fontPx, startIndex) {
+    var key = Math.round(fontPx) + '|' + startIndex + '|' + text;
+    var cached = lyricRows[key];
+    if (cached) { return cached; }
+    var built = makeLyricRow(text, fontPx, startIndex);
+    lyricRows[key] = built;
+    lyricRowOrder.push(key);
+    for (var trim = 0; trim < 4 && lyricRowOrder.length > 12; trim += 1) {
+      delete lyricRows[lyricRowOrder.shift()];
+    }
+    return built;
+  }
+
+  function layoutForLine(index, fontPx) {
+    var maxWidth = layout.lyricWidth;
+    var key = index + '@' + Math.round(fontPx) + '@' + Math.round(maxWidth);
+    var cachedLayout = lyricLayouts[key];
+    if (cachedLayout) { return cachedLayout; }
+    var text = lines[index] ? String(lines[index].text || '') : '';
+    var wrapped = wrapLyricRows(text, fontPx, maxWidth);
+    var rows = [];
+    for (var rowIndex = 0; rowIndex < wrapped.length; rowIndex += 1) {
+      rows.push(getLyricRow(wrapped[rowIndex].text, fontPx, wrapped[rowIndex].startIndex));
+    }
+    var entry = { rows: rows, fontPx: fontPx, text: text, index: index };
+    lyricLayouts[key] = entry;
+    lyricLayoutOrder.push(key);
+    for (var trim = 0; trim < 3 && lyricLayoutOrder.length > 7; trim += 1) {
+      delete lyricLayouts[lyricLayoutOrder.shift()];
+    }
+    return entry;
+  }
+
+  function lineWindow(line, index) {
+    var startAt = line && isFinite(Number(line.t)) ? Number(line.t) : 0;
+    var endAt = startAt + 4;
+    var declaredDur = Number(line && line.dur);
+    if (isFinite(declaredDur) && declaredDur > 0) { endAt = startAt + declaredDur; }
+    var nextLine = lines[index + 1];
+    if (nextLine && isFinite(Number(nextLine.t)) && Number(nextLine.t) > startAt) {
+      endAt = Number(nextLine.t);
+    }
+    if (endAt - startAt < 0.4) { endAt = startAt + 0.4; }
+    return { start: startAt, end: endAt };
+  }
+
+  var lineTiming = { key: '', times: [] };
+
+  function charTimesForLine(line, index) {
+    var chars = line && Array.isArray(line.chars) ? line.chars : null;
+    var text = String(line && line.text ? line.text : '');
+    var key = index + '|' + (line ? line.t : 0) + '|' + text.length + '|' + (chars ? chars.length : 0);
+    if (lineTiming.key === key) { return lineTiming.times; }
+    var windowSpan = lineWindow(line, index);
+    var span = Math.max(0.2, windowSpan.end - windowSpan.start);
+    var length = Math.max(1, text.length);
+    var times = [];
+    for (var slot = 0; slot < length; slot += 1) {
+      var startTime = windowSpan.start + slot * (span / length);
+      if (chars && slot < chars.length && chars[slot]) {
+        var yrcTime = chars[slot].t;
+        if (typeof yrcTime === 'number' && isFinite(yrcTime)) { startTime = yrcTime; }
+        else { startTime = windowSpan.start + slot * (span / Math.max(1, chars.length)); }
+      }
+      times.push(startTime);
+    }
+    lineTiming.key = key;
+    lineTiming.times = times;
+    return times;
+  }
+
+  function drawActiveRowFace(row, layerLeft, layerTop, charTimes, seconds, isCurrent) {
+    var topY = layerTop + row.baseline - row.fontPx;
+    var goldFace = ctx.createLinearGradient(0, topY, 0, topY + row.fontPx);
+    addStop(goldFace, 0, '#c67d12');
+    addStop(goldFace, 0.4, '#e8a72e');
+    addStop(goldFace, 0.72, '#ffe08a');
+    addStop(goldFace, 1, '#9c6208');
+
+    var diamondFace = ctx.createLinearGradient(0, topY, 0, topY + row.fontPx);
+    addStop(diamondFace, 0, '#ffffff');
+    addStop(diamondFace, 0.38, '#f3fbff');
+    addStop(diamondFace, 0.72, '#bcd8ff');
+    addStop(diamondFace, 1, '#ffe6a8');
+
+    var lastSung = -1;
+    ctx.font = lyricFont(row.fontPx);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    for (var charIndex = 0; charIndex < row.text.length; charIndex += 1) {
+      var character = row.text.charAt(charIndex);
+      if (character === ' ') { continue; }
+      var charX = layerLeft + row.textX + row.charX[charIndex];
+      var charY = layerTop + row.baseline;
+      var globalIndex = row.startIndex + charIndex;
+      var sung = isCurrent && charTimes.length > 0 && globalIndex < charTimes.length
+        ? seconds >= charTimes[globalIndex]
+        : false;
+      if (!isCurrent) { sung = false; }
+      if (sung) {
+        ctx.fillStyle = diamondFace;
+        ctx.fillText(character, charX, charY);
+        ctx.strokeStyle = 'rgba(28,12,0,0.4)';
+        ctx.lineWidth = Math.max(1, row.fontPx * 0.018);
+        ctx.strokeText(character, charX, charY);
+        lastSung = charIndex;
+      } else {
+        ctx.globalAlpha = isCurrent ? 0.84 : 0.46;
+        ctx.fillStyle = goldFace;
+        ctx.fillText(character, charX, charY);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    /* 镶钻高光：从已唱过的字里挑几个爆星芒 */
+    if (isCurrent && lastSung >= 0) {
+      var glintLimit = qualityLevel > 0 ? row.glints.length : 1;
+      for (var glintIndex = 0; glintIndex < glintLimit; glintIndex += 1) {
+        var glint = row.glints[glintIndex];
+        if (glint.slot > lastSung) { continue; }
+        var twinkle = state.rm ? 0.55 : 0.35 + 0.65 * Math.abs(Math.sin(seconds * 3.1 + glint.phase));
+        var glintX = layerLeft + row.textX + row.charX[Math.min(glint.slot, row.charX.length - 1)] + row.fontPx * 0.28;
+        var glintY = layerTop + row.baseline - row.fontPx * 0.62;
+        drawSparkleCross(glintX, glintY, row.fontPx * 0.36, twinkle);
+      }
+    }
+
+    /* 扫光 */
+    if (isCurrent && !state.rm && qualityLevel > 0) {
+      var sweepX = ((seconds * 0.42) % 1.6 - 0.3) * (row.layerW + row.fontPx);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(layerLeft, layerTop, row.layerW, row.layerH);
+      ctx.clip();
+      var sweep = ctx.createLinearGradient(sweepX, layerTop, sweepX + row.fontPx * 1.6, layerTop + row.fontPx);
+      addStop(sweep, 0, 'rgba(255,255,255,0)');
+      addStop(sweep, 0.5, 'rgba(255,255,255,0.22)');
+      addStop(sweep, 1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = sweep;
+      ctx.fillRect(layerLeft, layerTop, row.layerW, row.layerH);
+      ctx.restore();
+    }
+  }
+
+  function drawRowLayer(row, layerLeft, layerTop) {
+    var layer = row.layer;
+    if (!(layer instanceof HTMLCanvasElement) || layer.width <= 0 || layer.height <= 0) { return false; }
+    ctx.drawImage(layer, layerLeft, layerTop, row.layerW, row.layerH);
+    return true;
+  }
+
+  function drawInactiveLine(index, fontPx, centerY, alpha) {
+    if (index < 0 || index >= lines.length) { return; }
+    var lineLayout = layoutForLine(index, fontPx);
+    var rowHeight = fontPx * 1.16;
+    var totalHeight = lineLayout.rows.length * rowHeight;
+    var startY = centerY - totalHeight / 2;
+    var face = ctx.createLinearGradient(0, centerY - rowHeight / 2, 0, centerY + rowHeight / 2);
+    addStop(face, 0, '#f6d585');
+    addStop(face, 0.5, '#cf9126');
+    addStop(face, 1, '#7a4a08');
+    ctx.globalAlpha = alpha;
+    for (var rowIndex = 0; rowIndex < lineLayout.rows.length; rowIndex += 1) {
+      var row = lineLayout.rows[rowIndex];
+      var rowTop = startY + rowIndex * rowHeight + (rowHeight - row.layerH) / 2;
+      var layerLeft = view.w / 2 - row.layerW / 2;
+      if (!drawRowLayer(row, layerLeft, rowTop)) { continue; }
+      ctx.font = lyricFont(fontPx);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = face;
+      ctx.fillText(row.text, layerLeft + row.textX, rowTop + row.baseline);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function activeFontSize(text) {
+    var length = Math.max(1, Array.from(String(text || '')).length);
+    var base = Math.min(view.h * 0.135, view.w * 0.092, 124);
+    var shrink = length > 9 ? Math.max(0.42, 9 / length) : 1;
+    var portraitBoost = view.w < 620 ? 1.08 : 1;
+    return Math.max(22, Math.round(base * shrink * portraitBoost));
+  }
+
+  function drawLyricGlow(centerX, centerY, blockHeight) {
+    var radiusX = Math.min(layout.lyricWidth * 0.62, view.w * 0.52);
+    var radiusY = blockHeight * 0.72 + 40;
+    if (!(radiusX > 10 && radiusY > 10)) { return; }
+    ctx.save();
+    ctx.translate(centerX, centerY);
+    ctx.scale(1, radiusY / radiusX);
+    var glow = ctx.createRadialGradient(0, 0, 0, 0, 0, radiusX);
+    addStop(glow, 0, 'rgba(8,3,12,0.7)');
+    addStop(glow, 0.58, 'rgba(8,3,12,0.46)');
+    addStop(glow, 1, 'rgba(8,3,12,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, 0, radiusX, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawInterludeDots(centerY, fontPx, seconds) {
+    var size = Math.max(7, Math.min(18, fontPx * 0.14));
+    var gap = size * 2.6;
+    for (var dot = 0; dot < 3; dot += 1) {
+      var dotX = view.w / 2 + (dot - 1) * gap;
+      var pulse = state.rm ? 0.7 : 0.55 + 0.45 * Math.abs(Math.sin(seconds * 2.4 + dot * 0.9));
+      ctx.save();
+      ctx.translate(dotX, centerY);
+      ctx.rotate(Math.PI / 4);
+      var gem = ctx.createLinearGradient(-size, -size, size, size);
+      addStop(gem, 0, 'rgba(255,255,255,0.95)');
+      addStop(gem, 0.55, rgba(palette.base, 0.9));
+      addStop(gem, 1, 'rgba(120,70,10,0.9)');
+      ctx.fillStyle = gem;
+      ctx.fillRect(-size / 2, -size / 2, size, size);
+      ctx.restore();
+      drawSparkleCross(dotX, centerY, size * 2.2, pulse * 0.8);
+    }
+  }
+
+  function drawLyricBlock(seconds) {
+    if (!initialized) { drawWaitingState(); return; }
+    if (lines.length === 0) { drawEmptyState(); return; }
+    var isCurrent = current.idx >= 0;
+    var showIndex = isCurrent ? current.idx : 0;
+    var activeLine = lines[showIndex];
+    if (!activeLine) { drawEmptyState(); return; }
+
+    var fontPx = activeFontSize(activeLine.text);
+    var activeLayout = layoutForLine(showIndex, fontPx);
+    var rowHeight = fontPx * 1.16;
+    var blockHeight = activeLayout.rows.length * rowHeight;
+    var centerY = view.h * (isCurrent ? 0.53 : 0.51);
+    var blockTop = centerY - blockHeight / 2;
+    var neighborSize = Math.max(15, Math.round(fontPx * 0.42));
+    var neighborGap = Math.max(30, fontPx * 0.55);
+    var charTimes = isCurrent ? charTimesForLine(activeLine, showIndex) : [];
+    drawLyricGlow(view.w / 2, centerY, blockHeight + neighborGap * 1.2);
+
+    if (isCurrent && showIndex > 0) {
+      drawInactiveLine(showIndex - 1, neighborSize, blockTop - neighborGap, 0.4);
+    }
+    if (isCurrent && showIndex < lines.length - 1) {
+      drawInactiveLine(showIndex + 1, neighborSize, blockTop + blockHeight + neighborGap, 0.34);
+    }
+    if (!isCurrent) {
+      var introSize = Math.max(11, Math.round(fontPx * 0.2));
+      ctx.font = '700 ' + introSize + 'px "Arial Black", "Noto Sans SC", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = rgba(palette.base, 0.9);
+      ctx.fillText('前 奏', view.w / 2, Math.max(view.h * 0.2, blockTop - neighborGap * 0.85));
+    }
+
+    var enterAge = isCurrent ? Math.max(0, seconds - (Number(activeLine.t) || 0)) : 1;
+    var enterT = Math.min(1, enterAge / 0.26);
+    var eased = enterT * enterT * (3 - 2 * enterT);
+    var enterScale = state.rm ? 1 : 0.92 + 0.08 * eased;
+    var enterLift = state.rm ? 0 : (1 - eased) * fontPx * 0.12;
+    ctx.save();
+    if (enterScale !== 1) {
+      ctx.translate(view.w / 2, centerY + enterLift);
+      ctx.scale(enterScale, enterScale);
+      ctx.translate(-view.w / 2, -centerY);
+    }
+    if (String(activeLayout.text || '').trim().length === 0) {
+      drawInterludeDots(centerY, fontPx, seconds);
+    } else {
+      for (var rowIndex = 0; rowIndex < activeLayout.rows.length; rowIndex += 1) {
+        var row = activeLayout.rows[rowIndex];
+        var rowTop = blockTop + rowIndex * rowHeight + (rowHeight - row.layerH) / 2;
+        var layerLeft = view.w / 2 - row.layerW / 2;
+        drawRowLayer(row, layerLeft, rowTop);
+        drawActiveRowFace(row, layerLeft, rowTop, charTimes, isCurrent ? seconds : 0, isCurrent);
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawNoticePlate(headline, subtitle) {
+    var centerY = view.h * 0.5;
+    var headlineSize = Math.max(26, Math.min(view.w * 0.072, 92));
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    var plateWidth = Math.min(view.w * 0.78, 680);
+    var plateHeight = Math.max(76, headlineSize * 2.1);
+    var plate = ctx.createLinearGradient(0, centerY - plateHeight / 2, 0, centerY + plateHeight / 2);
+    addStop(plate, 0, 'rgba(24,10,2,0.82)');
+    addStop(plate, 1, 'rgba(8,4,2,0.9)');
+    ctx.fillStyle = plate;
+    ctx.strokeStyle = rgba(palette.base, 0.65);
+    ctx.lineWidth = Math.max(1.4, 2.2 * layout.uiScale);
+    ctx.beginPath();
+    ctx.rect(view.w / 2 - plateWidth / 2, centerY - plateHeight / 2, plateWidth, plateHeight);
+    ctx.fill();
+    ctx.stroke();
+
+    var face = ctx.createLinearGradient(0, centerY - headlineSize / 2, 0, centerY + headlineSize / 2);
+    addStop(face, 0, '#fff6cf');
+    addStop(face, 0.5, '#f2bc44');
+    addStop(face, 1, '#8d5409');
+    ctx.font = '900 ' + Math.round(headlineSize) + 'px Impact, "Arial Black", "Noto Sans SC", sans-serif';
+    ctx.fillStyle = face;
+    ctx.fillText(headline, view.w / 2, centerY - headlineSize * 0.22, plateWidth * 0.86);
+    ctx.font = '700 ' + Math.round(Math.max(12, headlineSize * 0.22)) + 'px "Arial Black", "Noto Sans SC", sans-serif';
+    ctx.fillStyle = rgba([255, 240, 205], 0.8);
+    ctx.fillText(subtitle, view.w / 2, centerY + headlineSize * 0.55, plateWidth * 0.86);
+    ctx.restore();
+    drawSparkleCross(view.w / 2 - plateWidth * 0.46, centerY - plateHeight * 0.34, headlineSize * 0.3, 0.7);
+    drawSparkleCross(view.w / 2 + plateWidth * 0.46, centerY + plateHeight * 0.3, headlineSize * 0.24, 0.5);
+  }
+
+  function drawEmptyState() {
+    drawNoticePlate('没有歌词', song.name ? '纯器乐 · ' + song.name.slice(0, 16) : '纯器乐 · 金子照样闪');
+  }
+
+  function drawWaitingState() {
+    drawNoticePlate('正在镶钻', '等待播放器');
+  }
+
+  function blitBackdrop() {
+    var layer = backdrop.canvas;
+    if (!backdrop.ready || !layer) { return false; }
+    if (!(layer instanceof HTMLCanvasElement) || layer.width <= 0 || layer.height <= 0) { return false; }
+    ctx.drawImage(layer, 0, 0, view.w, view.h);
+    return true;
+  }
+
+  function drawFrame(nowMs) {
+    var seconds = nowMs / 1000;
+    if (!blitBackdrop()) {
+      var emergency = ctx.createLinearGradient(0, 0, 0, view.h);
+      addStop(emergency, 0, '#070310');
+      addStop(emergency, 1, '#1c0616');
+      ctx.fillStyle = emergency;
+      ctx.fillRect(0, 0, view.w, view.h);
+    }
+    drawRays(seconds);
+    drawBeatBurst();
+    drawDiamondHalo(seconds);
+    drawMoneyStacks(seconds);
+    drawBurningBills(seconds);
+    drawLyricBlock(state.time);
+    drawStarField(seconds);
+    drawTitlePlate();
+    drawCoverPendant(seconds);
+  }
+
+  function loop(nowMs) {
+    state.frames += 1;
+    var frameStart = performance.now();
+    var deltaSeconds = lastFrameAt > 0 ? Math.min(0.12, (nowMs - lastFrameAt) / 1000) : 0.016;
+    lastFrameAt = nowMs;
+    energy.beatPulse = Math.max(0, energy.beatPulse - deltaSeconds * 2.6);
+    runBakes(7);
+    try { drawFrame(nowMs); }
+    catch (drawError) { noteError('drawFrame', drawError); }
+    state.js = performance.now() - frameStart;
+    frameCostAverage = frameCostAverage * 0.92 + state.js * 0.08;
+    if (frameCostAverage > 13 && qualityLevel > 0 && state.frames > 45) {
+      qualityLevel = 0;
+      console.error('[414] 帧耗时偏高，降到省电绘制档');
+    }
+    requestAnimationFrame(loop);
+  }
+  var lastFrameAt = 0;
+
+  window.addEventListener('message', function (event) {
+    var message = event.data;
+    if (!message || message.__c100 !== 1) { return; }
+    try {
+      if (message.type === 'init') { acceptInit(message.payload); }
+      else if (message.type === 'beat' && message.payload) {
+        var beatLevel = clampNumber(message.payload.level, 0, 1, 0.65);
+        energy.beatPulse = Math.max(energy.beatPulse, beatLevel);
+      }
+      else if (message.type === 'live' && message.payload) {
+        energy.level = clampNumber(message.payload.level, 0, 1, energy.level);
+        energy.bass = clampNumber(message.payload.bass, 0, 1, energy.bass);
+        energy.bpm = clampNumber(message.payload.bpm, 0, 400, energy.bpm);
+      }
+      else if (message.type === 'tick' && message.payload) {
+        var nextTime = Number(message.payload.time);
+        state.time = isFinite(nextTime) ? nextTime : state.time;
+        if (typeof message.payload.playing === 'boolean') { state.playing = message.payload.playing; }
+        current.idx = findLineIndex(state.time);
+        state.idx = current.idx;
+        state.text = current.idx >= 0 && lines[current.idx] ? String(lines[current.idx].text || '') : '';
+      }
+    } catch (messageError) { noteError('message:' + message.type, messageError); }
+  }, false);
+
+  window.addEventListener('resize', function () {
+    try { resize(); } catch (resizeError) { noteError('resize', resizeError); }
+  }, false);
+
+  try {
+    var motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    if (motionQuery && motionQuery.addEventListener) {
+      motionQuery.addEventListener('change', function (event) {
+        state.rm = !!(event && event.matches);
+      });
+    }
+  } catch (motionError) { noteError('motionQuery', motionError); }
+
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>生命轨迹</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070d;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(159,232,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   053 · 生命轨迹 —— 康威生命游戏在**每个字的字形里**播种，留下磷光余晖
+   ----------------------------------------------------------------------------
+   核心机制：屏幕上唯一的"动态"是**格子生灭**。每一代按 B3/S23 算下一帧，
+   死掉的格子不立刻消失，而是往一层余晖层上按存活时长写一块暗影 —— 磷光屏的
+   残留。整幅画是"细胞群落的历史"，不是粒子，也不是拖尾。
+
+   字怎么来：**每个字是一次播种**。句子先排成 1~3 行（读得出来优先），
+   第 k 个字在 chars[k].t 那一刻，把它自己字形里的格子按概率播成活细胞
+   （同时往磷光层上压一次亮），此后只要这个字已经唱过，每一代都会在它的笔画
+   里补种一小部分 —— 于是笔画是"活的"：边缘不断被规则啃掉，又被补回来。
+   字本身用同一套青白色亮在菌落之上，暗底压住，读得清。
+
+   和 004（沙粒）/010（余烬）的区别：那两个是粒子被笔画拦住；这里没有粒子，
+   只有格子的生死规则 + 一层会衰减的磷光历史。
+
+   分词：不用 —— 生成系统类逐字播种更自然，一个字一次播种。
+
+   精修记录：
+   ① 逐字时刻统一走 charTimes()（chars 长度与正文相等且可解析才采信，单调钳位，
+      否则 t+dur*k/n 均分回退）；第 k 字在 chars[k].t 播种，window.__stage().yrc
+      暴露是否走 YRC。
+   ② 阅读优先：1~3 行、取放得下的最大字号、行内居中；暗描边 + 暗场保证菌落再亮
+      也读得清；未唱到的字保持 0.62 可见度，句尾整句仍在。
+   ③ 动效：磷光整体缓慢缩放漂移（镜头），beat 一次相干脉冲（菌落提亮 + 字更亮），
+      进场 0.26s 淡入。
+   ④ 性能：活细胞按存活时长分 8 档合批成 8 条 Path2D，每帧一次 fill；余晖层
+      整层乘一次衰减，不逐格擦。
+   ========================================================================== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hint = document.getElementById('hint');
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+/* ---- 画布 ---- */
+let W = 0, H = 0, DPR = 1;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+function fit() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(320, innerWidth); H = Math.max(240, innerHeight);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+fit();
+
+/* ================= 排版：1~3 行，逐字绝对坐标 ================= */
+const FAMILY = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif';
+const FONT = (fs) => '800 ' + fs.toFixed(1) + 'px ' + FAMILY;
+const om = document.createElement('canvas').getContext('2d');
+
+function layout(text, availW, availH, maxRows, cy) {
+  const s = text;
+  if (!/\S/.test(s)) return null;
+  const n = s.length;
+  om.font = FONT(100);
+  let best = 0, bestR = 1;
+  for (let r = 1; r <= maxRows; r++) {
+    const per = Math.ceil(n / r);
+    const wPer = om.measureText(s.slice(0, Math.min(n, per))).width / 100 || 0.01;
+    const f = Math.min(availW / wPer, availH / (r * 1.34), 96);
+    if (f > best) { best = f; bestR = r; }
+  }
+  let fs = Math.max(13, best);
+  let ranges = null;
+  for (let guard = 0; guard < 30; guard++) {
+    om.font = FONT(fs);
+    const total = om.measureText(s).width;
+    const cap = Math.max(fs * 2.2, Math.min(availW, total / bestR * 1.04));
+    const rr = [];
+    let start = 0;
+    while (start < n) {
+      let lo = start + 1, hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (om.measureText(s.slice(start, mid)).width <= cap) lo = mid; else hi = mid - 1;
+      }
+      let end = Math.max(start + 1, lo);
+      const sp = s.lastIndexOf(' ', end - 1);
+      if (sp > start + Math.max(2, (end - start) * 0.5)) end = sp;
+      rr.push([start, end]);
+      start = end;
+    }
+    if (rr.length <= maxRows) { ranges = rr; break; }
+    fs *= 0.9;
+    if (fs < 13) { fs = 13; ranges = rr; break; }
+  }
+  if (!ranges) return null;
+  const lh = fs * 1.34;
+  const rows = [];
+  let maxw = 0;
+  om.font = FONT(fs);
+  for (let q = 0; q < ranges.length; q++) {
+    const a = ranges[q][0], b = ranges[q][1];
+    let x = 0;
+    const chars = [];
+    for (let i = a; i < b; i++) {
+      const ch = s[i];
+      const w = om.measureText(ch).width;
+      chars.push({ ch, x, w, k: i });
+      x += w;
+    }
+    if (x > maxw) maxw = x;
+    rows.push({ chars, w: x });
+  }
+  const blockH = rows.length * lh;
+  const y0 = cy - blockH / 2;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const rx = (W - row.w) / 2;
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      c.ax = rx + c.x + c.w / 2;
+      c.ay = y0 + r * lh + lh / 2;
+    }
+  }
+  return { rows, fs, lh, blockW: maxw, blockH, cy };
+}
+
+function charTimes(line, n) {
+  const out = new Float32Array(Math.max(1, n));
+  const chs = line ? line.chars : null;
+  const base = line ? (isFinite(line.t) ? line.t : 0) : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* ================= 生命游戏 ================= */
+let CELL = 7, cols = 0, rows = 0, N = 0;
+let A = null, B = null, age = null, mask = null;
+let gen = 0, pop = 0, simT = 0;
+let accent = [120, 240, 240];
+let hueBase = 180;
+let pulse = 0, time = 0, dtG = 0.016;
+let trail = null, tctx = null;
+let bgGrad = null, vg = null;
+let curLyric = null, pend = null;
+
+const PAL = [
+  'rgba(190,255,250,0.96)',
+  'rgba(130,248,242,0.95)',
+  'rgba(92,220,238,0.93)',
+  'rgba(70,182,230,0.91)',
+  'rgba(58,142,216,0.89)',
+  'rgba(48,110,196,0.86)',
+  'rgba(39,84,168,0.82)',
+  'rgba(32,64,136,0.78)'
+];
+
+function hueOf(rgb) {
+  const r = rgb[0] / 255, g = rgb[1] / 255, b = rgb[2] / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  if (d < 1e-4) return 180;
+  let h;
+  if (mx === r) h = ((g - b) / d) % 6;
+  else if (mx === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return h;
+}
+
+function measure() {
+  CELL = Math.max(5, Math.round(Math.sqrt((W * H) / 14000)));
+  cols = Math.ceil(W / CELL);
+  rows = Math.ceil(H / CELL);
+  N = cols * rows;
+  if (!A || A.length !== N) {
+    A = new Uint8Array(N); B = new Uint8Array(N); age = new Uint8Array(N); mask = new Uint8Array(N);
+  } else { A.fill(0); B.fill(0); age.fill(0); mask.fill(0); }
+  const tw = Math.round(W * DPR), th = Math.round(H * DPR);
+  if (!trail) { trail = document.createElement('canvas'); trail.width = tw; trail.height = th; }
+  else if (trail.width !== tw || trail.height !== th) { trail.width = tw; trail.height = th; }
+  tctx = trail.getContext('2d');
+  tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  tctx.clearRect(0, 0, W, H);
+}
+
+/* 单字 → 网格里的格子索引（用真实字形渲一遍再取点，最稳） */
+const gcv = document.createElement('canvas');
+const gctx = gcv.getContext('2d', { willReadFrequently: true });
+function glyphCells(ch, w, h, ax, ay) {
+  const nw = clamp(Math.round(w), 4, 220), nh = clamp(Math.round(h), 4, 220);
+  if (gcv.width !== nw) gcv.width = nw;
+  if (gcv.height !== nh) gcv.height = nh;
+  gctx.setTransform(1, 0, 0, 1, 0, 0);
+  gctx.clearRect(0, 0, nw, nh);
+  gctx.font = '800 ' + (Math.min(nw, nh) * 0.92).toFixed(1) + 'px ' + FAMILY;
+  gctx.textAlign = 'center'; gctx.textBaseline = 'middle';
+  gctx.fillStyle = '#fff';
+  gctx.fillText(ch, nw / 2, nh / 2);
+  const d = gctx.getImageData(0, 0, nw, nh).data;
+  const x0 = Math.floor((ax - w / 2) / CELL), x1 = Math.ceil((ax + w / 2) / CELL);
+  const y0 = Math.floor((ay - h / 2) / CELL), y1 = Math.ceil((ay + h / 2) / CELL);
+  const out = [];
+  for (let gy = Math.max(1, y0); gy < Math.min(rows - 1, y1); gy++) {
+    for (let gx = Math.max(1, x0); gx < Math.min(cols - 1, x1); gx++) {
+      const px = Math.floor((gx * CELL + CELL / 2 - (ax - w / 2)) / w * nw);
+      const py = Math.floor((gy * CELL + CELL / 2 - (ay - h / 2)) / h * nh);
+      if (px < 0 || py < 0 || px >= nw || py >= nh) continue;
+      if (d[(py * nw + px) * 4 + 3] > 100) out.push(gy * cols + gx);
+    }
+  }
+  return out;
+}
+
+function buildLyric(ln, idx) {
+  const text = (ln && ln.text) || '';
+  const n = text.length;
+  if (!n) return null;
+  const ct = charTimes(ln, n);
+  const lay = layout(text, Math.min(W * 0.88, 1360), Math.min(H * 0.36, 380), 3, H * 0.46);
+  if (!lay) return null;
+  const seeds = [];
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      if (!/\S/.test(c.ch)) continue;
+      const cells = glyphCells(c.ch, c.w * 1.52, lay.lh * 1.40, c.ax, c.ay);
+      if (!cells.length) continue;
+      seeds.push({ t: isFinite(ct.t[c.k]) ? ct.t[c.k] : 0, cells, k: c.k });
+    }
+  }
+  seeds.sort((a, b) => a.t - b.t);
+  return {
+    line: ln, t0: isFinite(ln.t) ? ln.t : 0, dur: ln.dur || 4, text, n, yrc: ct.yrc,
+    ct: ct.t, rows: lay.rows, fs: lay.fs, lh: lay.lh, cy: lay.cy,
+    scrim: makeScrim(lay.blockW, lay.blockH),
+    seeds, seedI: 0
+  };
+}
+
+/* ---- 菌落 ---- */
+function clearColony() {
+  if (A) { A.fill(0); B.fill(0); age.fill(0); mask.fill(0); }
+  pop = 0; gen = 0; simT = 0;
+}
+function release() {
+  curLyric = null; pend = null;
+  clearColony();
+  clearTrail();
+}
+
+/** 播种一个字：笔画上的格子按概率活过来，并往磷光层压一次 */
+function seedChar(s, strong) {
+  if (!A) return 0;
+  let n = 0;
+  const p = strong ? 0.40 : 0.10;
+  for (let i = 0; i < s.cells.length; i++) {
+    const idx = s.cells[i];
+    if (A[idx]) continue;
+    if (Math.random() < p) { A[idx] = 1; age[idx] = strong ? 2 : 1; n++; }
+  }
+  if (strong && mask) {
+    for (let i = 0; i < s.cells.length; i++) {
+      const idx = s.cells[i];
+      const gx = idx % cols, gy = (idx / cols) | 0;
+      mask[idx] = 1;
+      if (gx > 0) mask[idx - 1] = 1;
+      if (gx < cols - 1) mask[idx + 1] = 1;
+      if (gy > 0) mask[idx - cols] = 1;
+      if (gy < rows - 1) mask[idx + cols] = 1;
+    }
+  }
+  if (n && tctx) {
+    tctx.globalCompositeOperation = 'lighter';
+    tctx.fillStyle = 'hsla(' + hueBase.toFixed(0) + ',92%,' + (strong ? 62 : 52) + '%,' +
+                     (strong ? 0.30 : 0.10) + ')';
+    const pth = new Path2D();
+    for (let i = 0; i < s.cells.length; i++) {
+      const idx = s.cells[i];
+      if (!A[idx]) continue;
+      const x = (idx % cols) * CELL, y = ((idx / cols) | 0) * CELL;
+      pth.rect(x, y, CELL - 1, CELL - 1);
+    }
+    tctx.fill(pth);
+    tctx.globalCompositeOperation = 'source-over';
+  }
+  return n;
+}
+
+function stepLife() {
+  B.fill(0);
+  let count = 0;
+  for (let y = 1; y < rows - 1; y++) {
+    const y0 = (y - 1) * cols, y1 = y * cols, y2 = (y + 1) * cols;
+    for (let x = 1; x < cols - 1; x++) {
+      const i = y1 + x;
+      const nb = A[y0 + x - 1] + A[y0 + x] + A[y0 + x + 1] +
+                 A[y1 + x - 1] + A[y1 + x + 1] +
+                 A[y2 + x - 1] + A[y2 + x] + A[y2 + x + 1];
+      if (A[i]) {
+        if (nb === 2 || nb === 3) { B[i] = 1; if (age[i] < 255) age[i]++; count++; }
+        else age[i] = 0;
+      } else if (nb === 3) { B[i] = 1; age[i] = 1; count++; }
+    }
+  }
+  const t = A; A = B; B = t;
+  /* 字形约束：笔画外的活细胞活不长 —— 菌落不会糊成一团云，字才立得住 */
+  if (mask) {
+    let c2 = 0;
+    for (let i = 0; i < N; i++) {
+      if (!A[i]) continue;
+      if (!mask[i] && Math.random() < 0.80) { A[i] = 0; age[i] = 0; continue; }
+      c2++;
+    }
+    pop = c2;
+  } else pop = count;
+  gen++;
+}
+
+function clearTrail() {
+  if (!tctx) return;
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  tctx.globalCompositeOperation = 'source-over';
+  tctx.clearRect(0, 0, trail.width, trail.height);
+  tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+
+/* ---- 背景/暗场 ---- */
+function buildGrads() {
+  bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrad.addColorStop(0, '#050810');
+  bgGrad.addColorStop(0.55, '#060b16');
+  bgGrad.addColorStop(1, '#081120');
+  vg = ctx.createRadialGradient(W * 0.5, H * 0.48, Math.min(W, H) * 0.32,
+                                W * 0.5, H * 0.48, Math.max(W, H) * 0.82);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(2,4,10,0.50)');
+}
+
+function makeScrim(bw, bh) {
+  const pad = 66;
+  const w = bw + pad * 2, h = bh + pad * 2;
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(w * DPR));
+  c.height = Math.max(2, Math.round(h * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const rx = w * 0.5, ry = Math.max(h * 0.36, 1);
+  g.save();
+  g.translate(w / 2, h / 2);
+  g.scale(1, ry / rx);
+  const rg = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+  rg.addColorStop(0, 'rgba(3,7,13,0.66)');
+  rg.addColorStop(0.62, 'rgba(3,7,13,0.46)');
+  rg.addColorStop(1, 'rgba(3,7,13,0)');
+  g.fillStyle = rg;
+  g.beginPath(); g.arc(0, 0, rx, 0, Math.PI * 2); g.fill();
+  g.restore();
+  return { cv: c, w, h };
+}
+
+/* ================= 节奏 ================= */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+function prepare(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  pend = buildLyric(ln, idx);
+}
+
+function startLine(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  measure();
+  curLyric = (pend && pend.line === ln) ? pend : buildLyric(ln, idx);
+  pend = null;
+  if (!curLyric) return;
+  clearColony();
+  curLyric.seedI = 0;
+  /* 换句不清磷光：上一句的余晖淡掉，画面才有"历史" */
+  hint.style.opacity = '0';
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; release(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci); else release();
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prepare(nx); }
+  }
+}
+
+/* ================= 绘制 ================= */
+let lastFs = -1;
+function drawText(T) {
+  const L = curLyric;
+  if (!L || !L.rows) return;
+  const app = clamp((T - L.t0) / 0.26, 0, 1);
+  const ap = 0.34 + 0.66 * (app * app * (3 - 2 * app));
+  let curCh = -1;
+  for (let k = 0; k < L.n; k++) if (T >= L.ct[k]) curCh = k;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  lastFs = -1;
+  for (let r = 0; r < L.rows.length; r++) {
+    const row = L.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      const k = c.k;
+      const lit = T >= L.ct[k];
+      const isCur = k === curCh;
+      const fsz = L.fs * (isCur ? 1.07 : 1);
+      if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+      ctx.globalAlpha = ap;
+      ctx.lineWidth = Math.max(2, fsz * 0.11);
+      ctx.strokeStyle = 'rgba(3,7,13,0.90)';
+      ctx.strokeText(c.ch, c.ax, c.ay);
+      ctx.fillStyle = isCur ? 'rgba(240,255,255,0.99)'
+        : lit ? 'rgba(196,252,250,0.95)'
+          : 'rgba(132,168,190,0.62)';
+      ctx.fillText(c.ch, c.ax, c.ay);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawCells() {
+  const paths = [];
+  for (let b = 0; b < 8; b++) paths.push(new Path2D());
+  const glow = new Path2D();
+  const s = CELL - 1.6;
+  for (let y = 1; y < rows - 1; y++) {
+    const yo = y * cols;
+    for (let x = 1; x < cols - 1; x++) {
+      const i = yo + x;
+      if (!A[i]) continue;
+      const b = Math.min(7, age[i] >> 3);
+      const px = x * CELL + (CELL - s) * 0.5, py = y * CELL + (CELL - s) * 0.5;
+      paths[b].rect(px, py, s, s);
+      if (age[i] < 12) glow.rect(px - 1.4, py - 1.4, s + 2.8, s + 2.8);
+    }
+  }
+  tctx.globalCompositeOperation = 'lighter';
+  tctx.fillStyle = 'rgba(120,255,245,' + (0.05 + pulse * 0.06).toFixed(3) + ')';
+  tctx.fill(glow);
+  const boost = 1 + pulse * 0.35;
+  for (let b = 0; b < 8; b++) {
+    tctx.fillStyle = PAL[b];
+    tctx.globalAlpha = Math.min(1, boost);
+    tctx.fill(paths[b]);
+  }
+  tctx.globalAlpha = 1;
+  tctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---- 消息 ---- */
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent && p.accent.length === 3) accent = p.accent;
+    hueBase = hueOf(accent);
+    release();
+    buildGrads();
+    measure();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.5;
+    pulse = Math.min(1, pulse + 0.30 + lv * 0.45);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ---- 主循环 ---- */
+let last = performance.now();
+function frame(nowMs) {
+  dtG = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  time += dtG;
+  pulse *= Math.exp(-dtG * 3.0);
+  const T = now();
+  timing(T);
+
+  if (curLyric && curLyric.seeds.length) {
+    /* 逐字播种：到点的字播一次，唱过的字每代补种一点（笔画被啃掉还会长回来） */
+    let any = false;
+    while (curLyric.seedI < curLyric.seeds.length && curLyric.seeds[curLyric.seedI].t <= T) {
+      seedChar(curLyric.seeds[curLyric.seedI++], true);
+      any = true;
+    }
+    if (!any && (gen & 3) === 0) {
+      for (let i = 0; i < curLyric.seedI; i++) seedChar(curLyric.seeds[i], false);
+    }
+  }
+
+  if (A && curLyric) {
+    simT += dtG * (playing ? 1 : 0.35);
+    let n = 0;
+    while (simT >= 0.105 && n < 3) {
+      stepLife();
+      simT -= 0.105;
+      n++;
+      /* 补种：规则把笔画啃掉后慢慢补回来 —— 而笔画就是那个字 */
+      if ((gen & 1) === 0) {
+        for (let i = 0; i < curLyric.seedI; i++) {
+          const s = curLyric.seeds[i];
+          for (let q = 0; q < s.cells.length; q++) {
+            const idx = s.cells[q];
+            if (!A[idx] && Math.random() < 0.05) { A[idx] = 1; age[idx] = 1; }
+          }
+        }
+      }
+    }
+    if (n >= 3) simT = 0;
+  }
+
+  /* 余晖衰减 */
+  if (tctx) {
+    const fade = 1 - Math.exp(-dtG * 0.60);
+    tctx.globalCompositeOperation = 'destination-out';
+    tctx.fillStyle = 'rgba(0,0,0,' + fade.toFixed(4) + ')';
+    tctx.fillRect(0, 0, W, H);
+    tctx.globalCompositeOperation = 'source-over';
+    if (A) drawCells();
+  }
+
+  /* 合成：背景 → 磷光 → 字 → 暗角（镜头轻推 = 整层缓慢缩放） */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrad || '#05070d';
+  ctx.fillRect(0, 0, W, H);
+  if (trail) {
+    const sc = 1 + 0.012 * Math.sin(time * 0.11);
+    const dw = W * sc, dh = H * sc;
+    ctx.drawImage(trail, 0, 0, trail.width, trail.height,
+                  (W - dw) / 2 + Math.sin(time * 0.16) * 6, (H - dh) / 2 + Math.cos(time * 0.13) * 4,
+                  dw, dh);
+  }
+  drawText(T);
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => {
+  fit(); buildGrads(); measure();
+  if (curLyric && curLyric.line) curLyric = buildLyric(curLyric.line, curIdx >= 0 ? curIdx : 0);
+});
+buildGrads();
+measure();
+requestAnimationFrame(frame);
+
+window.__stage = () => {
+  let lit = 0;
+  if (curLyric) for (let k = 0; k < curLyric.n; k++) if (now() >= curLyric.ct[k]) lit++;
+  return {
+    lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+    yrc: !!(curLyric && curLyric.yrc), n: curLyric ? curLyric.n : 0,
+    fs: curLyric ? +curLyric.fs.toFixed(1) : 0,
+    rows: curLyric ? curLyric.rows.length : 0, lit,
+    seeds: curLyric ? curLyric.seeds.length : 0, cell: CELL, pop, gen
+  };
+};
+</script>
+</body>
+</html>

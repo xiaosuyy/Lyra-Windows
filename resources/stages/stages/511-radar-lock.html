@@ -1,0 +1,1385 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>511 · 雷达锁词</title>
+<style>
+  html,body{margin:0;height:100%;background:#04070a;overflow:hidden}
+  #cv{position:fixed;inset:0;width:100%;height:100%;display:block}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function(){
+"use strict";
+
+/* ================= 0. 状态 ================= */
+var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "" };
+var RM = false;
+try { RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); } catch(e0){}
+
+var MONO = 'ui-monospace,"Cascadia Mono","SF Mono",Consolas,"Courier New",monospace';
+var CJKF = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif';
+
+/* ================= 1. 自检口：最外层、无条件、直接算 ================= */
+window.__stage = function(){
+  var i = S.idx, ln = S.lines;
+  return {
+    lines: ln.length,
+    idx: i,
+    t: S.t,
+    playing: !!S.playing,
+    frames: S.frames,
+    js: Math.round(S.js * 100) / 100,
+    err: S.err,
+    text: (i >= 0 && ln[i] && ln[i].text != null) ? String(ln[i].text) : "",
+    gl: false,
+    rm: RM
+  };
+};
+
+/* ================= 2. 错误限流 ================= */
+var errLast = -1e9;
+function noteErr(e){
+  S.err = String((e && e.message) ? e.message : (e == null ? "error" : e));
+  var now = performance.now();
+  if (now - errLast > 1000){ errLast = now; try { console.error(e); } catch(_){} }
+}
+
+/* ================= 3. ready：第一个 rAF 无条件发，只发一次 ================= */
+var readySent = false;
+function sendReady(){
+  if (readySent) return;
+  readySent = true;
+  try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch(e){ noteErr(e); }
+}
+requestAnimationFrame(sendReady);
+setTimeout(sendReady, 800);
+
+/* ================= 4. 画布 ================= */
+var cv = document.getElementById("cv");
+var ctx = cv.getContext("2d", { alpha: false });
+var W = 1440, H = 900, DPR = 1, PORTRAIT = false;
+
+/* 静态底与暗角预烘焙，避免逐帧创建渐变 */
+var bgCv = document.createElement("canvas"), bgCtx = bgCv.getContext("2d");
+var vgCv = document.createElement("canvas"), vgCtx = vgCv.getContext("2d");
+var radarGrad = null;
+
+/* ================= 5. 调色 ================= */
+var C = {
+  bg0: "#04070a",
+  ink: "#e8f8f0",
+  inkDim: "rgba(200,236,224,.58)",
+  inkFaint: "rgba(178,220,208,.30)",
+  hair: "rgba(104,214,184,.42)",
+  hairSoft: "rgba(104,214,184,.20)",
+  hairFaint: "rgba(104,214,184,.10)",
+  grid: "rgba(88,196,170,.095)",
+  gridMajor: "rgba(88,196,170,.15)",
+  accent: "#ffb454",
+  accentDim: "rgba(255,180,84,.35)",
+  accentFaint: "rgba(255,180,84,.14)"
+};
+
+function setAccent(rgb){
+  var r = 255, g = 180, b = 84;
+  if (Array.isArray(rgb) && rgb.length >= 3){
+    var r0 = Number(rgb[0]), g0 = Number(rgb[1]), b0 = Number(rgb[2]);
+    if (isFinite(r0) && isFinite(g0) && isFinite(b0)){
+      r0 = clamp(r0, 0, 255); g0 = clamp(g0, 0, 255); b0 = clamp(b0, 0, 255);
+      var mx = Math.max(r0, g0, b0);
+      if (mx >= 34){
+        var k = 232 / mx;
+        r = Math.min(255, r0 * k); g = Math.min(255, g0 * k); b = Math.min(255, b0 * k);
+        r = r * 0.78 + 255 * 0.22;
+        g = g * 0.78 + 255 * 0.22;
+        b = b * 0.78 + 255 * 0.22;
+      }
+    }
+  }
+  r = Math.round(clamp(r, 0, 255));
+  g = Math.round(clamp(g, 0, 255));
+  b = Math.round(clamp(b, 0, 255));
+  C.accent = "rgb(" + r + "," + g + "," + b + ")";
+  C.accentDim = "rgba(" + r + "," + g + "," + b + ",.36)";
+  C.accentFaint = "rgba(" + r + "," + g + "," + b + ",.14)";
+}
+
+/* ================= 6. 数据 ================= */
+var SONG = { name: "", artists: "", duration: 0, date: "" };
+var lines = S.lines;
+var targets = [], segs = [];
+var sheet = { w: 3600, h: 2100 };
+var bnd = { x0: 0, y0: 0, x1: 3600, y1: 2100 };
+var cam = { x: 1800, y: 1050, z: 0.4, vx: 0, vy: 0, vz: 0 };
+var focus = { x: 1800, y: 1050, z: 0.4 };
+var activeIdx = -1;
+var live = { bpm: 0, level: 0, bass: 0, mid: 0, treble: 0 };
+var beat = { index: 0, level: 0, at: 0 };
+var placed = false, camPlaced = false, snapPending = false;
+
+function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+function clamp01(v){ return isFinite(v) ? (v < 0 ? 0 : (v > 1 ? 1 : v)) : 0; }
+function pad3(n){
+  n = Math.max(0, Math.round(Number(n) || 0));
+  return (n < 10 ? "00" : (n < 100 ? "0" : "")) + n;
+}
+function pad2(n){ n = Math.max(0, Math.round(Number(n) || 0)); return (n < 10 ? "0" : "") + n; }
+function fmtTime(s){
+  if (!isFinite(s) || s < 0) s = 0;
+  var m = Math.floor(s / 60);
+  var sec = s - m * 60;
+  return (m < 10 ? "0" : "") + m + ":" + (sec < 10 ? "0" : "") + sec.toFixed(1);
+}
+
+/* 简易可复现随机 */
+function mulberry32(a){
+  return function(){
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashStr(s){
+  var h = 2166136261;
+  s = String(s || "");
+  for (var i = 0; i < s.length; i++){
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/* ================= 7. 歌词 -> 词块 ================= */
+var BREAK = /[\s，。、；：！？,.;:!?—…·「」『』“”‘’()（）]/;
+
+function normalizeLines(raw){
+  var out = [];
+  if (!Array.isArray(raw)) return out;
+  for (var i = 0; i < raw.length; i++){
+    var l = raw[i];
+    if (!l || typeof l !== "object") continue;
+    var text = (l.text == null ? "" : String(l.text));
+    if (!text) continue;
+    var t = isFinite(Number(l.t)) ? Number(l.t) : 0;
+    var dur = isFinite(Number(l.dur)) ? Number(l.dur) : 0;
+    var chars = null;
+    if (Array.isArray(l.chars) && l.chars.length){
+      chars = [];
+      for (var j = 0; j < l.chars.length; j++){
+        var c = l.chars[j];
+        if (!c) { chars.push(null); continue; }
+        var ct = Number(c.t);
+        chars.push({ c: (c.c == null ? "" : String(c.c)), t: isFinite(ct) ? ct : null });
+      }
+    }
+    out.push({ t: t, dur: dur, text: text, chars: chars });
+  }
+  out.sort(function(a, b){ return a.t - b.t; });
+  return out;
+}
+
+function charTimes(line){
+  var chars = Array.from(line.text || "");
+  var n = chars.length, out = new Array(n), i, k;
+  var cs = line.chars;
+  if (cs && cs.length){
+    var first = null;
+    for (i = 0; i < cs.length; i++){
+      if (cs[i] && isFinite(cs[i].t)){ first = cs[i].t; break; }
+    }
+    var rel = (first != null) && (first < line.t - 0.08);
+    for (i = 0; i < n; i++){
+      var j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+      var rec = cs[j];
+      var ct = (rec && isFinite(rec.t)) ? rec.t : null;
+      out[i] = (ct == null) ? null : (rel ? line.t + ct : ct);
+    }
+  } else {
+    for (i = 0; i < n; i++) out[i] = null;
+  }
+
+  var d = line.dur > 0 ? line.dur : 3.4;
+  var any = false;
+  for (i = 0; i < n; i++){ if (out[i] != null){ any = true; break; } }
+  if (!any){
+    for (i = 0; i < n; i++) out[i] = line.t + d * 0.9 * i / Math.max(1, n);
+  } else {
+    var prevI = -1;
+    for (i = 0; i < n; i++){
+      if (out[i] == null) continue;
+      if (prevI >= 0){
+        var gap = i - prevI;
+        for (k = 1; k < gap; k++) out[prevI + k] = out[prevI] + (out[i] - out[prevI]) * k / gap;
+      } else {
+        for (k = 0; k < i; k++) out[k] = out[i] - 0.12 * (i - k);
+      }
+      prevI = i;
+    }
+    if (prevI >= 0 && prevI < n - 1){
+      var stepT = (line.dur > 0 ? line.dur / Math.max(1, n) : 0.28);
+      for (i = prevI + 1; i < n; i++) out[i] = out[prevI] + stepT * (i - prevI);
+    }
+  }
+  for (i = 0; i < n; i++){
+    if (!isFinite(out[i])) out[i] = line.t + 0.2 * i;
+    if (i > 0 && out[i] < out[i - 1]) out[i] = out[i - 1] + 0.02;
+  }
+  return { chars: chars, times: out };
+}
+
+function splitGroups(chars){
+  var n = chars.length;
+  if (n <= 5) return [[0, n]];
+  var k = n <= 8 ? 2 : (n <= 14 ? 3 : (n <= 22 ? 3 : 4));
+  k = Math.min(k, n);
+  var cuts = [0];
+  for (var g = 1; g < k; g++){
+    var ideal = Math.round(n * g / k);
+    var best = ideal;
+    for (var off = 1; off <= 4; off++){
+      var lo = ideal - off, hi = ideal + off;
+      if (lo > cuts[cuts.length - 1] + 1 && BREAK.test(chars[lo])){ best = lo; break; }
+      if (hi < n - 1 && BREAK.test(chars[hi])){ best = hi; break; }
+    }
+    if (best <= cuts[cuts.length - 1]) best = cuts[cuts.length - 1] + 1;
+    if (best >= n) best = n - 1;
+    cuts.push(best);
+  }
+  cuts.push(n);
+  var groups = [];
+  for (var q = 0; q < cuts.length - 1; q++){
+    if (cuts[q + 1] > cuts[q]) groups.push([cuts[q], cuts[q + 1]]);
+  }
+  return groups;
+}
+
+function buildTargets(){
+  targets = []; segs = []; activeIdx = -1;
+  if (!S.lines.length) return;
+  var gi = 0;
+  for (var li = 0; li < S.lines.length; li++){
+    var line = S.lines[li];
+    var info = charTimes(line);
+    if (!info.chars.length) continue;
+    var groups = splitGroups(info.chars);
+    for (var g = 0; g < groups.length; g++){
+      var a = groups[g][0], b = groups[g][1];
+      while (a < b - 1 && BREAK.test(info.chars[a])) a++;
+      while (b > a + 1 && BREAK.test(info.chars[b - 1])) b--;
+      var text = info.chars.slice(a, b).join("");
+      if (!text.replace(/\s+/g, "")) continue;
+      var cs = [];
+      for (var k = a; k < b; k++) cs.push({ c: info.chars[k], t: info.times[k] });
+      var t0 = cs.length ? cs[0].t : line.t;
+      var t1 = cs.length ? cs[cs.length - 1].t : line.t + 0.5;
+      targets.push({
+        i: gi++, lineIdx: li, chars: cs, text: text,
+        t0: t0, t1: Math.max(t0 + 0.18, t1),
+        fs: 56, w: 0, h: 0, tw: 0, x: 0, y: 0,
+        circ: false, rx: 0, ry: 0, cw: []
+      });
+    }
+  }
+}
+
+/* ================= 8. 版面：巨大的二维图纸 ================= */
+function layoutAll(){
+  var n = targets.length;
+  PORTRAIT = (W < 760 && H > W);
+
+  var pw = PORTRAIT ? W * 2.6 : W * 3.2;
+  var ph = PORTRAIT ? H * 2.9 : H * 2.5;
+  pw = Math.max(1400, Math.min(9000, pw));
+  ph = Math.max(1400, Math.min(7000, ph));
+  sheet.w = pw; sheet.h = ph;
+
+  if (!n){
+    bnd.x0 = pw * 0.1; bnd.y0 = ph * 0.1; bnd.x1 = pw * 0.9; bnd.y1 = ph * 0.9;
+    return;
+  }
+
+  /* 量字 */
+  for (var i = 0; i < n; i++){
+    var t = targets[i];
+    var cnt = t.chars.length;
+    var fs = cnt <= 3 ? 62 : (cnt === 4 ? 56 : (cnt === 5 ? 50 : (cnt <= 8 ? 44 : 38)));
+    if (PORTRAIT) fs *= 0.86;
+    t.fs = fs;
+    ctx.font = "600 " + fs + "px " + CJKF;
+    var xs = [], tw = 0;
+    for (var k = 0; k < cnt; k++){
+      xs.push(tw);
+      tw += ctx.measureText(t.chars[k].c || "").width;
+    }
+    t.cw = xs;
+    t.tw = Math.max(1, tw);
+    t.w = t.tw + fs * 0.92;
+    t.h = fs * 1.5;
+    t.circ = (cnt <= 3 && (i % 4 === 2));
+    t.rx = t.w * 0.56 + fs * 0.34;
+    t.ry = t.h * 0.86 + fs * 0.3;
+  }
+
+  /* 摆位：五列三行的靶区格，顺序刻意在远角之间跳跃 */
+  var seed = hashStr(SONG.name + "|" + SONG.artists + "|" + SONG.duration.toFixed(1));
+  var rnd = mulberry32(seed);
+  var cells = [[0, 0], [4, 2], [4, 0], [0, 2], [2, 1], [0, 1], [4, 1],
+               [2, 0], [2, 2], [1, 0], [3, 2], [3, 0], [1, 2], [1, 1], [3, 1]];
+
+  function boxGapX(t){ return (t.circ ? t.rx * 2 : t.w); }
+  function boxGapY(t){ return (t.circ ? t.ry * 2 : t.h); }
+  function hitsOther(j, cx, cy, tg){
+    for (var m = 0; m < j; m++){
+      var o = targets[m];
+      var gx = (boxGapX(tg) + boxGapX(o)) / 2 + 80;
+      var gy = (boxGapY(tg) + boxGapY(o)) / 2 + 46;
+      if (Math.abs(cx - o.x) < gx && Math.abs(cy - o.y) < gy) return true;
+    }
+    return false;
+  }
+
+  for (var j = 0; j < n; j++){
+    var tg = targets[j];
+    var cell = cells[j % cells.length];
+    var rep = Math.floor(j / cells.length);
+    var ax = 0.10 + 0.20 * cell[0];
+    var ay = 0.17 + 0.33 * cell[1];
+    var spr = Math.min(0.055, 0.014 * rep);
+    var sang = rep * 2.399;
+    var bestX = ax * pw, bestY = ay * ph, found = false;
+
+    for (var tryn = 0; tryn < 26; tryn++){
+      var jx = (rnd() * 2 - 1) * 0.075 + Math.cos(sang) * spr;
+      var jy = (rnd() * 2 - 1) * 0.115 + Math.sin(sang) * spr;
+      var cx = clamp((ax + jx) * pw, tg.w / 2 + pw * 0.035, pw - tg.w / 2 - pw * 0.035);
+      var cy = clamp((ay + jy) * ph, tg.h / 2 + ph * 0.04, ph - tg.h / 2 - ph * 0.04);
+      bestX = cx; bestY = cy;
+      if (!hitsOther(j, cx, cy, tg)){ found = true; break; }
+    }
+    if (!found){
+      bestX = clamp(ax * pw, tg.w / 2 + pw * 0.035, pw - tg.w / 2 - pw * 0.035);
+      bestY = clamp(ay * ph, tg.h / 2 + ph * 0.04, ph - tg.h / 2 - ph * 0.04);
+    }
+    tg.x = bestX; tg.y = bestY;
+  }
+
+  /* 连接折线 */
+  segs = [];
+  for (var s = 0; s < n - 1; s++){
+    var A = targets[s], B = targets[s + 1];
+    var p0 = edgePoint(A, B);
+    var p3 = edgePoint(B, A);
+    var mx = (p0.x + p3.x) / 2;
+    var pts = [p0, { x: mx, y: p0.y }, { x: mx, y: p3.y }, p3];
+    segs.push({ pts: pts, a: s, b: s + 1 });
+  }
+
+  /* 内容边界 */
+  var x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (var q = 0; q < n; q++){
+    var tt = targets[q];
+    var hw = Math.max(tt.w, tt.circ ? tt.rx * 2 : tt.w) / 2;
+    var hh = Math.max(tt.h, tt.circ ? tt.ry * 2 : tt.h) / 2;
+    if (tt.x - hw < x0) x0 = tt.x - hw;
+    if (tt.y - hh < y0) y0 = tt.y - hh;
+    if (tt.x + hw > x1) x1 = tt.x + hw;
+    if (tt.y + hh > y1) y1 = tt.y + hh;
+  }
+  bnd.x0 = x0 - 220; bnd.y0 = y0 - 200; bnd.x1 = x1 + 220; bnd.y1 = y1 + 200;
+}
+
+function edgePoint(a, b){
+  var dx = b.x - a.x, dy = b.y - a.y;
+  if (Math.abs(dx) < 1e-4 && Math.abs(dy) < 1e-4) return { x: a.x, y: a.y };
+  if (a.circ){
+    var u = dx / a.rx, v = dy / a.ry;
+    var s = 1 / Math.sqrt(u * u + v * v);
+    return { x: a.x + dx * s, y: a.y + dy * s };
+  }
+  var sx = Math.abs(dx) < 1e-4 ? 1e9 : (a.w / 2) / Math.abs(dx);
+  var sy = Math.abs(dy) < 1e-4 ? 1e9 : (a.h / 2) / Math.abs(dy);
+  var k = Math.min(sx, sy);
+  return { x: a.x + dx * k, y: a.y + dy * k };
+}
+
+/* ================= 9. 相机 ================= */
+function blockActive(t, lead){
+  var n = targets.length;
+  if (!n) return -1;
+  var lo = 0, hi = n - 1, best = -1;
+  while (lo <= hi){
+    var m = (lo + hi) >> 1;
+    if (targets[m].t0 <= t + lead){ best = m; lo = m + 1; }
+    else hi = m - 1;
+  }
+  return best;
+}
+
+function lineIdxAt(t){
+  var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+  while (lo <= hi){
+    var m = (lo + hi) >> 1;
+    if (a[m].t <= t + 0.02){ best = m; lo = m + 1; }
+    else hi = m - 1;
+  }
+  return best;
+}
+
+function zFor(t){
+  var fw = PORTRAIT ? 0.66 : 0.42;
+  var fh = PORTRAIT ? 0.26 : 0.30;
+  var z = Math.min((W * fw) / Math.max(1, t.w), (H * fh) / Math.max(1, t.h));
+  return clamp(z, 0.5, 1.25);
+}
+
+function updateFocus(t){
+  var n = targets.length;
+  if (!n){
+    focus.x = sheet.w * 0.5;
+    focus.y = sheet.h * 0.5;
+    focus.z = 0.42;
+    return;
+  }
+  var lead = RM ? 0.06 : 0.26;
+  var i = blockActive(t, lead);
+  activeIdx = i;
+  var cur = i >= 0 ? targets[i] : null;
+  var nxt = (i + 1 < n) ? targets[i + 1] : null;
+
+  if (!cur){
+    var bw = Math.max(1, bnd.x1 - bnd.x0);
+    var bh = Math.max(1, bnd.y1 - bnd.y0);
+    var zf0 = Math.min((W * 0.78) / bw, (H * 0.70) / bh);
+    focus.x = (bnd.x0 + bnd.x1) / 2;
+    focus.y = (bnd.y0 + bnd.y1) / 2;
+    focus.z = clamp(zf0, 0.20, 0.55);
+    return;
+  }
+
+  var zc = zFor(cur);
+  var holdEnd = cur.t1 + 0.45;
+
+  if (nxt && t > holdEnd && t < nxt.t0 - 0.34){
+    var ddx = Math.abs(nxt.x - cur.x), ddy = Math.abs(nxt.y - cur.y);
+    var zf2 = Math.min((W * 0.56) / Math.max(1, ddx), (H * 0.54) / Math.max(1, ddy));
+    focus.x = (cur.x + nxt.x) * 0.5;
+    focus.y = (cur.y + nxt.y) * 0.5;
+    focus.z = clamp(Math.min(zc * 0.82, zf2), 0.32, 0.95);
+  } else if (nxt && t >= nxt.t0 - 0.34){
+    focus.x = nxt.x;
+    focus.y = nxt.y;
+    focus.z = zFor(nxt);
+  } else {
+    focus.x = cur.x;
+    focus.y = cur.y;
+    focus.z = zc;
+  }
+}
+
+function stepCamera(dt){
+  var dist = Math.hypot(focus.x - cam.x, focus.y - cam.y);
+  if (!placed || snapPending || dist > Math.max(W * 2.2, 2600)){
+    cam.x = focus.x; cam.y = focus.y; cam.z = focus.z;
+    cam.vx = 0; cam.vy = 0; cam.vz = 0;
+    placed = true; snapPending = false;
+    return;
+  }
+  if (RM){
+    var k0 = Math.min(1, dt * 9);
+    cam.x += (focus.x - cam.x) * k0;
+    cam.y += (focus.y - cam.y) * k0;
+    cam.z += (focus.z - cam.z) * k0;
+    cam.vx = 0; cam.vy = 0;
+    return;
+  }
+  var k = 235, damp = 16;
+  var steps = Math.min(4, Math.max(1, Math.ceil(dt / 0.009)));
+  var h = dt / steps;
+  for (var s = 0; s < steps; s++){
+    cam.vx += (focus.x - cam.x) * k * h;
+    cam.vy += (focus.y - cam.y) * k * h;
+    cam.vx *= Math.exp(-damp * h);
+    cam.vy *= Math.exp(-damp * h);
+    cam.x += cam.vx * h;
+    cam.y += cam.vy * h;
+  }
+  cam.vz += (focus.z - cam.z) * 165 * dt;
+  cam.vz *= Math.exp(-17 * dt);
+  cam.z += cam.vz * dt;
+  cam.z = clamp(cam.z, 0.08, 2.6);
+}
+
+/* ================= 10. 绘制：世界 ================= */
+function applyCam(z){
+  ctx.setTransform(z * DPR, 0, 0, z * DPR, (W / 2 - cam.x * z) * DPR, (H / 2 - cam.y * z) * DPR);
+}
+
+function drawBackdrop(){
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (bgCv.width > 1) ctx.drawImage(bgCv, 0, 0, W, H);
+  else { ctx.fillStyle = C.bg0; ctx.fillRect(0, 0, W, H); }
+}
+
+function buildPlates(){
+  var pw = Math.max(1, Math.round(W * DPR));
+  var ph = Math.max(1, Math.round(H * DPR));
+
+  bgCv.width = pw; bgCv.height = ph;
+  bgCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bgCtx.fillStyle = C.bg0;
+  bgCtx.fillRect(0, 0, W, H);
+  try {
+    var g = bgCtx.createRadialGradient(W * 0.5, H * 0.48, 0, W * 0.5, H * 0.48, Math.max(W, H) * 0.82);
+    g.addColorStop(0, "rgba(20,58,50,.50)");
+    g.addColorStop(0.45, "rgba(9,24,23,.30)");
+    g.addColorStop(1, "rgba(3,6,8,0)");
+    bgCtx.fillStyle = g;
+    bgCtx.fillRect(0, 0, W, H);
+  } catch(e){}
+
+  vgCv.width = pw; vgCv.height = ph;
+  vgCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  vgCtx.clearRect(0, 0, W, H);
+  try {
+    var vg = vgCtx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.30, W / 2, H / 2, Math.max(W, H) * 0.80);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(0.72, "rgba(0,0,0,.22)");
+    vg.addColorStop(1, "rgba(0,0,0,.74)");
+    vgCtx.fillStyle = vg;
+    vgCtx.fillRect(0, 0, W, H);
+  } catch(e){}
+
+  radarGrad = null;
+}
+
+function drawSheetFrame(z){
+  ctx.strokeStyle = C.hairFaint;
+  ctx.lineWidth = 1 / z;
+  ctx.setLineDash([10 / z, 12 / z]);
+  ctx.beginPath();
+  ctx.rect(bnd.x0, bnd.y0, bnd.x1 - bnd.x0, bnd.y1 - bnd.y0);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  /* 图框角规 */
+  var L = 46 / z;
+  ctx.strokeStyle = C.hairSoft;
+  ctx.beginPath();
+  ctx.moveTo(bnd.x0, bnd.y0 + L); ctx.lineTo(bnd.x0, bnd.y0); ctx.lineTo(bnd.x0 + L, bnd.y0);
+  ctx.moveTo(bnd.x1 - L, bnd.y0); ctx.lineTo(bnd.x1, bnd.y0); ctx.lineTo(bnd.x1, bnd.y0 + L);
+  ctx.moveTo(bnd.x1, bnd.y1 - L); ctx.lineTo(bnd.x1, bnd.y1); ctx.lineTo(bnd.x1 - L, bnd.y1);
+  ctx.moveTo(bnd.x0 + L, bnd.y1); ctx.lineTo(bnd.x0, bnd.y1); ctx.lineTo(bnd.x0, bnd.y1 - L);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(140,214,196,.34)";
+  ctx.font = "600 " + (13 / z) + "px " + MONO;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  try { ctx.letterSpacing = (2 / z) + "px"; } catch(e){}
+  ctx.fillText("SHEET 511 · LYRIC TARGET PLOT", bnd.x0, bnd.y0 - 12 / z);
+  ctx.fillText("SCALE 1:1", bnd.x1 - 90 / z, bnd.y0 - 12 / z);
+  try { ctx.letterSpacing = "0px"; } catch(e){}
+}
+
+function drawGrid(z){
+  var step = 120;
+  while (step * z < 46) step *= 2;
+  while (step * z > 240) step /= 2;
+
+  var vx0 = cam.x - (W / 2) / z, vx1 = cam.x + (W / 2) / z;
+  var vy0 = cam.y - (H / 2) / z, vy1 = cam.y + (H / 2) / z;
+  var lw = 1 / z;
+
+  var i0 = Math.ceil(vx0 / step), i1 = Math.floor(vx1 / step);
+  var j0 = Math.ceil(vy0 / step), j1 = Math.floor(vy1 / step);
+
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = C.grid;
+  ctx.beginPath();
+  var i;
+  for (i = i0; i <= i1; i++){
+    if (i % 5 === 0) continue;
+    var x = i * step;
+    ctx.moveTo(x, vy0); ctx.lineTo(x, vy1);
+  }
+  for (i = j0; i <= j1; i++){
+    if (i % 5 === 0) continue;
+    var y = i * step;
+    ctx.moveTo(vx0, y); ctx.lineTo(vx1, y);
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle = C.gridMajor;
+  ctx.beginPath();
+  for (i = i0; i <= i1; i++){
+    if (i % 5 !== 0) continue;
+    var xx = i * step;
+    ctx.moveTo(xx, vy0); ctx.lineTo(xx, vy1);
+  }
+  for (i = j0; i <= j1; i++){
+    if (i % 5 !== 0) continue;
+    var yy = i * step;
+    ctx.moveTo(vx0, yy); ctx.lineTo(vx1, yy);
+  }
+  ctx.stroke();
+
+  /* 坐标标注：只标上、左边缘，限流 */
+  ctx.fillStyle = "rgba(130,206,186,.30)";
+  ctx.font = (9 / z) + "px " + MONO;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  var shown = 0;
+  for (i = i0; i <= i1 && shown < 9; i++){
+    if (i % 5 !== 0) continue;
+    ctx.fillText(String(i * step), i * step + 4 / z, vy0 + 4 / z);
+    shown++;
+  }
+  shown = 0;
+  ctx.textBaseline = "middle";
+  for (i = j0; i <= j1 && shown < 7; i++){
+    if (i % 5 !== 0) continue;
+    ctx.fillText(String(i * step), vx0 + 4 / z, i * step);
+    shown++;
+  }
+}
+
+function revealOf(i){
+  if (!targets[i + 1]) return 0;
+  var a = targets[i], b = targets[i + 1];
+  var start = Math.max(a.t0, b.t0 - 0.9);
+  var dur = Math.max(0.22, b.t0 - start);
+  var r = (S.t - start) / dur;
+  return clamp(r, 0, 1);
+}
+
+function drawPath(z){
+  if (!segs.length) return;
+  var lw = 1 / z;
+  var vx0 = cam.x - (W / 2) / z - 240, vx1 = cam.x + (W / 2) / z + 240;
+  var vy0 = cam.y - (H / 2) / z - 240, vy1 = cam.y + (H / 2) / z + 240;
+
+  var future = [], solid = [], ticks = [], head = null;
+
+  for (var i = 0; i < segs.length; i++){
+    var pts = segs[i].pts;
+    var minx = Math.min(pts[0].x, pts[1].x, pts[2].x, pts[3].x);
+    var maxx = Math.max(pts[0].x, pts[1].x, pts[2].x, pts[3].x);
+    var miny = Math.min(pts[0].y, pts[1].y, pts[2].y, pts[3].y);
+    var maxy = Math.max(pts[0].y, pts[1].y, pts[2].y, pts[3].y);
+    if (maxx < vx0 || minx > vx1 || maxy < vy0 || miny > vy1) continue;
+
+    var rv = revealOf(i);
+    if (rv <= 0.001){
+      future.push(pts);
+    } else if (rv >= 0.999){
+      solid.push(pts);
+      if (z >= 0.42) ticks.push(pts);
+    } else {
+      var res = partialPath(pts, rv);
+      solid.push(res.pts);
+      future.push(pts);
+      if (res.pts.length >= 2) head = res.pts;
+    }
+  }
+
+  /* 未走完的虚线 */
+  if (future.length){
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = C.hair;
+    ctx.lineWidth = lw;
+    ctx.setLineDash([6 / z, 9 / z]);
+    ctx.beginPath();
+    for (var f = 0; f < future.length; f++){
+      var p = future[f];
+      ctx.moveTo(p[0].x, p[0].y);
+      for (var q = 1; q < p.length; q++) ctx.lineTo(p[q].x, p[q].y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /* 已生长的主线 */
+  if (solid.length){
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = C.hair;
+    ctx.lineWidth = 1.35 / z;
+    ctx.beginPath();
+    for (var s = 0; s < solid.length; s++){
+      var sp = solid[s];
+      ctx.moveTo(sp[0].x, sp[0].y);
+      for (var q2 = 1; q2 < sp.length; q2++) ctx.lineTo(sp[q2].x, sp[q2].y);
+    }
+    ctx.stroke();
+
+    /* 折点直角标记，一次成路径 */
+    if (ticks.length){
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = lw;
+      ctx.beginPath();
+      for (var t2 = 0; t2 < ticks.length; t2++){
+        var tp = ticks[t2], tk = 7 / z;
+        for (var v = 1; v < tp.length - 1; v++){
+          var px = tp[v].x, py = tp[v].y;
+          ctx.moveTo(px - tk, py); ctx.lineTo(px, py); ctx.lineTo(px, py - tk);
+        }
+      }
+      ctx.stroke();
+    }
+  }
+
+  /* 行进箭头 */
+  if (head){
+    var e1 = head[head.length - 1], e0 = head[head.length - 2];
+    var ang = Math.atan2(e1.y - e0.y, e1.x - e0.x);
+    var al = 9 / z;
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = C.hair;
+    ctx.beginPath();
+    ctx.moveTo(e1.x, e1.y);
+    ctx.lineTo(e1.x - Math.cos(ang - 0.42) * al, e1.y - Math.sin(ang - 0.42) * al);
+    ctx.lineTo(e1.x - Math.cos(ang + 0.42) * al, e1.y - Math.sin(ang + 0.42) * al);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function partialPath(pts, frac){
+  var lens = [], total = 0, i;
+  for (i = 1; i < pts.length; i++){
+    var l = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    lens.push(l); total += l;
+  }
+  if (total <= 0.0001) return { pts: [pts[0]] };
+  var remain = total * clamp(frac, 0, 1);
+  var out = [pts[0]];
+  for (i = 1; i < pts.length; i++){
+    var len = lens[i - 1];
+    if (remain >= len){
+      out.push(pts[i]);
+      remain -= len;
+    } else {
+      var u = len > 0 ? remain / len : 0;
+      out.push({
+        x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * u,
+        y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * u
+      });
+      break;
+    }
+  }
+  return { pts: out };
+}
+
+function drawTargets(z, now){
+  if (!targets.length) return;
+  var pad = 260;
+  var vx0 = cam.x - (W / 2) / z - pad, vx1 = cam.x + (W / 2) / z + pad;
+  var vy0 = cam.y - (H / 2) / z - pad, vy1 = cam.y + (H / 2) / z + pad;
+  var lw = 1 / z;
+
+  for (var pass = 0; pass < 2; pass++){
+    for (var i = 0; i < targets.length; i++){
+      var isCur = (i === activeIdx);
+      if ((pass === 0) === isCur) continue;
+      var t = targets[i];
+      var hw = t.circ ? t.rx : t.w / 2;
+      var hh = t.circ ? t.ry : t.h / 2;
+      if (t.x + hw < vx0 || t.x - hw > vx1 || t.y + hh < vy0 || t.y - hh > vy1) continue;
+      drawOne(t, i, isCur, lw, now, z);
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.setLineDash([]);
+  ctx.shadowBlur = 0;
+}
+
+function drawOne(t, i, isCur, lw, now, z){
+  var past = i < activeIdx;
+  var next = (i === activeIdx + 1);
+  ctx.globalAlpha = isCur ? 1 : (next ? 0.82 : (past ? 0.40 : 0.60));
+
+  /* 锁定词块下压一层暗底，避免移动中的其他词压字 */
+  if (isCur){
+    ctx.fillStyle = "rgba(4,8,11,.62)";
+    ctx.beginPath();
+    if (t.circ) ctx.ellipse(t.x, t.y, t.rx, t.ry, 0, 0, Math.PI * 2);
+    else ctx.rect(t.x - t.w / 2, t.y - t.h / 2, t.w, t.h);
+    ctx.fill();
+  }
+
+  ctx.lineWidth = (isCur ? 1.5 : 1) * lw;
+  ctx.strokeStyle = isCur ? C.accent : C.hair;
+  if (!isCur && !past) ctx.setLineDash([5 * lw, 7 * lw]);
+  ctx.beginPath();
+  if (t.circ) ctx.ellipse(t.x, t.y, t.rx, t.ry, 0, 0, Math.PI * 2);
+  else ctx.rect(t.x - t.w / 2, t.y - t.h / 2, t.w, t.h);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  /* 角规：缩得太小时省掉 */
+  if (isCur || z >= 0.42){
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = isCur ? C.accent : C.hair;
+  ctx.beginPath();
+  if (t.circ){
+    for (var q = 0; q < 4; q++){
+      var ang = q * Math.PI / 2 + Math.PI / 4;
+      var c1x = t.x + Math.cos(ang) * t.rx * 0.93;
+      var c1y = t.y + Math.sin(ang) * t.ry * 0.93;
+      var c2x = t.x + Math.cos(ang) * t.rx * 1.07;
+      var c2y = t.y + Math.sin(ang) * t.ry * 1.07;
+      ctx.moveTo(c1x, c1y); ctx.lineTo(c2x, c2y);
+    }
+  } else {
+    var x0 = t.x - t.w / 2, y0 = t.y - t.h / 2;
+    var x1 = t.x + t.w / 2, y1 = t.y + t.h / 2;
+    var o = 7 * lw, e = 15 * lw;
+    ctx.moveTo(x0 - o, y0 - o + e); ctx.lineTo(x0 - o, y0 - o); ctx.lineTo(x0 - o + e, y0 - o);
+    ctx.moveTo(x1 + o - e, y0 - o); ctx.lineTo(x1 + o, y0 - o); ctx.lineTo(x1 + o, y0 - o + e);
+    ctx.moveTo(x1 + o, y1 + o - e); ctx.lineTo(x1 + o, y1 + o); ctx.lineTo(x1 + o - e, y1 + o);
+    ctx.moveTo(x0 - o + e, y1 + o); ctx.lineTo(x0 - o, y1 + o); ctx.lineTo(x0 - o, y1 + o - e);
+  }
+  ctx.stroke();
+  }
+
+  /* 编号标：太小时不画 */
+  if (isCur || z >= 0.38){
+  ctx.globalAlpha = isCur ? 0.95 : (past ? 0.28 : 0.4);
+  ctx.fillStyle = isCur ? C.accent : C.inkFaint;
+  ctx.font = "600 12px " + MONO;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  try { ctx.letterSpacing = "0.06em"; } catch(e){}
+  var topY = t.circ ? (t.y - t.ry) : (t.y - t.h / 2);
+  ctx.fillText("T" + pad3(i + 1), t.x - (t.circ ? t.rx * 0.9 : t.w / 2), topY - 10);
+  try { ctx.letterSpacing = "0px"; } catch(e){}
+  }
+
+  /* 文字：非当前词块整串一次画完 */
+  ctx.globalAlpha = 1;
+  ctx.font = "600 " + t.fs + "px " + CJKF;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  var tx = t.x - t.tw / 2;
+
+  if (!isCur){
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = (next ? "rgba(214,242,232,.95)" : "rgba(214,242,232,.86)");
+    ctx.fillText(t.text, tx, t.y + 2);
+  } else {
+    ctx.shadowColor = "rgba(130,255,218,.30)";
+    ctx.shadowBlur = 10;
+    var nextOn = -1;
+    for (var kk = 0; kk < t.chars.length; kk++){
+      if (S.t < t.chars[kk].t){ nextOn = kk; break; }
+    }
+    for (var k2 = 0; k2 < t.chars.length; k2++){
+      var ch = t.chars[k2];
+      var col;
+      if (S.t >= ch.t) col = C.ink;
+      else if (k2 === nextOn) col = C.accent;
+      else col = "rgba(200,236,224,.32)";
+      ctx.fillStyle = col;
+      ctx.fillText(ch.c, tx + t.cw[k2], t.y + 2);
+    }
+    ctx.shadowBlur = 0;
+  }
+
+  /* 锁定装饰：只在目标基本落在画面中心时显示 */
+  var onScreen = Math.hypot(t.x - cam.x, t.y - cam.y) * cam.z < Math.min(W, H) * 0.36;
+  if (isCur && onScreen){
+    var bx = t.circ ? t.rx * 1.12 : t.w / 2 + 12;
+    var by = t.circ ? t.ry * 1.12 : t.h / 2 + 12;
+    ctx.globalAlpha = 0.95;
+    ctx.strokeStyle = C.accent;
+    ctx.lineWidth = 1.4 * lw;
+    ctx.beginPath();
+    var br = 22;
+    ctx.moveTo(t.x - bx, t.y - by + br); ctx.lineTo(t.x - bx, t.y - by); ctx.lineTo(t.x - bx + br, t.y - by);
+    ctx.moveTo(t.x + bx - br, t.y - by); ctx.lineTo(t.x + bx, t.y - by); ctx.lineTo(t.x + bx, t.y - by + br);
+    ctx.moveTo(t.x + bx, t.y + by - br); ctx.lineTo(t.x + bx, t.y + by); ctx.lineTo(t.x + bx - br, t.y + by);
+    ctx.moveTo(t.x - bx + br, t.y + by); ctx.lineTo(t.x - bx, t.y + by); ctx.lineTo(t.x - bx, t.y + by - br);
+    ctx.stroke();
+
+    ctx.fillStyle = C.accent;
+    ctx.font = "600 11px " + MONO;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "alphabetic";
+    try { ctx.letterSpacing = "0.14em"; } catch(e){}
+    ctx.fillText("LOCK", t.x + bx, t.y - by - 6);
+    try { ctx.letterSpacing = "0px"; } catch(e){}
+
+    /* 扫描线 */
+    var sp = (now * 0.0005) % 1;
+    var sy = t.y - t.h / 2 + t.h * sp;
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = C.accentFaint;
+    ctx.lineWidth = 1.6 * lw;
+    ctx.beginPath();
+    ctx.moveTo(t.x - t.w / 2, sy);
+    ctx.lineTo(t.x + t.w / 2, sy);
+    ctx.stroke();
+
+    /* 外环 */
+    ctx.globalAlpha = 0.34;
+    ctx.strokeStyle = C.accent;
+    ctx.lineWidth = lw;
+    ctx.setLineDash([3 * lw, 10 * lw]);
+    ctx.lineDashOffset = -now * 0.02;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, Math.max(t.w, t.h) * 0.86, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineDashOffset = 0;
+  }
+
+  ctx.globalAlpha = 1;
+}
+
+/* ================= 11. 绘制：屏幕层 ================= */
+function drawVignette(){
+  if (vgCv.width > 1) ctx.drawImage(vgCv, 0, 0, W, H);
+}
+
+function drawSpeedLines(spd, z){
+  var px = spd * z;
+  if (px < 760) return;
+  var n = Math.min(16, Math.round(px / 460));
+  var ang = Math.atan2(cam.vy, cam.vx);
+  var dx = Math.cos(ang), dy = Math.sin(ang);
+  var a = Math.min(0.12, px / 13000);
+  ctx.save();
+  ctx.strokeStyle = "rgba(150,240,210,1)";
+  ctx.lineWidth = 1;
+  for (var i = 0; i < n; i++){
+    var ox = (Math.random() - 0.5) * W * 1.05;
+    var oy = (Math.random() - 0.5) * H * 1.05;
+    var len = (30 + Math.random() * 210) * Math.min(1.6, px / 2400);
+    var cx = W / 2 + ox * 0.55;
+    var cy = H / 2 + oy * 0.55;
+    ctx.globalAlpha = a * (0.35 + Math.random() * 0.85);
+    ctx.beginPath();
+    ctx.moveTo(cx - dx * len, cy - dy * len);
+    ctx.lineTo(cx + dx * len * 0.2, cy + dy * len * 0.2);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function ellipsize(text, maxW){
+  text = String(text == null ? "" : text);
+  if (!text) return "";
+  if (ctx.measureText(text).width <= maxW) return text;
+  var out = text;
+  while (out.length > 1 && ctx.measureText(out + "…").width > maxW) out = out.slice(0, -1);
+  return out + "…";
+}
+
+function cornerBracket(x, y, sx, sy, len){
+  ctx.beginPath();
+  ctx.moveTo(x, y + sy * len);
+  ctx.lineTo(x, y);
+  ctx.lineTo(x + sx * len, y);
+  ctx.stroke();
+}
+
+function fmtDate(){
+  try {
+    var d = new Date();
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  } catch(e){ return "---- -- --"; }
+}
+
+function drawHUD(now){
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  var mx = PORTRAIT ? 20 : 48;
+  var my = PORTRAIT ? 18 : 40;
+  var i;
+
+  ctx.strokeStyle = "rgba(120,210,185,.16)";
+  ctx.lineWidth = 1;
+  cornerBracket(16, 16, 1, 1, 26);
+  cornerBracket(W - 16, 16, -1, 1, 26);
+  cornerBracket(16, H - 16, 1, -1, 26);
+  cornerBracket(W - 16, H - 16, -1, -1, 26);
+
+  /* 左上：曲目 */
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.font = "10px " + MONO;
+  ctx.fillStyle = "rgba(150,214,196,.78)";
+  try { ctx.letterSpacing = "0.2em"; } catch(e){}
+  ctx.fillText("Lyra // STAGE 511", mx, my + 8);
+  try { ctx.letterSpacing = "0.08em"; } catch(e){}
+  ctx.fillStyle = "rgba(150,214,196,.44)";
+  ctx.fillText("LYRIC TARGET PLOT", mx, my + 24);
+  try { ctx.letterSpacing = "0px"; } catch(e){}
+
+  var nameSize = PORTRAIT ? 18 : Math.round(clamp(W * 0.016, 20, 27));
+  ctx.font = "600 " + nameSize + "px " + CJKF;
+  ctx.fillStyle = C.ink;
+  ctx.fillText(ellipsize(SONG.name || "未命名曲目", W * 0.46), mx, my + 48);
+  ctx.font = "12px " + CJKF;
+  ctx.fillStyle = C.inkDim;
+  ctx.fillText(ellipsize(SONG.artists || "未知艺术家", W * 0.34), mx, my + 68);
+
+  /* 右上：遥测 */
+  var rx = W - mx;
+  ctx.textAlign = "right";
+  ctx.font = "10px " + MONO;
+  ctx.fillStyle = "rgba(150,214,196,.72)";
+  try { ctx.letterSpacing = "0.14em"; } catch(e){}
+  var ly = my + 8;
+  ctx.fillText("BPM " + (live.bpm > 0 ? pad3(live.bpm) : "---"), rx, ly);
+  ctx.fillText("TGT " + (activeIdx >= 0 ? pad3(activeIdx + 1) : "---") + " / " + pad3(targets.length), rx, ly + 16);
+  ctx.fillText("ZOOM " + cam.z.toFixed(2) + "X", rx, ly + 32);
+  try { ctx.letterSpacing = "0px"; } catch(e){}
+
+  /* 能量条 */
+  var bw = 96, bx = rx - bw, byy = ly + 42;
+  ctx.fillStyle = "rgba(120,210,185,.12)";
+  ctx.fillRect(bx, byy, bw, 3);
+  ctx.fillStyle = "rgba(150,238,205,.80)";
+  ctx.fillRect(bx, byy, bw * clamp01(live.level), 3);
+  ctx.fillStyle = "rgba(120,210,185,.18)";
+  for (i = 1; i < 8; i++) ctx.fillRect(bx + bw * i / 8, byy - 1, 1, 5);
+
+  /* 雷达盘 */
+  if (!PORTRAIT && W > 1020){
+    var cx = rx - 58, cy = my + 130, r = 52;
+    ctx.fillStyle = "rgba(5,9,12,.72)";
+    ctx.beginPath(); ctx.arc(cx, cy, r + 2, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "rgba(120,210,185,.22)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = "rgba(120,210,185,.13)";
+    ctx.beginPath(); ctx.arc(cx, cy, r * 0.62, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, r * 0.28, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy);
+    ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r);
+    ctx.stroke();
+
+    var sweep = (now * 0.00042) % (Math.PI * 2);
+    try {
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, r, sweep - 0.55, sweep);
+      ctx.closePath();
+      if (!radarGrad){
+        radarGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+        radarGrad.addColorStop(0, "rgba(150,240,210,.14)");
+        radarGrad.addColorStop(1, "rgba(150,240,210,0)");
+      }
+      ctx.fillStyle = radarGrad;
+      ctx.fill();
+    } catch(e){}
+    ctx.strokeStyle = "rgba(160,244,214,.38)";
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(sweep) * r, cy + Math.sin(sweep) * r);
+    ctx.stroke();
+
+    var ext = (W / 2) / Math.max(0.2, cam.z);
+    for (i = 0; i < targets.length; i += Math.max(1, Math.round(targets.length / 26))){
+      var tt = targets[i];
+      var dx = (tt.x - cam.x) / ext, dy = (tt.y - cam.y) / ext;
+      var rr = Math.hypot(dx, dy);
+      if (rr > 0.96) continue;
+      var px2 = cx + dx * r, py2 = cy + dy * r;
+      ctx.fillStyle = (i === activeIdx) ? C.accent : "rgba(150,238,205,.5)";
+      ctx.fillRect(px2 - 1.5, py2 - 1.5, 3, 3);
+    }
+    ctx.fillStyle = "rgba(150,214,196,.4)";
+    ctx.font = "9px " + MONO;
+    ctx.textAlign = "center";
+    ctx.fillText("SCAN", cx, cy + r + 14);
+  }
+
+  /* 左下：时间码 */
+  var by = H - my;
+  ctx.textAlign = "left";
+  ctx.font = "13px " + MONO;
+  ctx.fillStyle = C.ink;
+  ctx.fillText(fmtTime(S.t), mx, by - 30);
+  ctx.font = "10px " + MONO;
+  ctx.fillStyle = C.inkDim;
+  ctx.fillText("/ " + (SONG.duration > 0 ? fmtTime(SONG.duration) : "--:--"), mx + 74, by - 30);
+
+  var pbw = PORTRAIT ? Math.min(W * 0.58, 210) : 260;
+  var pby = by - 14;
+  ctx.fillStyle = "rgba(120,210,185,.16)";
+  ctx.fillRect(mx, pby, pbw, 1);
+  var prog = SONG.duration > 0 ? clamp01(S.t / SONG.duration) : 0;
+  ctx.fillStyle = "rgba(150,235,205,.78)";
+  ctx.fillRect(mx, pby, pbw * prog, 1);
+  if (SONG.duration > 0){
+    ctx.fillStyle = "rgba(120,210,185,.30)";
+    for (var st = 0; st <= SONG.duration; st += 30){
+      var tx2 = mx + pbw * (st / SONG.duration);
+      ctx.fillRect(tx2, pby - 3, 1, 7);
+    }
+  }
+  ctx.fillStyle = C.accent;
+  ctx.fillRect(mx + pbw * prog - 1, pby - 3, 2, 7);
+
+  /* 航向读数（真实：当前折线方向） */
+  var brg = 0;
+  if (activeIdx >= 0 && segs[activeIdx]){
+    var sa = targets[activeIdx], sb = targets[activeIdx + 1] || sa;
+    brg = (Math.atan2(sb.y - sa.y, sb.x - sa.x) * 180 / Math.PI + 360) % 360;
+  }
+  ctx.font = "9px " + MONO;
+  ctx.fillStyle = "rgba(150,214,196,.56)";
+  try { ctx.letterSpacing = "0.1em"; } catch(e){}
+  ctx.fillText("BRG " + pad3(brg) + " DEG   SEG " + (activeIdx >= 0 ? pad3(activeIdx + 1) : "---"), mx, by - 50);
+  try { ctx.letterSpacing = "0px"; } catch(e){}
+
+  /* 右下：图纸标题栏 */
+  if (!PORTRAIT && W > 900){
+    var tw2 = 300, th2 = 84;
+    var tbx = W - mx - tw2, tby = H - my - th2;
+    ctx.fillStyle = "rgba(5,9,12,.88)";
+    ctx.fillRect(tbx, tby, tw2, th2);
+    ctx.strokeStyle = "rgba(120,210,185,.26)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(tbx, tby, tw2, th2);
+    ctx.beginPath();
+    ctx.moveTo(tbx, tby + 28); ctx.lineTo(tbx + tw2, tby + 28);
+    ctx.moveTo(tbx, tby + 56); ctx.lineTo(tbx + tw2, tby + 56);
+    ctx.moveTo(tbx + 156, tby); ctx.lineTo(tbx + 156, tby + th2);
+    ctx.stroke();
+
+    ctx.font = "9px " + MONO;
+    ctx.fillStyle = "rgba(150,214,196,.5)";
+    try { ctx.letterSpacing = "0.12em"; } catch(e){}
+    ctx.textAlign = "left";
+    ctx.fillText("SHEET 511", tbx + 10, tby + 18);
+    ctx.textAlign = "right";
+    ctx.fillText("SCALE 1:1", tbx + tw2 - 10, tby + 18);
+    ctx.textAlign = "left";
+    try { ctx.letterSpacing = "0px"; } catch(e){}
+
+    ctx.font = "11px " + CJKF;
+    ctx.fillStyle = "rgba(214,244,232,.8)";
+    ctx.fillText(ellipsize(SONG.name || "未命名曲目", 136), tbx + 10, tby + 46);
+    ctx.font = "10px " + MONO;
+    ctx.fillStyle = "rgba(150,214,196,.6)";
+    ctx.fillText("RADAR / LOCK", tbx + 166, tby + 44);
+    ctx.fillText(fmtDate(), tbx + 166, tby + 64);
+
+    ctx.font = "10px " + CJKF;
+    ctx.fillStyle = "rgba(170,214,200,.55)";
+    ctx.fillText(ellipsize(SONG.artists || "未知艺术家", 136), tbx + 10, tby + 66);
+  }
+
+  /* 准星 */
+  var cx0 = W / 2, cy0 = H / 2;
+  ctx.strokeStyle = targets.length ? "rgba(150,230,205,.18)" : "rgba(150,230,205,.42)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx0 - 42, cy0); ctx.lineTo(cx0 - 12, cy0);
+  ctx.moveTo(cx0 + 12, cy0); ctx.lineTo(cx0 + 42, cy0);
+  ctx.moveTo(cx0, cy0 - 42); ctx.lineTo(cx0, cy0 - 12);
+  ctx.moveTo(cx0, cy0 + 12); ctx.lineTo(cx0, cy0 + 42);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx0, cy0, 5, 0, Math.PI * 2);
+  ctx.stroke();
+
+  /* 空态 */
+  if (!targets.length){
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.font = "11px " + MONO;
+    ctx.fillStyle = "rgba(160,220,200,.72)";
+    try { ctx.letterSpacing = "0.3em"; } catch(e){}
+    ctx.fillText("NO LYRIC DATA", cx0 + 1, cy0 + 96);
+    try { ctx.letterSpacing = "0.04em"; } catch(e){}
+    ctx.font = "12px " + CJKF;
+    ctx.fillStyle = "rgba(160,200,190,.62)";
+    ctx.fillText("无歌词数据 · 待机", cx0, cy0 + 118);
+    try { ctx.letterSpacing = "0px"; } catch(e){}
+  }
+}
+
+/* ================= 12. 主绘制 ================= */
+function draw(now){
+  drawBackdrop();
+
+  var spd = Math.hypot(cam.vx, cam.vy);
+  var z = cam.z;
+  if (!RM) z = z * (1 - Math.min(0.07, spd / 14000));
+  if (!isFinite(z) || z <= 0.05) z = 0.4;
+
+  applyCam(z);
+  drawSheetFrame(z);
+  drawGrid(z);
+  drawPath(z);
+  drawTargets(z, now);
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawVignette();
+  if (!RM) drawSpeedLines(spd, z);
+  drawHUD(now);
+}
+
+/* ================= 13. 主循环 ================= */
+var lastNow = performance.now();
+var lastDrawAt = -1e9;
+function frame(now){
+  var js0 = performance.now();
+  try {
+    var dt = (now - lastNow) / 1000;
+    lastNow = now;
+    if (!isFinite(dt) || dt < 0) dt = 0;
+    if (dt > 0.35) dt = 0.016;
+    dt = Math.min(0.05, dt);
+
+    if (S.playing) S.t += dt;
+    S.idx = lineIdxAt(S.t);
+    updateFocus(S.t);
+    stepCamera(dt);
+
+    /* 暂停且镜头已停稳时降频重绘，省掉无意义的整屏刷新 */
+    var moving = Math.abs(cam.vx) + Math.abs(cam.vy) > 3 ||
+                 Math.abs(focus.x - cam.x) + Math.abs(focus.y - cam.y) > 6 ||
+                 Math.abs(focus.z - cam.z) > 0.008;
+    var idle = !S.playing && !moving && placed && !snapPending;
+    if (!idle || now - lastDrawAt > 110){
+      draw(now);
+      lastDrawAt = now;
+    }
+    S.frames++;
+  } catch(e){ noteErr(e); }
+  S.js = performance.now() - js0;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ================= 14. 通信 ================= */
+function applyInit(p){
+  var song = p.song || {};
+  SONG.name = (song.name == null ? "" : String(song.name));
+  var ar = song.artists;
+  if (Array.isArray(ar)){
+    var parts = [];
+    for (var i = 0; i < ar.length; i++){
+      if (ar[i] != null && String(ar[i]) !== "") parts.push(String(ar[i]));
+    }
+    SONG.artists = parts.join(" / ");
+  } else {
+    SONG.artists = (ar == null ? "" : String(ar));
+  }
+  var dd = Number(p.duration);
+  SONG.duration = (isFinite(dd) && dd > 0) ? dd : 0;
+  setAccent(Array.isArray(p.accent) ? p.accent : null);
+
+  S.lines = normalizeLines(p.lines);
+  if (typeof p.playing === "boolean") S.playing = p.playing;
+  else S.playing = true;
+
+  buildTargets();
+  layoutAll();
+  placed = false;
+  snapPending = false;
+  activeIdx = -1;
+  camPlaced = false;
+}
+
+addEventListener("message", function(ev){
+  var d = ev.data;
+  if (!d || d.__c100 !== 1) return;
+  var p = d.payload || {};
+  try {
+    if (d.type === "init"){
+      applyInit(p);
+    } else if (d.type === "tick"){
+      var tt = Number(p.time);
+      if (isFinite(tt)){
+        if (Math.abs(tt - S.t) > 2.2) snapPending = true;
+        S.t = tt;
+      }
+      if (typeof p.playing === "boolean") S.playing = p.playing;
+    } else if (d.type === "beat"){
+      var bi = Number(p.index), bl = Number(p.level);
+      beat.index = isFinite(bi) ? bi : 0;
+      beat.level = clamp01(bl);
+      beat.at = performance.now();
+    } else if (d.type === "live"){
+      var bpm = Number(p.bpm);
+      live.bpm = (isFinite(bpm) && bpm > 0) ? bpm : 0;
+      live.level = clamp01(Number(p.level));
+      live.bass = clamp01(Number(p.bass));
+      live.mid = clamp01(Number(p.mid));
+      live.treble = clamp01(Number(p.treble));
+      if (typeof p.playing === "boolean") S.playing = p.playing;
+    }
+  } catch(e){ noteErr(e); }
+});
+
+/* ================= 15. 宿主交互 ================= */
+var actAt = 0;
+function activity(){
+  var n = performance.now();
+  if (n - actAt < 240) return;
+  actAt = n;
+  try { parent.postMessage({ __c100: 1, type: "activity" }, "*"); } catch(e){}
+}
+addEventListener("mousemove", activity, { passive: true });
+addEventListener("pointerdown", activity, { passive: true });
+addEventListener("touchstart", activity, { passive: true });
+addEventListener("keydown", function(ev){
+  if (ev && (ev.key === " " || ev.code === "Space" || ev.key === "Spacebar")){
+    try { parent.postMessage({ __c100: 1, type: "key", payload: { key: "Space" } }, "*"); } catch(e){}
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  activity();
+}, { passive: false });
+
+/* ================= 16. 尺寸 ================= */
+function resize(){
+  W = innerWidth || 1440;
+  H = innerHeight || 900;
+  if (!isFinite(W) || W <= 0) W = 1440;
+  if (!isFinite(H) || H <= 0) H = 900;
+  /* 像素预算：超大窗口不让画布像素无限膨胀 */
+  var rawDpr = Math.min(2, window.devicePixelRatio || 1);
+  var dprCap = Math.sqrt(3400000 / Math.max(1, W * H));
+  DPR = Math.max(1, Math.min(rawDpr, dprCap));
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  cv.style.width = W + "px";
+  cv.style.height = H + "px";
+  PORTRAIT = (W < 760 && H > W);
+  try { ctx.setTransform(DPR, 0, 0, DPR, 0, 0); } catch(e){}
+  buildPlates();
+  if (targets.length){
+    var keep = { x: cam.x / sheet.w, y: cam.y / sheet.h };
+    layoutAll();
+    cam.x = keep.x * sheet.w;
+    cam.y = keep.y * sheet.h;
+  } else {
+    layoutAll();
+    cam.x = sheet.w * 0.5;
+    cam.y = sheet.h * 0.5;
+    focus.x = cam.x;
+    focus.y = cam.y;
+  }
+}
+addEventListener("resize", resize);
+resize();
+cam.z = focus.z = 0.42;
+S.date = fmtDate();
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>体积迷雾歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#03050a;overflow:hidden}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;color:rgba(160,200,255,.26);
+        letter-spacing:.16em;pointer-events:none;transition:opacity .6s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="gl"></canvas>
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   221 · 体积迷雾 —— 字是挡光的实体，一盏灯在字后面绕行
+
+   机制一句话：屏幕空间沿每个像素到光源的方向做 22 步"遮挡累积"（体积光散射），
+   遮挡体就是当前句的字形；于是光从笔画的缝里挤出来、在字的外缘拉成光柱，
+   整块雾被字切开。光锥会随灯位缓慢绕行而扫过画面 —— 三维感来自遮挡关系，
+   而不是把字画大。
+
+   · WebGL 只负责"散射累积"这一件事（全屏一个 quad，22 次纹理取样）。
+   · 2D 层负责：预烘的雾团（三团缓慢漂移的加色径向渐变）、尘埃、字的
+     暗底 + 主色辉光 + 清晰白字 —— 保证在任何光柱上都读得清。
+   · 字本身是自发光的那一层：白字顶在光柱上，暗底把它从亮雾里"挖"出来。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const glc = document.getElementById('gl');
+const hint = document.getElementById('hint');
+
+let W = 1, H = 1, MN = 1, DPR = 1, VX = 1, VY = 1;
+const RM = (() => { try { return matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; } })();
+
+let gl = null;
+try {
+  gl = glc.getContext('webgl', { antialias: false, alpha: false, depth: false, premultipliedAlpha: false })
+    || glc.getContext('experimental-webgl', { antialias: false, alpha: false, depth: false });
+} catch (_) { gl = null; }
+
+/* ---------------------------- 颜色 ---------------------------- */
+let ACC = [126, 178, 255];
+let ICE = [200, 226, 255];
+function buildColors() {
+  const r = ACC[0] | 0, g = ACC[1] | 0, b = ACC[2] | 0;
+  ICE = [Math.min(232, Math.round(r * 0.92 + 16)), Math.min(242, Math.round(g * 0.94 + 18)), Math.min(255, Math.round(b * 0.98 + 24))];
+}
+
+/* ---------------------------- 排版 ---------------------------- */
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+const fontStr = (fs) => '800 ' + fs + 'px ' + FAMILY;
+const TRACK = 0.04;
+const OPUNCT = '，。、；：！？）】》」』”’,.!?;:)]}%…';
+const LPUNCT = '（【《「『“‘({[';
+const measCtx = document.createElement('canvas').getContext('2d');
+
+function measureStr(s, fs) {
+  measCtx.font = fontStr(fs);
+  let w = 0;
+  for (let i = 0; i < s.length; i++) w += measCtx.measureText(s[i]).width + fs * TRACK;
+  return Math.max(0, w - fs * TRACK);
+}
+function splitRows(s, L) {
+  const n = s.length, cuts = [];
+  for (let i = 1; i < L; i++) {
+    let c = Math.round(i * n / L);
+    while (c < n && OPUNCT.indexOf(s[c]) >= 0) c++;
+    if (c > 0 && c < n && LPUNCT.indexOf(s[c - 1]) >= 0) c--;
+    if (c <= 0 || c >= n) continue;
+    if (cuts.length && c <= cuts[cuts.length - 1]) continue;
+    cuts.push(c);
+  }
+  const rows = [];
+  let prev = 0;
+  for (let i = 0; i < cuts.length; i++) { rows.push(s.slice(prev, cuts[i])); prev = cuts[i]; }
+  rows.push(s.slice(prev));
+  return rows.filter((r) => r.length > 0);
+}
+function layout(raw) {
+  if (!raw) return null;
+  const s = raw.replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const n = s.length;
+  const maxW = Math.min(W * 0.70, 1040);
+  const maxH = H * 0.34;
+  const maxL = n <= 12 ? 1 : (n <= 24 ? 2 : 3);
+  let best = null;
+  for (let L = 1; L <= maxL; L++) {
+    if (L > 1 && n < L + 2) continue;
+    const rows = splitRows(s, L);
+    let w100 = 0;
+    for (let i = 0; i < rows.length; i++) w100 = Math.max(w100, measureStr(rows[i], 100));
+    const fs = Math.min(maxW / (Math.max(1, w100) / 100), maxH / (1.22 * rows.length), 168);
+    if (fs < 24) continue;
+    if (best && fs < best.fs * 1.07) continue;
+    best = { rows: rows, fs: fs };
+  }
+  if (!best) {
+    const w100 = Math.max(1, measureStr(s, 100));
+    best = { rows: [s], fs: Math.max(20, Math.min(maxW / (w100 / 100), maxH / 1.22, 168)) };
+  }
+  const fs = best.fs, lh = fs * 1.22;
+  measCtx.font = fontStr(fs);
+  const rows = [];
+  let bw = 0;
+  for (let r = 0; r < best.rows.length; r++) {
+    const txt = best.rows[r], chars = [];
+    let x = 0;
+    for (let k = 0; k < txt.length; k++) {
+      const c = txt[k], wch = measCtx.measureText(c).width;
+      if (c !== ' ') chars.push({ c: c, x: x, w: wch });
+      x += wch + fs * TRACK;
+    }
+    const rw = Math.max(0, x - fs * TRACK);
+    rows.push({ chars: chars, w: rw, ly: (r + 0.5) * lh });
+    if (rw > bw) bw = rw;
+  }
+  const bh = lh * rows.length;
+  return { rows: rows, fs: fs, lh: lh, bw: Math.max(1, bw), bh: bh };
+}
+
+function paintRows(g, lay, ox, oy) {
+  g.font = fontStr(lay.fs);
+  g.textAlign = 'left';
+  g.textBaseline = 'middle';
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let k = 0; k < row.chars.length; k++) g.fillText(row.chars[k].c, ox + row.chars[k].x, oy + row.ly);
+  }
+}
+
+/* ---------------------------- WebGL：散射 ---------------------------- */
+const VS = 'attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }';
+const FS = [
+  'precision mediump float;',
+  'uniform vec2 u_res;',
+  'uniform float u_time;',
+  'uniform sampler2D u_occ;',
+  'uniform vec2 u_light;',
+  'uniform vec3 u_col;',
+  'uniform float u_kick;',
+  'uniform sampler2D u_noise;',
+  'float hash21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }',
+  'void main(){',
+  '  vec2 uv = gl_FragCoord.xy / u_res;',
+  '  vec2 d = u_light - uv;',
+  '  float dist = length(d);',
+  '  float jit = hash21(gl_FragCoord.xy + fract(u_time*0.37)*311.0);',
+  '  vec2 stepv = d / 22.0;',
+  '  vec2 p = uv + stepv * (0.25 + jit*0.75);',
+  '  float acc = 0.0;',
+  '  float decay = 1.0;',
+  '  for (int i = 0; i < 22; i++){',
+  '    p += stepv;',
+  '    float o = texture2D(u_occ, p).r;',
+  '    float n = texture2D(u_noise, p*1.55 + vec2(u_time*0.011, u_time*0.007)).r;',
+  '    acc += (1.0 - o) * decay * (0.45 + n*1.15);',
+  '    decay *= 0.915;',
+  '  }',
+  '  acc /= 22.0;',
+  /* 光锥衰减：光源附近亮，远处落进雾里 */
+  '  float cone = 1.0 / (1.0 + dist*4.6);',
+  /* 一点体积感：整体亮度随角度轻微起伏（像雾团被灯光擦过） */
+  '  float ang = atan(d.y, d.x);',
+  '  float wisp = 0.82 + 0.18*sin(ang*3.0 + u_time*0.22) * sin(ang*5.0 - u_time*0.17);',
+  '  acc = pow(acc, 1.75);',
+  '  vec3 col = u_col * acc * (0.04 + cone*2.35) * wisp;',
+  /* 环境雾：整块画面有一层很淡的底 */
+  '  col += u_col * (0.005 + 0.009*acc);',
+  '  col += u_col * exp(-dist*6.5) * 0.30;',
+  '  col *= 1.0 + u_kick*0.30;',
+  '  col += (hash21(gl_FragCoord.xy + u_time*13.0) - 0.5)*0.006;',
+  '  gl_FragColor = vec4(col, 1.0);',
+  '}'
+].join('\n');
+
+let uRes = null, uTime = null, uOcc = null, uLight = null, uCol = null, uKick = null, uNoise = null;
+let noiseTex = null, occTex = null;
+
+/* 一张 128² 的平滑值噪声：让散射沿视线有"云"的浓淡，而不是一根根硬线 */
+function makeNoiseTex() {
+  const NS = 128, G = 8;
+  const grid = new Float32Array((G + 1) * (G + 1));
+  for (let i = 0; i < grid.length; i++) grid[i] = Math.random();
+  const data = new Uint8Array(NS * NS);
+  for (let y = 0; y < NS; y++) {
+    for (let x = 0; x < NS; x++) {
+      const fx = x / NS * G, fy = y / NS * G;
+      const ix = fx | 0, iy = fy | 0;
+      let tx = fx - ix, ty = fy - iy;
+      tx = tx * tx * (3 - 2 * tx); ty = ty * ty * (3 - 2 * ty);
+      const x1 = (ix + 1) % G, y1 = (iy + 1) % G;
+      const a = grid[iy * G + ix], b = grid[iy * G + x1];
+      const c = grid[y1 * G + ix], d = grid[y1 * G + x1];
+      const v = (a + (b - a) * tx) + ((c + (d - c) * tx) - (a + (b - a) * tx)) * ty;
+      data[y * NS + x] = (v * 255) | 0;
+    }
+  }
+  return { data: data, size: NS };
+}
+const NOISE = makeNoiseTex();
+let shaderErr = '';
+if (gl) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) shaderErr += (gl.getShaderInfoLog(s) || 'compile fail') + ' ';
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    shaderErr += gl.getProgramInfoLog(prog) || 'link failed';
+    gl = null;
+  } else {
+    gl.useProgram(prog);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'a');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    uRes = gl.getUniformLocation(prog, 'u_res');
+    uTime = gl.getUniformLocation(prog, 'u_time');
+    uOcc = gl.getUniformLocation(prog, 'u_occ');
+    uLight = gl.getUniformLocation(prog, 'u_light');
+    uCol = gl.getUniformLocation(prog, 'u_col');
+    uKick = gl.getUniformLocation(prog, 'u_kick');
+    occTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, occTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 1, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, new Uint8Array([0]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    uNoise = gl.getUniformLocation(prog, 'u_noise');
+    noiseTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, NOISE.size, NOISE.size, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, NOISE.data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    gl.clearColor(0.012, 0.02, 0.035, 1);
+  }
+}
+
+/* 遮挡体纹理：整屏半分辨率，字画在它该在的位置上 */
+const OS = 0.5;
+let occCv = document.createElement('canvas'), occCtx = occCv.getContext('2d');
+let occDirty = true;
+function drawOcc() {
+  occCv.width = Math.max(2, Math.round(W * OS));
+  occCv.height = Math.max(2, Math.round(H * OS));
+  occCtx.setTransform(1, 0, 0, 1, 0, 0);
+  occCtx.fillStyle = '#000';
+  occCtx.fillRect(0, 0, occCv.width, occCv.height);
+  if (blurCache) {
+    occCtx.globalAlpha = 1;
+    occCtx.drawImage(blurCache.crisp, (VX - blurCache.bw / 2) * OS, (VY - blurCache.bh / 2) * OS,
+      blurCache.bw * OS, blurCache.bh * OS);
+    occCtx.filter = 'none';
+  }
+  if (gl) {
+    gl.bindTexture(gl.TEXTURE_2D, occTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gl.LUMINANCE, gl.UNSIGNED_BYTE, occCv);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+  occDirty = false;
+}
+
+/* ---------------------------- 预烘 ---------------------------- */
+let blurCache = null;
+function bakeLine(text) {
+  const lay = layout(text);
+  if (!lay) return null;
+  const pad = Math.round(lay.fs * 0.34) + 22;
+  const bw = Math.ceil(lay.bw) + pad * 2;
+  const bh = Math.ceil(lay.bh) + pad * 2;
+  if (bw < 8 || bh < 8) return null;
+
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(bw * DPR));
+  c.height = Math.max(2, Math.round(bh * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.fillStyle = '#fff';
+  paintRows(g, lay, pad, pad);
+
+  /* 暗底：把白字从亮雾里挖出来（预烘，drawImage 一次） */
+  const sh = document.createElement('canvas');
+  sh.width = Math.max(2, Math.round(bw));
+  sh.height = Math.max(2, Math.round(bh));
+  const sg = sh.getContext('2d');
+  sg.filter = 'blur(' + Math.max(5, Math.round(lay.fs * 0.075)) + 'px)';
+  sg.fillStyle = 'rgba(0,0,0,1)';
+  paintRows(sg, lay, pad, pad);
+  sg.filter = 'none';
+
+  /* 主色辉光 */
+  const gw = document.createElement('canvas');
+  gw.width = sh.width; gw.height = sh.height;
+  const gg = gw.getContext('2d');
+  gg.filter = 'blur(' + Math.max(7, Math.round(lay.fs * 0.13)) + 'px)';
+  gg.fillStyle = 'rgb(' + Math.min(255, ACC[0] + 46) + ',' + Math.min(255, ACC[1] + 40) + ',' + Math.min(255, ACC[2] + 22) + ')';
+  paintRows(gg, lay, pad, pad);
+  gg.filter = 'none';
+
+  return { lay: lay, crisp: c, shadow: sh, glow: gw, bw: bw, bh: bh, pad: pad };
+}
+
+/* ---------------------------- 雾团 / 尘埃 ---------------------------- */
+const BLOBN = 3;
+const blobs = [];
+function buildBlobs() {
+  blobs.length = 0;
+  for (let i = 0; i < BLOBN; i++) {
+    const c = document.createElement('canvas');
+    const R = 340;
+    c.width = R; c.height = R;
+    const g = c.getContext('2d');
+    const rg = g.createRadialGradient(R / 2, R / 2, 0, R / 2, R / 2, R / 2);
+    rg.addColorStop(0, 'rgba(255,255,255,0.55)');
+    rg.addColorStop(0.45, 'rgba(255,255,255,0.16)');
+    rg.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = rg;
+    g.fillRect(0, 0, R, R);
+    blobs.push({ cv: c, x: Math.random(), y: Math.random(), sp: 0.10 + Math.random() * 0.16,
+      ph: Math.random() * 6.28, r: 0.45 + Math.random() * 0.7 });
+  }
+}
+const MN2 = 240;
+const mx = new Float32Array(MN2), my = new Float32Array(MN2), mz = new Float32Array(MN2), ms = new Float32Array(MN2);
+function seedMotes() {
+  for (let i = 0; i < MN2; i++) {
+    mx[i] = Math.random(); my[i] = Math.random();
+    mz[i] = Math.random(); ms[i] = 0.4 + Math.random() * 1.6;
+  }
+}
+seedMotes();
+
+/* ---------------------------- 状态 ---------------------------- */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+let prep = null, prepIdx = -1;
+let reveal = 0, needRebake = false;
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let vT = 0, beat = 0, lampX = 0.5, lampY = 0.48;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(2, window.innerWidth);
+  H = Math.max(2, window.innerHeight);
+  MN = Math.min(W, H);
+  VX = W / 2;
+  VY = H * 0.50;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (gl) {
+    const s = Math.min(0.58, 1100 / W, 680 / H);
+    glc.width = Math.max(1, Math.round(W * s));
+    glc.height = Math.max(1, Math.round(H * s));
+    gl.viewport(0, 0, glc.width, glc.height);
+  }
+  needRebake = true;
+  const vg = ctx.createRadialGradient(VX, VY, MN * 0.30, VX, VY, MN * 1.02);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(1,2,5,0.72)');
+  vigGrad = vg;
+}
+
+let vigGrad = null;
+function timing(T) {
+  if (!lines.length) { if (blurCache) { blurCache = null; curIdx = -1; occDirty = true; } return; }
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; prep = null; prepIdx = -1; blurCache = null; reveal = 0; occDirty = true; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci; brewIdx = -1;
+    blurCache = ci >= 0 ? ((prep && prepIdx === ci) ? prep : bakeLine(lines[ci].text)) : null;
+    occDirty = true;
+    reveal = 0;
+    prep = null; prepIdx = -1;
+    hint.style.opacity = ci >= 0 ? '0' : '1';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(1.7, Math.max(0.55, gap * 0.62));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prep = bakeLine(lines[nx].text); prepIdx = nx; }
+  }
+}
+
+/* ---------------------------- 主循环 ---------------------------- */
+let last = performance.now(), frames = 0, raf = 0;
+
+function frame(ms) {
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  vT += dt * (playing ? 1 : 0.08);
+  beat *= Math.exp(-dt * 2.6);
+  if (needRebake) { needRebake = false; if (curIdx >= 0 && lines[curIdx]) { blurCache = bakeLine(lines[curIdx].text); reveal = 1; occDirty = true; } }
+  timing(now());
+  if (reveal < 1) reveal = Math.min(1, reveal + dt / 0.4);
+  if (occDirty) drawOcc();
+
+  /* --- 灯：在字后面慢慢绕，光锥就扫过整个雾 --- */
+  const amp = RM ? 0.055 : 0.30;
+  lampX = 0.5 + amp * Math.sin(vT * 0.125) + beat * 0.006;
+  lampY = 0.45 + amp * 0.62 * Math.cos(vT * 0.098 + 1.2);
+
+  /* --- WebGL：遮挡累积 --- */
+  if (gl) {
+    gl.uniform2f(uRes, glc.width, glc.height);
+    gl.uniform1f(uTime, vT);
+    gl.uniform2f(uLight, lampX, 1 - lampY);
+    gl.uniform3f(uCol, ICE[0] / 255, ICE[1] / 255, ICE[2] / 255);
+    gl.uniform1f(uKick, Math.min(1.2, beat));
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, occTex);
+    gl.uniform1i(uOcc, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, noiseTex);
+    gl.uniform1i(uNoise, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  /* --- 2D 层 --- */
+  ctx.clearRect(0, 0, W, H);
+  if (!gl) {
+    /* 没有 WebGL 的兜底：一团从字的边缘往外散的光 + 雾 */
+    const rg = ctx.createRadialGradient(VX, VY, MN * 0.05, VX, VY, MN * 0.75);
+    rg.addColorStop(0, 'rgba(' + ICE[0] + ',' + ICE[1] + ',' + ICE[2] + ',0.20)');
+    rg.addColorStop(1, 'rgba(4,7,14,0)');
+    ctx.fillStyle = '#04070e';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = rg;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  /* 雾团：加色的柔斑，慢慢漂 */
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < blobs.length; i++) {
+    const b = blobs[i];
+    const px = (b.x + 0.06 * Math.sin(vT * b.sp + b.ph)) * W;
+    const py = (b.y + 0.05 * Math.cos(vT * b.sp * 0.8 + b.ph * 1.7)) * H;
+    const R = MN * b.r * (1 + 0.03 * Math.sin(vT * 0.3 + b.ph));
+    ctx.globalAlpha = 0.085 + 0.03 * Math.sin(vT * 0.23 + b.ph);
+    ctx.drawImage(b.cv, px - R, py - R * 0.72, R * 2, R * 1.44);
+  }
+  ctx.globalAlpha = 1;
+
+  /* 尘埃：靠近灯的那几颗亮。按亮度分 3 档合批（逐颗设 fillStyle 会白烧样式解析） */
+  const asX = W / H;
+  for (let band = 0; band < 3; band++) {
+    ctx.fillStyle = 'rgba(' + ICE[0] + ',' + ICE[1] + ',' + ICE[2] + ',' + (0.16 + band * 0.16) + ')';
+    for (let i = 0; i < MN2; i++) {
+      my[i] -= dt * (RM ? 0.002 : 0.010) * ms[i];
+      if (my[i] < -0.03) { my[i] = 1.03; mx[i] = Math.random(); }
+      const x = mx[i] * W, y = my[i] * H;
+      const dx = (mx[i] - lampX) * asX, dy = my[i] - lampY;
+      const d2 = dx * dx + dy * dy;
+      const lit = 1 / (1 + d2 * 27);
+      const b = lit > 0.55 ? 2 : (lit > 0.22 ? 1 : 0);
+      if (b !== band) continue;
+      const s = ms[i] * 1.7;
+      ctx.fillRect(x, y, s, s);
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* --- 字：暗底 → 辉光 → 白字 --- */
+  if (blurCache) {
+    const a = reveal;
+    const bx = VX - blurCache.bw / 2, by = VY - blurCache.bh / 2;
+    /* 字幕暗带：一团很软的椭圆压暗，把字从亮雾里"端"出来（不能有直边） */
+    ctx.save();
+    ctx.translate(VX, VY);
+    ctx.scale(1, 0.30);
+    const bg2 = ctx.createRadialGradient(0, 0, 0, 0, 0, blurCache.bw * 0.62);
+    bg2.addColorStop(0, 'rgba(2,4,9,0.50)');
+    bg2.addColorStop(0.55, 'rgba(2,4,9,0.32)');
+    bg2.addColorStop(1, 'rgba(2,4,9,0)');
+    ctx.fillStyle = bg2;
+    ctx.beginPath();
+    ctx.arc(0, 0, blurCache.bw * 0.62, 0, 6.2832);
+    ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 0.62 * a;
+    ctx.drawImage(blurCache.shadow, bx, by, blurCache.bw, blurCache.bh);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = (0.50 + beat * 0.25) * a;
+    ctx.drawImage(blurCache.glow, bx, by, blurCache.bw, blurCache.bh);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = a;
+    ctx.drawImage(blurCache.crisp, bx, by, blurCache.bw, blurCache.bh);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 暗角：四周压下去，雾不至于糊满 */
+  ctx.fillStyle = vigGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------------------- 协议 ---------------------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; prep = null; prepIdx = -1;
+    blurCache = null; reveal = 0; occDirty = true;
+    clockT = 0; clockAt = performance.now();
+    if (p.accent && p.accent.length >= 3) { ACC = [p.accent[0] | 0, p.accent[1] | 0, p.accent[2] | 0]; buildColors(); }
+    drawOcc();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.45';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    beat = Math.min(1.0, beat + 0.26 + (d.payload.level || 0) * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+addEventListener('pagehide', () => { cancelAnimationFrame(raf); });
+
+buildColors();
+buildBlobs();
+resize();
+raf = requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, idx: curIdx, curIdx: curIdx, t: +now().toFixed(2), playing: playing,
+  frames: frames, gl: !!gl, err: shaderErr, reveal: +reveal.toFixed(2),
+  lamp: [+lampX.toFixed(3), +lampY.toFixed(3)], vT: +vT.toFixed(2)
+});
+</script>
+</body>
+</html>

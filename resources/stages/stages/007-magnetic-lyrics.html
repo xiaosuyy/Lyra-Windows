@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>铁屑磁场歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#04050a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(175,215,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+  /* 磁屑梳向：横 / 竖 / 45°。动一下就出现，静 3 秒自己退场。 */
+  #ctl{position:fixed;top:12px;right:14px;display:flex;align-items:center;gap:4px;padding:5px 6px 5px 10px;
+       border-radius:999px;background:rgba(8,12,20,.52);border:1px solid rgba(150,190,240,.14);
+       -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+       font:500 11px/1 ui-monospace,Consolas,monospace;letter-spacing:.06em;
+       opacity:0;transform:translateY(-4px);pointer-events:none;
+       transition:opacity .45s,transform .45s}
+  #ctl.on{opacity:1;transform:none;pointer-events:auto}
+  #ctl .lb{color:rgba(160,200,245,.34);margin-right:2px;user-select:none}
+  #ctl button{appearance:none;margin:0;border:1px solid transparent;border-radius:999px;padding:5px 9px;
+       font:inherit;color:rgba(200,225,255,.62);background:transparent;cursor:pointer;
+       transition:color .18s,background .18s}
+  #ctl button:hover{color:rgba(230,244,255,.95);background:rgba(160,200,245,.10)}
+  #ctl button.on{color:#060a12;background:rgba(214,236,255,.92)}
+  #ctl button:focus-visible{outline:1px solid rgba(170,215,255,.7);outline-offset:1px}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<div id="ctl" aria-label="磁屑朝向">
+  <span class="lb">磁屑</span>
+  <button type="button" data-m="0">横</button>
+  <button type="button" data-m="1">竖</button>
+  <button type="button" data-m="2">45°</button>
+</div>
+<script>
+"use strict";
+/* ============================================================================
+   007 · 铁屑磁场歌词
+
+   机制：铁屑是短划线。字形里按"同一朝向"的等距磁力线取样（横 0° / 竖 90° /
+   45°，可切换），铁屑被吸到这些线上、转到同一朝向 —— 等距的平行线让字清楚。
+   - 朝向：被吸住的铁屑严格平行（不跟笔画走），这是字能被读出来的根。
+   - 逐字：用 YRC 的 chars[k].t 当落位时间，唱到哪个字哪个字的铁屑才飞进来。
+   - 镜头：每句按墨迹包围盒算 fit（字号按句长自适应），镜头缓推近并带一点偏移，
+     句内慢慢 push-in，换句先退半步 —— 像镜头贴近这一句。
+   - 铁屑 3~5.5px，比旧版（6~15px）短一半；字内落位沿磁力线只有很小的抖动，
+     所以同一行的短划线首尾相接，看起来是连续的磁力线。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const ctl = document.getElementById('ctl');
+const btns = [].slice.call(ctl.querySelectorAll('button'));
+
+let W = 0, H = 0, DPR = 1;
+const PI = Math.PI, HALF_PI = Math.PI / 2;
+
+/* ---------------- 朝向 ---------------- */
+const MODES = [{ a: 0 }, { a: HALF_PI }, { a: PI / 4 }];
+let mode = 0;
+let MODE_A = MODES[mode].a;
+/* URL ?orient=0|1|2（截图对照用）；否则记用户上次的选择 */
+try {
+  const q = new URLSearchParams(location.search).get('orient');
+  if (q != null) {
+    const qi = q === 'h' ? 0 : q === 'v' ? 1 : q === 'd' ? 2 : (parseInt(q, 10) | 0);
+    if (qi >= 0 && qi <= 2) mode = qi;
+  } else {
+    const s = localStorage.getItem('c100.007.orient');
+    if (s != null) { const si = parseInt(s, 10) | 0; if (si >= 0 && si <= 2) mode = si; }
+  }
+} catch (_) {}
+MODE_A = MODES[mode].a;
+
+/* ---------------- 铁屑 ---------------- */
+const N = 13200;
+const px = new Float32Array(N), py = new Float32Array(N);   // 位置（世界坐标）
+const ang = new Float32Array(N);                            // 当前朝向
+const lenw = new Float32Array(N);                           // 自由铁屑的长度
+const clen = new Float32Array(N);                           // 吸住后的长度（跟着磁力线）
+const drx = new Float32Array(N), dry = new Float32Array(N), drs = new Float32Array(N);
+const jpar = new Float32Array(N), jper = new Float32Array(N); // 落位抖动（沿/垂直磁力线）
+const role = new Float32Array(N);                           // 0..1，能不能被磁化
+const rndT = new Float32Array(N);                           // 落位延迟
+const wgt = new Float32Array(N);                            // 吸住程度 0..1
+const asg = new Int32Array(N);                              // 目标取样点 +1（0 = 自由）
+const act = new Float32Array(N);                            // 开始飞的时刻
+const tgx = new Float32Array(N), tgy = new Float32Array(N); // 目标位置
+const fc = new Int16Array(N);                               // 属于第几个字（-1 = 自由）
+const fedge = new Uint8Array(N);                            // 这颗是不是在字形边缘上
+const grp = new Uint8Array(N);                              // 本帧画在哪一档（0..5）
+
+function initFilings() {
+  for (let i = 0; i < N; i++) {
+    px[i] = Math.random() * W;
+    py[i] = Math.random() * H;
+    ang[i] = Math.random() * PI;
+    lenw[i] = 4.4 + Math.random() * 3.6;
+    clen[i] = lenw[i];
+    drx[i] = (Math.random() - 0.5) * 5;
+    dry[i] = (Math.random() - 0.5) * 5;
+    drs[i] = (Math.random() - 0.5) * 0.3;
+    jpar[i] = (Math.random() * 2 - 1) * 0.34;
+    jper[i] = (Math.random() * 2 - 1) * 0.34;
+    role[i] = Math.random();
+    rndT[i] = Math.random() * 0.06;
+    wgt[i] = 0; asg[i] = 0; act[i] = 0; fc[i] = -1; grp[i] = 0; fedge[i] = 0;
+  }
+}
+
+/* ---------------- 镜头 / 播放状态 ---------------- */
+const cam = { x: 0, y: 0, s: 0, tx: 0, ty: 0, ts: 1 };
+const camBase = { x: 0, y: 0, s: 1 };
+let camPunch = 0;
+
+let lines = [];
+let accent = [175, 215, 255];
+let clockT = 0, clockAt = 0, playing = false;
+function nowSec() { return clockT + (playing ? (performance.now() - clockAt) / 1000 : 0); }
+
+let curIdx = -1, lastT = -1e9;
+let prep = null, prepNext = null;
+
+/* ---------------- 字形取样（沿磁力线） ---------------- */
+const FONT = (F) => `800 ${F}px "PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif`;
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const P_CAP = 48000;
+const EMPTY_T = new Float32Array(0);
+
+function makeBuf() {
+  return {
+    n: 0, x: new Float32Array(P_CAP), y: new Float32Array(P_CAP),
+    t: new Float32Array(P_CAP), c: new Int16Array(P_CAP), e: new Uint8Array(P_CAP),
+    charT: EMPTY_T, lineT: 0, dur: 3, nchars: 0, text: '', F: 0, rows: 0, step: 3.3,
+    bx0: 0, by0: 0, bx1: 0, by1: 0,
+  };
+}
+const bufA = makeBuf(), bufB = makeBuf();
+let bufTurn = 0;
+function nextBuf() { bufTurn ^= 1; return bufTurn ? bufA : bufB; }
+
+const PUNCT = /[，。、；：！？…—）」』》】,.;:!?)]/;
+
+function wrapChars(widths, maxW, chars) {
+  const rows = [];
+  let s = 0, w = 0;
+  for (let i = 0; i < widths.length; i++) {
+    const cw = widths[i];
+    if (i > s && w + cw > maxW) {
+      if (chars && PUNCT.test(chars[i])) { w += cw; continue; }   // 标点不拿来做行首
+      rows.push({ s, e: i, w });
+      s = i; w = cw;
+    } else {
+      w += cw;
+    }
+  }
+  if (s < widths.length) rows.push({ s, e: widths.length, w });
+  return rows;
+}
+
+/* 在一个字的位图里，按 (ux,uy) 方向的等距平行磁力线取样 */
+function hatchChar(b, ch, cx, cy, t, ci, ow, oh, hs, step, ux, uy, nx, ny) {
+  octx.clearRect(0, 0, ow, oh);
+  octx.fillText(ch, ow / 2, oh / 2);
+  const img = octx.getImageData(0, 0, ow, oh).data;
+  const R = Math.hypot(ow, oh) * 0.5;
+  const ox = cx - ow / 2, oy = cy - oh / 2;
+  /* 边缘判定：采样点左右 2.4px 内有空 → 算轮廓上的铁屑（画亮一档，
+     字的形状主要靠这一圈读出来） */
+  const at = (x, y) => (x < 0 || y < 0 || x >= ow || y >= oh) ? 0 : img[(((y | 0) * ow) + (x | 0)) * 4 + 3];
+  for (let d = -R + hs * 0.5; d < R; d += hs) {
+    const bx = ow / 2 + nx * d, by = oh / 2 + ny * d;
+    for (let q = -R; q < R; q += step) {
+      const lx = bx + ux * q, ly = by + uy * q;
+      if (lx < 0 || ly < 0 || lx >= ow || ly >= oh) continue;
+      if (img[(((ly | 0) * ow) + (lx | 0)) * 4 + 3] < 128) continue;
+      if (b.n >= P_CAP) return;
+      const k = b.n++;
+      b.x[k] = ox + lx;
+      b.y[k] = oy + ly;
+      b.t[k] = t;
+      b.c[k] = ci;
+      b.e[k] = (at(lx + 2.4, ly) < 96 || at(lx - 2.4, ly) < 96 ||
+                at(lx, ly + 2.4) < 96 || at(lx, ly - 2.4) < 96) ? 1 : 0;
+    }
+  }
+}
+
+/* 一句 → 取样点（世界坐标）+ 每个字的 YRC 时间 */
+function makePrep(line) {
+  const b = nextBuf();
+  b.n = 0;
+  b.text = String(line.text || '').trim();
+  b.lineT = +line.t || 0;
+  b.dur = Math.max(0.8, +(line.dur || 2.6));
+  b.nchars = 0;
+  b.F = 0; b.rows = 0; b.step = 3.3;
+  b.charT = EMPTY_T;
+  b.bx0 = W / 2; b.by0 = H / 2; b.bx1 = W / 2; b.by1 = H / 2;
+  if (!b.text) return b;
+
+  const chars = Array.from(b.text);
+  const n = chars.length;
+  b.nchars = n;
+
+  /* 字号：先按总宽试 1/2/3 行，再按实际逐字宽度换行校验 */
+  const MAXW = W * 0.86;
+  const F0 = 132;
+  octx.font = FONT(F0);
+  const tw0 = Math.max(1, octx.measureText(b.text).width);
+  let F = F0, wantRows = 1;
+  for (const r of [1, 2, 3]) {
+    const f = Math.min(F0, (r * MAXW * F0) / tw0);
+    if (f >= 60 || r === 3) { wantRows = r; F = f; break; }
+  }
+  F = Math.max(44, Math.min(F0, F));
+
+  let widths = null, rows = null;
+  for (let guard = 0; guard < 6; guard++) {
+    octx.font = FONT(F);
+    widths = new Array(n);
+    for (let i = 0; i < n; i++) widths[i] = octx.measureText(chars[i]).width || F * 0.5;
+    rows = wrapChars(widths, MAXW, chars);
+    if (rows.length <= wantRows && rows.length <= 3) break;
+    F = Math.max(30, F * 0.9);
+  }
+  b.F = F;
+  b.rows = rows.length;
+
+  /* 逐字时间：YRC 优先，没有就按句长均分 */
+  const cs = line.chars;
+  const hasYrc = !!(cs && cs.length);
+  const span = Math.min(3.4, Math.max(0.5, b.dur * 0.72));
+  const charT = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    charT[i] = hasYrc && cs[i] && cs[i].t != null ? +cs[i].t : b.lineT + span * (i / Math.max(1, n - 1));
+  }
+  b.charT = charT;
+
+  /* 磁力线间距：字少就细，字多就疏（不然铁屑不够铺满） */
+  const per = n <= 8 ? 0.82 : (n <= 14 ? 1.0 : (n <= 22 ? 1.3 : 1.7));
+  const hs = Math.max(2.5, (F / 32) * per);
+  const step = Math.max(2.2, (F / 44) * per);
+  b.step = step;
+
+  const rowH = F * 1.26;
+  const cy0 = H * 0.5 - (rows.length * rowH) / 2 + rowH / 2;
+  const ow = Math.max(24, Math.ceil(F * 1.8));
+  const oh = Math.max(24, Math.ceil(F * 1.6));
+  off.width = ow; off.height = oh;
+  octx.font = FONT(F);
+  octx.textAlign = 'center';
+  octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+
+  const ux = Math.cos(MODE_A), uy = Math.sin(MODE_A);
+  const nx = -uy, ny = ux;
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const rowCy = cy0 + r * rowH;
+    let x = W / 2 - row.w / 2;
+    for (let i = row.s; i < row.e; i++) {
+      const w = widths[i];
+      if (chars[i].trim()) hatchChar(b, chars[i], x + w / 2, rowCy, charT[i], i, ow, oh, hs, step, ux, uy, nx, ny);
+      x += w;
+    }
+  }
+
+  if (b.n) {
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (let i = 0; i < b.n; i++) {
+      const x = b.x[i], y = b.y[i];
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    b.bx0 = x0; b.by0 = y0; b.bx1 = x1; b.by1 = y1;
+  }
+  return b;
+}
+
+/* ---------------- 落位 / 镜头目标 ---------------- */
+let magnetCount = 0;
+
+function assignAll() {
+  asg.fill(0); fc.fill(-1); act.fill(0); fedge.fill(0);
+  magnetCount = 0;
+  if (!prep || !prep.n) return;
+  const PN = prep.n;
+  /* 每个取样点正好一颗：一行短划线的首尾自然接上，亮度也均匀 */
+  const dens = PN >= 12000 ? 0.86 : PN >= 7000 ? 0.78 : 0.68;
+  let sel = 0;
+  for (let i = 0; i < N; i++) if (role[i] < dens) sel++;
+  if (!sel) return;
+  const K = Math.min(sel, PN);
+  const ca = Math.cos(MODE_A), sa = Math.sin(MODE_A);
+  const baseLen = prep.step * 1.18;
+  let k = 0;
+  for (let i = 0; i < N && k < K; i++) {
+    if (role[i] >= dens) continue;
+    const pi = Math.min(PN - 1, (k * PN / K) | 0);
+    asg[i] = pi + 1;
+    fc[i] = prep.c[pi];
+    fedge[i] = prep.e[pi];
+    tgx[i] = prep.x[pi] + ca * jpar[i] - sa * jper[i];
+    tgy[i] = prep.y[pi] + sa * jpar[i] + ca * jper[i];
+    act[i] = prep.t[pi] + rndT[i];
+    clen[i] = baseLen * (fedge[i] ? 1.55 : 1) * (0.92 + Math.random() * 0.16);
+    k++;
+  }
+  magnetCount = k;
+}
+
+function camBaseFor(idx) {
+  if (!prep || !prep.n) {
+    camBase.s = 1; camBase.x = W / 2; camBase.y = H / 2;
+    return;
+  }
+  const bw = Math.max(8, prep.bx1 - prep.bx0);
+  const bh = Math.max(8, prep.by1 - prep.by0);
+  let s = Math.min((W * 0.86) / bw, (H * 0.62) / bh);
+  s = Math.max(1.02, Math.min(1.75, s));
+  camBase.s = s;
+  camBase.x = (prep.bx0 + prep.bx1) / 2 + Math.sin(idx * 1.9) * W * 0.010;
+  camBase.y = (prep.by0 + prep.by1) / 2 + Math.cos(idx * 2.3) * H * 0.010;
+}
+
+/* ---------------- 节奏 ---------------- */
+function setLine(ci) {
+  curIdx = ci;
+  if (ci < 0 || !lines[ci]) {
+    prep = null; prepNext = null;
+    asg.fill(0); fc.fill(-1);
+    camBaseFor(-1);
+    return;
+  }
+  const L = lines[ci];
+  if (prepNext && Math.abs(prepNext.lineT - (+L.t || 0)) < 0.001) { prep = prepNext; prepNext = null; }
+  else { prepNext = null; prep = makePrep(L); }
+  assignAll();
+  camBaseFor(ci);
+  camPunch = 1;
+  hint.style.opacity = '0';
+}
+
+function timing(T) {
+  if (T < lastT - 0.9) {          // 往回拖 / 重播
+    curIdx = -1; lastT = -1e9;
+    prep = null; prepNext = null;
+    asg.fill(0); fc.fill(-1);
+    camPunch = 0;
+  }
+  lastT = T;
+  if (!lines.length) { if (curIdx !== -1) setLine(-1); return; }
+
+  let ci = curIdx;
+  if (ci >= lines.length) ci = lines.length - 1;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  while (ci >= 0 && T < lines[ci].t) ci--;
+  if (ci !== curIdx) setLine(ci);
+
+  /* 提前排版下一句（字形取样要在画外先做掉，别卡在换句那一帧） */
+  const nx = curIdx < 0 ? 0 : curIdx + 1;
+  if (nx >= lines.length) return;
+  if (prepNext && Math.abs(prepNext.lineT - (+lines[nx].t || 0)) < 0.001) return;
+  const lead = curIdx < 0 ? 0.9 : Math.min(1.3, Math.max(0.55, (lines[nx].t - lines[curIdx].t) * 0.5));
+  if (T >= lines[nx].t - lead) prepNext = makePrep(lines[nx]);
+}
+
+/* ---------------- 样式 ---------------- */
+let STYLE = [];
+function buildStyle() {
+  const r = accent[0], g = accent[1], b = accent[2];
+  const mix = (k) => [
+    Math.round(r + (255 - r) * k),
+    Math.round(g + (255 - g) * k),
+    Math.round(b + (255 - b) * k),
+  ];
+  const m2 = mix(0.5), m3 = mix(0.8);
+  STYLE = [
+    { c: `rgba(${Math.round(r * 0.62)},${Math.round(g * 0.74)},${Math.round(b * 0.88)},0.17)`, w: 1.00 },
+    { c: `rgba(${Math.round(r * 0.86)},${Math.round(g * 0.94)},${b},0.21)`, w: 1.05 },
+    { c: `rgba(${m2[0]},${m2[1]},${m2[2]},0.34)`, w: 1.05 },
+    { c: `rgba(${m3[0]},${m3[1]},${m3[2]},0.55)`, w: 1.25 },
+    { c: 'rgba(255,252,244,0.98)', w: 1.40 },
+    { c: 'rgba(255,252,244,0.95)', w: 1.45 },
+  ];
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#04050a';
+  ctx.fillRect(0, 0, W, H);
+  if (!cam.s) {
+    cam.s = 1; cam.x = W / 2; cam.y = H / 2;
+    camBase.s = 1; camBase.x = W / 2; camBase.y = H / 2;
+  }
+  if (prep && curIdx >= 0 && lines[curIdx]) {
+    prepNext = null;
+    const idx = curIdx;
+    prep = makePrep(lines[idx]);
+    assignAll();
+    camBaseFor(idx);
+  }
+}
+addEventListener('resize', resize);
+
+/* ---------------- 帧 ---------------- */
+let lastMs = performance.now(), t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, Math.max(0.0005, (nowMs - lastMs) / 1000));
+  lastMs = nowMs;
+  t0 += dt;
+  const T = nowSec();
+
+  timing(T);
+
+  /* 当前唱到第几个字（YRC）—— 单独提亮，加强"一个字一个字" */
+  let curChar = -1, fresh = false;
+  if (prep && prep.charT.length) {
+    const ct = prep.charT;
+    for (let k = 0; k < ct.length; k++) { if (T >= ct[k]) curChar = k; else break; }
+    fresh = curChar >= 0 && (T - ct[curChar]) < 1.15;
+  }
+
+  /* 镜头：fit 到这句 + 句内缓慢 push-in，换句先退半步 */
+  let ts = camBase.s;
+  if (prep && prep.n) {
+    const prog = Math.min(1, Math.max(0, (T - prep.lineT) / Math.max(0.7, prep.dur)));
+    ts *= 1 + 0.04 * prog;
+    const maxS = (W * 0.94) / Math.max(8, prep.bx1 - prep.bx0);
+    if (ts > maxS) ts = maxS;
+  }
+  ts *= 1 - 0.05 * camPunch;
+  cam.ts = ts;
+  cam.tx = camBase.x + Math.sin(t0 * 0.23) * 4;
+  cam.ty = camBase.y + Math.cos(t0 * 0.19) * 3;
+  const ke = 1 - Math.exp(-3.3 * dt);
+  cam.s += (cam.ts - cam.s) * ke;
+  cam.x += (cam.tx - cam.x) * ke;
+  cam.y += (cam.ty - cam.y) * ke;
+  camPunch *= Math.exp(-2.8 * dt);
+
+  /* 铁屑：朝向显形 + 逐字落位 */
+  const MA = MODE_A;
+  const kFly = 1 - Math.exp(-7.4 * dt);
+  const kAng = 1 - Math.exp(-10 * dt);
+  const kFree = 1 - Math.exp(-1.9 * dt);
+  const AURA = 100;
+  const hasText = !!(prep && prep.n);
+  const bx0 = hasText ? prep.bx0 : 1, bx1 = hasText ? prep.bx1 : -1;
+  const by0 = hasText ? prep.by0 : 1, by1 = hasText ? prep.by1 : -1;
+
+  for (let i = 0; i < N; i++) {
+    const pi = asg[i] - 1;
+    if (pi >= 0 && T >= act[i]) {
+      px[i] += (tgx[i] - px[i]) * kFly;
+      py[i] += (tgy[i] - py[i]) * kFly;
+      let da = MA - ang[i];
+      if (da > HALF_PI) da -= PI; else if (da < -HALF_PI) da += PI;
+      ang[i] += da * kAng;
+      wgt[i] += (1 - wgt[i]) * kFly;
+      /* 先判轮廓：轮廓永远最亮（字的形靠它读），正在唱的字的内部再提亮一档 */
+      grp[i] = wgt[i] < 0.55 ? 2 : (fedge[i] ? 5 : (fresh && fc[i] === curChar ? 4 : 3));
+    } else {
+      px[i] += drx[i] * dt;
+      py[i] += dry[i] * dt;
+      ang[i] += drs[i] * dt;
+      if (px[i] < -14) px[i] += W + 28; else if (px[i] > W + 14) px[i] -= W + 28;
+      if (py[i] < -14) py[i] += H + 28; else if (py[i] > H + 14) py[i] -= H + 28;
+      wgt[i] -= wgt[i] * kFree;
+      let g = 0;
+      if (hasText) {
+        const ax = px[i], ay = py[i];
+        const ddx = ax < bx0 ? bx0 - ax : (ax > bx1 ? ax - bx1 : 0);
+        const ddy = ay < by0 ? by0 - ay : (ay > by1 ? ay - by1 : 0);
+        const d2 = ddx * ddx + ddy * ddy;
+        if (d2 < AURA * AURA) {          // 字形外一圈铁屑被"梳"向同一边
+          const aw = 1 - Math.sqrt(d2) / AURA;
+          let da = MA - ang[i];
+          if (da > HALF_PI) da -= PI; else if (da < -HALF_PI) da += PI;
+          ang[i] += da * Math.min(1, dt * 3.2 * aw);
+          g = 1;
+        }
+      }
+      grp[i] = g;
+    }
+  }
+
+  /* 画 */
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = 'rgba(4,5,10,0.42)';
+  ctx.fillRect(0, 0, W, H);
+
+  const s = cam.s;
+  ctx.setTransform(DPR * s, 0, 0, DPR * s, DPR * (W / 2 - cam.x * s), DPR * (H / 2 - cam.y * s));
+  ctx.globalCompositeOperation = 'lighter';
+
+  const hw = W / (2 * s) + 24, hh = H / (2 * s) + 24;
+  const vx0 = cam.x - hw, vx1 = cam.x + hw, vy0 = cam.y - hh, vy1 = cam.y + hh;
+  const cA = Math.cos(MA), sA = Math.sin(MA);
+
+  for (let g = 0; g < 6; g++) {
+    const S = STYLE[g];
+    ctx.strokeStyle = S.c;
+    ctx.lineWidth = S.w;
+    ctx.beginPath();
+    const fixed = g >= 3;
+    for (let i = 0; i < N; i++) {
+      if (grp[i] !== g) continue;
+      const x = px[i], y = py[i];
+      if (x < vx0 || x > vx1 || y < vy0 || y > vy1) continue;
+      const h = (g >= 2 ? clen[i] : lenw[i]) * 0.5;
+      if (fixed) {
+        ctx.moveTo(x - cA * h, y - sA * h);
+        ctx.lineTo(x + cA * h, y + sA * h);
+      } else {
+        const cx = Math.cos(ang[i]) * h, sy = Math.sin(ang[i]) * h;
+        ctx.moveTo(x - cx, y - sy);
+        ctx.lineTo(x + cx, y + sy);
+      }
+    }
+    ctx.stroke();
+  }
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 朝向 UI ---------------- */
+function syncBtns() {
+  for (let i = 0; i < btns.length; i++) btns[i].classList.toggle('on', (+btns[i].dataset.m) === mode);
+}
+let ctlTimer = 0;
+function showCtl(ms) {
+  ctl.classList.add('on');
+  clearTimeout(ctlTimer);
+  ctlTimer = setTimeout(() => ctl.classList.remove('on'), ms || 3200);
+}
+function setMode(m) {
+  if (m === mode) { showCtl(); return; }
+  mode = m;
+  MODE_A = MODES[m].a;
+  syncBtns();
+  try { localStorage.setItem('c100.007.orient', String(m)); } catch (_) {}
+  /* 磁力线方向变了 → 重新取样这一句，铁屑会整片梳过去 */
+  if (prep && curIdx >= 0 && lines[curIdx]) {
+    prepNext = null;
+    prep = makePrep(lines[curIdx]);
+    assignAll();
+    camBaseFor(curIdx);
+  }
+  showCtl();
+}
+btns.forEach((b) => b.addEventListener('click', (e) => {
+  e.preventDefault();
+  setMode(+b.dataset.m);
+}));
+
+/* ---------------- 与播放器通信 ---------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', () => { ping(); showCtl(); }, { passive: true });
+addEventListener('pointerdown', () => { ping(); showCtl(); }, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+    return;
+  }
+  const k = e.key;
+  if (k === '1' || k === 'h' || k === 'H') setMode(0);
+  else if (k === '2' || k === 'v' || k === 'V') setMode(1);
+  else if (k === '3' || k === 'd' || k === 'D') setMode(2);
+  ping();
+  showCtl();
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; lastT = -1e9;
+    prep = null; prepNext = null;
+    asg.fill(0); fc.fill(-1); wgt.fill(0); grp.fill(0);
+    cam.s = 1; cam.x = W / 2; cam.y = H / 2;
+    camBase.s = 1; camBase.x = W / 2; camBase.y = H / 2;
+    camPunch = 0;
+    if (Array.isArray(p.accent) && p.accent.length >= 3) {
+      const r = +p.accent[0], g = +p.accent[1], b = +p.accent[2];
+      // 铁屑是冷钢色，主色只轻微染色
+      accent = [Math.round((r + 175 * 2) / 3), Math.round((g + 215 * 2) / 3), Math.round((b + 255 * 2) / 3)];
+      buildStyle();
+    }
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：镜头轻推 + 自由铁屑同向一颤（被吸住的保持平行，字不能抖糊） */
+    const lv = 0.4 + (d.payload.level || 0);
+    camPunch = Math.max(camPunch, 0.34 * lv);
+    for (let i = 0; i < N; i++) {
+      if (grp[i] <= 1) ang[i] += Math.sin(t0 * 3 + i * 0.7) * 0.03 * lv;
+    }
+  }
+});
+
+/* ---------------- 启动 ---------------- */
+syncBtns();
+resize();          // 先定 W/H，铁屑才有地方撒
+initFilings();
+buildStyle();
+showCtl(4500);
+requestAnimationFrame(frame);
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => {
+  let lit = 0;
+  const gc = [0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < N; i++) { if (wgt[i] > 0.5) lit++; gc[grp[i]]++; }
+  const b = prep;
+  return {
+    lines: lines.length, curIdx, brewIdx: prepNext ? 1 : 0,
+    poles: magnetCount, lit,
+    orient: mode, pts: b ? b.n : 0, cam: +cam.s.toFixed(2),
+    f: b ? Math.round(b.F || 0) : 0, rows: b ? b.rows || 0 : 0,
+    bw: b ? Math.round(b.bx1 - b.bx0) : 0, bh: b ? Math.round(b.by1 - b.by0) : 0,
+    lineT: b ? +b.lineT.toFixed(2) : 0,
+    camX: +cam.x.toFixed(0), camY: +cam.y.toFixed(0), gc,
+    t: +nowSec().toFixed(2),
+  };
+};
+</script>
+</body>
+</html>

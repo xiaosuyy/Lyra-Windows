@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>萤火虫歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#030807;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(190,240,200,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   003 · 萤火虫歌词 —— 用光写字
+   字由**累积的光**构成：萤火虫沿字形飞行，在独立的光绘层上留辉光，长曝光一样显影。
+
+   两个关键点（都是被上一版坑过的）：
+   1. **显示和酝酿分开**。萤火虫分成两组：一组守着当前这句一直在画光，
+      另一组提前飞去下一句的位置酝酿。显示只在句首切换，
+      所以不会"字还没展现完就消散"。
+   2. **飞行要快**。原来上限只有 520px/s，从屏幕另一头飞过来要两三秒，
+      字根本来不及成 —— 这就是"组合太慢"的直接原因。
+
+   ---- 性能（实测 15.6 → 59~60 fps，已顶到垂直同步）：原来每帧 14000 次逐颗绘制 ----
+   ① 光绘层原来是 7000 次 `drawImage`（每颗一张光斑图）——每次 ~6.7µs，光这一项
+      23ms。现在按「角色 + 闪烁档」12 组**合批**：每组把 rect 全灌进一条 path、
+      一次 fill；而且这层按 20Hz 更新（长曝光本来变化就慢）。软边由"半分辨率
+      图层放大"提供，不再逐颗贴光斑图。
+   ② 主画面原来是 7000 次 `fillRect`（逐颗画虫体），每次 ~4µs。现在把「当前句 /
+      酝酿句」的落点**在派活时烘焙成一张贴图**，每帧 2 次 drawImage；亮度按
+      "已到位的比例"渐显，长曝光显影的手感和原来一致。
+   ③ 已经停在落点上的那 3000 颗每帧都在重画同一批像素 —— 直接从光绘层里跳过，
+      改由一张 1/4 的"柔光版"贴图一次补上底光（见 bakeWord 的 bloom）。
+   ========================================================================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+let W = 0, H = 0, DPR = 1;
+
+const light = document.createElement('canvas');
+const lx = light.getContext('2d');
+/* 光绘层按半分辨率渲染。
+   这一层每次更新都要整屏 destination-out 衰减，全分辨率时是全片最贵的一笔；
+   而它本来就是模糊的辉光，半分辨率放大回来肉眼几乎看不出差别。 */
+const LS = 0.5;
+/* 放大回全屏保留双线性（关掉能省 4.6ms，但辉光会变成硬边方块，不值）。 */
+const SMOOTH = true;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  light.width = Math.max(1, Math.round(W * DPR * LS));
+  light.height = Math.max(1, Math.round(H * DPR * LS));
+  // 变换按 DPR*LS 设，所以下面照旧用 CSS 像素坐标画，尺寸自动对上
+  lx.setTransform(DPR * LS, 0, 0, DPR * LS, 0, 0);
+}
+resize();
+addEventListener('resize', resize);
+
+/* ---- 萤火虫 ---- */
+const N = 7000;
+const fx = new Float32Array(N), fy = new Float32Array(N);
+const fvx = new Float32Array(N), fvy = new Float32Array(N);
+const tx = new Float32Array(N), ty = new Float32Array(N);
+const mode = new Uint8Array(N);          // 0 自由 / 1 当前句 / 2 酝酿中的下一句
+const ph = new Float32Array(N);
+const sp = new Float32Array(N);
+for (let i = 0; i < N; i++) {
+  fx[i] = Math.random() * W; fy[i] = Math.random() * H;
+  ph[i] = Math.random() * 6.283; sp[i] = 0.7 + Math.random() * 0.6;
+}
+
+/* ---- 光绘层的三种颜色（原来每颗一张光斑图，现在只需要颜色） ---- */
+const COL_FREE = '190,240,190';    // 环境萤火
+const COL_BREW = '210,230,255';    // 酝酿中（偏冷，一眼分得出）
+const COL_CUR = '255,255,235';     // 当前句
+
+/* ---- 字形采样 ---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+function glyphPoints(text) {
+  const CH = Array.from(text);
+  const FONT = (fs) => `800 ${fs}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+  const F = 86;
+  const maxW = Math.min(W * 0.66, 1180);
+
+  /* 先用 F 量一遍每个字，超宽就整体缩，再按最终字号重新量 ——
+     逐字合成需要**每个字自己的 x 区间**，所以必须逐字量，不能只量整行。 */
+  octx.font = FONT(F);
+  let total = 0;
+  const wF = CH.map((c) => octx.measureText(c).width);
+  for (const w of wF) total += w;
+  const fs = total > maxW ? F * (maxW / total) : F;
+  octx.font = FONT(fs);
+  const widths = CH.map((c) => octx.measureText(c).width);
+  let sum = 0;
+  const bounds = [];                       // 每个字的 [left, right]，相对整行中心
+  for (const w of widths) { bounds.push([sum, sum + w]); sum += w; }
+  for (const b of bounds) { b[0] -= sum / 2; b[1] -= sum / 2; }
+
+  const w = Math.ceil(sum) + 8;
+  const h = Math.ceil(fs * 1.35);
+  off.width = w; off.height = h;
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'left'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(text, 4, h / 2);           // 左对齐画，坐标换算更直观
+  const d = octx.getImageData(0, 0, w, h).data;
+
+  const pts = [];                          // 相对整行中心
+  const step = 2;
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - 4 - sum / 2, y - h / 2);
+    }
+  }
+  /* 按 x 把采样点分到各个字上（空格没有点，自然为空） */
+  const pc = pts.length / 2;
+  const charPts = bounds.map(() => []);
+  for (let k = 0; k < pc; k++) {
+    const px = pts[k * 2];
+    for (let c = 0; c < bounds.length; c++) {
+      if (px >= bounds[c][0] && px < bounds[c][1]) { charPts[c].push(pts[k * 2], pts[k * 2 + 1]); break; }
+    }
+  }
+  return { pts, bounds, charPts, w: sum, h, fs };
+}
+
+const anchors = [];
+function buildAnchors() {
+  anchors.length = 0;
+  for (let i = 0; i < 96; i++) {
+    const g = i * 2.399963;
+    const rr = 0.35 + 0.65 * (((i * 37) % 97) / 97);
+    // 存**归一化**坐标（-1~1），实际落点等知道这句字多宽之后再映射 ——
+    // 直接存像素坐标的话，字宽一变就会跑到屏幕外或者全挤在一起。
+    anchors.push({
+      nx: Math.cos(g) * rr,
+      ny: Math.sin(g) * rr * 0.8,
+      z: 0.9 + 0.4 * (((i * 53) % 89) / 89),
+    });
+  }
+}
+buildAnchors();
+
+let lines = [];
+let curIdx = -1;
+let brewIdx = -1;
+let accent = [190, 240, 190];
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+const dist = new Float32Array(N);
+/* 每帧的分组：0-2 自由 / 3-5 酝酿 / 6-8 当前·已就位 / 9-11 当前·还在飞
+   （每组再按闪烁亮度分 3 档）。同组颜色和透明度完全一致，可以合批。 */
+const grp = new Uint8Array(N);
+let lightTick = 0;      // 光绘层隔帧更新用
+/* 分桶用的缓冲区（预分配，避免每帧 GC）。
+   bucket 里按组连续存放粒子下标，bucketStart[g]..bucketStart[g+1] 就是第 g 组。 */
+const bucket = new Int32Array(N);
+const bucketStart = new Int32Array(14);
+
+/* ---- 字的"实心层"：派活时把落点烘焙成贴图，每帧一次 drawImage ----
+   [1] 当前句 / [2] 酝酿中的下一句。
+   原来这两层是每帧 7000 次 fillRect 逐颗画的，合计约 28ms。 */
+const wordSpr = [null, null, null];
+let curA = 0;           // 当前句实心层的渐显（0 → 1）
+
+/* ================= 逐字合成 =================
+   原来是整句一次性派活：一句的所有萤火虫同时飞向整行笔画，字是"整句一起显影"。
+   现在改成**一个字一个字长出来**：
+     · 开场把整行按字切开，每个字有自己的采样点、自己的屏幕位置；
+     · 第 k 个字到它自己的时间点才派活 —— 有 YRC 就用 chars[k].t（逐字时间），
+       没有就按句长均分。于是句子是从左到右一个字一个字显影出来的；
+     · 酝酿下一句不再落在笔画上，而是在那行的包围盒里撒一团雾（mode 2）：
+       轮到它时那团雾被逐字吸回去，观感是"雾凝成字"。
+   —— 这套只改"什么时候、往哪儿派活"，渲染（合批/光绘/贴图）一行没动。 */
+
+const MAXPT = 14000;
+const heldIdx = new Int32Array(MAXPT);      // 当前句已经派出去的粒子下标
+let heldCount = 0;
+
+let lineLay = null;                          // 当前句的排版
+let releasedChars = 0;                       // 当前句已经放出几个字
+
+/** 整行排版：锚点映射到"能完整容纳整行"的合法区间（同原来那套归一化重映射） */
+function layoutLine(text, a) {
+  const g = glyphPoints(text);
+  if (g.pts.length < 2) return null;
+  const hw = g.w / 2 + 6, hh = g.h / 2 + 6;
+  const M = 56;
+  const x0 = M + hw, x1 = W - M - hw;
+  const y0 = M + hh, y1 = H - M - hh;
+  a.x = x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2;
+  a.y = y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2;
+  return { bounds: g.bounds, charPts: g.charPts, w: g.w, h: g.h, ax: a.x, ay: a.y, n: g.bounds.length };
+}
+
+/** 从自由池里取离 (cx,cy) 半径 r 内的 k 个粒子（不够就把半径放大再补）
+    不排序：萤火虫本来就均匀随机分布，取"附近的随机一批"和取"最近的 k 个"
+    观感一样，但省掉每次 7000 条的排序（长句要派十几次，排序会卡）。 */
+const pickFlag = new Uint8Array(N);
+function takeNearest(cx, cy, k) {
+  const out = [];
+  let r = 240;
+  while (out.length < k && r < Math.max(W, H) * 1.6) {
+    const r2 = r * r;
+    for (let i = 0; i < N && out.length < k; i++) {
+      if (mode[i] !== 0 || pickFlag[i]) continue;
+      const dx = fx[i] - cx, dy = fy[i] - cy;
+      if (dx * dx + dy * dy <= r2) { out.push(i); pickFlag[i] = 1; }
+    }
+    r *= 2;
+  }
+  for (let j = 0; j < out.length; j++) pickFlag[out[j]] = 0;
+  return out;
+}
+
+/** 用当前句已经派出去的所有粒子重新烘一张实心层 */
+function rebake() {
+  if (!heldCount) { wordSpr[1] = null; return; }
+  const xs = new Float32Array(heldCount), ys = new Float32Array(heldCount);
+  for (let k = 0; k < heldCount; k++) { const i = heldIdx[k]; xs[k] = tx[i]; ys[k] = ty[i]; }
+  wordSpr[1] = bakeWord(xs, ys, heldCount, 1);
+}
+
+/** 放出一个字：把离它最近的一批自由萤火虫派到它的笔画上 */
+function releaseChar(k) {
+  const L = lineLay;
+  if (!L || k >= L.n) return 0;
+  const pts = L.charPts[k];
+  if (!pts || pts.length < 2) return 0;        // 空格：没有点，跳过（不占配额）
+  const pc = pts.length / 2;
+  /* 每个字分多少只 —— 这是逐字合成能不能"成字"的关键：
+     一个 86px 的汉字按 step=2 采样约 700~900 个点，粒子数少于这个数就会露出点阵。
+     所以按整句预算 ~5200 只均分，并把单字上限压在该字的采样点数上（多派也是浪费）：
+       8 个字 → 每字 650；15 个字 → 每字 347；短句则被采样点数封顶。 */
+  const per = Math.max(260, Math.min(Math.min(pc, 700), Math.round(5200 / Math.max(1, L.n))));
+  const b = L.bounds[k];
+  const cx = L.ax + (b[0] + b[1]) / 2, cy = L.ay;
+  const pick = takeNearest(cx, cy, per);
+  for (let j = 0; j < pick.length; j++) {
+    const i = pick[j];
+    /* 等间隔取样铺满这个字（按扫描顺序取只会用到上面一部分行） */
+    const p = (Math.floor(j * pc / pick.length) % pc) * 2;
+    tx[i] = L.ax + pts[p] + (Math.random() - 0.5) * 2.2;
+    ty[i] = L.ay + pts[p + 1] + (Math.random() - 0.5) * 2.2;
+    mode[i] = 1;
+    if (heldCount < MAXPT) heldIdx[heldCount++] = i;
+  }
+  rebake();
+  return pick.length;
+}
+
+/** 酝酿下一句：只在那行的包围盒里撒一团雾，不落在笔画上 */
+function assignCloud(text, a) {
+  const g = glyphPoints(text);
+  if (g.pts.length < 2) return;
+  const hw = g.w / 2 + 6, hh = g.h / 2 + 6;
+  const M = 56;
+  const x0 = M + hw, x1 = W - M - hw;
+  const y0 = M + hh, y1 = H - M - hh;
+  a.x = x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2;
+  a.y = y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2;
+  const pick = takeNearest(a.x, a.y, 1000);
+  for (let j = 0; j < pick.length; j++) {
+    const i = pick[j];
+    tx[i] = a.x + (Math.random() - 0.5) * g.w;
+    ty[i] = a.y + (Math.random() - 0.5) * g.h;
+    mode[i] = 2;
+  }
+  wordSpr[2] = null;          // 雾不烘焙贴图：它没有确定形状
+}
+/* 每个槽位复用两块画布：[主贴图, 1/4 的柔光版]。切句时两块一起换手，
+   免得下一次烘焙把还在显示的贴图覆盖掉。 */
+const bakeCache = [null, null, null];
+
+/** 把"这句字最终落到哪些点"烘焙成一张贴图（屏幕坐标，静止不动） */
+function bakeWord(xs, ys, n, TM) {
+  // 先量出这批点的包围盒
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let k = 0; k < n; k++) {
+    const x = xs[k], y = ys[k];
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  const pad = 6;
+  const box = bakeCache[TM] || (bakeCache[TM] = { img: document.createElement('canvas'), blm: document.createElement('canvas') });
+  const c = box.img;
+  c.width = Math.max(1, Math.ceil(x1 - x0 + pad * 2));
+  c.height = Math.max(1, Math.ceil(y1 - y0 + pad * 2));
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffffe9';
+  g.beginPath();
+  for (let k = 0; k < n; k++) {
+    g.rect(xs[k] - x0 + pad - 1.3, ys[k] - y0 + pad - 1.3, 2.6, 2.6);
+  }
+  g.fill();                        // 一条 path 一次 fill（不是 3000 次 fillRect）
+  /* 柔光版：缩到 1/4 再放大回去就是糊的。光绘层拿它当"已就位那批"的底光，
+     省掉每帧 3000 次逐颗绘制。 */
+  const blm = box.blm;
+  blm.width = Math.max(1, Math.round(c.width / 4));
+  blm.height = Math.max(1, Math.round(c.height / 4));
+  const bg = blm.getContext('2d');
+  bg.clearRect(0, 0, blm.width, blm.height);
+  bg.drawImage(c, 0, 0, blm.width, blm.height);
+  return { img: c, bloom: blm, x: Math.floor(x0 - pad), y: Math.floor(y0 - pad), k: n };
+}
+
+const hint = document.getElementById('hint');
+let hintO = '';
+let last = performance.now();
+let t0 = 0;
+let lastT = -1;
+let curArrived = 0, brewArrived = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+
+  /* ================= 节奏：显示与酝酿分开 ================= */
+  const LEAD = 1.5;
+  if (lines.length) {
+    if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; mode.fill(0); wordSpr[1] = wordSpr[2] = null; }
+    lastT = T;
+
+    // 显示：正好在句首切换，绝不提前 —— 否则字还没写完就被顶掉了
+    let ci = curIdx;
+    while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+    if (ci !== curIdx) {
+      curIdx = ci;
+      brewIdx = -1;
+      /* 全部释放回自由池（当前句 + 那团雾）。
+         逐字合成时"雾"就是待用的萤火虫：轮到哪个字，就近吸哪一批 —— 
+         所以这里不能把 mode 2 直接提升成 1，否则那一句一上来就整句成形了。 */
+      mode.fill(0);
+      heldCount = 0;
+      releasedChars = 0;
+      lineLay = null;
+      wordSpr[1] = wordSpr[2] = null;
+      curA = 0.2;
+      if (lines[curIdx]) {
+        lineLay = layoutLine(lines[curIdx].text, anchors[curIdx % anchors.length]);
+        // 句首那一瞬间就把第一个字放出去，别等下一帧
+        if (lineLay) { releaseChar(0); releasedChars = 1; }
+      }
+    }
+
+    /* ---- 逐字放出 ----
+       有 YRC（chars 带逐字时间）就按每个字自己的时间；
+       没有就按句长均分。空格没有采样点，releaseChar 会直接跳过、不占配额。 */
+    if (curIdx >= 0 && lineLay) {
+      const L = lines[curIdx];
+      const n = lineLay.n;
+      const dur = L.dur || 4;
+      let ready = releasedChars;
+      while (ready < n) {
+        const ct = (L.chars && L.chars[ready] && L.chars[ready].t != null)
+          ? L.chars[ready].t
+          : L.t + dur * (ready / Math.max(1, n));
+        /* 提前 0.12s 放：萤火虫飞过去要时间，卡在字音上放会"慢半拍" */
+        if (T + 0.12 < ct) break;
+        releaseChar(ready);
+        ready++;
+      }
+      releasedChars = ready;
+    }
+
+    // 酝酿下一句：只撒一团雾，不落笔画
+    const nx = curIdx + 1;
+    if (nx < lines.length && brewIdx !== nx) {
+      const gap = lines[nx].t - (lines[curIdx] ? lines[curIdx].t : 0);
+      const lead = Math.min(LEAD, Math.max(0.5, gap * 0.55));
+      if (T >= lines[nx].t - lead) {
+        assignCloud(lines[nx].text, anchors[nx % anchors.length]);
+        brewIdx = nx;
+      }
+    }
+    const ho = lines.length ? (curIdx >= 0 ? '0' : '1') : '0.5';
+    if (ho !== hintO) { hintO = ho; hint.style.opacity = ho; }
+  }
+  curA += (1 - curA) * Math.min(1, dt * 5);
+
+  /* ---- 萤火虫行为 + 分组 ---- */
+  curArrived = 0; brewArrived = 0;
+  for (let i = 0; i < N; i++) {
+    const ddx = tx[i] - fx[i], ddy = ty[i] - fy[i];
+    const d2 = ddx * ddx + ddy * ddy;
+    // 分组：先按角色，再按闪烁亮度分 3 档（原来是每只各算各的颜色）
+    const gl = ph[i] > 0 ? (((Math.sin(t0 * 2.1 + ph[i]) + 1) * 1.5) | 0) : 1;
+    if (mode[i] === 1) { grp[i] = (d2 > 36 ? 9 : 6) + gl; if (d2 <= 36) curArrived++; }
+    else if (mode[i] === 2) { grp[i] = 3 + gl; if (d2 <= 36) brewArrived++; }
+    else grp[i] = gl;
+
+    if (mode[i] !== 0) {
+      const d = Math.sqrt(d2);
+      if (d > 1.5) {
+        /* 远就全速冲、近就自然减速。
+           原来上限只有 520px/s，从屏幕另一头飞过来要两三秒，字根本来不及成。 */
+        const want = Math.min(2100 * sp[i], d * 7);
+        fvx[i] += ((ddx / d) * want - fvx[i]) * Math.min(1, dt * 7);
+        fvy[i] += ((ddy / d) * want - fvy[i]) * Math.min(1, dt * 7);
+      } else {
+        // 到点了只小幅浮动 —— 浮动大了光会糊成一片，笔迹必须留在笔画上
+        fvx[i] += (Math.sin(t0 * 1.7 + i * 0.9) * 2.5 - fvx[i]) * Math.min(1, dt * 2);
+        fvy[i] += (Math.cos(t0 * 1.4 + i * 1.3) * 2.5 - fvy[i]) * Math.min(1, dt * 2);
+      }
+    } else {
+      fvx[i] += Math.sin(t0 * 0.5 + i * 0.37) * 22 * dt;
+      fvy[i] += Math.cos(t0 * 0.43 + i * 0.53) * 22 * dt;
+      fvx[i] *= 0.985; fvy[i] *= 0.985;
+    }
+    fx[i] += fvx[i] * dt; fy[i] += fvy[i] * dt;
+    if (fx[i] < -40) fx[i] = W + 40; if (fx[i] > W + 40) fx[i] = -40;
+    if (fy[i] < -40) fy[i] = H + 40; if (fy[i] > H + 40) fy[i] = -40;
+  }
+
+  /* ---- 分桶：一次计数排序，替代"每组各扫一遍全量数组" ----
+     12 组 × 7000 × 2 处 = 168000 次遍历/帧，分桶后只要 2 遍。 */
+  bucketStart.fill(0);
+  for (let i = 0; i < N; i++) bucketStart[grp[i] + 1]++;
+  for (let g = 0; g < 12; g++) bucketStart[g + 1] += bucketStart[g];
+  {
+    const cur = bucketStart.slice(0, 12);   // 复制一份当写入游标
+    for (let i = 0; i < N; i++) bucket[cur[grp[i]]++] = i;
+  }
+
+  /* ---- 光绘层：每 3 帧更新一次（20Hz） ----
+     这一层是长曝光累积，变化本来就慢，20Hz 和 60Hz 肉眼没有区别。 */
+  lightTick = (lightTick + 1) % 3;
+  if (lightTick === 0) {
+    lx.globalCompositeOperation = 'destination-out';
+    lx.fillStyle = 'rgba(0,0,0,0.271)';     // 1-(1-0.10)^3
+    lx.fillRect(0, 0, W, H);
+    lx.globalCompositeOperation = 'lighter';
+
+    /* 按组合批：颜色只设一次、整组灌进一条 path、一次 fill。
+       原来是每颗一次 drawImage（7000 次），光这一项就 23ms。
+       软边由"半分辨率图层放大"提供，不再逐颗贴光斑图。
+       6-8 组（当前句·已就位）跳过：它们停在原地不动，每帧重画同一批像素，
+       改由下面一次"预烘的柔光贴图"覆盖，省掉 3000 次绘制。 */
+    for (let g = 0; g < 12; g++) {
+      if (g >= 6 && g < 9) continue;
+      const lo = bucketStart[g], hi = bucketStart[g + 1];
+      if (lo >= hi) continue;
+      const lv = g % 3;                       // 闪烁档 0/1/2
+      const col = g < 3 ? COL_FREE : (g < 6 ? COL_BREW : COL_CUR);
+      const base = g < 3 ? 0.011 + lv * 0.004
+        : g < 6 ? 0.018 + lv * 0.006
+        : 0.070;                             // 还在飞：笔迹更亮，显影更快
+      lx.fillStyle = `rgba(${col},${Math.min(1, base)})`;   // 20Hz 下 ×3 补偿（原来逐颗贴光斑图时 globalAlpha 是 ×2、面积 1/3，这里正好抵平）
+      lx.beginPath();
+      for (let k = lo; k < hi; k++) {
+        const i = bucket[k];
+        lx.rect(fx[i] - 2, fy[i] - 2, 4, 4);   // 4 CSS px = 2 设备像素（半分辨率层）
+      }
+      lx.fill();
+    }
+    /* 已经就位的那批：整张柔光贴图一次画进去，充当字周围的底光 */
+    const wob = wordSpr[1];
+    if (wob && wob.bloom) {
+      lx.globalAlpha = 0.050;
+      lx.drawImage(wob.bloom, wob.x, wob.y, wob.img.width, wob.img.height);
+      lx.globalAlpha = 1;
+    }
+  }
+
+  /* ---- 主画面 ---- */
+  ctx.fillStyle = '#030807';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.imageSmoothingEnabled = SMOOTH;
+  ctx.drawImage(light, 0, 0, W, H);
+  ctx.imageSmoothingEnabled = true;
+
+  /* 字的实心层：每句一张贴图，一次 drawImage。
+     亮度按"已到位的比例"渐显 —— 字是随着萤火虫飞到位一点点显影出来的。 */
+  const bs = wordSpr[2];
+  if (bs) {
+    const f = Math.min(1, brewArrived / bs.k);
+    if (f > 0.02) {
+      ctx.globalAlpha = 0.30 * f;
+      ctx.drawImage(bs.img, bs.x, bs.y);
+    }
+  }
+  const cs = wordSpr[1];
+  if (cs) {
+    ctx.globalAlpha = (0.42 + 0.38 * curA) * (0.55 + 0.45 * Math.min(1, curArrived / cs.k));
+    ctx.drawImage(cs.img, cs.x, cs.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+
+/* 空格暂停/播放。焦点在 iframe 里时父页面收不到键盘事件，
+   所以要主动转发过去（和 F5 是同一个道理）。 */
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    mode.fill(0);
+    wordSpr[1] = wordSpr[2] = null;
+    curA = 0;
+    if (p.accent) {
+      // 萤火虫是绿色调，主色只做轻微染色，别把整片森林染成别的颜色
+      const [r, g, b] = p.accent;
+      accent = [Math.round((r + 190 * 2) / 3), Math.round((g + 240 * 2) / 3), Math.round((b + 190 * 2) / 3)];
+    }
+    buildAnchors();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hintO = lines.length ? '1' : '0.5'; hint.style.opacity = hintO;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = d.payload.level || 0;
+    for (let i = 0; i < N; i++) ph[i] += 1.2 + lv;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+window.__stage = () => {
+  let cur = 0, brew = 0;
+  for (let i = 0; i < N; i++) { if (mode[i] === 1) cur++; else if (mode[i] === 2) brew++; }
+  return { lines: lines.length, curIdx, brewIdx, cur, brew, held: heldCount, rel: releasedChars, chars: curIdx >= 0 && lines[curIdx] && lines[curIdx].chars ? lines[curIdx].chars.length : 0, t: +now().toFixed(2) };
+};
+</script>
+</body>
+</html>

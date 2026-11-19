@@ -1,0 +1,907 @@
+<!-- 650 / S09B —— 零下旷野的红外热成像：歌词是逐词升温、又慢慢冷却的热源 -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>650 / S09B — Thermal Field</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#06040a;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ================= 0. 状态 / 契约 ================= */
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "" };
+  var RM = false;
+  try { RM = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) {}
+  var GL_OK = false;
+
+  window.__stage = function () {
+    var i = S.idx, tx = "";
+    if (i >= 0 && S.lines[i] && S.lines[i].text != null) tx = String(S.lines[i].text);
+    return {
+      lines: S.lines.length,
+      idx: i,
+      t: S.t,
+      playing: !!S.playing,
+      frames: S.frames,
+      js: Math.round(S.js * 100) / 100,
+      err: S.err,
+      text: tx,
+      gl: GL_OK,
+      rm: RM
+    };
+  };
+
+  var lastErrAt = 0;
+  function logErr(e) {
+    try {
+      S.err = String((e && e.message) || e);
+      var now = (window.performance && performance.now()) || Date.now();
+      if (now - lastErrAt > 900) {
+        lastErrAt = now;
+        S.js += 1;
+        try { console.error(e); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+  window.addEventListener("error", function (ev) { logErr(ev.error || ev.message); });
+  window.addEventListener("unhandledrejection", function (ev) { logErr(ev.reason); });
+
+  /* ================= 1. ready：首个 rAF 无条件 + 800ms 兜底 ================= */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (e) { logErr(e); }
+  }
+  var booted = false;
+  function boot() {
+    if (booted) return;
+    booted = true;
+    resize();
+    lastWall = performance.now();
+    raf = requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(function () { sendReady(); boot(); });
+  setTimeout(function () { sendReady(); boot(); }, 800);
+
+  /* ================= 2. 画布 / 常量 ================= */
+  var cv = document.getElementById("cv");
+  var ctx = cv.getContext("2d");
+  var W = 1440, H = 900, DPR = 1, raf = 0, running = true, lastWall = 0;
+  var FONT_STACK = '"PingFang SC","Microsoft YaHei","Noto Sans SC","Helvetica Neue",Arial,sans-serif';
+  var MONO = '"SF Mono","Cascadia Mono","Consolas","Menlo",monospace';
+  var accent = [255, 126, 82];
+  var coverTint = null;
+  var live = { bpm: 0, level: 0, bass: 0, mid: 0, treble: 0 };
+  var hasInit = false;
+  var duration = 0;
+  var lastBeatT = -99, lastBeatLevel = 0;
+  var layouts = {}, layoutCache = null, layoutCount = 0;
+  var particles = [], lastParticleT = 0;
+  var bg = null, vig = null, glowSpr = null, scanPat = null, grainPats = [];
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function sanitizeAccent(a) {
+    if (!Array.isArray(a) || a.length < 3) return [255, 126, 82];
+    var r = Number(a[0]), g = Number(a[1]), b = Number(a[2]);
+    if (!isFinite(r) || !isFinite(g) || !isFinite(b)) return [255, 126, 82];
+    if (r + g + b < 40) return [255, 126, 82];
+    return [clamp(Math.round(r), 0, 255), clamp(Math.round(g), 0, 255), clamp(Math.round(b), 0, 255)];
+  }
+
+  /* ================= 3. 歌词数据（charTimes / parse / idx） ================= */
+  function charTimes(line) {
+    var chars = Array.from(line.text || ""), n = chars.length, out = new Array(n);
+    var cs = line.chars, i, j, rec, ct;
+    if (cs && cs.length) {
+      var rel = cs[0] && isFinite(cs[0].t) && cs[0].t < line.t - 0.08;
+      for (i = 0; i < n; i++) {
+        j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+        rec = cs[j];
+        ct = rec && rec.t;
+        out[i] = isFinite(ct) ? (rel ? line.t + ct : ct) : null;
+      }
+      return out;
+    }
+    var d = line.dur > 0 ? line.dur : 3.4;
+    for (i = 0; i < n; i++) out[i] = line.t + d * 0.88 * i / Math.max(1, n);
+    return out;
+  }
+
+  function buildLines(raw) {
+    var out = [];
+    if (!Array.isArray(raw)) return out;
+    for (var i = 0; i < raw.length; i++) {
+      var l = raw[i];
+      if (!l || typeof l !== "object") continue;
+      var text = (l.text == null) ? "" : String(l.text);
+      if (!text.trim()) continue;
+      var t = Number(l.t); if (!isFinite(t) || t < 0) t = 0;
+      var dur = Number(l.dur); if (!isFinite(dur) || dur < 0) dur = 0;
+      var line = {
+        t: t, dur: dur, text: text,
+        chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null
+      };
+      line.times = charTimes(line);
+      out.push(line);
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    return out;
+  }
+
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    while (lo <= hi) {
+      var m = (lo + hi) >> 1;
+      if (a[m].t <= t + 0.02) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return best;
+  }
+
+  /* ================= 4. 分词 / 排版 / 热字精灵 ================= */
+  function isLatin(ch) { return /[A-Za-z0-9'’\-–—_.&/+%]/.test(ch); }
+  function isCJK(ch) { return /[㐀-䶿一-鿿豈-﫿]/.test(ch); }
+
+  function tokenize(text) {
+    var cs = Array.from(text || ""), out = [], i = 0, gap = 0;
+    while (i < cs.length) {
+      var ch = cs[i];
+      if (/\s/.test(ch)) { i++; gap += 1; continue; }
+      var st, txt;
+      if (isLatin(ch)) {
+        st = i;
+        while (i < cs.length && isLatin(cs[i])) i++;
+        txt = cs.slice(st, i).join("");
+      } else if (isCJK(ch)) {
+        st = i; i++;
+        if (i < cs.length && isCJK(cs[i])) i++;
+        txt = cs.slice(st, i).join("");
+      } else {
+        st = i; i++;
+        txt = ch;
+      }
+      out.push({ text: txt, ci: st, gap: gap });
+      gap = 0;
+    }
+    return out;
+  }
+
+  var measureCv = document.createElement("canvas");
+  var measureCtx = measureCv.getContext("2d");
+  function fontFor(fs) { return "600 " + fs.toFixed(2) + "px " + FONT_STACK; }
+
+  function makeSprite(text, fs, w) {
+    var padX = Math.ceil(fs * 1.0), padY = Math.ceil(fs * 0.72);
+    var sw = Math.max(2, Math.ceil(w + padX * 2));
+    var sh = Math.max(2, Math.ceil(fs * 2.05 + padY * 2));
+    var c = document.createElement("canvas");
+    c.width = sw; c.height = sh;
+    var g = c.getContext("2d");
+    if (!g) return c;
+    g.font = fontFor(fs);
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    var x = sw / 2, y = sh / 2 + fs * 0.015;
+    var canFilter = ("filter" in g);
+    function layer(blur, color, alpha) {
+      g.save();
+      g.globalAlpha = alpha;
+      if (canFilter) g.filter = "blur(" + Math.max(0.1, blur).toFixed(2) + "px)";
+      else { g.shadowColor = color; g.shadowBlur = Math.max(2, blur * 2); }
+      g.fillStyle = color;
+      g.fillText(text, x, y);
+      g.restore();
+    }
+    layer(fs * 0.62, "#ff2f63", 0.34);
+    layer(fs * 0.30, "#ff7a34", 0.52);
+    layer(fs * 0.12, "#ffc76e", 0.74);
+    layer(1.1, "#fff5e6", 0.96);
+    return c;
+  }
+
+  function layoutFor(idx) {
+    var line = S.lines[idx];
+    if (!line) return null;
+    var key = idx + "|" + Math.round(W) + "|" + Math.round(H) + "|" + accent.join(",");
+    if (layoutCache && layoutCache.key === key) return layoutCache;
+    if (layouts[key]) return layouts[key];
+
+    var toks = tokenize(line.text);
+    if (!toks.length) return null;
+    var maxW = Math.min(W * 0.84, W - 72);
+    var fs = Math.min(64, Math.min(H * 0.072, W * 0.075));
+    fs = Math.max(15, fs);
+
+    function widthAt(size, tk) {
+      measureCtx.font = fontFor(size);
+      return measureCtx.measureText(tk.text).width;
+    }
+    function totalAt(size) {
+      var gapW = size * 0.36, sum = 0;
+      for (var i = 0; i < toks.length; i++) {
+        sum += widthAt(size, toks[i]) + toks[i].gap * gapW;
+      }
+      return sum;
+    }
+    var total = totalAt(fs);
+    if (total > maxW) {
+      fs = Math.max(13, fs * (maxW / total));
+      total = totalAt(fs);
+    }
+    var gapW = fs * 0.36;
+    var startX = (W - total) / 2;
+    var cursor = startX;
+    var baseY = H * 0.615;
+
+    for (var i = 0; i < toks.length; i++) {
+      var tk = toks[i];
+      cursor += tk.gap * gapW;
+      var w = widthAt(fs, tk);
+      tk.w = w;
+      tk.cx = cursor + w / 2;
+      var tt = line.times[tk.ci];
+      tk.time = isFinite(tt) ? tt : (line.t + i * 0.05);
+      tk.spawned = (S.t > tk.time + 0.05);
+      tk.spr = makeSprite(tk.text, fs, w);
+      cursor += w;
+    }
+    var layout = {
+      key: key, idx: idx, fs: fs, tokens: toks,
+      box: { x0: startX, x1: cursor, y: baseY },
+      line: line
+    };
+    layoutCache = layout;
+    layouts[key] = layout;
+    layoutCount++;
+    if (layoutCount > 18) {
+      var ks = Object.keys(layouts);
+      for (var k = 0; k < ks.length - 12; k++) delete layouts[ks[k]];
+      layoutCount = 12;
+    }
+    return layout;
+  }
+
+  /* ================= 5. 时间 / 声音状态 ================= */
+  function beatPulse(t) {
+    var age = t - lastBeatT;
+    if (age < 0 || age > 3.2) return 0;
+    return Math.exp(-age * 5.2) * lastBeatLevel;
+  }
+
+  function applyInit(p) {
+    hasInit = true;
+    S.lines = buildLines(p.lines);
+    if (typeof p.playing === "boolean") S.playing = p.playing;
+    if (Array.isArray(p.accent)) accent = sanitizeAccent(p.accent);
+    if (p.song && p.song.cover) loadCover(p.song.cover);
+    var d = Number(p.duration);
+    duration = isFinite(d) ? d : 0;
+    layouts = {}; layoutCache = null; layoutCount = 0;
+    particles.length = 0;
+    lastParticleT = S.t;
+    S.idx = idxAt(S.t);
+  }
+
+  function onTick(p) {
+    var t = Number(p.time);
+    if (!isFinite(t)) return;
+    if (Math.abs(t - S.t) > 0.5) {
+      layouts = {}; layoutCache = null; layoutCount = 0;
+      particles.length = 0;
+      lastParticleT = t;
+      lastBeatT = t - 10;
+    }
+    S.t = t;
+    if (typeof p.playing === "boolean") S.playing = p.playing;
+    S.idx = idxAt(t);
+  }
+
+  function onBeat(p) {
+    var lv = Number(p.level);
+    var ix = Number(p.index);
+    var v = isFinite(lv) ? clamp(lv, 0, 1) : 0.5;
+    lastBeatT = S.t;
+    lastBeatLevel = (ix === 0 ? 0.9 : 0.62) * (0.45 + v * 0.55);
+    if (!S.playing || RM) return;
+    var boolFirst = (ix === 0);
+    var n = boolFirst ? 6 : 3;
+    var cx = W / 2, cy = H * (S.idx >= 0 ? 0.60 : 0.56);
+    spawnEmbers(cx, cy, n, 0.7 + v * 0.6);
+    if (S.idx >= 0 && layoutCache) {
+      var tk = layoutCache.tokens[layoutCache.tokens.length - 1];
+      if (tk) spawnEmbers(tk.cx, H * 0.60, boolFirst ? 3 : 1, 0.6 + v * 0.5);
+    }
+  }
+
+  function onLive(p) {
+    if (!S.playing) return;
+    var bpm = Number(p.bpm); if (isFinite(bpm)) live.bpm = bpm;
+    var lv = Number(p.level); if (isFinite(lv)) live.level = clamp(lv, 0, 1);
+    var ba = Number(p.bass); if (isFinite(ba)) live.bass = clamp(ba, 0, 1);
+    var mi = Number(p.mid); if (isFinite(mi)) live.mid = clamp(mi, 0, 1);
+    var tr = Number(p.treble); if (isFinite(tr)) live.treble = clamp(tr, 0, 1);
+  }
+
+  addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === "init") applyInit(p);
+      else if (d.type === "tick") onTick(p);
+      else if (d.type === "beat") onBeat(p);
+      else if (d.type === "live") onLive(p);
+    } catch (e) { logErr(e); }
+  });
+
+  function loadCover(src) {
+    try {
+      var im = new Image();
+      im.crossOrigin = "anonymous";
+      im.onload = function () {
+        try {
+          var c = document.createElement("canvas");
+          c.width = c.height = 12;
+          var g = c.getContext("2d");
+          g.drawImage(im, 0, 0, 12, 12);
+          var d = g.getImageData(0, 0, 12, 12).data;
+          var r = 0, gg = 0, b = 0, n = 0;
+          for (var i = 0; i < d.length; i += 4) {
+            if (d[i + 3] < 8) continue;
+            r += d[i]; gg += d[i + 1]; b += d[i + 2]; n++;
+          }
+          if (n > 0) coverTint = [Math.round(r / n), Math.round(gg / n), Math.round(b / n)];
+        } catch (_) {}
+      };
+      im.onerror = function () {};
+      im.src = src;
+    } catch (_) {}
+  }
+
+  /* ================= 6. 静态底图 / 叠加素材 ================= */
+  function seeded(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
+  var spots = [];
+
+  function buildBackdrop() {
+    var c = document.createElement("canvas");
+    c.width = Math.max(2, Math.round(W * DPR));
+    c.height = Math.max(2, Math.round(H * DPR));
+    var g = c.getContext("2d");
+    g.scale(DPR, DPR);
+
+    var sky = g.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, "#05030a");
+    sky.addColorStop(0.42, "#0a0612");
+    sky.addColorStop(0.68, "#140b17");
+    sky.addColorStop(1, "#1a0e14");
+    g.fillStyle = sky;
+    g.fillRect(0, 0, W, H);
+
+    function ridge(base, amp, phase, color) {
+      g.beginPath();
+      g.moveTo(-12, H + 12);
+      for (var x = -12; x <= W + 12; x += 7) {
+        var y = base +
+          Math.sin(x * 0.0058 + phase) * amp +
+          Math.sin(x * 0.0163 + phase * 2.3) * amp * 0.34 +
+          Math.sin(x * 0.041 + phase * 3.7) * amp * 0.11;
+        g.lineTo(x, y);
+      }
+      g.lineTo(W + 12, H + 12);
+      g.closePath();
+      g.fillStyle = color;
+      g.fill();
+    }
+    ridge(H * 0.585, 24, 1.1, "#0c0813");
+    ridge(H * 0.705, 18, 2.6, "#110a14");
+    ridge(H * 0.825, 13, 4.2, "#160e15");
+
+    var hz = g.createLinearGradient(0, H * 0.47, 0, H * 0.76);
+    hz.addColorStop(0, "rgba(128,54,84,0)");
+    hz.addColorStop(0.5, "rgba(128,54,84,0.085)");
+    hz.addColorStop(1, "rgba(128,54,84,0)");
+    g.fillStyle = hz;
+    g.fillRect(0, H * 0.47, W, H * 0.29);
+
+    var r = seeded(9150);
+    var n = Math.min(1100, Math.round(W * H / 1400));
+    for (var i = 0; i < n; i++) {
+      var x = r() * W, y = r() * H, s = 0.4 + r() * 1.5;
+      g.fillStyle = r() < 0.52
+        ? "rgba(178,92,122," + (0.02 + r() * 0.05).toFixed(3) + ")"
+        : "rgba(86,66,126," + (0.02 + r() * 0.045).toFixed(3) + ")";
+      g.fillRect(x, y, s, s);
+    }
+
+    spots = [];
+    for (var k = 0; k < 15; k++) {
+      spots.push({
+        x: (0.05 + r() * 0.9) * W,
+        y: (0.50 + r() * 0.24) * H,
+        s: 12 + r() * 34,
+        ph: r() * 6.28,
+        hot: 0.25 + r() * 0.6
+      });
+    }
+    bg = c;
+  }
+
+  function buildOverlayAssets() {
+    var v = document.createElement("canvas");
+    v.width = Math.max(2, Math.round(W * DPR));
+    v.height = Math.max(2, Math.round(H * DPR));
+    var g = v.getContext("2d");
+    g.scale(DPR, DPR);
+    var rg = g.createRadialGradient(W * 0.5, H * 0.56, Math.min(W, H) * 0.10, W * 0.5, H * 0.56, Math.max(W, H) * 0.80);
+    rg.addColorStop(0, "rgba(0,0,0,0)");
+    rg.addColorStop(0.58, "rgba(0,0,0,0.10)");
+    rg.addColorStop(1, "rgba(0,0,0,0.66)");
+    g.fillStyle = rg;
+    g.fillRect(0, 0, W, H);
+    vig = v;
+
+    var sc = document.createElement("canvas");
+    sc.width = 1; sc.height = 4;
+    var sg = sc.getContext("2d");
+    sg.fillStyle = "rgba(0,0,0,0.42)";
+    sg.fillRect(0, 0, 1, 1);
+    try { scanPat = ctx.createPattern(sc, "repeat"); } catch (_) { scanPat = null; }
+
+    grainPats = [];
+    for (var k = 0; k < 3; k++) {
+      var gc = document.createElement("canvas");
+      gc.width = gc.height = 180;
+      var gg = gc.getContext("2d");
+      var id = gg.createImageData(180, 180);
+      for (var i = 0; i < id.data.length; i += 4) {
+        var val = (Math.random() * 255) | 0;
+        id.data[i] = val; id.data[i + 1] = val; id.data[i + 2] = val; id.data[i + 3] = 255;
+      }
+      gg.putImageData(id, 0, 0);
+      try { grainPats.push(ctx.createPattern(gc, "repeat")); } catch (_) {}
+    }
+
+    var gl = document.createElement("canvas");
+    gl.width = gl.height = 64;
+    var lg = gl.getContext("2d");
+    var gr = lg.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, "rgba(255,196,142,0.95)");
+    gr.addColorStop(0.30, "rgba(255,110,72,0.42)");
+    gr.addColorStop(0.68, "rgba(220,44,92,0.12)");
+    gr.addColorStop(1, "rgba(120,20,70,0)");
+    lg.fillStyle = gr;
+    lg.beginPath();
+    lg.arc(32, 32, 32, 0, Math.PI * 2);
+    lg.fill();
+    glowSpr = gl;
+  }
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1440);
+    H = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 900);
+    cv.width = Math.round(W * DPR);
+    cv.height = Math.round(H * DPR);
+    cv.style.width = W + "px";
+    cv.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    buildBackdrop();
+    buildOverlayAssets();
+    layouts = {}; layoutCache = null; layoutCount = 0;
+  }
+  addEventListener("resize", resize, { passive: true });
+  addEventListener("pagehide", function () {
+    running = false;
+    try { cancelAnimationFrame(raf); } catch (_) {}
+  });
+
+  /* ================= 7. 粒子 ================= */
+  function spawnEmbers(x, y, n, power) {
+    if (particles.length > 100) return;
+    for (var i = 0; i < n; i++) {
+      particles.push({
+        x: x + (Math.random() - 0.5) * 26,
+        y: y + (Math.random() - 0.5) * 12,
+        vx: (Math.random() - 0.5) * 15,
+        vy: -9 - Math.random() * 22 * power,
+        age: 0,
+        life: 0.7 + Math.random() * 1.5,
+        r: 0.6 + Math.random() * 1.8,
+        ph: Math.random() * 6.28
+      });
+    }
+  }
+
+  function updateParticles(t) {
+    var dt = Math.min(0.12, Math.max(0, t - lastParticleT));
+    lastParticleT = t;
+    if (dt <= 0) return;
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.age += dt;
+      if (p.age >= p.life) { particles.splice(i, 1); continue; }
+      p.x += (p.vx + Math.sin(t * 2.2 + p.ph) * 7) * dt;
+      p.y += p.vy * dt;
+      p.vy += 3.2 * dt;
+    }
+  }
+
+  function drawParticles(t) {
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var a = Math.sin(Math.PI * clamp(p.age / p.life, 0, 1)) * 0.55;
+      if (a <= 0.01) continue;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = "rgba(255,172,108,1)";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /* ================= 8. 镜头 / 场景 ================= */
+  function camera(t, pulse) {
+    if (RM) return { k: 1, dx: 0, dy: 0 };
+    var k = 1.035 + Math.sin(t * 0.031) * 0.014 + Math.sin(t * 0.009 + 1.3) * 0.006;
+    var dx = Math.sin(t * 0.021 + 0.7) * 9 + Math.sin(t * 51) * pulse * 1.4;
+    var dy = Math.cos(t * 0.017) * 6 + Math.cos(t * 47) * pulse * 1.0;
+    return { k: k, dx: dx, dy: dy };
+  }
+
+  function applyCam(cam) {
+    ctx.translate(W / 2 + cam.dx, H / 2 + cam.dy);
+    ctx.scale(cam.k, cam.k);
+    ctx.translate(-W / 2, -H / 2);
+  }
+
+  function drawSpots(t, pulse) {
+    if (!glowSpr) return;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < spots.length; i++) {
+      var s = spots[i];
+      var flick = 0.55 + 0.45 * Math.sin(t * 0.8 + s.ph);
+      var a = (0.05 + 0.10 * flick) * s.hot * (0.7 + pulse * 0.5);
+      var size = s.s * (1.0 + 0.16 * flick);
+      ctx.globalAlpha = a;
+      ctx.drawImage(glowSpr, s.x - size / 2, s.y - size / 2, size, size);
+    }
+    ctx.restore();
+  }
+
+  function drawAmbient(t, pulse) {
+    var cx = W / 2, cy = H * 0.61;
+    var bass = live.bass || 0, lvl = live.level || 0;
+    var tint = coverTint || accent;
+    var rad = Math.min(W, H) * (0.20 + 0.09 * bass + 0.055 * pulse);
+    var grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+    var a0 = 0.05 + 0.055 * lvl + 0.055 * pulse;
+    var a1 = 0.022 + 0.035 * bass + 0.02 * pulse;
+    grd.addColorStop(0, "rgba(" + tint[0] + "," + Math.round(tint[1] * 0.62) + "," + Math.round(tint[2] * 0.72) + "," + a0.toFixed(3) + ")");
+    grd.addColorStop(0.45, "rgba(255,88,110," + a1.toFixed(3) + ")");
+    grd.addColorStop(1, "rgba(40,10,40,0)");
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.fillStyle = grd;
+    ctx.fillRect(cx - rad, cy - rad, rad * 2, rad * 2);
+    ctx.restore();
+  }
+
+  function drawLayout(layout, baseY, scaleMul, alphaMul, t, pulse, isPrev) {
+    if (!layout) return;
+    var fs = layout.fs;
+    var trm = 0;
+    for (var i = 0; i < layout.tokens.length; i++) {
+      var tk = layout.tokens[i];
+      var age = t - tk.time;
+      if (age < -0.05) continue;
+      var pp = clamp(age / 0.58, 0, 1);
+      var spring;
+      if (RM) spring = smooth(pp);
+      else spring = 1 - Math.exp(-7.0 * pp) * Math.cos(10.0 * pp);
+      var enterA = smooth(clamp(pp * 1.9, 0, 1));
+      var heat = 0.60 + 0.40 * Math.exp(-Math.max(0, age) / 3.0);
+      if (!S.playing) heat = 0.72;
+      var a = alphaMul * enterA * heat * (0.90 + 0.13 * pulse);
+      if (a <= 0.004) continue;
+      var sc = scaleMul * (RM ? 1 : (0.80 + 0.20 * spring));
+      var shimmer = RM ? 0 : Math.sin(t * 2.15 + tk.ci * 0.7) * 0.55;
+      var cx = isPrev ? (W / 2 + (tk.cx - W / 2) * scaleMul) : tk.cx;
+      var cy = baseY - fs * 0.32 + (RM ? 0 : (1 - spring) * fs * 0.20);
+      var dw = tk.spr.width * sc, dh = tk.spr.height * sc;
+      ctx.globalAlpha = Math.min(1, a);
+      ctx.drawImage(tk.spr, cx + shimmer - dw / 2, cy - dh / 2, dw, dh);
+
+      if (!tk.spawned && age > -0.02) {
+        tk.spawned = true;
+        if (!isPrev && S.playing && !RM) spawnEmbers(cx + (Math.random() - 0.5) * tk.w, cy + fs * 0.15, 2, 0.55);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawSweep(layout, baseY, t) {
+    if (!layout || RM) return;
+    var x0 = layout.box.x0 - 34, x1 = layout.box.x1 + 34;
+    var sw = (Math.sin(t * 0.42 + 0.8) * 0.5 + 0.5);
+    var sx = x0 + (x1 - x0) * sw;
+    var grd = ctx.createLinearGradient(sx - 55, 0, sx + 55, 0);
+    grd.addColorStop(0, "rgba(255,140,90,0)");
+    grd.addColorStop(0.5, "rgba(255,196,140,0.085)");
+    grd.addColorStop(1, "rgba(255,140,90,0)");
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.fillStyle = grd;
+    ctx.fillRect(sx - 55, baseY - layout.fs * 1.0, 110, layout.fs * 2.0);
+    ctx.restore();
+  }
+
+  function drawReticle(layout, t, pulse) {
+    var b = layout.box;
+    var x0 = b.x0 - 17, x1 = b.x1 + 17;
+    var y0 = b.y - layout.fs * 0.78, y1 = b.y + layout.fs * 0.42;
+    var a = 0.20 + 0.16 * pulse;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,198,158," + a.toFixed(3) + ")";
+    ctx.lineWidth = 1;
+    var L = 9;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0 + L); ctx.lineTo(x0, y0); ctx.lineTo(x0 + L, y0);
+    ctx.moveTo(x1 - L, y0); ctx.lineTo(x1, y0); ctx.lineTo(x1, y0 + L);
+    ctx.moveTo(x0, y1 - L); ctx.lineTo(x0, y1); ctx.lineTo(x0 + L, y1);
+    ctx.moveTo(x1 - L, y1); ctx.lineTo(x1, y1); ctx.lineTo(x1, y1 - L);
+    ctx.stroke();
+
+    var temp = 36.2 + (live.level || 0) * 3.1 + pulse * 2.2 + Math.sin(t * 0.7) * 0.35;
+    ctx.font = "9px " + MONO;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "rgba(255,208,172,0.50)";
+    ctx.fillText("TRK 01   +" + temp.toFixed(1) + "°C", x0, y0 - 6);
+    ctx.restore();
+  }
+
+  function drawAudioOrb(t, pulse) {
+    var cx = W / 2, cy = H * 0.56;
+    var bass = live.bass || 0, lvl = live.level || 0;
+    var base = Math.min(W, H) * (0.065 + 0.03 * lvl + 0.028 * pulse);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    var size = base * 3.4;
+    ctx.globalAlpha = 0.42 + 0.2 * pulse;
+    if (glowSpr) ctx.drawImage(glowSpr, cx - size / 2, cy - size / 2, size, size);
+    for (var i = 0; i < 5; i++) {
+      var rr = base * (0.55 + i * 0.52) + (RM ? 0 : Math.sin(t * 1.35 - i * 0.72) * base * 0.075);
+      ctx.globalAlpha = 0.10 + 0.07 * (1 - i / 5) + pulse * 0.08;
+      ctx.strokeStyle = "rgba(255,168,112,1)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rr, rr * 0.60, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+    var msg = hasInit ? "AUDIO ONLY · NO LYRIC DATA" : "ACQUIRING THERMAL SIGNAL";
+    label(msg, cx, cy + base * 2.25, 9, "rgba(255,214,182,0.34)", "center");
+    drawStandbyCross(cx, cy, t, pulse, base * 2.6);
+  }
+
+  function drawStandbyCross(cx, cy, t, pulse, rad) {
+    var a = 0.12 + 0.10 * pulse;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,190,150," + a.toFixed(3) + ")";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx - rad, cy); ctx.lineTo(cx - rad * 0.55, cy);
+    ctx.moveTo(cx + rad * 0.55, cy); ctx.lineTo(cx + rad, cy);
+    ctx.moveTo(cx, cy - rad * 0.6); ctx.lineTo(cx, cy - rad * 0.32);
+    ctx.moveTo(cx, cy + rad * 0.32); ctx.lineTo(cx, cy + rad * 0.6);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /* ================= 9. UI / 调色 ================= */
+  function label(str, x, y, size, color, align, weight, mono) {
+    ctx.font = (weight || 400) + " " + size + "px " + (mono === false ? FONT_STACK : MONO);
+    ctx.fillStyle = color;
+    ctx.textAlign = align || "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(str, x, y);
+  }
+
+  function drawBracket(x, y, sx, sy) {
+    var L = 13;
+    ctx.beginPath();
+    ctx.moveTo(x, y + sy * L); ctx.lineTo(x, y); ctx.lineTo(x + sx * L, y);
+    ctx.stroke();
+  }
+
+  function drawUI(t, pulse) {
+    var lvl = live.level || 0;
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+
+    ctx.strokeStyle = "rgba(255,176,142,0.20)";
+    ctx.lineWidth = 1;
+    drawBracket(19, 19, 1, 1);
+    drawBracket(W - 19, 19, -1, 1);
+    drawBracket(19, H - 19, 1, -1);
+    drawBracket(W - 19, H - 19, -1, -1);
+
+    label("THERMAL FIELD / UNIT 07", 30, 34, 9.5, "rgba(255,224,204,0.62)");
+    label("8–14 µm   ·   GAIN 1.8×   ·   IRONBOW 03", 30, 49, 8.5, "rgba(255,198,172,0.36)");
+    var amb = (-18.4 + lvl * 2.1 + pulse * 0.8);
+    label((amb < 0 ? "−" : "+") + Math.abs(amb).toFixed(1) + " °C   AMBIENT", 30, 66, 8.5, "rgba(255,190,162,0.40)");
+
+    var sec = Math.max(0, t);
+    var mm = Math.floor(sec / 60);
+    var ss = Math.floor(sec % 60);
+    var ff = Math.floor((sec % 1) * 24);
+    var tc = pad2(mm) + ":" + pad2(ss) + ":" + pad2(ff);
+    label(tc, W - 30, 53, 9.5, "rgba(255,222,202,0.52)", "right");
+    var recOn = S.playing && (Math.floor(t * 2) % 2 === 0);
+    var recColor = S.playing ? (recOn ? "rgba(255,84,68,0.95)" : "rgba(255,84,68,0.28)") : "rgba(255,196,160,0.30)";
+    ctx.fillStyle = recColor;
+    ctx.beginPath();
+    ctx.arc(W - 96, 32.5, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+    label(S.playing ? "REC" : "HOLD", W - 88, 36, 8.5, "rgba(255,198,172,0.52)");
+
+    if (W > 760) {
+      var sx = 31, y0 = H * 0.30, y1 = H * 0.70;
+      var grd = ctx.createLinearGradient(0, y1, 0, y0);
+      grd.addColorStop(0, "rgba(255,54,112,0.40)");
+      grd.addColorStop(0.55, "rgba(255,136,62,0.38)");
+      grd.addColorStop(1, "rgba(255,246,228,0.46)");
+      ctx.fillStyle = grd;
+      ctx.fillRect(sx, y0, 1.5, y1 - y0);
+      ctx.font = "7.5px " + MONO;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      for (var i = 0; i <= 6; i++) {
+        var yy = y1 - (i / 6) * (y1 - y0);
+        ctx.strokeStyle = "rgba(255,196,164,0.20)";
+        ctx.beginPath();
+        ctx.moveTo(sx - 4, yy);
+        ctx.lineTo(sx + 4, yy);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(255,196,164,0.27)";
+        ctx.fillText(String(-20 + i * 20), sx + 9, yy);
+      }
+      var iy = y1 - (0.30 + 0.48 * lvl) * (y1 - y0);
+      ctx.fillStyle = "rgba(255,238,218,0.72)";
+      ctx.beginPath();
+      ctx.moveTo(sx - 6, iy);
+      ctx.lineTo(sx - 1, iy - 2.6);
+      ctx.lineTo(sx - 1, iy + 2.6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.textBaseline = "alphabetic";
+    }
+
+    var bpmTxt = live.bpm ? String(Math.round(live.bpm)) : "--";
+    label("IRONBOW · BPM " + bpmTxt + " · " + (S.playing ? "PLAY" : "HOLD"), 30, H - 28, 8.5, "rgba(255,198,170,0.38)");
+    label("650 / S09B", W - 30, H - 28, 8.5, "rgba(255,198,170,0.30)", "right");
+
+    if (S.lines.length > 0 && S.idx < 0) {
+      label("STANDBY · AWAITING SIGNAL", W / 2, H * 0.70, 9, "rgba(255,206,178,0.34)", "center");
+      drawStandbyCross(W / 2, H * 0.58, t, pulse, Math.min(W, H) * 0.14);
+    }
+    ctx.restore();
+  }
+
+  function drawScanGrain(t) {
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 0.30;
+    if (scanPat) {
+      ctx.fillStyle = scanPat;
+      ctx.fillRect(0, 0, W, H);
+    }
+    ctx.globalAlpha = 1;
+    if (grainPats.length) {
+      ctx.globalCompositeOperation = "overlay";
+      ctx.globalAlpha = RM ? 0.040 : 0.055;
+      var gi = Math.floor(t * 11) % grainPats.length;
+      var ox = RM ? 0 : -((t * 157) % 180);
+      var oy = RM ? 0 : -((t * 91) % 180);
+      ctx.save();
+      ctx.translate(ox, oy);
+      ctx.fillStyle = grainPats[gi];
+      ctx.fillRect(0, 0, W + 180, H + 180);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    if (vig) {
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
+      ctx.drawImage(vig, 0, 0, W, H);
+    }
+  }
+
+  /* ================= 10. 主渲染 ================= */
+  function draw() {
+    var t = S.t;
+    var pulse = beatPulse(t);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    if (bg) ctx.drawImage(bg, 0, 0, W, H);
+    else { ctx.fillStyle = "#08050e"; ctx.fillRect(0, 0, W, H); }
+
+    var cam = camera(t, pulse);
+    ctx.save();
+    applyCam(cam);
+    drawSpots(t, pulse);
+    drawAmbient(t, pulse);
+
+    if (S.lines.length === 0) {
+      drawAudioOrb(t, pulse);
+      updateParticles(t);
+      drawParticles(t);
+      ctx.restore();
+      drawUI(t, pulse);
+      drawScanGrain(t);
+      return;
+    }
+
+    if (S.idx >= 0) {
+      var cur = layoutFor(S.idx);
+      if (cur) {
+        var prev = null;
+        if (S.idx > 0) {
+          var pl = S.lines[S.idx - 1];
+          if (pl && t - pl.t < 7.5) prev = layoutFor(S.idx - 1);
+        }
+        if (prev) drawLayout(prev, H * 0.435, 0.62, 0.15, t, pulse, true);
+        drawSweep(cur, H * 0.615, t);
+        drawLayout(cur, H * 0.615, 1, 1, t, pulse, false);
+        drawReticle(cur, t, pulse);
+      }
+    } else {
+      drawStandbyCross(W / 2, H * 0.58, t, pulse, Math.min(W, H) * 0.14);
+    }
+
+    updateParticles(t);
+    drawParticles(t);
+    ctx.restore();
+
+    drawUI(t, pulse);
+    drawScanGrain(t);
+  }
+
+  function frame(now) {
+    if (!running) return;
+    S.frames++;
+    lastWall = now;
+    try { draw(); } catch (e) { logErr(e); }
+    raf = requestAnimationFrame(frame);
+  }
+
+  /* 首帧在 boot 内绘制；此处的 0 号 rAF 只用于 ready，不重复占帧 */
+})();
+</script>
+</body>
+</html>

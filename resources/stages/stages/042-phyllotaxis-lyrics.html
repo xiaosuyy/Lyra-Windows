@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>叶序</title>
+<style>
+  html,body{margin:0;height:100%;background:#05050a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;pointer-events:none;
+       background:radial-gradient(112% 92% at 50% 50%,transparent 46%,rgba(4,4,8,.5) 82%,rgba(4,4,8,.88))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(255,206,140,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   042 · 叶序 —— 字是花盘上被种子**让出来**的那块空洞
+   ---------------------------------------------------------------------------
+   和已有 10 个的区别：001-010 全都在"往画面上加东西"把字堆出来。
+   这一台反过来：画面先是一整盘向日葵（叶序：第 i 颗种子的角度 = i·137.507°，
+   半径 = sqrt(i/N)·R —— 和参考页同一条公式），
+   字是**从花盘里被挖掉的负空间**。所以这里的"字"不是亮的东西，是缺席的东西。
+
+   机制：疏散。参考页里种子是不动的；这里每当一个字符开始被"念"到，
+   洞口就在那个字符的位置张开 —— 原本长在那里的种子被挤出去，
+   沿着自己那条叶序螺旋臂的切线方向飞离，堆到洞口边缘成了一圈亮边。
+   于是"书写顺序"就是"疏散顺序"：句子从左到右一个字一个字地把花盘挖空，
+   被挖掉的那部分花盘变成洞口边上的一圈种子。
+
+   为什么快：
+     · 花盘（两万多颗种子）只在 resize 时烘一次，烘进一张离屏画布；
+     · 每句只把那张画布复制一份，用 destination-out 逐字挖洞（每帧几个 fillText）；
+     · 每帧真正画的只有：1 次整屏 blit + 洞口亮边（2 档合批）+ 飞出去的种子（3 档合批）。
+
+   精修记录：① YRC 逐字挖洞 —— 每个字的"完全挖空 + 洞沿亮边 + 种子飞散"压在
+   chars[k].t 上（chars 必须和 text 等长且 t 有限，否则按 t+dur*k/n 均分；
+   __stage 增 yrc 字段）；② 整句先以 94% 的浅洞"起稿"，所以任何时刻整句都
+   完整可读 —— 旧版 4s 时只挖到第 19 字、后半句还是一整盘种子（不可读），
+   现在第 k 字在 chars[k].t 那一刻从浅洞变成真正挖空、种子被挤出去，前后对比
+   就是"这个字被唱出来了"；②b 洞底背光（sigChar/bakeSig）：挖洞只能挖出暗块，
+   CJK 字身占满 em 框，相邻字的洞会连成一条黑带（实测整句不可读），所以在
+   洞底再垫一层同字形的光 —— 整句 30%、唱到的字 80%，字是"透光的洞"；
+   ③ 长句自动折 2~3 行（41 字 @92px 三行，旧版压成一行 28px 且溢出花盘）；
+   ④ 镜头缓慢呼吸缩放 + 平移（整个花盘一起漂）、洞口亮边/飞散种子按 accent 调色、
+   踩拍整盘相干提亮。
+   分词：不使用。逐字时间已精确到字、浅洞保证整句可读，按词团释放只会让
+   "疏散"一顿一顿地走。
+   ========================================================================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const TAU = Math.PI * 2;
+const GOLD = Math.PI * (3 - Math.sqrt(5));      // 黄金角 137.507°
+const BG0 = '#05050a';
+const FONT = (fs) => '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+let W = 0, H = 0, DPR = 1;
+
+/* ---- 花盘：透明底，只有种子和辉光（背景单独画，洞口才透得出来）---- */
+const headBase = document.createElement('canvas');
+const hb = headBase.getContext('2d');
+const headLine = document.createElement('canvas');
+const hl = headLine.getContext('2d');
+
+const BUCKETS = 18;
+const fills = [];
+for (let b = 0; b < BUCKETS; b++) {
+  const p = (b + 0.5) / BUCKETS;
+  fills.push('hsl(' + (43 - p * 33).toFixed(1) + ',92%,' + (73 - p * 29).toFixed(1) + '%)');
+}
+
+let bgGrad = null, glowSprite = null;
+
+/* ---- 疏散出去的种子（有池子，换句必须整池释放）---- */
+const ESC_MAX = 300;
+const ex = new Float32Array(ESC_MAX), ey = new Float32Array(ESC_MAX);
+const evx = new Float32Array(ESC_MAX), evy = new Float32Array(ESC_MAX);
+const el = new Float32Array(ESC_MAX);
+let exN = 0;
+
+/* ---- 洞口亮边 ---- */
+let rim = new Float32Array(0), rimN = 0;
+
+/* ---- 字形占据 + 洞口外的距离场（用一次倒角变换，之后 O(1) 查表）---- */
+const CELL = 6;
+let gw = 0, gh = 0, ink = null, outd = null;
+
+let lines = [], accent = [255, 200, 120];
+let lay = null, ctArr = null, curYrc = false, lit = 0, curT = 0;
+let rimAlpha = 0;
+let beatPulse = 0;
+let camS = 1, camX = 0, camY = 0;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  bgGrad = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.72);
+  bgGrad.addColorStop(0, '#12100e');
+  bgGrad.addColorStop(0.45, '#0a0909');
+  bgGrad.addColorStop(1, BG0);
+
+  /* 中心暖核：预渲染一次，之后只 drawImage（坑⑪：不要逐帧 createRadialGradient）*/
+  const gs = document.createElement('canvas');
+  const gsz = 256;
+  gs.width = gsz; gs.height = gsz;
+  const gc = gs.getContext('2d');
+  const gg = gc.createRadialGradient(gsz / 2, gsz / 2, 0, gsz / 2, gsz / 2, gsz / 2);
+  gg.addColorStop(0, 'rgba(255,196,110,0.30)');
+  gg.addColorStop(0.42, 'rgba(232,142,60,0.10)');
+  gg.addColorStop(1, 'rgba(200,100,40,0)');
+  gc.fillStyle = gg; gc.fillRect(0, 0, gsz, gsz);
+  glowSprite = gs;
+
+  buildHead();
+  if (curLines0) relayout();
+}
+addEventListener('resize', resize);
+let curLines0 = false;
+
+/* ---- 烘花盘：叶序种子（角度 i·GOLD，半径 sqrt(i/N)·R），按半径分 18 档合批 ---- */
+function buildHead() {
+  headBase.width = W; headBase.height = H;
+  headLine.width = W; headLine.height = H;
+  const cx = W / 2, cy = H / 2;
+  const ax = W * 0.53, ay = H * 0.47;                 // 椭圆花盘：横向铺满，字一定在盘里
+  const SP = 7.8;                                     // 叶序点距
+  const N = Math.min(32000, Math.floor(Math.PI * ax * ay / (SP * SP)));
+  const paths = [], glints = [];
+  for (let b = 0; b < BUCKETS; b++) { paths.push(new Path2D()); glints.push(new Path2D()); }
+
+  for (let i = 0; i < N; i++) {
+    const q = i / N;
+    const r = Math.sqrt(q);
+    const a = i * GOLD;
+    const x = cx + Math.cos(a) * r * ax;
+    const y = cy + Math.sin(a) * r * ay;
+    const size = 1.25 + q * 3.4;
+    const b = Math.min(BUCKETS - 1, (q * BUCKETS) | 0);
+    paths[b].moveTo(x + size, y);
+    paths[b].arc(x, y, size, 0, TAU);
+    if ((i & 3) === 0) {
+      const gx = x - size * 0.30, gy = y - size * 0.32, gr = size * 0.30;
+      glints[b].moveTo(gx + gr, gy);
+      glints[b].arc(gx, gy, gr, 0, TAU);
+    }
+  }
+
+  hb.setTransform(1, 0, 0, 1, 0, 0);
+  hb.clearRect(0, 0, W, H);
+  hb.globalCompositeOperation = 'source-over';
+  for (let b = 0; b < BUCKETS; b++) { hb.fillStyle = fills[b]; hb.fill(paths[b]); }
+  hb.globalCompositeOperation = 'lighter';
+  hb.fillStyle = 'rgba(255,246,215,0.55)';
+  for (let b = 0; b < BUCKETS; b++) hb.fill(glints[b]);
+  /* 外圈一道极淡的边界环（参考页那条 rgba(255,196,110,.055)）*/
+  hb.globalCompositeOperation = 'source-over';
+  hb.strokeStyle = 'rgba(255,196,110,0.055)';
+  hb.lineWidth = 1;
+  hb.beginPath(); hb.ellipse(cx, cy, ax * 1.01, ay * 1.01, 0, 0, TAU); hb.stroke();
+
+  hl.setTransform(1, 0, 0, 1, 0, 0);
+  hl.globalCompositeOperation = 'source-over';
+  hl.globalAlpha = 1;
+  hl.clearRect(0, 0, W, H);
+  hl.drawImage(headBase, 0, 0);
+  hl.globalCompositeOperation = 'destination-out';
+}
+
+/* ---- 排版：逐字量宽 + 折行（长句 2~3 行，字才挖得出来）---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => {
+    if (i > 0 && i < n) {
+      const c = text.charCodeAt(i);
+      if (c >= 0xDC00 && c <= 0xDFFF) return i - 1;
+    }
+    return i;
+  };
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+function makeLayout(text) {
+  if (!text) return null;
+  const rows = splitRows(text);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.80, 1290);
+  const maxH = H * 0.44;                       // 必须留在椭圆花盘里
+  const LHK = 1.20;
+  octx.font = FONT(96);
+  let widest = 0;
+  for (const r of rows) widest = Math.max(widest, octx.measureText(r).width);
+  let fs = 96 * Math.min(1, maxW / Math.max(1, widest), maxH / (nr * LHK * 96));
+  fs = Math.max(28, Math.floor(fs));
+  octx.font = FONT(fs);
+  let wMax = 0;
+  for (const r of rows) wMax = Math.max(wMax, octx.measureText(r).width);
+  if (wMax > maxW) { fs = Math.max(28, Math.floor(fs * maxW / wMax)); octx.font = FONT(fs); }
+  const LH = fs * LHK;
+  const glyphs = [], rowInfo = [];
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  let gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r];
+    let wsum = 0; const ws = [];
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH;
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi++ });
+      x += w;
+    }
+    rowInfo.push({ text: row, x0: W / 2 - wsum / 2, w: wsum, y: y });
+  }
+  return { glyphs: glyphs, rowInfo: rowInfo, fs: fs, LH: LH, nr: nr };
+}
+
+function charTimes(line) {
+  const n = line.text.length;
+  const ct = new Float32Array(n);
+  const chs = line.chars;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      ct[k] = v;
+    }
+  }
+  if (!ok) {
+    const dur = line.dur > 0 ? line.dur : 3;
+    const t0 = +line.t || 0;
+    for (let k = 0; k < n; k++) ct[k] = t0 + dur * k / Math.max(1, n);
+  }
+  for (let k = 1; k < n; k++) if (ct[k] < ct[k - 1]) ct[k] = ct[k - 1];
+  return { ct: ct, yrc: ok };
+}
+
+/* ---- 单字采样（相对字心）---- */
+function sampleChar(ch, fs) {
+  octx.font = FONT(fs);
+  const w = Math.max(6, Math.ceil(octx.measureText(ch).width) + 8);
+  const h = Math.max(6, Math.ceil(fs * 1.35) + 8);
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(ch, w / 2, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const pts = [];
+  for (let y = 0; y < h; y += 2)
+    for (let x = 0; x < w; x += 2)
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - w / 2, y - h / 2);
+  return pts;
+}
+
+function layoutPoints(L) {
+  const out = [];
+  for (let i = 0; i < L.glyphs.length; i++) {
+    const g = L.glyphs[i];
+    const p = sampleChar(g.ch, L.fs);
+    for (let k = 0; k < p.length; k += 2) out.push(g.x + p[k], g.y + p[k + 1]);
+  }
+  return out;
+}
+
+/* ---- 占据栅格 + 洞口外一圈的距离场（一次倒角变换，之后 O(1) 查表）---- */
+function buildField(pts) {
+  gw = Math.ceil(W / CELL) + 1; gh = Math.ceil(H / CELL) + 1;
+  const n = gw * gh;
+  if (!ink || ink.length !== n) { ink = new Uint8Array(n); outd = new Float32Array(n); }
+  else { ink.fill(0); outd.fill(0); }
+  const cx = W / 2, cy = H / 2;
+  for (let i = 0; i < pts.length; i += 2) {
+    const gx = (pts[i] / CELL) | 0, gy = (pts[i + 1] / CELL) | 0;   // 点云已是画布绝对坐标
+    if (gx >= 0 && gx < gw && gy >= 0 && gy < gh) ink[gy * gw + gx] = 1;
+  }
+  /* 背景格 = INF、笔画格 = 0，两遍倒角 → 每个背景格到最近笔画的距离。
+     洞口亮边取"紧贴洞沿的那一圈背景格"，所以它永远在洞外面，不会把洞填上 */
+  const INF = 1e6;
+  for (let i = 0; i < n; i++) outd[i] = ink[i] ? 0 : INF;
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const i = y * gw + x; let v = outd[i];
+    if (x > 0 && outd[i - 1] + 1 < v) v = outd[i - 1] + 1;
+    if (y > 0 && outd[i - gw] + 1 < v) v = outd[i - gw] + 1;
+    if (x > 0 && y > 0 && outd[i - gw - 1] + 1.414 < v) v = outd[i - gw - 1] + 1.414;
+    if (x < gw - 1 && y > 0 && outd[i - gw + 1] + 1.414 < v) v = outd[i - gw + 1] + 1.414;
+    outd[i] = v;
+  }
+  for (let y = gh - 1; y >= 0; y--) for (let x = gw - 1; x >= 0; x--) {
+    const i = y * gw + x; let v = outd[i];
+    if (x < gw - 1 && outd[i + 1] + 1 < v) v = outd[i + 1] + 1;
+    if (y < gh - 1 && outd[i + gw] + 1 < v) v = outd[i + gw] + 1;
+    if (x < gw - 1 && y < gh - 1 && outd[i + gw + 1] + 1.414 < v) v = outd[i + gw + 1] + 1.414;
+    if (x > 0 && y < gh - 1 && outd[i + gw - 1] + 1.414 < v) v = outd[i + gw - 1] + 1.414;
+    outd[i] = v;
+  }
+  const tmp = [];
+  for (let y = 1; y < gh - 1; y++) for (let x = 1; x < gw - 1; x++) {
+    const i = y * gw + x;
+    if (!ink[i] && outd[i] <= 1.05) tmp.push(x * CELL + CELL * 0.5, y * CELL + CELL * 0.5);
+  }
+  rim = new Float32Array(tmp);
+  rimN = tmp.length / 2;
+}
+
+/* ---- 洞口背光：洞底透出来的那一层光 ----
+   为什么要它：挖洞只能挖出"没有种子"的暗块，而 CJK 的字身几乎占满 em 框，
+   相邻字的洞一定会连成一条黑带 —— 实测整句只剩一条黑带，字读不出来。
+   所以洞底再垫一层**同字形的光**（lighter 叠加）：字是透光的洞，不是黑块。
+   整句先铺 30%（任何时刻整句可读），唱到第 k 字时把那个字写到 80% + 辉光。 */
+let sigCv = null, sigG = null, sigX = 0, sigY = 0, sigW = 0, sigH = 0;
+
+function sigBox() {
+  if (!lay || !lay.glyphs.length) return false;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let i = 0; i < lay.glyphs.length; i++) {
+    const g = lay.glyphs[i];
+    if (g.x - g.w * 0.5 < x0) x0 = g.x - g.w * 0.5;
+    if (g.x + g.w * 0.5 > x1) x1 = g.x + g.w * 0.5;
+    if (g.y - lay.fs * 0.60 < y0) y0 = g.y - lay.fs * 0.60;
+    if (g.y + lay.fs * 0.60 > y1) y1 = g.y + lay.fs * 0.60;
+  }
+  const pad = Math.ceil(lay.fs * 0.20) + 8;
+  sigX = Math.floor(x0 - pad); sigY = Math.floor(y0 - pad);
+  sigW = Math.max(8, Math.ceil(x1 - x0 + pad * 2));
+  sigH = Math.max(8, Math.ceil(y1 - y0 + pad * 2));
+  if (!sigCv) sigCv = document.createElement('canvas');
+  sigCv.width = sigW; sigCv.height = sigH;
+  sigG = sigCv.getContext('2d');
+  sigG.setTransform(1, 0, 0, 1, 0, 0);
+  sigG.clearRect(0, 0, sigW, sigH);
+  sigG.textAlign = 'center'; sigG.textBaseline = 'middle';
+  sigG.font = FONT(lay.fs);
+  sigG.translate(-sigX, -sigY);                   // 之后一律用画布绝对坐标写字
+  return true;
+}
+
+function bakeSig() {
+  if (!sigBox()) { sigCv = null; sigG = null; return; }
+  const g = sigG;
+  g.shadowColor = 'rgba(255,226,178,0.50)';
+  g.shadowBlur = Math.max(2, lay.fs * 0.09);
+  g.fillStyle = 'rgba(255,239,212,0.30)';
+  for (let r = 0; r < lay.rowInfo.length; r++) {
+    const row = lay.rowInfo[r];
+    g.fillText(row.text, row.x0 + row.w / 2, row.y);
+  }
+  g.shadowBlur = 0; g.shadowColor = 'transparent';
+}
+
+/* 第 k 个字：洞底的那一层光从 30% 提到 80% —— 和挖洞同帧，所以"成立"就是一下 */
+function sigChar(k) {
+  if (!sigG || !lay) return;
+  const g = lay.glyphs[k];
+  if (!g) return;
+  sigG.shadowColor = 'rgba(255,238,204,0.85)';
+  sigG.shadowBlur = Math.max(3, lay.fs * 0.15);
+  sigG.fillStyle = 'rgba(255,250,240,0.80)';
+  sigG.fillText(g.ch, g.x, g.y);
+  sigG.shadowBlur = 0; sigG.shadowColor = 'transparent';
+}
+
+/* 换句 = 把上一句的洞整块还回去，再重新起稿 */
+function punchReset() {
+  hl.setTransform(1, 0, 0, 1, 0, 0);
+  hl.globalCompositeOperation = 'source-over';
+  hl.globalAlpha = 1;
+  hl.clearRect(0, 0, W, H);
+  hl.drawImage(headBase, 0, 0);
+  hl.globalCompositeOperation = 'destination-out';
+  hl.textAlign = 'center'; hl.textBaseline = 'middle';
+  hl.font = FONT(lay ? lay.fs : 96);
+  if (lay) {
+    /* 起稿：整句按 94% 挖（留一点字距，洞不连成一条）。唱到第 k 字时张到 100% */
+    for (let i = 0; i < lay.glyphs.length; i++) {
+      const g = lay.glyphs[i];
+      hl.save();
+      hl.translate(g.x, g.y);
+      hl.scale(0.94, 0.94);
+      hl.globalAlpha = 1;
+      hl.fillText(g.ch, 0, 0);
+      hl.restore();
+    }
+    hl.globalAlpha = 1;
+  }  lit = 0; rimAlpha = 0;
+  exN = 0;                                        // 上一句飞出去的种子整池释放（坑③）
+  bakeSig();
+}
+
+/* 第 k 个字：从浅洞变成真正挖空，洞沿亮起，种子被挤出去 */
+function punchChar(k) {
+  if (!lay) return;
+  const g = lay.glyphs[k];
+  if (!g) return;
+  hl.globalAlpha = 1;
+  hl.font = FONT(lay.fs);
+  hl.fillText(g.ch, g.x, g.y);
+  /* 只把字心挖透，不再外扩：CJK 的字身几乎占满 em 框，外扩 3px 就会把整行连成一条黑带 */
+  hl.globalAlpha = 1;
+  sigChar(k);
+  spawnEscape(g.x, g.y, 1);
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let pend = null, pendIdx = -1;
+
+function brewLine(i) {
+  const L = lines[i];
+  const tm = charTimes(L);
+  const ly = makeLayout(L.text);
+  pend = { lay: ly, ct: tm.ct, yrc: tm.yrc, pts: ly ? layoutPoints(ly) : [] };
+  pendIdx = i;
+}
+
+function relayout() {
+  /* resize / 换句重建：用当前句重排一次（版式与洞都按新尺寸重来）*/
+  const L = curLineRef;
+  if (!L) return;
+  const tm = charTimes(L);
+  lay = makeLayout(L.text); ctArr = tm.ct; curYrc = tm.yrc;
+  buildField(lay ? layoutPoints(lay) : []);
+  punchReset();
+  lit = 0;
+}
+
+let curLineRef = null;
+
+function startLine(i) {
+  if (pendIdx !== i) brewLine(i);
+  const b = pend;
+  pend = null; pendIdx = -1;
+  curLineRef = lines[i];
+  curLines0 = true;
+  if (!b || !b.lay) {
+    lay = null; ctArr = null; curYrc = false;
+    hl.setTransform(1, 0, 0, 1, 0, 0);
+    hl.globalCompositeOperation = 'source-over'; hl.globalAlpha = 1;
+    hl.clearRect(0, 0, W, H);
+    hl.drawImage(headBase, 0, 0);
+    hl.globalCompositeOperation = 'destination-out';
+    rimN = 0; rim = new Float32Array(0); exN = 0;
+    sigCv = null; sigG = null;
+    return;
+  }
+  lay = b.lay; ctArr = b.ct; curYrc = b.yrc;
+  buildField(b.pts || []);
+  punchReset();
+}
+
+function timing(T) {
+  curT = T;
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    lay = null; ctArr = null; curLineRef = null; lit = 0; curLines0 = false;
+    pend = null; pendIdx = -1;
+    rimN = 0; rim = new Float32Array(0); exN = 0;
+    sigCv = null; sigG = null;
+    hl.setTransform(1, 0, 0, 1, 0, 0);
+    hl.globalCompositeOperation = 'source-over'; hl.globalAlpha = 1;
+    hl.clearRect(0, 0, W, H);
+    hl.drawImage(headBase, 0, 0);
+    hl.globalCompositeOperation = 'destination-out';
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci);
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine(nx); }
+  }
+  /* YRC：第 k 字的完全挖空压在 chars[k].t 上（浅洞提前就有了，这一下是"成立"）*/
+  if (ctArr) {
+    while (lit < ctArr.length && T >= ctArr[lit]) {
+      punchChar(lit);
+      if (lit === 0) rimAlpha = 0.35;
+      lit++;
+    }
+  }
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    lay = null; ctArr = null; curLineRef = null; lit = 0; pend = null; pendIdx = -1;
+    curLines0 = false;
+    rimN = 0; exN = 0; rimAlpha = 0;
+    sigCv = null; sigG = null;
+    if (p.accent) accent = p.accent;
+    punchResetHead();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整盘种子一起亮、洞口亮边一起闪（相干），飞出去的种子被同一阵风吹一下 */
+    beatPulse = Math.min(1, beatPulse + 0.6 * (0.35 + (d.payload.level || 0)));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+function punchResetHead() {
+  hl.setTransform(1, 0, 0, 1, 0, 0);
+  hl.globalCompositeOperation = 'source-over'; hl.globalAlpha = 1;
+  hl.clearRect(0, 0, W, H);
+  hl.drawImage(headBase, 0, 0);
+  hl.globalCompositeOperation = 'destination-out';
+  hl.textAlign = 'center'; hl.textBaseline = 'middle';
+  hl.font = FONT(lay ? lay.fs : 96);
+}
+
+/* ---------------- 主循环 ---------------- */
+let last = performance.now();
+let t0 = 0;
+
+resize();
+requestAnimationFrame(frame);
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  beatPulse *= Math.exp(-dt * 3.0);
+  rimAlpha = Math.min(1, rimAlpha + dt * 1.6);
+
+  /* 镜头：整个花盘缓慢呼吸缩放 + 平移（字和洞都在盘上，一起动）*/
+  camS = 1 + 0.012 * Math.sin(t0 * 0.075) + 0.005 * Math.sin(t0 * 0.029);
+  camX = Math.sin(t0 * 0.061) * 11;
+  camY = Math.cos(t0 * 0.047) * 8;
+
+  /* ---- 疏散出去的种子：沿自己那条叶序螺旋臂的切线飞走 ---- */
+  for (let i = 0; i < exN; i++) {
+    el[i] -= dt;
+    if (el[i] <= 0) {
+      exN--;
+      ex[i] = ex[exN]; ey[i] = ey[exN]; evx[i] = evx[exN]; evy[i] = evy[exN];
+      el[i] = el[exN];
+      i--; continue;
+    }
+    ex[i] += evx[i] * dt; ey[i] += evy[i] * dt;
+    evx[i] *= Math.exp(-dt * 1.4); evy[i] *= Math.exp(-dt * 1.4);
+  }
+
+  /* ---- 合成 ---- */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(W / 2 + camX, H / 2 + camY);
+  ctx.scale(camS, camS);
+  ctx.translate(-W / 2, -H / 2);
+
+  /* 中心暖核 */
+  ctx.globalCompositeOperation = 'lighter';
+  const gr = Math.min(W, H) * 0.42;
+  ctx.drawImage(glowSprite, W / 2 - gr, H / 2 - gr, gr * 2, gr * 2);
+
+  /* 花盘（已经挖好洞的那一份）*/
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(headLine, 0, 0, W, H);
+
+  /* 洞底的光：整句 30%，唱到的字 80% —— 字是透光的洞，不是黑块 */
+  if (sigCv && lay) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.95;
+    ctx.drawImage(sigCv, sigX, sigY, sigW, sigH);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 洞口亮边：被挤出来的种子堆在洞沿上，微微闪 */
+  if (rimN > 0 && rimAlpha > 0.01) {
+    const pa = new Path2D(), pb = new Path2D();
+    for (let i = 0; i < rimN; i++) {
+      const x = rim[i * 2], y = rim[i * 2 + 1];
+      const tw = 0.5 + 0.5 * Math.sin(t0 * 2.1 + (x * 0.07 + y * 0.11));
+      const q = tw * (0.55 + 0.45 * beatPulse);
+      const p = q > 0.55 ? pb : pa;
+      p.moveTo(x + 1.7, y); p.arc(x, y, 1.7, 0, TAU);
+    }
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = rimAlpha * 0.55;
+    ctx.fillStyle = 'rgba(' + Math.min(255, accent[0] * 0.7 + 90) + ',' +
+                    Math.min(255, accent[1] * 0.6 + 60) + ',' + Math.min(255, accent[2] * 0.4 + 20) + ',0.75)';
+    ctx.fill(pa);
+    ctx.fillStyle = 'rgba(255,248,226,0.95)';
+    ctx.fill(pb);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 飞出去还没落定的种子：3 档合批 */
+  if (exN > 0) {
+    const b1 = new Path2D(), b2 = new Path2D(), b3 = new Path2D();
+    for (let i = 0; i < exN; i++) {
+      const a = Math.min(1, el[i] / 1.15);
+      const r = 1.0 + 1.5 * a;
+      const p = a > 0.66 ? b1 : (a > 0.33 ? b2 : b3);
+      p.moveTo(ex[i] + r, ey[i]); p.arc(ex[i], ey[i], r, 0, TAU);
+    }
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'rgba(255,238,200,0.85)'; ctx.fill(b1);
+    ctx.fillStyle = 'rgba(' + Math.min(255, accent[0]) + ',' + Math.min(255, accent[1] * 0.7 + 40) + ',' +
+                    Math.min(255, accent[2] * 0.4 + 30) + ',0.55)'; ctx.fill(b2);
+    ctx.fillStyle = 'rgba(210,120,50,0.30)'; ctx.fill(b3);
+  }
+
+  /* 整盘相干提亮（踩拍）*/
+  if (beatPulse > 0.01) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'rgba(' + Math.min(255, accent[0]) + ',' + Math.min(255, accent[1]) + ',' +
+                    Math.min(255, accent[2]) + ',' + (0.05 * beatPulse).toFixed(3) + ')';
+    ctx.fillRect(-W, -H, W * 3, H * 3);
+    ctx.fillStyle = 'rgba(255,214,150,' + (0.02 * beatPulse).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+  ctx.restore();
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+
+/* 被挖掉的种子的去处：沿叶序螺旋臂的切线方向飞离洞口 */
+function spawnEscape(x, y, k0) {
+  const ccx = W / 2, ccy = H / 2;
+  let dx = x - ccx, dy = y - ccy;
+  const dl = Math.sqrt(dx * dx + dy * dy) || 1;
+  dx /= dl; dy /= dl;
+  /* 螺旋臂切线 = 径向再转半个黄金角，方向由所在位置决定（相干，不是逐颗随机）*/
+  const rot = GOLD * 0.5;
+  const tx = dx * Math.cos(rot) - dy * Math.sin(rot);
+  const ty = dx * Math.sin(rot) + dy * Math.cos(rot);
+  const n = 8;
+  for (let k = 0; k < n && exN < ESC_MAX - 2; k++) {
+    const i = exN++;
+    const a = (k / n) * TAU;
+    const rr = 22 + Math.random() * 26;
+    ex[i] = x + Math.cos(a) * rr * 0.5;
+    ey[i] = y + Math.sin(a) * rr * 0.34;
+    const sp = 90 + Math.random() * 150;
+    evx[i] = tx * sp + dx * 40;
+    evy[i] = ty * sp * 0.62 + dy * 30;
+    el[i] = 0.85 + Math.random() * 0.5;
+  }
+}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  rim: rimN, esc: exN, yrc: !!curYrc, lit: lit,
+  rows: lay ? lay.rowInfo.length : 0, fs: lay ? lay.fs : 0,
+  chars: ctArr ? ctArr.length : 0, T: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

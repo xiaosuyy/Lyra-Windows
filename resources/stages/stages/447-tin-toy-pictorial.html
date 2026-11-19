@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>447 · 铁皮画报</title>
+<style>
+  html,body{margin:0;height:100%;background:#f0dcb8;overflow:hidden}
+  #stage{position:fixed;inset:0}
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #veil{position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(128% 100% at 50% 40%,rgba(255,248,230,0) 42%,rgba(70,35,15,.20) 100%);}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="bg"></canvas>
+  <canvas id="ly"></canvas>
+  <div id="veil"></div>
+</div>
+<script>
+/* ================= 447 · 铁皮画报 =================
+   1980s 中国画报 / 铁皮发条玩具 / 三原色套印
+   静态画报底离屏预渲染，逐句只重绘画词层 */
+var W = 1440, H = 900, DPR = 1, RM = false;
+var LINES = [], IDX = -1, T = 0, PLAYING = true;
+var FRAMES = 0, JSMS = 0, ERR = "", ACCENT = [214, 54, 40], SONG = '铁皮画报';
+var bg, bx, ly, lx, bgDirty = true, pW = 0, curLayout = null, curKey = '';
+var hlY = null, hlN = null;
+var BEAT_LV = 0, FLASH = 0, LIVE = { level: 0, bass: 0, mid: 0, treble: 0 };
+var GRAIN = null, DOTS = null, TICKERW = 0;
+
+var RED = '#d8342a', BLUE = '#1d5fae', YEL = '#f2c32c', CREAM = '#f7e8c8', INK = '#22180f';
+var PORTRAIT = false, LEFTX = 0, HEADY = 0.47;
+
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+/* ---- 自检口：最外层无条件赋值 ---- */
+window.__stage = function () {
+  return {
+    lines: LINES.length, idx: IDX, t: T, playing: PLAYING, frames: FRAMES, js: JSMS,
+    err: ERR, text: (IDX >= 0 && LINES[IDX]) ? (LINES[IDX].text || '') : '',
+    gl: false, rm: RM
+  };
+};
+
+function safe(fn, tag) { try { fn(); } catch (e) { ERR = String((e && e.message) || e); console.error('[' + tag + ']', e); } }
+
+function normLines(arr) {
+  var out = [];
+  if (!arr || !arr.length) return out;
+  var n = Math.min(arr.length, 400);
+  for (var i = 0; i < n; i++) {
+    var L = arr[i]; if (!L) continue;
+    var t = +L.t; if (!isFinite(t)) t = 0;
+    var d = +L.dur; if (!isFinite(d) || d < 0) d = 0;
+    var txt = L.text == null ? '' : String(L.text).replace(/\s+$/, '');
+    if (!txt) continue;
+    out.push({ t: t, dur: d, text: txt, chars: (L.chars && L.chars.length) ? L.chars : null });
+  }
+  out.sort(function (a, b) { return a.t - b.t; });
+  return out;
+}
+function findIdx(t) {
+  var i = -1;
+  for (var k = 0; k < LINES.length; k++) { if (LINES[k].t <= t + 0.05) i = k; else break; }
+  return i;
+}
+function measure() {
+  var w = window.innerWidth, h = window.innerHeight;
+  if (!isFinite(w) || w < 2) w = 1440;
+  if (!isFinite(h) || h < 2) h = 900;
+  W = w; H = h; DPR = Math.min(window.devicePixelRatio || 1, 2);
+  PORTRAIT = H > W * 1.05;
+  LEFTX = PORTRAIT ? 0 : W * 0.043;
+  HEADY = PORTRAIT ? 0.545 : 0.455;
+}
+function setupC(cv, ctx) {
+  var w = Math.max(1, Math.round(W * DPR)), h = Math.max(1, Math.round(H * DPR));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+function font(size, weight) {
+  return (weight || 900) + ' ' + size.toFixed(1) + 'px "PingFang SC","Microsoft YaHei","Noto Sans SC","Hiragino Sans GB",sans-serif';
+}
+
+/* ================= 静态画报底 ================= */
+function makeGrain() {
+  var c = document.createElement('canvas'); c.width = c.height = 150;
+  var g = c.getContext('2d'), i, x, y;
+  g.fillStyle = '#fff';
+  for (i = 0; i < 900; i++) {
+    x = (i * 73.13 % 150); y = (i * 41.77 % 150);
+    g.fillRect(x, y, 1.25, 1.25);
+  }
+  return c;
+}
+function makeDots() {
+  var c = document.createElement('canvas'); c.width = c.height = 14;
+  var g = c.getContext('2d');
+  g.fillStyle = 'rgba(255,248,225,.85)';
+  g.beginPath(); g.arc(7, 7, 2.2, 0, 6.2832); g.fill();
+  return c;
+}
+
+function drawMasthead(b) {
+  var txt = String(SONG || '铁皮画报').replace(/\s+/g, ' ');
+  if (txt.length > 11) txt = txt.slice(0, 11) + '·';
+  var fs = Math.min(H * 0.115, W * 0.082);
+  if (PORTRAIT) fs = Math.min(H * 0.075, W * 0.155);
+  fs = Math.max(22, fs);
+  b.save();
+  b.textAlign = 'center'; b.textBaseline = 'alphabetic'; b.lineJoin = 'round';
+  b.font = font(fs);
+  b.translate(W / 2, H * (PORTRAIT ? 0.085 : 0.102));
+  b.transform(1, 0, -0.155, 1, 0, 0);
+  // 蓝色套印错位（露出版口）
+  b.strokeStyle = BLUE; b.lineWidth = fs * 0.115;
+  b.strokeText(txt, fs * 0.035, -fs * 0.028);
+  b.fillStyle = 'rgba(29,95,174,.55)';
+  b.fillText(txt, fs * 0.035, -fs * 0.028);
+  // 墨线描边
+  b.strokeStyle = INK; b.lineWidth = fs * 0.24; b.lineJoin = 'round';
+  b.strokeText(txt, 0, 0);
+  // 正红套印
+  b.fillStyle = RED; b.fillText(txt, 0, 0);
+  b.restore();
+
+  // 报头小装饰线
+  b.fillStyle = INK;
+  b.fillRect(W * 0.07, H * (PORTRAIT ? 0.108 : 0.132), W * 0.86, 3);
+  b.fillRect(W * 0.07, H * (PORTRAIT ? 0.115 : 0.139), W * 0.86, 1.5);
+}
+
+function drawSun(b) {
+  var R = Math.min(W, H) * (PORTRAIT ? 0.30 : 0.235);
+  var cx = PORTRAIT ? W * 0.72 : W * 0.175;
+  var cy = PORTRAIT ? H * 0.235 : H * 0.315;
+  // 光芒
+  b.save(); b.translate(cx, cy);
+  b.fillStyle = YEL; b.globalAlpha = 0.55;
+  for (var i = 0; i < 16; i++) {
+    b.rotate(Math.PI * 2 / 16);
+    b.beginPath();
+    b.moveTo(R * 1.44, 0); b.lineTo(R * 1.72, -R * 0.085); b.lineTo(R * 1.72, R * 0.085);
+    b.closePath(); b.fill();
+  }
+  b.restore();
+  // 圆盘 + 网点半调渐变
+  if (!DOTS) DOTS = makeDots();
+  b.save();
+  b.beginPath(); b.arc(cx, cy, R, 0, 6.2832); b.closePath();
+  b.fillStyle = YEL; b.fill();
+  b.clip();
+  if (DOTS) {
+    b.fillStyle = b.createPattern(DOTS, 'repeat');
+    b.globalAlpha = 0.55;
+    b.fillRect(cx - R, cy, R * 2, R);
+  }
+  b.globalAlpha = 0.10;
+  b.fillStyle = RED;
+  b.beginPath(); b.arc(cx + R * 0.55, cy + R * 0.45, R * 0.95, 0, 6.2832); b.fill();
+  b.restore();
+  b.strokeStyle = INK; b.lineWidth = Math.max(2, R * 0.014);
+  b.beginPath(); b.arc(cx, cy, R, 0, 6.2832); b.stroke();
+  // 内圈虚线
+  b.save(); b.setLineDash([R * 0.06, R * 0.05]); b.lineWidth = R * 0.012;
+  b.beginPath(); b.arc(cx, cy, R * 0.80, 0, 6.2832); b.stroke(); b.restore();
+}
+
+function drawBuildings(b) {
+  var gy = H * (PORTRAIT ? 0.80 : 0.76);
+  var n = 11, i, x = -W * 0.02, bw, bh, seed;
+  // 远景浅蓝
+  b.fillStyle = 'rgba(29,95,174,.30)';
+  for (i = 0; i < n; i++) {
+    seed = Math.abs(Math.sin(i * 12.9898) * 43758.5453) % 1;
+    bw = W * (0.055 + seed * 0.045);
+    bh = H * (0.06 + seed * 0.13);
+    b.fillRect(x, gy - bh, bw, bh);
+    x += bw + W * 0.012;
+  }
+  // 近景蓝块
+  b.fillStyle = BLUE;
+  b.globalAlpha = 0.92;
+  x = W * 0.30;
+  for (i = 0; i < 6; i++) {
+    seed = Math.abs(Math.sin((i + 4) * 7.31) * 2001.7) % 1;
+    bw = W * (0.045 + seed * 0.05);
+    bh = H * (0.05 + seed * 0.10);
+    b.fillRect(x, gy - bh, bw, bh);
+    x += bw + W * 0.011;
+  }
+  b.globalAlpha = 1;
+  // 地平线
+  b.fillStyle = INK; b.fillRect(0, gy, W, 3);
+  // 红蓝斜条带（套印刷版痕）
+  b.save();
+  if (PORTRAIT) {
+    b.globalAlpha = 0.9;
+    b.fillStyle = RED; b.fillRect(0, gy + 3, W * 0.62, H * 0.026);
+    b.fillStyle = BLUE; b.fillRect(W * 0.62, gy + 3, W * 0.38, H * 0.026);
+  } else {
+    b.translate(W * 0.5, gy + H * 0.055);
+    b.rotate(-0.055);
+    b.fillStyle = RED; b.fillRect(-W, 0, W * 2, H * 0.016);
+    b.fillStyle = BLUE; b.fillRect(-W, H * 0.030, W * 2, H * 0.008);
+    b.fillStyle = YEL; b.fillRect(-W, H * 0.046, W * 2, H * 0.005);
+  }
+  b.restore();
+}
+
+function drawBike(b) {
+  var gy = H * (PORTRAIT ? 0.80 : 0.76);
+  var s = Math.min(W, H) * 0.085;
+  var cx = W * 0.135, cy = gy - s * 0.62;
+  var r = s * 0.42, dx = s * 0.92;
+  b.save();
+  b.strokeStyle = INK; b.lineWidth = Math.max(2, s * 0.048); b.lineCap = 'round';
+  // 轮
+  for (var k = 0; k < 2; k++) {
+    b.beginPath(); b.arc(cx + (k ? dx : 0), cy, r, 0, 6.2832); b.stroke();
+    b.beginPath(); b.arc(cx + (k ? dx : 0), cy, r * 0.16, 0, 6.2832); b.stroke();
+  }
+  // 车架
+  b.beginPath();
+  b.moveTo(cx, cy); b.lineTo(cx + dx * 0.5, cy - s * 0.50);
+  b.lineTo(cx + dx * 0.92, cy - s * 0.44); b.lineTo(cx + dx, cy);
+  b.moveTo(cx + dx * 0.5, cy - s * 0.50); b.lineTo(cx + dx * 0.46, cy);
+  b.lineTo(cx + dx * 0.92, cy - s * 0.44);
+  b.stroke();
+  // 车把 + 座
+  b.beginPath();
+  b.moveTo(cx + dx * 0.99, cy - s * 0.44); b.lineTo(cx + dx * 1.04, cy - s * 0.60);
+  b.moveTo(cx + dx * 0.42, cy - s * 0.50); b.lineTo(cx + dx * 0.30, cy - s * 0.60);
+  b.stroke();
+  // 红车筐
+  b.fillStyle = RED;
+  b.fillRect(cx + dx * 0.98, cy - s * 0.55, s * 0.30, s * 0.23);
+  b.strokeRect(cx + dx * 0.98, cy - s * 0.55, s * 0.30, s * 0.23);
+  b.restore();
+}
+
+function drawAthlete(b) {
+  var gy = H * (PORTRAIT ? 0.80 : 0.76);
+  var s = Math.min(W, H) * 0.062;
+  var cx = W * 0.855, cy = gy - s * 1.05;
+  b.save();
+  b.strokeStyle = INK; b.lineWidth = Math.max(2, s * 0.10); b.lineCap = 'round';
+  b.fillStyle = RED;
+  // 头
+  b.beginPath(); b.arc(cx, cy - s * 1.02, s * 0.30, 0, 6.2832); b.fill(); b.stroke();
+  // 身体
+  b.beginPath(); b.moveTo(cx, cy - s * 0.72); b.lineTo(cx, cy + s * 0.02); b.stroke();
+  // 腿（马步）
+  b.beginPath();
+  b.moveTo(cx, cy + s * 0.02); b.lineTo(cx - s * 0.42, cy + s * 0.55);
+  b.moveTo(cx, cy + s * 0.02); b.lineTo(cx + s * 0.42, cy + s * 0.55);
+  b.stroke();
+  // 杠铃
+  b.lineWidth = Math.max(2, s * 0.055);
+  b.beginPath(); b.moveTo(cx - s * 1.15, cy - s * 0.62); b.lineTo(cx + s * 1.15, cy - s * 0.62); b.stroke();
+  // 手臂
+  b.lineWidth = Math.max(2, s * 0.10);
+  b.beginPath();
+  b.moveTo(cx, cy - s * 0.60); b.lineTo(cx - s * 0.55, cy - s * 1.02); b.lineTo(cx - s * 0.55, cy - s * 0.62);
+  b.moveTo(cx, cy - s * 0.60); b.lineTo(cx + s * 0.55, cy - s * 1.02); b.lineTo(cx + s * 0.55, cy - s * 0.62);
+  b.stroke();
+  // 铁片
+  b.fillStyle = BLUE;
+  b.beginPath(); b.arc(cx - s * 1.20, cy - s * 0.62, s * 0.26, 0, 6.2832); b.fill();
+  b.beginPath(); b.arc(cx + s * 1.20, cy - s * 0.62, s * 0.26, 0, 6.2832); b.fill();
+  b.restore();
+}
+
+function drawBirds(b) {
+  var gy = H * (PORTRAIT ? 0.22 : 0.16), s = Math.min(W, H) * 0.016;
+  b.save(); b.strokeStyle = INK; b.lineWidth = Math.max(1.6, s * 0.34); b.lineCap = 'round';
+  for (var i = 0; i < 5; i++) {
+    var x = W * (0.42 + i * 0.085), y = gy + Math.sin(i * 1.7) * s * 2.4;
+    b.beginPath();
+    b.moveTo(x - s, y); b.quadraticCurveTo(x - s * 0.4, y - s * 0.9, x, y);
+    b.quadraticCurveTo(x + s * 0.4, y - s * 0.9, x + s, y);
+    b.stroke();
+  }
+  b.restore();
+}
+
+function drawKite(b) {
+  var sx = W * 0.87, sy = H * 0.30, tx = W * 0.60, ty = H * 0.13;
+  b.save();
+  b.strokeStyle = INK; b.lineWidth = 1.4; b.globalAlpha = 0.75;
+  b.beginPath(); b.moveTo(W * 0.80, H * 0.20); b.quadraticCurveTo(W * 0.88, H * 0.30, sx, sy); b.stroke();
+  b.globalAlpha = 1;
+  var s = Math.min(W, H) * 0.045;
+  b.translate(tx, ty); b.rotate(-0.22);
+  b.fillStyle = RED; b.beginPath();
+  b.moveTo(0, -s); b.lineTo(s * 0.72, 0); b.lineTo(0, s); b.lineTo(-s * 0.72, 0); b.closePath(); b.fill();
+  b.strokeStyle = INK; b.lineWidth = 2; b.stroke();
+  b.beginPath(); b.moveTo(0, -s); b.lineTo(0, s); b.moveTo(-s * 0.72, 0); b.lineTo(s * 0.72, 0);
+  b.strokeStyle = YEL; b.lineWidth = 2.5; b.stroke();
+  b.restore();
+}
+
+function drawMarks(b) {
+  // 印刷对位十字
+  var s = Math.min(W, H) * 0.018;
+  b.save();
+  b.strokeStyle = 'rgba(34,24,15,.55)'; b.lineWidth = 1.4;
+  var pts = [[W * 0.045, H * 0.045], [W * 0.955, H * 0.045]];
+  for (var i = 0; i < pts.length; i++) {
+    var x = pts[i][0], y = pts[i][1];
+    b.beginPath(); b.arc(x, y, s, 0, 6.2832); b.stroke();
+    b.beginPath(); b.moveTo(x - s * 1.7, y); b.lineTo(x + s * 1.7, y);
+    b.moveTo(x, y - s * 1.7); b.lineTo(x, y + s * 1.7); b.stroke();
+  }
+  b.restore();
+}
+
+function drawBase() {
+  var b = bx;
+  b.setTransform(DPR, 0, 0, DPR, 0, 0);
+  b.clearRect(0, 0, W, H);
+  // 纸底
+  var g = b.createLinearGradient(0, 0, W * 0.35, H);
+  g.addColorStop(0, '#f7ead0'); g.addColorStop(0.55, '#f0dcb8'); g.addColorStop(1, '#e6cda2');
+  b.fillStyle = g; b.fillRect(0, 0, W, H);
+
+  // 顶部淡蓝色块（画报天空）
+  b.fillStyle = 'rgba(29,95,174,.10)';
+  b.fillRect(0, 0, W, H * (PORTRAIT ? 0.42 : 0.34));
+
+  drawSun(b);
+  drawBirds(b);
+  drawKite(b);
+  drawBuildings(b);
+  if (!PORTRAIT) { drawBike(b); drawAthlete(b); }
+  drawMasthead(b);
+  drawMarks(b);
+
+  // 边距规线
+  b.strokeStyle = 'rgba(34,24,15,.30)'; b.lineWidth = 1;
+  b.strokeRect(W * 0.022, H * 0.022, W * 0.956, H * 0.956);
+
+  // 纸张颗粒
+  if (!GRAIN) GRAIN = makeGrain();
+  b.save();
+  b.globalAlpha = 0.055;
+  b.fillStyle = b.createPattern(GRAIN, 'repeat');
+  b.fillRect(0, 0, W, H);
+  b.restore();
+}
+
+/* ================= 歌词层 ================= */
+function buildLayout(txt) {
+  var boxW = PORTRAIT ? W * 0.86 : (W - LEFTX) * 0.88;
+  var boxH = H * (PORTRAIT ? 0.32 : 0.36);
+  var fs = Math.min(boxH * 0.42, W * 0.115);
+  fs = clamp(fs, 24, 140);
+  lx.font = font(fs);
+  var w = lx.measureText(txt).width;
+  // 固定次数收敛：最多 8 步缩到装下为止；仍超长则硬截断（带省略号）
+  var g;
+  for (g = 0; g < 8 && w > boxW && fs > 22; g++) {
+    fs = Math.max(22, fs * Math.min(0.92, boxW / w));
+    lx.font = font(fs);
+    w = lx.measureText(txt).width;
+  }
+  if (w > boxW && txt.length > 4) {
+    var cut = txt.length, guard;
+    for (guard = 0; guard < 40; guard++) {
+      cut--;
+      if (cut < 3) break;
+      if (lx.measureText(txt.slice(0, cut) + '…').width <= boxW) break;
+    }
+    txt = txt.slice(0, Math.max(2, cut)) + '…';
+    w = lx.measureText(txt).width;
+  }
+  return { fs: fs, lines: [txt], w: [w] };
+}
+function charProg(L, t) {
+  if (!L) return 0;
+  if (L.chars && L.chars.length) {
+    var n = Math.min(L.chars.length, 300), c = 0, i, ct;
+    for (i = 0; i < n; i++) {
+      var o = L.chars[i];
+      ct = (o && isFinite(+o.t)) ? +o.t : L.t;
+      if (t >= ct - 0.01) c = i + 1;
+    }
+    return n ? c / n : 0;
+  }
+  if (L.dur > 0.12) return clamp((t - L.t) / L.dur, 0, 1);
+  return 1;
+}
+function paintLine(c2, str, x, y, fs, fill) {
+  var off = fs * 0.032;
+  c2.fillStyle = 'rgba(34,24,15,.40)';               // 套印错位的暗影
+  c2.fillText(str, x + off, y + off * 1.4);
+  c2.lineJoin = 'round'; c2.miterLimit = 2;
+  c2.strokeStyle = 'rgba(20,13,7,.96)';
+  c2.lineWidth = Math.max(5, fs * 0.175);
+  c2.strokeText(str, x, y);
+  c2.fillStyle = fill;
+  c2.fillText(str, x, y);
+}
+/* 已唱图 / 未唱图 各预渲染一次，每帧只做两次 drawImage + 一次裁剪 */
+function renderHeadline() {
+  var lay = curLayout;
+  if (!lay) { hlY = null; hlN = null; return; }
+  var fs = lay.fs, lh = fs * 1.13, n = lay.lines.length;
+  var top = H * HEADY - (n - 1) * lh * 0.5;
+  var x0 = PORTRAIT ? W * 0.5 : LEFTX + (W - LEFTX) * 0.5;
+  var pad = fs * 0.55;
+  var bh = Math.min(H, lh * n + pad * 2);
+  var oy = top - lh * 0.5 - pad;
+  var mw = 0, i;
+  for (i = 0; i < n; i++) mw = Math.max(mw, lay.w[i] || 0);
+  lay.cx = x0; lay.top = top; lay.lh = lh; lay.oy = oy; lay.bh = bh; lay.mw = mw;
+  lay.bw = W;
+  var pw = Math.max(1, Math.round(W * DPR)), ph = Math.max(1, Math.round(bh * DPR));
+  if (!hlY) hlY = document.createElement('canvas');
+  if (!hlN) hlN = document.createElement('canvas');
+  var set = [hlY, hlN], fills = ['#ffcf2e', '#fdf6e4'], j, cv, c2;
+  for (j = 0; j < 2; j++) {
+    cv = set[j];
+    if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; }
+    c2 = cv.getContext('2d');
+    c2.setTransform(DPR, 0, 0, DPR, 0, 0);
+    c2.clearRect(0, 0, W, bh);
+    c2.textAlign = 'center'; c2.textBaseline = 'middle';
+    c2.font = font(fs);
+    for (i = 0; i < n; i++) paintLine(c2, lay.lines[i], x0, top - oy + i * lh, fs, fills[j]);
+  }
+  lay.ready = 1;
+}
+function drawHeadline(prog) {
+  var lay = curLayout;
+  if (!lay || !lay.ready || !hlN || !hlY) return;
+  var mw = lay.mw || 0;
+  var revealW = mw * clamp(prog, 0, 1);
+  var lx0 = lay.cx - mw * 0.5;
+  var right = lx0 + revealW;
+  // 未唱底（整句）
+  lx.drawImage(hlN, 0, lay.oy, lay.bw, lay.bh);
+  if (revealW > 0.5) {
+    // 已唱区：把黄图裁成一条贴上去
+    lx.save();
+    lx.beginPath();
+    lx.rect(lx0, lay.oy, revealW, lay.bh);
+    lx.clip();
+    lx.drawImage(hlY, 0, lay.oy, lay.bw, lay.bh);
+    lx.restore();
+    // 揭示前沿：一道竖的套印红线
+    lx.save();
+    lx.globalAlpha = 0.75;
+    lx.fillStyle = RED;
+    lx.fillRect(right, lay.oy + lay.bh * 0.16, Math.max(2, lay.fs * 0.045), lay.bh * 0.68);
+    lx.restore();
+  }
+}
+function drawLyrics() {
+  var L = (IDX >= 0) ? LINES[IDX] : null;
+  var txt, prog = 0;
+  if (!LINES.length) {
+    txt = '这一首没有歌词';
+    if (curKey !== 'empty|' + W + H) { curLayout = buildLayout(txt); renderHeadline(); curKey = 'empty|' + W + H; }
+    drawHeadline(0);
+    return;
+  }
+  if (!L) {
+    txt = '前奏';
+    if (curKey !== 'pre|' + W + H) { curLayout = buildLayout(txt); renderHeadline(); curKey = 'pre|' + W + H; }
+    drawHeadline(0);
+    return;
+  }
+  txt = L.text || '';
+  prog = charProg(L, T);
+  var key = IDX + '|' + txt + '|' + W.toFixed(0) + 'x' + H.toFixed(0);
+  if (key !== curKey) { curLayout = buildLayout(txt); renderHeadline(); curKey = key; }
+  drawHeadline(prog);
+  // 句下节奏条（从左侧起，随句推进）
+  if (prog > 0.004 && curLayout && curLayout.ready) {
+    var mw = curLayout.mw || 0;
+    var baseY = curLayout.top + curLayout.fs * 0.86;
+    var x0 = curLayout.cx;
+    var th = Math.max(2, curLayout.fs * 0.055);
+    lx.save();
+    lx.fillStyle = 'rgba(34,24,15,.82)';
+    lx.fillRect(x0 - mw * 0.5, baseY, mw, th);
+    lx.fillStyle = accentCss(1);
+    lx.fillRect(x0 - mw * 0.5, baseY, mw * prog, th);
+    lx.restore();
+  }
+}
+
+/* 角标：曲名 + 清单 */
+function drawCorner() {
+  var m = Math.min(W, H);
+  var fs = clamp(m * 0.021, 11, 21);
+  var y = H - clamp(H * 0.048, 22, 54) - fs * 1.7;
+  lx.save();
+  lx.font = font(fs, 700); lx.textBaseline = 'alphabetic'; lx.textAlign = 'left';
+  var txt = String(SONG || '未知曲目');
+  if (txt.length > 22) txt = txt.slice(0, 22) + '…';
+  lx.globalAlpha = 0.86;
+  lx.fillStyle = INK;
+  lx.fillText('曲目 · ' + txt, W * 0.045, y);
+  lx.textAlign = 'right';
+  lx.fillText((IDX + 1) + ' / ' + LINES.length, W * 0.955, y);
+  lx.restore();
+}
+
+/* ================= 动态层：清单 / 跑马条 / 闪烁 ================= */
+function drawSide(tt) {
+  if (PORTRAIT) return;
+  var cw = clamp(Math.min(W * 0.050, H * 0.070), 24, 92);
+  var lfs = clamp(cw * 0.72, 12, 60);
+  var rowH = cw * 1.08;
+  var x = LEFTX + cw * 0.55;
+  var cy = H * HEADY;
+  var dist, i, k, y, t, prog, alpha;
+  lx.save();
+  lx.textAlign = 'center'; lx.textBaseline = 'middle';
+  for (dist = 5; dist >= 0; dist--) {               // 当前句在最下、往上叠历史
+    k = IDX - dist;
+    if (k < 0 || k >= LINES.length) continue;
+    t = (LINES[k].text || '·').charAt(0);
+    y = cy - dist * rowH;
+    if (y < H * 0.14 || y > H * 0.84) continue;
+    alpha = clamp(1 - dist * 0.16, 0.18, 1);
+    if (dist === 0) {
+      prog = charProg(LINES[k], tt);
+      lx.globalAlpha = 1;
+      lx.fillStyle = RED;
+      lx.fillRect(x - cw * 0.52, y - cw * 0.52, cw * 1.04, cw * 1.04);
+      lx.fillStyle = YEL;                          // 已唱比例：黄底从下往上长
+      lx.fillRect(x - cw * 0.52, y + cw * 0.52 - cw * 1.04 * prog, cw * 1.04, cw * 1.04 * prog);      lx.strokeStyle = INK; lx.lineWidth = 2;
+      lx.strokeRect(x - cw * 0.52, y - cw * 0.52, cw * 1.04, cw * 1.04);
+      lx.font = font(lfs, 900);
+      lx.fillStyle = '#fffaf0';
+      lx.fillText(t, x, y + 1);
+    } else {
+      lx.globalAlpha = alpha * 0.85;
+      lx.font = font(lfs * 0.86, 700);
+      lx.fillStyle = INK;
+      lx.fillText(t, x, y);
+    }
+  }
+  lx.restore();
+}
+function drawTicker(tt) {
+  var h = clamp(H * 0.048, 22, 54);
+  var y = H - h;
+  var fs = clamp(h * 0.52, 10, 26);
+  lx.save();
+  lx.fillStyle = INK;
+  lx.fillRect(0, y, W, h);
+  lx.beginPath(); lx.rect(0, y, W, h); lx.clip();
+  lx.font = font(fs, 700); lx.textBaseline = 'middle'; lx.textAlign = 'left';
+  var base = '铁皮发条 · 中国唱片 · 永久自行车 · ' + (SONG || '未知曲目') + ' · 1986 年画报 · ';
+  if (!TICKERW) { TICKERW = lx.measureText(base).width || W; }
+  var off = RM ? 0 : ((tt * 42) % TICKERW);
+  var x = -off, guard;
+  lx.fillStyle = YEL;
+  for (guard = 0; guard < 6; guard++) {
+    lx.fillText(base, x, y + h * 0.52);
+    x += TICKERW;
+    if (x > W + 10) break;
+  }
+  lx.restore();
+}
+function drawFlash() {
+  if (FLASH <= 0.02) return;
+  // 只在四边压一圈，不覆盖正文（整屏泛红会冲掉歌词对比度）
+  var a = FLASH * 0.40;
+  var e = Math.max(3, Math.min(W, H) * 0.010);
+  lx.save();
+  lx.fillStyle = RED; lx.globalAlpha = a;
+  lx.fillRect(0, 0, W, e); lx.fillRect(0, H - e, W, e);
+  lx.fillRect(0, 0, e, H); lx.fillRect(W - e, 0, e, H);
+  lx.globalAlpha = a * 0.5;
+  lx.fillStyle = accentCss(1);
+  lx.fillRect(0, e, W, e * 0.45);
+  lx.restore();
+}
+
+/* 铁皮发条钥匙：随鼓点转动 —— 这一条的灵魂符号 */
+function drawKeyWrap(tt) {
+  var s = Math.min(W, H) * (PORTRAIT ? 0.075 : 0.058);
+  var cx = PORTRAIT ? W * 0.16 : W * 0.075;
+  var cy = PORTRAIT ? H * 0.155 : H * 0.815;
+  var spin = RM ? 0 : (tt * 1.1);
+  lx.save();
+  lx.translate(cx, cy);
+  lx.globalAlpha = 0.95;
+  // 底盘（黄铜色圆片）
+  lx.fillStyle = YEL;
+  lx.beginPath(); lx.arc(0, 0, s, 0, 6.2832); lx.fill();
+  lx.strokeStyle = INK; lx.lineWidth = Math.max(2, s * 0.10); lx.stroke();
+  // 齿圈
+  lx.save();
+  lx.rotate(spin);
+  lx.fillStyle = RED;
+  var i, guard;
+  for (i = 0; i < 8; i++) {
+    lx.rotate(6.2832 / 8);
+    lx.fillRect(-s * 0.10, -s * 0.98, s * 0.20, s * 0.20);
+  }
+  lx.restore();
+  // 钥匙杆 + 蝴蝶结
+  lx.save();
+  lx.rotate(-spin * 0.7);
+  lx.strokeStyle = INK; lx.lineWidth = Math.max(2.5, s * 0.16); lx.lineCap = 'round';
+  lx.beginPath(); lx.moveTo(0, 0); lx.lineTo(0, -s * 0.30); lx.stroke();
+  lx.beginPath(); lx.arc(0, 0, s * 0.26, 0, 6.2832);
+  lx.fillStyle = CREAM; lx.fill(); lx.stroke();
+  lx.beginPath(); lx.arc(0, 0, s * 0.10, 0, 6.2832);
+  lx.fillStyle = INK; lx.fill();
+  lx.restore();
+  lx.restore();
+  // 标签
+  lx.save();
+  lx.font = font(Math.max(10, s * 0.30), 700);
+  lx.textAlign = 'center'; lx.textBaseline = 'top';
+  lx.fillStyle = 'rgba(34,24,15,.75)';
+  lx.fillText('上弦', cx, cy + s * 1.22);
+  lx.restore();
+}
+
+function accentCss(a) { return 'rgba(' + ACCENT[0] + ',' + ACCENT[1] + ',' + ACCENT[2] + ',' + a + ')'; }
+
+/* ================= 帧 ================= */
+function frame(now) {
+  FRAMES++;
+  var t0 = performance.now();
+  try {
+    if (bgDirty) { drawBase(); bgDirty = false; }
+    pW += (BEAT_LV - pW) * 0.12;                      // 平滑
+    FLASH *= RM ? 0.85 : 0.80;
+    lx.clearRect(0, 0, W, H);
+    drawTicker(T);
+    drawSide(T);
+    drawLyrics();
+    drawKeyWrap(T);
+    drawCorner();
+    if (!RM) drawFlash();
+    // 频谱呼吸：太阳外圈脉冲（轻量，仅描边）
+    var pulse = (RM ? 0 : (LIVE.bass * 0.5 + pW * 0.5));
+    if (pulse > 0.02) {
+      lx.save();
+      lx.globalAlpha = 0.16 * pulse;
+      lx.strokeStyle = RED; lx.lineWidth = Math.max(2, W * 0.004);
+      var R = Math.min(W, H) * (PORTRAIT ? 0.30 : 0.235) * (1 + 0.10 * pulse);
+      lx.beginPath();
+      lx.arc(PORTRAIT ? W * 0.72 : W * 0.175, PORTRAIT ? H * 0.235 : H * 0.315, R, 0, 6.2832);
+      lx.stroke();
+      lx.restore();
+    }
+  } catch (e) { ERR = String((e && e.message) || e); console.error('[frame]', e); }
+  JSMS = +(performance.now() - t0).toFixed(3);
+  requestAnimationFrame(frame);
+}
+
+/* ================= 消息 ================= */
+function onMsg(e) {
+  var d = e && e.data; if (!d || d.__c100 !== 1) return;
+  var p = d.payload || {};
+  if (d.type === 'init') {
+    safe(function () {
+      var song = p.song || {};
+      var nm = (typeof song.name === 'string' && song.name) ? song.name : '未知曲目';
+      var ar = song.artists;
+      if (Array.isArray(ar)) ar = ar.filter(Boolean).join('、');
+      if (typeof ar === 'string' && ar) nm += ' · ' + ar;
+      SONG = nm;
+      if (Array.isArray(p.accent) && p.accent.length >= 3) {
+        ACCENT = [clamp(+p.accent[0] | 0, 0, 255), clamp(+p.accent[1] | 0, 0, 255), clamp(+p.accent[2] | 0, 0, 255)];
+      }
+      LINES = normLines(p.lines);
+      IDX = findIdx(T);
+      curKey = '';
+      TICKERW = 0;
+      if (typeof p.playing === 'boolean') PLAYING = p.playing; else PLAYING = true;
+      bgDirty = true;
+      if (!LINES.length) IDX = -1;
+    }, 'init');
+  } else if (d.type === 'tick') {
+    safe(function () {
+      var tt = +p.time; if (isFinite(tt)) T = Math.max(0, tt);
+      if (typeof p.playing === 'boolean') PLAYING = p.playing;
+      var n = findIdx(T);
+      if (n !== IDX) { IDX = n; curKey = ''; }
+    }, 'tick');
+  } else if (d.type === 'beat') {
+    BEAT_LV = clamp(+p.level || 0, 0, 1);
+    if (!RM) FLASH = Math.min(1, 0.45 + BEAT_LV * 0.55);
+  } else if (d.type === 'live') {
+    LIVE.level = clamp(+p.level || 0, 0, 1);
+    LIVE.bass = clamp(+p.bass || 0, 0, 1);
+    if (typeof p.playing === 'boolean') PLAYING = p.playing;
+  }
+}
+
+/* ================= 启动 ================= */
+var readySent = 0;
+function sendReady() {
+  if (readySent) return; readySent = 1;
+  safe(function () { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }, 'ready');
+}
+function resizeStage() {
+  safe(function () {
+    measure();
+    if (!bg || !ly) return;
+    setupC(bg, bx); setupC(ly, lx);
+    bgDirty = true; curKey = ''; TICKERW = 0;
+    hlY = null; hlN = null;                  // 尺寸变了，词层缓存作废
+    if (curLayout) { curLayout.ready = 0; }
+    safe(drawBase, 'base');
+  }, 'resize');
+}
+
+safe(function () {
+  bg = document.getElementById('bg'); bx = bg.getContext('2d');
+  ly = document.getElementById('ly'); lx = ly.getContext('2d');
+  RM = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}, 'boot');
+
+safe(function () { measure(); }, 'measure0');
+
+window.addEventListener('message', onMsg);
+window.addEventListener('resize', resizeStage);
+window.addEventListener('orientationchange', resizeStage);
+
+requestAnimationFrame(function () {
+  sendReady();
+  safe(function () {
+    resizeStage();
+    try { curLayout = buildLayout('铁皮画报'); renderHeadline(); curKey = 'boot'; } catch (e) { console.error('[boot-layout]', e); }
+    frame(0);
+  }, 'first');
+});
+setTimeout(sendReady, 700);
+</script>
+</body>
+</html>

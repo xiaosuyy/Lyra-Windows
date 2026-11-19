@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>字符相机</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(175,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   025 · 字符相机 —— 整屏是一台**字符显像管**
+   ----------------------------------------------------------------------------
+   屏幕被切成上千个字符格，每格显示哪个字符由**字形采样值**决定 ——
+   不是把字"贴"在字符上，而是字的灰度被量化成字符。
+
+   精修记录：① 歌词区独立成一块"字符显像管"：整句先按自适应字号画进离屏
+     canvas，再按 4×7px 单元格平均 alpha 采样，alpha→密度梯度 " .:-=+*#%@"，
+     **字符只由采样值决定、整句锁死不再变**；41 字长句折 3 排（每排 ≤14 字，
+     一个汉字 ≈ 23×16 个字符格，字号 ≈91px），汉字读得出来、整句不裁切；
+   ② YRC 接 chars[k].t（chars 长度不等于 text 长度则按 t+dur*i/n 均分）——
+     只改亮度不改字符：未唱暗青、点火闪白、回落到近白常亮；
+   ③ 每字亮度量化成 8 档，只在档位变化时重绘**这个字自己那一小片**（列区间×行
+     区间，同档只设一次 fillStyle），离屏面板整体 drawImage 上屏；换句时逐行
+     扫入，避免一帧画几千个字符卡一下；
+   ④ 背景保留流动字符噪点（相位预算、帧内只做乘加）+ beat 相干扫描墙 + 酝酿
+     涟漪，歌词区压暗 52% 留白；
+   ⑤ 换句字形整体淡入 0.25s，四角有淡淡的取景框。
+   分词说明：不用分词。本形态的机关就是"一个汉字 = 一片字符格"，逐字点亮才是
+     显像管的量化感；按词团点亮会把字符网格的独立性抹掉。
+   ========================================================================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+
+/* ======================= 状态（先声明，后面的函数都要用） ================= */
+let lines = [];
+let accent = [160, 176, 255];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let beat = 0;
+let swX = 1e9, swV = 70;                 // beat 扫描墙
+let rip = 0, ripAmp = 0, ripSpeed = 26;  // 酝酿涟漪
+
+/* ======================= 背景：粗字符网格（纯装饰） ======================= */
+const BCW = 10, BCH = 16;
+const bgcv = document.createElement('canvas');   // 背景字符单独一层，30Hz 重绘后再贴上来
+const bgctx = bgcv.getContext('2d', { alpha: false });
+let bgFrame = 0;
+const BG_RAMP = " .':-=+*xX#%";
+const BGN = BG_RAMP.length;
+let bcols = 1, brows = 1, box = 0, boy = 0;
+let s1 = null, c1 = null, s2 = null, c2 = null, bval = null;
+
+function buildBG() {
+  bcols = Math.max(8, Math.ceil(W / BCW));
+  brows = Math.max(6, Math.ceil(H / BCH));
+  box = (W - bcols * BCW) * 0.5 + BCW * 0.5;
+  boy = (H - brows * BCH) * 0.5 + BCH * 0.5;
+  const n = bcols * brows;
+  s1 = new Float32Array(n); c1 = new Float32Array(n);
+  s2 = new Float32Array(n); c2 = new Float32Array(n);
+  bval = new Float32Array(n);
+  for (let y = 0; y < brows; y++) {
+    const ny = (brows > 1 ? y / (brows - 1) : 0.5) * 2 - 1;
+    for (let x = 0; x < bcols; x++) {
+      const nx = (bcols > 1 ? x / (bcols - 1) : 0.5) * 2 - 1;
+      const i = y * bcols + x;
+      /* 把静态相位预存成 sin/cos，帧内只需要乘加，不再算 sin */
+      const p1 = nx * 3.1 + ny * 2.2;
+      const p2 = ny * 2.7 + nx;
+      s1[i] = Math.sin(p1); c1[i] = Math.cos(p1);
+      s2[i] = Math.sin(p2); c2[i] = Math.cos(p2);
+    }
+  }
+}
+
+/* ======================= 歌词面板：字形 → ASCII 单元 ===================== */
+const CELLW = 4, CELLH = 7;               // 一个字符格的像素尺寸
+const VS = 1.45;                          // 字符纵向拉伸，填满 4×7 的格子（不留横黑缝）
+const RAMP = " .:-=+*#%@";                // 密度梯度：alpha 越高越靠后
+const RN = RAMP.length;
+
+const gcv = document.createElement('canvas');
+const gctx = gcv.getContext('2d', { willReadFrequently: true });
+const pcv = document.createElement('canvas');   // 歌词面板缓冲（只重绘脏行）
+const pctx = pcv.getContext('2d');
+const FONTF = (s) => '600 ' + s + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+let panelOn = false;
+let pcols = 0, prows = 0, px0 = 0, py0 = 0, panelW = 0, panelH = 0;
+let fsPx = 0, glyphGain = 0, panelGlow = null;
+let cellRamp = null;                      // 每格密度档 0..9（0 = 空格子）
+let cellChar = null;                      // 每格所属字索引
+let charDirty = null;                     // 需要重绘的字
+let revealTo = 0;                         // 逐行扫入的进度
+let charTimes = null;                     // 每字点亮时刻（绝对秒）
+let charLevel = null;                     // 每字当前亮度档 0..7
+let charRow0 = null, charRow1 = null;     // 每字占的行区间
+let charCol0 = null, charCol1 = null;     // 每字占的列区间
+let yrcFlag = false;
+
+/* 8 档颜色：暗（未唱）→ 淡青紫 → 近白 → 纯白（点火） */
+const LV = new Array(8);
+function buildPalette() {
+  const ar = accent[0], ag = accent[1], ab = accent[2];
+  const pale = [
+    Math.round(120 + (ar - 120) * 0.55),
+    Math.round(210 + (ag - 210) * 0.55),
+    Math.round(235 + (ab - 235) * 0.55)
+  ];
+  const WH = [244, 250, 255];
+  const st = (t) => 'rgb(' + Math.round(pale[0] + (WH[0] - pale[0]) * t) + ',' +
+                            Math.round(pale[1] + (WH[1] - pale[1]) * t) + ',' +
+                            Math.round(pale[2] + (WH[2] - pale[2]) * t) + ')';
+  LV[0] = 'rgb(52,64,92)';                // 未唱：暗青，仍看得清
+  LV[1] = 'rgb(64,80,114)';
+  LV[2] = 'rgb(80,106,144)';
+  LV[3] = st(0.02);                       // 起亮：淡青紫
+  LV[4] = st(0.30);
+  LV[5] = st(0.66);                       // 唱到：近白
+  LV[6] = st(0.88);
+  LV[7] = 'rgb(255,255,255)';             // 点火瞬间：纯白
+}
+
+/* ---------- 长句折行：≤14 字 1 排、≤28 字 2 排、更长 3 排；不切拉丁词 ---------- */
+const LAT = /[A-Za-z0-9'’]/;
+function splitRows(text) {
+  const n = text.length;
+  const nR = n <= 14 ? 1 : (n <= 28 ? 2 : 3);
+  const cuts = [0];
+  if (nR === 1) { cuts.push(n); return { n: 1, cuts }; }
+  const per = Math.ceil(n / nR);
+  let start = 0;
+  for (let r = 1; r < nR; r++) {
+    let cut = Math.min(n, start + per);
+    if (LAT.test(text[cut - 1] || '') && LAT.test(text[cut] || '')) {
+      let moved = -1;
+      for (let d = 1; d <= 6 && moved < 0; d++) {
+        if (cut - d > start + 2 && /\s/.test(text[cut - d])) moved = cut - d;
+        else if (cut + d < n - 2 && /\s/.test(text[cut + d])) moved = cut + d + 1;
+      }
+      if (moved > 0) cut = moved;
+    }
+    cuts.push(cut);
+    start = cut;
+  }
+  cuts.push(n);
+  return { n: nR, cuts };
+}
+
+/* ---------- 建面板：量宽定字号 → 画字形 → 4×7 采样成字符格 ---------- */
+function buildGlyph(line) {
+  const text = line && line.text ? String(line.text) : '';
+  if (!text) {
+    panelOn = false; glyphGain = 0; panelGlow = null;
+    cellRamp = null; cellChar = null; charDirty = null;
+    charTimes = null; charLevel = null; charRow0 = null; charRow1 = null;
+    charCol0 = null; charCol1 = null;
+    panelW = 0; panelH = 0; pcols = 0; prows = 0;
+    return;
+  }
+
+  /* 逐字时间：chars 可信才用 YRC，否则均分回退 */
+  const n = text.length;
+  const chars = line.chars && line.chars.length === n ? line.chars : null;
+  yrcFlag = !!chars;
+  const dur = line.dur > 0 ? line.dur : 4;
+  const t0 = typeof line.t === 'number' ? line.t : 0;
+  charTimes = new Float64Array(n);
+  for (let k = 0; k < n; k++) {
+    const c = chars ? chars[k] : null;
+    charTimes[k] = c && isFinite(c.t) ? c.t : t0 + dur * k / n;
+  }
+  charLevel = new Uint8Array(n);
+  charLevel.fill(255);                    // 哨兵：首帧强制建立档位
+  charRow0 = new Int32Array(n);
+  charRow1 = new Int32Array(n);
+  charCol0 = new Int32Array(n);
+  charCol1 = new Int32Array(n);
+
+  const sp = splitRows(text);
+  const nR = sp.n, cuts = sp.cuts;
+  let maxChars = 1;
+  for (let i = 0; i < nR; i++) maxChars = Math.max(maxChars, cuts[i + 1] - cuts[i]);
+
+  /* 字号：先按"每排最多几个字"和可用高度估，再量实际宽度收敛一次 */
+  const padX = CELLW * 10;
+  const availW = W * 0.96 - padX * 2;
+  const availH = H * 0.72;
+  let fs = Math.min(availW / maxChars, availH / (nR * 1.24));
+  fs = Math.max(14, Math.min(300, fs * 0.985));
+  gctx.font = FONTF(fs);
+  let textW = 1;
+  const rowW = new Array(nR);
+  for (let i = 0; i < nR; i++) {
+    const w = gctx.measureText(text.slice(cuts[i], cuts[i + 1])).width;
+    rowW[i] = w;
+    if (w > textW) textW = w;
+  }
+  if (textW > availW) {                   // 拉丁/标点把行撑宽了就再收一次
+    fs = fs * (availW / textW);
+    gctx.font = FONTF(fs);
+    textW = 1;
+    for (let i = 0; i < nR; i++) {
+      const w = gctx.measureText(text.slice(cuts[i], cuts[i + 1])).width;
+      rowW[i] = w;
+      if (w > textW) textW = w;
+    }
+  }
+  fsPx = fs;
+
+  const pitch = fs * 1.24;
+  const padY = Math.max(CELLH * 4, Math.round(fs * 0.12));
+  panelW = Math.ceil(textW) + padX * 2;
+  panelH = Math.ceil(nR * pitch + padY * 2);
+  pcols = Math.max(8, Math.round(panelW / CELLW));
+  prows = Math.max(6, Math.round(panelH / CELLH));
+  panelW = pcols * CELLW;
+  panelH = prows * CELLH;
+  px0 = Math.round((W - panelW) * 0.5);
+  py0 = Math.round((H - panelH) * 0.5 - H * 0.012);
+
+  /* 字形画进离屏 canvas（CSS 像素，采样精度 = 显示像素） */
+  gcv.width = panelW; gcv.height = panelH;
+  gctx.clearRect(0, 0, panelW, panelH);
+  gctx.font = FONTF(fs);
+  gctx.textAlign = 'left';
+  gctx.textBaseline = 'middle';
+  gctx.fillStyle = '#ffffff';
+  const rowX = new Array(nR), rowY = new Array(nR);
+  for (let i = 0; i < nR; i++) {
+    rowX[i] = (panelW - rowW[i]) * 0.5;
+    rowY[i] = padY + i * pitch + pitch * 0.5;
+    gctx.fillText(text.slice(cuts[i], cuts[i + 1]), rowX[i], rowY[i]);
+  }
+
+  /* 每排的逐字像素边界，用来给每个字符格认领"它属于哪个字" */
+  const bnds = new Array(nR);
+  for (let i = 0; i < nR; i++) {
+    const seg = text.slice(cuts[i], cuts[i + 1]);
+    const b = new Float32Array(seg.length + 1);
+    for (let q = 1; q <= seg.length; q++) b[q] = gctx.measureText(seg.substring(0, q)).width;
+    bnds[i] = b;
+  }
+
+  const d = gctx.getImageData(0, 0, panelW, panelH).data;
+  cellRamp = new Uint8Array(pcols * prows);
+  cellChar = new Int16Array(pcols * prows);
+  cellChar.fill(-1);
+  charDirty = new Uint8Array(n);
+  charDirty.fill(1);
+  revealTo = 0;                           // 换句时逐行"扫进来"，别一帧画完卡一下
+
+  const inv = 1 / (255 * CELLW * CELLH);
+  for (let cy = 0; cy < prows; cy++) {
+    const y0 = cy * CELLH, y1 = y0 + CELLH;
+    for (let cx = 0; cx < pcols; cx++) {
+      const x0 = cx * CELLW, x1 = x0 + CELLW;
+      let sum = 0;
+      for (let py = y0; py < y1; py++) {
+        let o = (py * panelW + x0) * 4 + 3;
+        for (let px = x0; px < x1; px++, o += 4) sum += d[o];
+      }
+      const a = sum * inv;
+      if (a < 0.14) continue;                       // 太淡 → 空格子
+      let idx = 1 + Math.round((a - 0.14) / 0.86 * (RN - 2));
+      if (idx < 1) idx = 1; else if (idx > RN - 1) idx = RN - 1;
+      const ci = cy * pcols + cx;
+      cellRamp[ci] = idx;
+      /* 所属字：按格心 y 归排、按格心 x 在排内二分 */
+      let li = Math.floor((cy * CELLH + CELLH * 0.5 - padY) / pitch);
+      if (li < 0) li = 0; else if (li > nR - 1) li = nR - 1;
+      const xr = cx * CELLW + CELLW * 0.5 - rowX[li];
+      const b = bnds[li], len = b.length - 1;
+      let lo = 0, hi = len - 1;
+      while (lo < hi) { const m = (lo + hi + 1) >> 1; if (b[m] <= xr) lo = m; else hi = m - 1; }
+      cellChar[ci] = cuts[li] + Math.min(len - 1, Math.max(0, lo));
+    }
+  }
+
+  /* 每个字占的行/列区间（档位一变只重绘它自己那一小片） */
+  for (let i = 0; i < nR; i++) {
+    const yTop = padY + i * pitch;          // 第 i 排的字形带（字心在带正中）
+    const yBot = padY + (i + 1) * pitch;
+    let r0 = Math.floor(yTop / CELLH) - 1, r1 = Math.ceil(yBot / CELLH) + 1;
+    if (r0 < 0) r0 = 0; if (r1 > prows) r1 = prows;
+    const b = bnds[i];
+    for (let q = 0; q < b.length - 1; q++) {
+      const k = cuts[i] + q;
+      charRow0[k] = r0; charRow1[k] = r1;
+      let c0 = Math.floor((rowX[i] + b[q]) / CELLW) - 1;
+      let c1 = Math.ceil((rowX[i] + b[q + 1]) / CELLW) + 1;
+      if (c0 < 0) c0 = 0; if (c1 > pcols) c1 = pcols;
+      if (c1 <= c0) c1 = Math.min(pcols, c0 + 1);
+      charCol0[k] = c0; charCol1[k] = c1;
+    }
+  }
+
+  /* 面板缓冲：DPR 缩放 + 纵向 VS 拉伸（字符填满 4×7 的格子） */
+  pcv.width = Math.round(panelW * DPR);
+  pcv.height = Math.round(panelH * DPR * VS);
+  pctx.setTransform(DPR, 0, 0, DPR * VS, 0, 0);
+  pctx.clearRect(0, 0, panelW, panelH);
+  pctx.font = '700 ' + (CELLH * 0.98).toFixed(1) + 'px ui-monospace,Consolas,"Courier New",monospace';
+  pctx.textAlign = 'center';
+  pctx.textBaseline = 'middle';
+
+  /* 面板背后的 accent 辉光 */
+  const gcx = px0 + panelW * 0.5, gcy = py0 + panelH * 0.5;
+  const gRad = Math.max(panelW, panelH) * 0.62;
+  panelGlow = ctx.createRadialGradient(gcx, gcy, 0, gcx, gcy, gRad);
+  const ga = Math.round(accent[0] * 0.55 + 60), gb = Math.round(accent[1] * 0.55 + 70);
+  panelGlow.addColorStop(0, 'rgba(' + ga + ',' + gb + ',235,0.10)');
+  panelGlow.addColorStop(0.55, 'rgba(' + ga + ',' + gb + ',235,0.045)');
+  panelGlow.addColorStop(1, 'rgba(' + ga + ',' + gb + ',235,0)');
+
+  panelOn = true;
+}
+
+function rebuildGlyph() {
+  buildGlyph(curIdx >= 0 && lines[curIdx] ? lines[curIdx] : null);
+}
+
+/* 每帧把每字的亮度量化成 8 档；档位变了的字 → 标脏，下一帧只重画它那一小片 */
+function updateLevels(T) {
+  if (!charTimes) return;
+  for (let k = 0; k < charTimes.length; k++) {
+    const dt = T - charTimes[k];
+    let lit;
+    if (dt < -0.35) lit = 0.14;                                   // 唱前：幽灵
+    else if (dt < 0) lit = 0.14 + 0.40 * (1 + dt / 0.35);         // 渐升
+    else lit = 0.86 + 0.55 * Math.exp(-dt * 3.4);                 // 点火闪白 → 常亮
+    let lv = Math.round((lit - 0.10) * 6.2);
+    if (lv < 0) lv = 0; else if (lv > 7) lv = 7;
+    if (lv !== charLevel[k]) { charLevel[k] = lv; charDirty[k] = 1; }
+  }
+}
+
+/* 只重绘"变了的字"那一小片；同片的连续同档格子共用一个 fillStyle */
+function flushPanel() {
+  if (!panelOn) return;
+  const rowH = CELLH / VS, midY = CELLH * 0.5 / VS;
+  /* 换句时逐行扫入（每帧 12 行），避免一次性几千次 fillText 卡一帧 */
+  if (revealTo < prows) {
+    const end = Math.min(prows, revealTo + 12);
+    for (let k = 0; k < charDirty.length; k++)
+      if (charRow1[k] > revealTo && charRow0[k] < end) charDirty[k] = 1;
+    revealTo = end;
+  }
+  for (let k = 0; k < charDirty.length; k++) {
+    if (!charDirty[k]) continue;
+    charDirty[k] = 0;
+    const c0 = charCol0[k], c1 = charCol1[k];
+    const r0 = charRow0[k];
+    let r1 = charRow1[k];
+    if (r1 > revealTo) r1 = revealTo;
+    if (r1 <= r0) continue;
+    pctx.clearRect(c0 * CELLW, r0 * rowH, (c1 - c0) * CELLW, (r1 - r0) * rowH);
+    for (let r = r0; r < r1; r++) {
+      const base = r * pcols, py = r * rowH + midY;
+      let cur = -1;
+      for (let x = c0; x < c1; x++) {
+        const ri = cellRamp[base + x];
+        if (!ri) continue;
+        const c = cellChar[base + x];
+        const lv = c >= 0 ? charLevel[c] : 0;
+        if (lv !== cur) { pctx.fillStyle = LV[lv]; cur = lv; }
+        pctx.fillText(RAMP[ri], x * CELLW + CELLW * 0.5, py);
+      }
+    }
+  }
+}
+
+/* ---------- 背景字符噪点：预存相位，帧内只做乘加 ---------- */
+function drawBG(T, beat2) {
+  bgctx.fillStyle = '#05060a';
+  bgctx.fillRect(0, 0, W, H);
+  const t = T * 0.55;
+  const ct = Math.cos(t), st = Math.sin(t), c8 = Math.cos(t * 0.8), s8 = Math.sin(t * 0.8);
+  const amp = 0.52 + 0.36 * beat2;
+  const N = bcols * brows;
+  for (let i = 0; i < N; i++) {
+    const a = s1[i] * ct + c1[i] * st;
+    const b = s2[i] * c8 - c2[i] * s8;
+    const v = 0.5 + 0.5 * a * b;
+    bval[i] = v * v * amp;
+  }
+  bgctx.font = '600 ' + (BCH * 0.84).toFixed(1) + 'px ui-monospace,Consolas,"Courier New",monospace';
+  const thr = 0.045;
+  /* 暗档 */
+  bgctx.fillStyle = 'rgb(86,108,150)';
+  for (let y = 0, i = 0; y < brows; y++) {
+    const py = boy + y * BCH;
+    for (let x = 0; x < bcols; x++, i++) {
+      const v = bval[i];
+      if (v < thr || v > 0.62) continue;
+      let k = (v * BGN) | 0;
+      bgctx.fillText(BG_RAMP[k < 1 ? 1 : k], box + x * BCW, py);
+    }
+  }
+  /* 亮档（相干高光） */
+  bgctx.fillStyle = 'rgb(142,170,218)';
+  for (let y = 0, i = 0; y < brows; y++) {
+    const py = boy + y * BCH;
+    for (let x = 0; x < bcols; x++, i++) {
+      const v = bval[i];
+      if (v <= 0.62) continue;
+      let k = (v * BGN) | 0;
+      if (k < 3) k = 3; else if (k > BGN - 1) k = BGN - 1;
+      bgctx.fillText(BG_RAMP[k], box + x * BCW, py);
+    }
+  }
+}
+
+function layout() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(320, window.innerWidth);
+  H = Math.max(240, window.innerHeight);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  bgcv.width = cv.width;
+  bgcv.height = cv.height;
+  bgctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bgctx.textAlign = 'center';
+  bgctx.textBaseline = 'middle';
+  bgFrame = 0;
+  buildBG();
+  buildPalette();
+  rebuildGlyph();
+}
+
+/* ================= 节奏：显示与酝酿分离、索引单调、只回退才清场 ========== */
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; setGlyph(null); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    setGlyph(ci >= 0 ? lines[ci] : null);
+    hint.style.opacity = ci >= 0 || !lines.length ? '0' : '1';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; rip = 0; ripAmp = Math.max(ripAmp, 1.1); }
+  }
+}
+
+function setGlyph(line) {
+  buildGlyph(line);
+  glyphGain = 0;                          // 新句字形整体淡入
+}
+
+let last = performance.now();
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  const T = now();
+  timing(T);
+
+  beat *= Math.exp(-dt * 5.0);
+  glyphGain += (1 - glyphGain) * Math.min(1, dt * 9);
+  if (glyphGain > 0.995) glyphGain = 1;
+  if (swX < bcols + 14) swX += swV * dt;
+  rip += ripSpeed * dt;
+  ripAmp *= Math.exp(-dt * 2.1);
+
+  /* 背景字符层：变化很慢，30Hz 重画够用；每帧只贴一张图 */
+  bgFrame++;
+  if (bgFrame % 2 === 1) drawBG(T, beat);
+  ctx.drawImage(bgcv, 0, 0, W, H);
+
+  const sweepOn = swX > -20 && swX < bcols + 14;
+  const sx = box + swX * BCW;
+
+  /* beat 扫描墙：整屏从左往右一道亮墙（在字后面） */
+  if (sweepOn) {
+    const swW = 90 + 46 * beat;
+    ctx.globalCompositeOperation = 'lighter';
+    for (let k = 0; k < 4; k++) {
+      const ww = swW * (1 - k * 0.2);
+      ctx.fillStyle = 'rgba(110,150,230,' + (0.055 - k * 0.011).toFixed(3) + ')';
+      ctx.fillRect(sx - ww * 0.5, 0, ww, H);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* 酝酿涟漪：从面板中心荡开 */
+  if (ripAmp > 0.02) {
+    const rcx = panelOn ? px0 + panelW * 0.5 : W * 0.5;
+    const rcy = panelOn ? py0 + panelH * 0.5 : H * 0.5;
+    ctx.beginPath();
+    ctx.arc(rcx, rcy, Math.max(2, rip), 0, 6.283185307179586);
+    ctx.strokeStyle = 'rgba(150,185,255,' + (0.32 * ripAmp).toFixed(3) + ')';
+    ctx.lineWidth = 1.2 + 3.2 * beat;
+    ctx.stroke();
+  }
+
+  if (panelOn) {
+    updateLevels(T);
+    flushPanel();
+
+    /* 面板背后的辉光 + 压暗 52% 的留白 */
+    if (panelGlow) {
+      ctx.fillStyle = panelGlow;
+      ctx.fillRect(px0 - 90, py0 - 70, panelW + 180, panelH + 140);
+    }
+    ctx.fillStyle = 'rgba(3,5,9,0.52)';
+    ctx.fillRect(px0 - 10, py0 - 8, panelW + 20, panelH + 16);
+
+    ctx.globalAlpha = glyphGain;
+    ctx.drawImage(pcv, px0, py0, panelW, panelH);
+    ctx.globalAlpha = 1;
+
+    /* 很淡的扫描墙从字面上掠过（只叠光，不改字符） */
+    if (sweepOn) {
+      ctx.globalCompositeOperation = 'lighter';
+      for (let k = 0; k < 3; k++) {
+        const ww = 70 + k * 60;
+        ctx.fillStyle = 'rgba(190,215,255,' + (0.048 - k * 0.013).toFixed(3) + ')';
+        ctx.fillRect(sx - ww * 0.5, py0 - 10, ww, panelH + 20);
+      }
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    /* 取景框四角（很淡，像取景器） */
+    const cl = 15;
+    ctx.strokeStyle = 'rgba(150,185,255,0.20)';
+    ctx.lineWidth = 1;
+    const x0 = px0 - 7, y0 = py0 - 7, x1 = px0 + panelW + 7, y1 = py0 + panelH + 7;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0 + cl); ctx.lineTo(x0, y0); ctx.lineTo(x0 + cl, y0);
+    ctx.moveTo(x1 - cl, y0); ctx.lineTo(x1, y0); ctx.lineTo(x1, y0 + cl);
+    ctx.moveTo(x0, y1 - cl); ctx.lineTo(x0, y1); ctx.lineTo(x0 + cl, y1);
+    ctx.moveTo(x1 - cl, y1); ctx.lineTo(x1, y1); ctx.lineTo(x1, y1 - cl);
+    ctx.stroke();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* 尺寸变化：重建格网、面板、字形场 */
+let rzTimer = 0;
+addEventListener('resize', () => {
+  clearTimeout(rzTimer);
+  rzTimer = setTimeout(() => { layout(); }, 140);
+});
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent && p.accent.length === 3) accent = p.accent;
+    layout();
+    rip = 0; ripAmp = 0; beat = 0; swX = 1e9;
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = d.payload.level || 0;
+    swX = -8;
+    swV = 48 + 50 * lv;
+    beat = Math.min(1.6, beat + 0.35 + 0.5 * lv);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+layout();
+requestAnimationFrame(frame);
+window.__stage = () => ({
+  lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+  cols: bcols, rows: brows, yrc: curIdx >= 0 ? !!yrcFlag : false,
+  panel: panelOn ? (pcols + 'x' + prows) : 'off', fs: +fsPx.toFixed(1)
+});
+</script>
+</body>
+</html>

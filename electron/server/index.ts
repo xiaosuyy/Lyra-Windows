@@ -13,13 +13,12 @@ import fastifyMultipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import fastify from "fastify";
 
-/** 形态页资源目录：内含 stages/ 与 segdict.bin，开发取仓库旁资源，打包后取 resources/stages */
+/** 形态页资源目录：内含 stages/ 与 segdict.bin，开发取仓库内资源，打包后取 resources/stages */
 const resolveStageRoot = (): string | null => {
   const candidates = [
     process.env.LYRA_STAGE_DIR,
     join(process.resourcesPath, "stages"),
-    join(app.getAppPath(), "..", "LIZI", "resources", "app", "public"),
-    join(app.getAppPath(), "..", "..", "LIZI", "resources", "app", "public"),
+    join(app.getAppPath(), "resources", "stages"),
   ].filter(Boolean) as string[];
   for (const dir of candidates) {
     if (existsSync(join(dir, "stages"))) return dir;

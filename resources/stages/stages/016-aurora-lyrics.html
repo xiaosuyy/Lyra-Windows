@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>极光</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060c;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,255,210,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   016 · 极光（丁达尔版）
+
+   画面里没有"一片一片的帘子"了，只有三件事：
+     ① 一束丁达尔光从**右上角**斜射进来 —— 屏幕空间放射光柱，越靠近光源越亮；
+     ② 星空一直在转（不是转一下回原位）：基础角速度 + 每换一句给一个速度脉冲，
+        星星沿转动切向拉出拖尾；
+     ③ 歌词一开始是**暗的**，光扫到哪个字，哪个字才亮起来，亮的那一下爆一下光晕
+        （bloom 直接给），唱过去的字留在"已点亮"的亮度。
+
+   管线：星空+光柱 → fboA → 字形层（叠在 fboA 上）→ 模糊 → fboB → 合成(泛光+色调映射+暗角)
+   ========================================================================== */
+const cv = document.getElementById('c');
+const hint = document.getElementById('hint');
+const gl = cv.getContext('webgl', { antialias: false, alpha: false, premultipliedAlpha: false })
+        || cv.getContext('experimental-webgl');
+
+let W = 0, H = 0;
+let lines = [];
+let accent = [120, 255, 190];
+
+/* ---------------- 着色器 ---------------- */
+const VS_QUAD = [
+  'attribute vec2 a_p;',
+  'varying vec2 v_uv;',
+  'void main(){ v_uv = a_p*0.5 + 0.5; gl_Position = vec4(a_p,0.0,1.0); }'
+].join('\n');
+
+const FS_SKY = [
+  'precision highp float;',
+  'uniform vec2 u_res;',
+  'uniform float u_time;',
+  'uniform float u_amp;',
+  'uniform vec2 u_cam;',
+  'uniform float u_rot;',                    /* 星空累计转角（只增不减） */
+  'uniform float u_tail;',                   /* 拖尾长度（跟角速度走） */
+  'uniform vec2 u_light;',                   /* 丁达尔光源（屏幕 uv，右上角外） */
+  'uniform float u_ray;',                    /* 光柱强度 */
+  'uniform vec2 u_text;',                    /* 歌词中心（uv），让光"落在"字上 */
+  'uniform float u_textOn;',                 /* 已点亮比例 */
+  'varying vec2 v_uv;',
+  'float hash21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }',
+  'float vnoise(vec2 p){',
+  '  vec2 i = floor(p), f = fract(p);',
+  '  vec2 u = f*f*(3.0-2.0*f);',
+  '  float a = hash21(i), b = hash21(i+vec2(1.0,0.0));',
+  '  float c = hash21(i+vec2(0.0,1.0)), d = hash21(i+vec2(1.0,1.0));',
+  '  return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);',
+  '}',
+  'void main(){',
+  '  float t = u_time;',
+  '  vec2 uv = v_uv;',
+  '  uv.x += u_cam.x*0.00022;',
+  '  float asp = u_res.x/max(1.0, u_res.y);',
+  '  vec3 sky = mix(vec3(0.008,0.011,0.030), vec3(0.026,0.016,0.062), uv.y);',
+  '  sky = mix(sky, vec3(0.048,0.026,0.100), pow(uv.y,3.0)*0.6);',
+  '  vec3 col = sky;',
+  '',
+  '  /* 远景极光薄雾：很弱的一层，只是让天不空 */',
+  '  float bandY = 0.34 + 0.06*sin(uv.x*2.3 + t*0.07) + 0.03*sin(uv.x*5.7 - t*0.05);',
+  '  float band  = exp(-pow((uv.y - bandY)/0.16, 2.0));',
+  '  float sweep = 0.45 + 0.55*sin(uv.x*5.1 + t*0.22 + sin(uv.x*1.9 - t*0.13)*1.7);',
+  '  vec3 aCol = mix(vec3(0.10,0.72,0.40), vec3(0.42,0.22,0.85), smoothstep(0.10,0.62,uv.y));',
+  '  col += aCol*band*(0.30 + 0.70*sweep)*0.045;',
+  '',
+  '  /* ① 丁达尔光柱：以右上角为原点的放射光轴，细而不规则，越远越散 */',
+  '  vec2 d = uv - u_light;',
+  '  d.x *= asp;',
+  '  float dist = length(d);',
+  '  float ang = atan(d.x, -d.y);',                       /* 0 = 正下方 */
+  '  float jit = sin(ang*9.0 + t*0.16)*0.55 + sin(ang*23.0 - t*0.23)*0.30;',
+  '  float spoke = 0.5 + 0.5*sin(ang*64.0 + jit*3.4 + t*0.06);',
+  '  spoke = pow(spoke, 7.0);',                           /* 细光轴 */
+  '  spoke *= 0.35 + 0.65*vnoise(vec2(ang*26.0, 5.0 + t*0.05));',  /* 每束光粗细/亮度都不一样 */
+  '  float dust = 0.55 + 0.45*vnoise(vec2(ang*7.0, dist*2.2 - t*0.15));',  /* 尘埃让光轴断断续续 */
+  '  float fall = smoothstep(1.95, 0.10, dist);',         /* 近亮远散 */
+  '  float sector = smoothstep(1.85, 0.50, abs(ang + 0.75));',  /* 扇面朝向左下方（字的方向） */
+  '  vec3 rayCol = mix(vec3(0.36,0.98,0.62), vec3(0.82,0.96,1.00), 0.40);',
+  '  col += rayCol*spoke*fall*sector*dust*0.95*u_ray;',
+  '  col += rayCol*exp(-dist*1.25)*0.09*u_ray;',           /* 光源附近的柔光 */
+  '  col += vec3(0.26,0.70,0.52)*exp(-dist*2.4)*0.06*u_ray;',
+  '  /* 光落在字上之后的散射：字周围一层薄光，把光柱和歌词连起来 */',
+  '  vec2 te = (uv - u_text)*vec2(asp, 1.0);',
+  '  float halo = exp(-dot(te,te)*5.0);',
+  '  col += rayCol*halo*0.09*(0.35 + 0.65*u_textOn);',
+  '',
+  '  /* ② 星空：整体绕画面中心持续旋转（u_rot 只增不减），星点沿切向拉拖尾 */',
+  '  vec2 q0 = vec2(uv.x - 0.5, uv.y - 0.46);',
+  '  q0.x *= asp;',
+  '  float cs = cos(u_rot), sn = sin(u_rot);',
+  '  vec2 qr = vec2(q0.x*cs - q0.y*sn, q0.x*sn + q0.y*cs);',
+  '  qr.x /= asp;',
+  '  vec2 suv = vec2(0.5, 0.46) + qr;',
+  '  vec2 tang = normalize(vec2(-q0.y, q0.x));',
+  '  tang.x /= asp;',
+  '  float star = 0.0;',
+  '  for (int i = 0; i < 3; i++) {',
+  '    float k = float(i) - 1.0;',
+  '    vec2 sp = (suv + tang*(k*u_tail))*u_res/4.0;',
+  '    vec2 id = floor(sp);',
+  '    float rnd = hash21(id);',
+  '    if (rnd > 0.976) {',
+  '      float dd = length(fract(sp)-0.5);',
+  '      float tw = 0.60 + 0.40*sin(t*2.3 + rnd*61.0);',
+  '      star += (1.0 - smoothstep(0.02,0.26,dd))*tw*(1.0 - abs(k)*0.46);',
+  '    }',
+  '  }',
+  '  col += vec3(0.86,0.92,1.00)*star*0.90*smoothstep(0.04,0.46,suv.y);',
+  '',
+  '  /* 远山 + 地平线 */',
+  '  float mh  = 0.16 + vnoise(vec2(uv.x*2.3, 4.2))*0.09;',
+  '  float mh2 = 0.07 + vnoise(vec2(uv.x*3.7, 1.7))*0.05;',
+  '  col = mix(col, vec3(0.012,0.021,0.040), 1.0 - smoothstep(mh-0.004, mh, uv.y));',
+  '  col = mix(col, vec3(0.004,0.006,0.012), 1.0 - smoothstep(mh2-0.003, mh2, uv.y));',
+  '  col += vec3(0.18,0.62,0.46)*exp(-abs(uv.y-mh)*80.0)*0.10;',
+  '',
+  '  /* 边缘收一点，别让光柱在画面边界留一条常亮的边 */',
+  '  float ef = (1.0 - smoothstep(0.94, 1.0, uv.x))*(1.0 - smoothstep(0.94, 1.0, 1.0-uv.x))*',
+  '             (1.0 - smoothstep(0.94, 1.0, uv.y))*(1.0 - smoothstep(0.94, 1.0, 1.0-uv.y));',
+  '  col *= ef*u_amp;',
+  '  gl_FragColor = vec4(col, 1.0);',
+  '}'
+].join('\n');
+
+const VS_MASK = [
+  'attribute vec2 a_pos;',
+  'attribute vec2 a_uv;',
+  'uniform vec2 u_res;',
+  'uniform vec2 u_cam;',
+  'uniform float u_zoom;',
+  'varying vec2 v_uv;',
+  'void main(){',
+  '  vec2 p = a_pos + u_cam*0.25;',
+  '  p = (p - u_res*0.5)*u_zoom + u_res*0.5;',
+  '  vec2 n = p/u_res*2.0 - 1.0;',
+  '  gl_Position = vec4(n.x, -n.y, 0.0, 1.0);',
+  '  v_uv = a_uv;',
+  '}'
+].join('\n');
+
+const FS_MASK = [
+  'precision highp float;',
+  'uniform sampler2D u_tex;',
+  'uniform sampler2D u_lit;',
+  'uniform float u_time;',
+  'uniform float u_amp;',
+  'uniform vec4 u_rect;',
+  'varying vec2 v_uv;',
+  'float hash21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }',
+  'float vnoise(vec2 p){',
+  '  vec2 i = floor(p), f = fract(p);',
+  '  vec2 u = f*f*(3.0-2.0*f);',
+  '  float a = hash21(i), b = hash21(i+vec2(1.0,0.0));',
+  '  float c = hash21(i+vec2(0.0,1.0)), d = hash21(i+vec2(1.0,1.0));',
+  '  return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);',
+  '}',
+  'void main(){',
+  '  float m = texture2D(u_tex, v_uv).a;',
+  '  /* 5 点取最大 = 把字往外扩一圈，做"光晕"（泛光会再把它糊开） */',
+  '  float r = 0.0065;',
+  '  float mm = m;',
+  '  mm = max(mm, texture2D(u_tex, v_uv + vec2(r, 0.0)).a);',
+  '  mm = max(mm, texture2D(u_tex, v_uv - vec2(r, 0.0)).a);',
+  '  mm = max(mm, texture2D(u_tex, v_uv + vec2(0.0, r*2.2)).a);',
+  '  mm = max(mm, texture2D(u_tex, v_uv - vec2(0.0, r*2.2)).a);',
+  '  if (mm < 0.012) discard;',
+  '  float v = v_uv.y;',
+  '  float t = u_time;',
+  '  vec2 spx = u_rect.xy + v_uv*u_rect.zw;',
+  '',
+  '  /* 逐字（YRC）进度：0 = 还没被光照到，1 = 已经亮着 */',
+  '  float lit = texture2D(u_lit, vec2(v_uv.x, 0.5)).r;',
+  '  float flash  = smoothstep(0.02, 0.18, lit);',        /* 被照到的那一下冲起来 */
+  '  float settle = 1.0 - 0.20*smoothstep(0.30, 1.0, lit);', /* 然后落到持续亮 */
+  '  float on = 0.18 + 0.82*flash*settle;',               /* 没被照到 = 暗着，但还能看出字 */
+  '  float hot = smoothstep(0.04, 0.30, lit)*(1.0 - smoothstep(0.30, 0.90, lit));', /* 刚点亮的一瞬 */
+  '',
+  '  float n  = vnoise(vec2(spx.x/430.0, v*2.0 - t*0.10));',
+  '  float top = 1.0 - smoothstep(0.02, 0.95, v);',
+  '  vec3 col = mix(vec3(0.10,0.46,0.32), vec3(0.26,1.00,0.66), flash);',
+  '  col = mix(col, vec3(0.70,1.00,0.88), hot*0.50);',
+  '  col *= 0.80 + 0.35*n;',
+  '  float body = m*on*(0.72 + 0.28*top)*(0.80 + 0.30*n);',
+  '  float halo = (mm - m)*on*0.40;',                     /* 字外一圈的光晕 */
+  '  float a = (body*0.88 + m*m*hot*0.70 + halo)*u_amp;',
+  '  gl_FragColor = vec4(col*a, 1.0);',
+  '}'
+].join('\n');
+
+const FS_BLUR = [
+  'precision highp float;',
+  'uniform sampler2D u_tex;',
+  'uniform vec2 u_dir;',
+  'uniform vec2 u_texel;',
+  'varying vec2 v_uv;',
+  'void main(){',
+  '  vec2 o = u_dir*u_texel;',
+  '  vec3 s = texture2D(u_tex, v_uv).rgb*0.227027;',
+  '  s += texture2D(u_tex, v_uv + o*1.384615).rgb*0.316216;',
+  '  s += texture2D(u_tex, v_uv - o*1.384615).rgb*0.316216;',
+  '  s += texture2D(u_tex, v_uv + o*3.230769).rgb*0.070270;',
+  '  s += texture2D(u_tex, v_uv - o*3.230769).rgb*0.070270;',
+  '  gl_FragColor = vec4(s, 1.0);',
+  '}'
+].join('\n');
+
+const FS_COMP = [
+  'precision highp float;',
+  'uniform sampler2D u_base;',
+  'uniform sampler2D u_bloom;',
+  'uniform vec2 u_res;',
+  'uniform float u_time;',
+  'varying vec2 v_uv;',
+  'void main(){',
+  '  vec3 c = texture2D(u_base, v_uv).rgb;',
+  '  vec3 b = texture2D(u_bloom, v_uv).rgb;',
+  '  c += b*1.05;',                              /* 泛光：点亮时的光晕 */
+  '  c = c/(1.0 + c*0.45);',
+  '  vec2 q = v_uv - 0.5;',
+  '  c *= 1.0 - 0.30*dot(q,q);',
+  '  float g = fract(sin(dot(v_uv*u_res, vec2(12.9898,78.233)))*43758.5453);',
+  '  c += (g - 0.5)*0.014;',
+  '  gl_FragColor = vec4(c, 1.0);',
+  '}'
+].join('\n');
+
+/* ---------------- 基础设施 ---------------- */
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs, vs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs || VS_QUAD));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+let progSky = null, progBlur = null, progComp = null, progMask = null;
+let quadBuf = null, maskBuf = null, glyphTex = null, litTex = null;
+let litData = null, litW = 0;
+let charSegs = null;
+let maskRect = null;
+let starAngle = 0, starTarget = 0;   /* 星空当前角 / 目标角：只有在句尾才往目标转一段，转完停住 */
+let fboA = null, fboB = null, texA = null, texB = null, texBW = 1, texBH = 1;
+const U = {};
+
+if (!gl) {
+  hint.textContent = '当前浏览器不支持 WebGL';
+  hint.style.opacity = '0.5';
+} else {
+  progSky = program(FS_SKY);
+  progBlur = program(FS_BLUR);
+  progComp = program(FS_COMP);
+  progMask = program(FS_MASK, VS_MASK);
+
+  U.sRes = gl.getUniformLocation(progSky, 'u_res');
+  U.sTime = gl.getUniformLocation(progSky, 'u_time');
+  U.sAmp = gl.getUniformLocation(progSky, 'u_amp');
+  U.sCam = gl.getUniformLocation(progSky, 'u_cam');
+  U.sRot = gl.getUniformLocation(progSky, 'u_rot');
+  U.sTail = gl.getUniformLocation(progSky, 'u_tail');
+  U.sLight = gl.getUniformLocation(progSky, 'u_light');
+  U.sRay = gl.getUniformLocation(progSky, 'u_ray');
+  U.sText = gl.getUniformLocation(progSky, 'u_text');
+  U.sTextOn = gl.getUniformLocation(progSky, 'u_textOn');
+  U.sP = gl.getAttribLocation(progSky, 'a_p');
+
+  U.bTex = gl.getUniformLocation(progBlur, 'u_tex');
+  U.bDir = gl.getUniformLocation(progBlur, 'u_dir');
+  U.bTexel = gl.getUniformLocation(progBlur, 'u_texel');
+  U.bP = gl.getAttribLocation(progBlur, 'a_p');
+
+  U.cBase = gl.getUniformLocation(progComp, 'u_base');
+  U.cBloom = gl.getUniformLocation(progComp, 'u_bloom');
+  U.cRes = gl.getUniformLocation(progComp, 'u_res');
+  U.cTime = gl.getUniformLocation(progComp, 'u_time');
+  U.cP = gl.getAttribLocation(progComp, 'a_p');
+
+  U.mTex = gl.getUniformLocation(progMask, 'u_tex');
+  U.mLit = gl.getUniformLocation(progMask, 'u_lit');
+  U.mRect = gl.getUniformLocation(progMask, 'u_rect');
+  U.mTime = gl.getUniformLocation(progMask, 'u_time');
+  U.mAmp = gl.getUniformLocation(progMask, 'u_amp');
+  U.mRes = gl.getUniformLocation(progMask, 'u_res');
+  U.mCam = gl.getUniformLocation(progMask, 'u_cam');
+  U.mZoom = gl.getUniformLocation(progMask, 'u_zoom');
+  U.mPos = gl.getAttribLocation(progMask, 'a_pos');
+  U.mUv = gl.getAttribLocation(progMask, 'a_uv');
+
+  quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+
+  maskBuf = gl.createBuffer();
+  glyphTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  litTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, litTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function bindQuad(loc) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+function makeTex(w, h) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFbo(w, h) {
+  const t = makeTex(w, h);
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { f: f, t: t };
+}
+
+let needRebuild = false;
+function resize() {
+  W = Math.max(1, window.innerWidth);
+  H = Math.max(1, window.innerHeight);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * dpr);
+  cv.height = Math.round(H * dpr);
+  if (!gl) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  if (fboA) { gl.deleteFramebuffer(fboA.f); gl.deleteTexture(fboA.t); }
+  if (fboB) { gl.deleteFramebuffer(fboB.f); gl.deleteTexture(fboB.t); }
+  fboA = makeFbo(cv.width, cv.height);
+  texBW = Math.max(2, cv.width >> 2);
+  texBH = Math.max(2, cv.height >> 2);
+  fboB = makeFbo(texBW, texBH);
+  texA = fboA.t; texB = fboB.t;
+  needRebuild = true;
+}
+resize();
+addEventListener('resize', resize);
+
+/* ---------------- 字形采样 ---------------- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+function glyphMask(text) {
+  const F = 108;
+  const maxW = Math.min(W * 0.78, 1320);
+  const font = (px) => '800 ' + px + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  octx.font = font(F);
+  let w = Math.ceil(octx.measureText(text).width) + 8;
+  const fs = w > maxW ? F * (maxW / w) : F;
+  octx.font = font(fs);
+  const tw = octx.measureText(text).width;
+  w = Math.ceil(tw) + 8;
+  const h = Math.ceil(fs * 1.35);
+  off.width = w; off.height = h;
+  octx.clearRect(0, 0, w, h);
+  octx.font = font(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(text, w / 2, h / 2);
+  return { w: w, h: h, tw: tw, font: font(fs) };
+}
+
+/* 歌词位置固定：水平居中、垂直略低于中线 */
+const TEXT_CY = 0.52;
+function placeFixed(gw, gh) {
+  const M = 44;
+  const x = Math.min(W - M - gw / 2, Math.max(M + gw / 2, W * 0.5));
+  const y = Math.min(H - M - gh / 2, Math.max(M + gh / 2, H * TEXT_CY));
+  return { x: x, y: y };
+}
+
+let curText = '';
+
+function buildLine(idx) {
+  if (idx < 0 || !lines[idx] || !gl) return;
+  const L = lines[idx];
+  const g = glyphMask(L.text);
+  curText = L.text;
+  const A = placeFixed(g.w, g.h);
+
+  /* 逐字边界 + YRC 起始时间 */
+  const charsArr = Array.from(L.text);
+  const dur = L.dur || (lines[idx + 1] ? lines[idx + 1].t - L.t : 3.2);
+  if (litW !== g.w) { litW = g.w; litData = new Uint8Array(litW); }
+  octx.font = g.font;
+  const segs = [];
+  let acc = (g.w - g.tw) / 2;
+  for (let i = 0; i < charsArr.length; i++) {
+    const cw = octx.measureText(charsArr[i]).width;
+    const ch = L.chars && L.chars[i];
+    const t0 = (ch && typeof ch.t === 'number') ? ch.t : (L.t + dur * i / Math.max(1, charsArr.length));
+    segs.push({ a: acc / g.w, b: (acc + cw) / g.w, t: t0 });
+    acc += cw;
+  }
+  charSegs = segs;
+  gl.bindTexture(gl.TEXTURE_2D, litTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, litW, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, litData);
+
+  /* 字形纹理 */
+  gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, off);
+
+  const lx = A.x - g.w / 2, ly = A.y - g.h / 2;
+  maskRect = { x: lx, y: ly, w: g.w, h: g.h };
+  const q = [lx, ly, 0, 0, lx + g.w, ly, 1, 0, lx, ly + g.h, 0, 1,
+             lx + g.w, ly, 1, 0, lx + g.w, ly + g.h, 1, 1, lx, ly + g.h, 0, 1];
+  gl.bindBuffer(gl.ARRAY_BUFFER, maskBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(q), gl.STATIC_DRAW);
+}
+
+/* ---------------- 节奏 ---------------- */
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+function updateLit(T) {
+  if (!litData || !charSegs || !litW) return;
+  litData.fill(0);
+  for (let i = 0; i < charSegs.length; i++) {
+    const s = charSegs[i];
+    const p = (T - s.t) / 0.30;
+    if (p <= 0) continue;
+    const v = Math.round((p > 1 ? 1 : p) * 255);
+    const i0 = Math.max(0, Math.round(s.a * litW));
+    const i1 = Math.min(litW, Math.round(s.b * litW));
+    for (let k = i0; k < i1; k++) litData[k] = v;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, litTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, litW, 1, gl.LUMINANCE, gl.UNSIGNED_BYTE, litData);
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 ================= */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    maskRect = null; charSegs = null;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) buildLine(ci);
+    /* 句尾（上一句唱完、这一句接上）才让星空转一段：目标角只累加，转完停在原地，
+       下一次从停下的位置继续转，不会弹回去 */
+    starTarget += 0.22;
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) brewIdx = nx;
+  }
+}
+
+/* ---------------- 状态 ---------------- */
+let amp = 1, ampTarget = 1;
+let beat = 0;
+let camX = 0, camY = 0, camZoom = 1;
+let last = performance.now(), t0 = 0;
+
+/* ---------------- 主循环 ---------------- */
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  if (!gl) { requestAnimationFrame(frame); return; }
+  if (needRebuild) { needRebuild = false; if (curIdx >= 0) buildLine(curIdx); }
+  updateLit(T);
+
+  ampTarget = playing ? 1.0 : 0.62;
+  amp += (ampTarget - amp) * Math.min(1, dt * 2.2);
+  beat *= Math.exp(-dt * 3.0);
+
+  /* 星空：句尾转一段（缓动追目标角，目标只累加），平时基本静止；
+     拖尾长度跟当前角速度走，转的时候拉出尾巴，停住就收回 */
+  starAngle += (starTarget - starAngle) * Math.min(1, dt * 2.0);
+  const vRot = Math.abs(starTarget - starAngle) * 2.0;
+
+  const k = Math.min(1, dt * 1.6);
+  camZoom += (1 + 0.018 * Math.sin(t0 * 0.33) + beat * 0.008 - camZoom) * k;
+  camX += (10 * Math.sin(t0 * 0.21) - camX) * k;
+  camY += (6 * Math.sin(t0 * 0.29 + 1.1) - camY) * k;
+
+  /* ---- pass 1：星空 + 丁达尔光柱 → fboA ---- */
+  let litFrac = 0;
+  if (charSegs && charSegs.length) {
+    let on = 0;
+    for (let i = 0; i < charSegs.length; i++) if (T >= charSegs[i].t + 0.30) on++;
+    litFrac = on / charSegs.length;
+  }
+  const tuv = maskRect
+    ? [(maskRect.x + maskRect.w * 0.5) / W, 1 - (maskRect.y + maskRect.h * 0.5) / H]
+    : [0.5, 0.5];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.f);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progSky);
+  bindQuad(U.sP);
+  gl.uniform2f(U.sRes, cv.width, cv.height);
+  gl.uniform1f(U.sTime, t0);
+  gl.uniform1f(U.sAmp, amp);
+  gl.uniform2f(U.sCam, camX, camY);
+  gl.uniform1f(U.sRot, starAngle);
+  gl.uniform1f(U.sTail, Math.min(0.010, Math.max(0.0005, vRot * 0.040)));
+  gl.uniform2f(U.sLight, 1.16 + 0.02 * Math.sin(t0 * 0.13), 1.20 + 0.02 * Math.cos(t0 * 0.17));
+  gl.uniform1f(U.sRay, 0.75 + 0.25 * Math.sin(t0 * 0.29) + beat * 0.30);
+  gl.uniform2f(U.sText, tuv[0], tuv[1]);
+  gl.uniform1f(U.sTextOn, litFrac);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  /* ---- 字形层：叠在天空上，被照到的字发光 ---- */
+  if (maskRect) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(progMask);
+    gl.bindBuffer(gl.ARRAY_BUFFER, maskBuf);
+    gl.enableVertexAttribArray(U.mPos);
+    gl.vertexAttribPointer(U.mPos, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(U.mUv);
+    gl.vertexAttribPointer(U.mUv, 2, gl.FLOAT, false, 16, 8);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+    gl.uniform1i(U.mTex, 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, litTex);
+    gl.uniform1i(U.mLit, 3);
+    gl.uniform4f(U.mRect, maskRect.x, maskRect.y, maskRect.w, maskRect.h);
+    gl.uniform1f(U.mTime, t0);
+    gl.uniform2f(U.mRes, W, H);
+    gl.uniform2f(U.mCam, camX, camY);
+    gl.uniform1f(U.mZoom, camZoom);
+    gl.uniform1f(U.mAmp, amp * (1 + beat * 0.25));
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disable(gl.BLEND);
+  }
+
+  /* ---- pass 2：模糊 → fboB ---- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboB.f);
+  gl.viewport(0, 0, texBW, texBH);
+  gl.useProgram(progBlur);
+  bindQuad(U.bP);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texA);
+  gl.uniform1i(U.bTex, 0);
+  gl.uniform2f(U.bTexel, 1 / cv.width, 1 / cv.height);
+  gl.uniform2f(U.bDir, 1, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.uniform2f(U.bDir, 0, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  /* ---- pass 3：合成 → 屏幕 ---- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.useProgram(progComp);
+  bindQuad(U.cP);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texA);
+  gl.uniform1i(U.cBase, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, texB);
+  gl.uniform1i(U.cBloom, 1);
+  gl.uniform2f(U.cRes, cv.width, cv.height);
+  gl.uniform1f(U.cTime, t0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    curText = ''; maskRect = null; charSegs = null;
+    if (p.accent && p.accent.length === 3) {
+      accent = [
+        Math.round(140 * 0.75 + p.accent[0] * 0.25),
+        Math.round(235 * 0.75 + p.accent[1] * 0.25),
+        Math.round(190 * 0.75 + p.accent[2] * 0.25)
+      ];
+    }
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    beat = Math.min(1.6, beat + 0.5 + (d.payload.level || 0) * 0.6);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  lit: charSegs ? charSegs.filter((s) => litData && litData[Math.round(s.a * litW)] > 8).length : 0,
+  text: curText, amp: +amp.toFixed(2), rot: +starAngle.toFixed(3), tgt: +starTarget.toFixed(3),
+  t: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

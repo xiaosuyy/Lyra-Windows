@@ -1,0 +1,1515 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>512 · 折页</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #08080A; overflow: hidden; }
+  #cv { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- 1) 自检口 ---------- */
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "" };
+  var RM = false;
+  try { RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) {}
+
+  /* ---------- 1.5) 设置项 ---------- */
+  var P = { paper: "ruled", swap: "crumple" };
+  try {
+    window.__stagePanel = {
+      title: "折页",
+      hint: "换句动效立即生效；纸型切换不会打断当前这句。",
+      items: [
+        { key: "paper", label: "纸型", type: "segment", def: "ruled",
+          options: [{ v: "ruled", t: "横线本" }, { v: "fold", t: "折页" }] },
+        { key: "swap", label: "换句动效", type: "segment", def: "crumple",
+          options: [{ v: "crumple", t: "捏团抛出" }, { v: "flash", t: "闪白" }] }
+      ]
+    };
+  } catch (eP) {}
+
+  window.__stage = function () {
+    var i = S.idx;
+    return {
+      lines: S.lines.length,
+      idx: i,
+      t: S.t,
+      playing: S.playing,
+      frames: S.frames,
+      js: Math.round(S.js * 100) / 100,
+      err: S.err,
+      text: (i >= 0 && S.lines[i] && S.lines[i].text) ? String(S.lines[i].text) : "",
+      gl: false,
+      rm: RM
+    };
+  };
+
+  /* ---------- 2) ready ---------- */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (e) { console.error(e); }
+  }
+  requestAnimationFrame(sendReady);
+  setTimeout(sendReady, 800);
+
+  /* ---------- 3) 基础 ---------- */
+  var cv = document.getElementById("cv");
+  var ctx = cv.getContext("2d", { alpha: false });
+  var mainCtx = ctx;
+  var W = 1440, H = 900, DPR = 1, portrait = false;
+
+  var SONG = { name: "", artists: "" };
+  var META = { duration: 0 };
+  var AC = { r: 226, g: 59, b: 34 };
+  var INK = { r: 26, g: 24, b: 20 };
+
+  var BW = 1000, BH = 1500;
+  var SHEET_W = 1.02, SHEET_H = 1.50;
+  var U = [0, 0.36, 0.54, 1];
+  var PANG = [0.62, -0.62, 0.42];
+  var V = [0, 0.52, 1];
+  var VANG = [-0.55, 0.46];
+  var LIGHT = { x: -0.55, y: 0.45, z: 0.70 };
+  var BACK_SHEETS = 7;
+
+  var CAM = { yaw: 0.30, pitch: 0.095, dist: 2.0, f: 855, ox: 0, oy: 0, tx: 0 };
+  var ANG = 0.20, ROLL = -0.150;
+
+  var bake = null, bctx = null, bakeKey = "";
+  var bakePrev = null, bctxPrev = null;
+  var crumpleSrc = null, CSW = 640, CSH = 960;
+  var PLANES = [], throwDir = 1;
+  var transOn = false, transAt = -9999, snapAmp = 0.8;
+  var TRANS_DUR = 900;
+  var paperPat = null, paperPatMain = null, paperPatAlt = null, paperTile = null, grainPat = null, grainCv = null;
+
+  var foldAmp = 0.95;
+  var GEOM = null;
+  var lastIdxShown = -1, swapAt = -9999, kick = 0, swingStart = -9999;
+  var beatAt = -9999, beatAmp = 0, beat = 0;
+  var ptr = { x: 0, y: 0, tx: 0, ty: 0 };
+  var errAt = 0, lastAct = 0;
+
+  function cl(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function smooth(a, b, x) { var t = cl((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
+  function easeOutCubic(t) { var u = 1 - cl(t, 0, 1); return 1 - u * u * u; }
+  function addStop(g, p, c) { try { g.addColorStop(p, c); } catch (e) {} }
+
+  function font(w, size, mono) {
+    var fam = mono
+      ? 'ui-monospace,Consolas,"Courier New",monospace'
+      : '"PingFang SC","Microsoft YaHei","Noto Sans SC","Source Han Sans SC",sans-serif';
+    return w + " " + size.toFixed(1) + "px " + fam;
+  }
+
+  function accentA(a) {
+    return "rgba(" + Math.round(AC.r) + "," + Math.round(AC.g) + "," + Math.round(AC.b) + "," + a + ")";
+  }
+
+  function errLog(e) {
+    S.err = String((e && e.message) || e);
+    var n = performance.now();
+    if (n - errAt > 1000) {
+      errAt = n;
+      try { console.error(e); } catch (e2) {}
+    }
+  }
+
+  function setAccent(a) {
+    if (!Array.isArray(a) || a.length < 3) return;
+    var r = Number(a[0]), g = Number(a[1]), b = Number(a[2]);
+    if (!isFinite(r) || !isFinite(g) || !isFinite(b)) return;
+    r = cl(Math.round(r), 0, 255); g = cl(Math.round(g), 0, 255); b = cl(Math.round(b), 0, 255);
+    if (r + g + b < 30) return;
+    AC.r = r; AC.g = g; AC.b = b;
+  }
+
+  function pad2(n) { n = Math.round(n); return (n < 10 ? "0" : "") + n; }
+
+  function fmtTime(sec) {
+    if (!isFinite(sec) || sec < 0) sec = 0;
+    var m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  /* ---------- 4) 尺寸 ---------- */
+  function resize() {
+    var w = innerWidth, h = innerHeight;
+    if (!isFinite(w) || w <= 0) w = 1440;
+    if (!isFinite(h) || h <= 0) h = 900;
+    W = Math.round(w); H = Math.round(h);
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = Math.round(W * DPR);
+    cv.height = Math.round(H * DPR);
+    cv.style.width = W + "px";
+    cv.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    portrait = H > W * 1.02;
+
+    if (portrait) {
+      CAM.f = W * 1.62;
+      CAM.ox = W * 0.50;
+      CAM.oy = H * 0.545;
+      CAM.dist = 2.0;
+      CAM.pitch = 0.07;
+      ROLL = -0.045;
+      ANG = 0.10;
+    } else {
+      CAM.f = Math.min(H * 0.99, W * 0.62);
+      CAM.ox = W * 0.615;
+      CAM.oy = H * 0.505;
+      CAM.dist = 2.0;
+      CAM.pitch = 0.09;
+      ROLL = -0.150;
+      ANG = 0.20;
+    }
+    bakeKey = "";
+  }
+
+  /* ---------- 5) 纸纹 ---------- */
+  function buildGrain() {
+    var n = 220;
+    grainCv = document.createElement("canvas");
+    grainCv.width = n; grainCv.height = n;
+    var g = grainCv.getContext("2d");
+    if (!g) return;
+    var img = g.createImageData(n, n);
+    var seed = 24681357;
+    function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+    for (var i = 0; i < n * n; i++) {
+      var v = Math.floor(rnd() * 255);
+      var a = Math.floor(16 + rnd() * 24);
+      img.data[i * 4] = v;
+      img.data[i * 4 + 1] = v;
+      img.data[i * 4 + 2] = v;
+      img.data[i * 4 + 3] = a;
+    }
+    g.putImageData(img, 0, 0);
+    try { grainPat = ctx.createPattern(grainCv, "repeat"); } catch (e) { grainPat = null; }
+
+    var p = document.createElement("canvas");
+    p.width = 260; p.height = 260;
+    var pg = p.getContext("2d");
+    if (pg) {
+      var s2 = 97531;
+      function r2() { s2 = (s2 * 1664525 + 1013904223) >>> 0; return s2 / 4294967296; }
+      for (var k = 0; k < 2400; k++) {
+        pg.fillStyle = "rgba(66,56,40," + (0.012 + r2() * 0.045).toFixed(3) + ")";
+        pg.fillRect(Math.floor(r2() * 260), Math.floor(r2() * 260), 1, 1);
+      }
+      for (var m = 0; m < 30; m++) {
+        pg.fillStyle = "rgba(96,82,58," + (0.010 + r2() * 0.018).toFixed(3) + ")";
+        pg.fillRect(0, r2() * 260, 260, 1);
+      }
+      paperTile = p;
+      try { paperPatMain = ctx.createPattern(p, "repeat"); } catch (e3) { paperPatMain = null; }
+    }
+  }
+
+  /* ---------- 6) 页面烘焙 ---------- */
+  function lineTimes(line) {
+    var chars = Array.from(line.text || "");
+    var n = chars.length, out = [], i;
+    var cs = line.chars;
+    if (cs && cs.length) {
+      var first = cs[0];
+      var rel = !!(first && isFinite(first.t) && Number(first.t) < line.t - 0.08);
+      for (i = 0; i < n; i++) {
+        var j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+        var rec = cs[j] || null;
+        var ct = rec ? Number(rec.t) : NaN;
+        out.push(isFinite(ct) ? (rel ? line.t + ct : ct) : null);
+      }
+      return out;
+    }
+    var d = line.dur > 0 ? line.dur : 3.4;
+    for (i = 0; i < n; i++) out.push(line.t + d * 0.9 * i / Math.max(1, n));
+    return out;
+  }
+
+  function activeIndex(times, n) {
+    var k = -1;
+    for (var i = 0; i < n; i++) {
+      var t = times[i];
+      if (t != null && S.t >= t) k = i;
+    }
+    return k;
+  }
+
+  function textGeom(n) {
+    var padT = BH * 0.070, padB = BH * 0.085;
+    var availH = BH - padT - padB;
+    var cols = cl(Math.ceil(n / 6), 1, 4);
+    var rows = Math.ceil(n / Math.max(1, cols));
+    var lineH = Math.min(availH / Math.max(1, rows), 250);
+    var fs = Math.min(240, lineH * 0.94, BW * 0.30);
+    var colW = fs * 1.24;
+    var guard = 0;
+    while (cols * colW > BW * 0.90 && fs > 42 && guard++ < 40) { fs *= 0.94; colW = fs * 1.24; }
+    var rightEdge = BW * 0.5 + cols * colW * 0.5;
+    var left = rightEdge - cols * colW;
+    if (left < BW * 0.04) { left = BW * 0.04; }
+    var top = (BH - rows * lineH) * 0.5;
+    var colX = [];
+    for (var i = 0; i < cols; i++) colX.push(rightEdge - colW * 0.5 - i * colW);
+    return { cols: cols, rows: rows, lineH: lineH, fs: fs, colW: colW, rightEdge: rightEdge, left: left, top: top, colX: colX };
+  }
+
+  function applyCreases(n) {
+    var g = textGeom(n);
+    var picks = [], i, j;
+    var pref = [];
+    var mid = Math.floor((g.cols - 1) * 0.5);
+    pref.push(mid);
+    pref.push(g.cols - 1);
+    for (i = 0; i < g.cols; i++) pref.push(i);
+    for (i = 0; i < pref.length && picks.length < 2; i++) {
+      var v = g.colX[cl(pref[i], 0, g.cols - 1)] / BW;
+      if (v < 0.10 || v > 0.90) continue;
+      var ok = true;
+      for (j = 0; j < picks.length; j++) { if (Math.abs(picks[j] - v) < 0.12) ok = false; }
+      if (ok) picks.push(v);
+    }
+    var fb = [0.34, 0.66, 0.22, 0.80];
+    for (i = 0; i < fb.length && picks.length < 2; i++) {
+      var wv = fb[i], ok2 = true;
+      for (j = 0; j < picks.length; j++) { if (Math.abs(picks[j] - wv) < 0.12) ok2 = false; }
+      if (ok2) picks.push(wv);
+    }
+    if (picks.length < 2) return;
+    picks.sort(function (a, b) { return a - b; });
+    var c0 = cl(picks[0], 0.10, 0.78);
+    var c1 = cl(picks[1], c0 + 0.12, 0.90);
+    U = [0, c0, c1, 1];
+
+    GEOM = g;
+    var rowMid = Math.floor((g.rows - 1) * 0.5);
+    var midY = (g.top + g.lineH * (rowMid + 0.5)) / BH;
+    V = [0, cl(midY, 0.30, 0.70), 1];
+  }
+
+  /* ---------- 6b) 横线本 ---------- */
+  var RULE = { top: 148, gap: 76, left: 152, x0: 196, x1: 928 };
+
+  function splitText(arr) {
+    var n = arr.length, mid = Math.ceil(n / 2), k;
+    for (k = mid; k < n - 1; k++) {
+      if ("，,。.、！!？?；;：: ".indexOf(arr[k]) >= 0) { mid = k + 1; break; }
+    }
+    for (k = mid; k > 2; k--) {
+      if ("，,。.、！!？?；;：: ".indexOf(arr[k - 1]) >= 0) { mid = k; break; }
+    }
+    if (mid < 2 || mid > n - 2) mid = Math.ceil(n / 2);
+    return [arr.slice(0, mid), arr.slice(mid)];
+  }
+
+  function accentInk(mix) {
+    return "rgb(" + Math.round(AC.r * mix + 28 * (1 - mix)) + "," +
+      Math.round(AC.g * mix + 26 * (1 - mix)) + "," +
+      Math.round(AC.b * mix + 21 * (1 - mix)) + ")";
+  }
+
+  function drawRuledPaper(c) {
+    var top = RULE.top, bot = BH - 58, y;
+    c.save();
+    for (y = top; y <= bot; y += RULE.gap) {
+      var heavy = (Math.abs(y - top) < 1);
+      c.strokeStyle = heavy ? "rgba(92,124,158,0.62)" : "rgba(92,124,158,0.44)";
+      c.lineWidth = heavy ? 3.6 : 2.6;
+      c.beginPath();
+      c.moveTo(66, y + 0.5);
+      c.lineTo(BW - 58, y + 0.5);
+      c.stroke();
+    }
+    c.strokeStyle = "rgba(204,104,92,0.72)";
+    c.lineWidth = 3.2;
+    c.beginPath();
+    c.moveTo(RULE.left, top - 52);
+    c.lineTo(RULE.left, bot + 34);
+    c.stroke();
+    c.strokeStyle = "rgba(204,104,92,0.22)";
+    c.lineWidth = 1;
+    c.beginPath();
+    c.moveTo(RULE.left + 9, top - 52);
+    c.lineTo(RULE.left + 9, bot + 34);
+    c.stroke();
+    c.fillStyle = "rgba(96,84,66,0.085)";
+    for (var h = 0; h < 4; h++) {
+      c.beginPath();
+      c.arc(88, 252 + h * 318, 14, 0, Math.PI * 2);
+      c.fill();
+    }
+    c.restore();
+  }
+
+  function ruledRows() {
+    var rows = [], i = S.idx;
+    function add(idx, role) {
+      if (idx < 0 || idx >= S.lines.length) return;
+      var l = S.lines[idx];
+      if (!l || !l.text) return;
+      rows.push({ l: l, role: role });
+    }
+    if (i >= 0) {
+      add(i - 2, "prev"); add(i - 1, "prev"); add(i, "cur"); add(i + 1, "next"); add(i + 2, "next");
+    } else {
+      add(0, "next"); add(1, "next"); add(2, "next");
+    }
+
+    var maxW = RULE.x1 - RULE.x0;
+    var out = [];
+    for (var r = 0; r < rows.length; r++) {
+      var row = rows[r], arr = Array.from(String(row.l.text));
+      var base = row.role === "cur" ? 86 : 54;
+      var natural = maxW / Math.max(1, arr.length) * 0.97;
+      if (row.role === "cur" && natural < 44 && arr.length > 6) {
+        var parts = splitText(arr);
+        var f2 = cl(maxW / Math.max(1, parts[0].length) * 0.97, 34, base);
+        var off = 0;
+        for (var q = 0; q < parts.length; q++) {
+          out.push({ l: row.l, role: row.role, chars: parts[q], fs: f2, offset: off });
+          off += parts[q].length;
+        }
+      } else {
+        out.push({ l: row.l, role: row.role, chars: arr, fs: cl(natural, 34, base), offset: 0 });
+      }
+    }
+    return out;
+  }
+
+  function drawRuledText(c, line, act) {
+    c.save();
+    c.textBaseline = "alphabetic";
+    c.textAlign = "left";
+
+    if (!S.lines.length || !line) {
+      c.fillStyle = "rgba(30,27,22,0.42)";
+      c.font = font(600, 56);
+      c.fillText("暂无歌词", RULE.x0, RULE.top + RULE.gap * 8);
+      c.fillStyle = "rgba(30,27,22,0.22)";
+      c.font = font(400, 24, true);
+      c.fillText("INSTRUMENTAL", RULE.x0, RULE.top + RULE.gap * 8 + 46);
+      c.restore();
+      return;
+    }
+
+    var out = ruledRows();
+    if (!out.length) { c.restore(); return; }
+
+    var k0 = Math.round((BH * 0.515 - RULE.top) / RULE.gap);
+    var startK = k0 - Math.floor((out.length - 1) / 2);
+    var curTimes = lineTimes(line);
+
+    for (var d = 0; d < out.length; d++) {
+      var it = out[d];
+      var by = RULE.top + (startK + d) * RULE.gap;
+      if (it.role === "cur") {
+        c.font = font(700, it.fs);
+        var x = RULE.x0;
+        for (var k = 0; k < it.chars.length; k++) {
+          var ch = it.chars[k];
+          var gi = it.offset + k;
+          var tk = curTimes[gi];
+          var lit = tk != null && S.t >= tk - 0.001;
+          if (lit) {
+            c.fillStyle = (gi === act) ? accentInk(0.62) : "rgb(28,26,21)";
+            c.globalAlpha = 1;
+          } else {
+            c.fillStyle = "rgb(28,26,21)";
+            c.globalAlpha = 0.30;
+          }
+          if (ch !== " ") c.fillText(ch, x, by);
+          x += c.measureText(ch).width;
+        }
+        c.globalAlpha = 1;
+        c.fillStyle = accentA(0.88);
+        c.fillRect(RULE.left - 28, by - it.fs * 0.44, 6, it.fs * 0.44);
+      } else {
+        c.font = font(it.role === "prev" ? 400 : 500, it.fs);
+        c.globalAlpha = it.role === "prev" ? 0.20 : 0.27;
+        c.fillStyle = "rgb(34,31,26)";
+        c.fillText(it.chars.join(""), RULE.x0, by);
+        c.globalAlpha = 1;
+      }
+    }
+
+    if (S.lines.length) {
+      c.textAlign = "right";
+      c.font = font(700, 30, true);
+      c.fillStyle = accentA(0.85);
+      c.fillText(pad2(Math.max(1, S.idx + 1)), BW - 62, BH - 42);
+      c.fillStyle = "rgba(28,26,21,0.26)";
+      c.font = font(400, 20, true);
+      c.fillText("/ " + pad2(S.lines.length), BW - 62 - 62, BH - 42);
+    }
+
+    c.restore();
+  }
+
+  function bakePage() {
+    if (!bctx) return;
+    var line = S.idx >= 0 ? (S.lines[S.idx] || null) : (S.lines[0] || null);
+    var chars = line ? Array.from(line.text || "") : [];
+    var times = line ? lineTimes(line) : [];
+    var act = line ? activeIndex(times, chars.length) : -1;
+    if (P.paper === "fold") {
+      if (chars.length) applyCreases(chars.length);
+    } else {
+      U = [0, 1 / 3, 2 / 3, 1];
+      V = [0, 0.5, 1];
+      GEOM = null;
+    }
+    var key = P.paper + "|" + S.idx + "|" + S.lines.length + "|" + act + "|" + (line ? line.t : -1) + "|" +
+      AC.r + "," + AC.g + "," + AC.b;
+    if (key === bakeKey) return;
+    bakeKey = key;
+
+    bctx.setTransform(1, 0, 0, 1, 0, 0);
+    bctx.clearRect(0, 0, BW, BH);
+
+    var g = bctx.createLinearGradient(0, 0, BW * 0.9, BH);
+    addStop(g, 0, "#FDFAF2");
+    addStop(g, 0.34, "#F6F1E5");
+    addStop(g, 0.70, "#EEE8D9");
+    addStop(g, 1, "#E0D8C5");
+    bctx.fillStyle = g;
+    bctx.fillRect(0, 0, BW, BH);
+
+    if (paperPat) {
+      bctx.globalAlpha = 0.75;
+      bctx.fillStyle = paperPat;
+      bctx.fillRect(0, 0, BW, BH);
+      bctx.globalAlpha = 1;
+    }
+
+    var lg = bctx.createRadialGradient(BW * 0.28, BH * 0.18, 0, BW * 0.28, BH * 0.18, BW * 1.15);
+    addStop(lg, 0, "rgba(255,253,246,0.55)");
+    addStop(lg, 0.55, "rgba(255,252,242,0.12)");
+    addStop(lg, 1, "rgba(120,104,78,0.07)");
+    bctx.fillStyle = lg;
+    bctx.fillRect(0, 0, BW, BH);
+
+    if (P.paper === "ruled") {
+      drawRuledPaper(bctx);
+      drawRuledText(bctx, line, act);
+    } else {
+      drawBakedText(bctx, line, chars, times, act);
+    }
+    if (DBG) window.__bake = bake;
+    var eg = bctx.createLinearGradient(0, 0, BW, 0);
+    addStop(eg, 0, "rgba(66,54,38,0.15)");
+    addStop(eg, 0.05, "rgba(66,54,38,0)");
+    addStop(eg, 0.95, "rgba(66,54,38,0)");
+    addStop(eg, 1, "rgba(66,54,38,0.18)");
+    bctx.fillStyle = eg;
+    bctx.fillRect(0, 0, BW, BH);
+
+    var vg = bctx.createLinearGradient(0, 0, 0, BH);
+    addStop(vg, 0, "rgba(255,255,250,0.30)");
+    addStop(vg, 0.08, "rgba(255,255,250,0)");
+    addStop(vg, 0.92, "rgba(120,100,70,0)");
+    addStop(vg, 1, "rgba(96,80,52,0.14)");
+    bctx.fillStyle = vg;
+    bctx.fillRect(0, 0, BW, BH);
+  }
+
+  function drawBakedText(c, line, chars, times, act) {
+    var shown = S.idx >= 0 ? S.idx : 0;
+    var pageNo = S.lines.length ? shown + 1 : 0;
+
+    if (!S.lines.length || !line) {
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.fillStyle = "rgba(26,24,20,0.60)";
+      c.font = font(600, 84);
+      c.fillText("暂无歌词", BW * 0.5, BH * 0.455);
+      c.fillStyle = "rgba(26,24,20,0.30)";
+      c.font = font(400, 30, true);
+      c.fillText("INSTRUMENTAL", BW * 0.5, BH * 0.455 + 82);
+      return;
+    }
+
+    var n = chars.length;
+    if (!n) return;
+
+    var g = textGeom(n);
+    var rows = g.rows, lineH = g.lineH, fs = g.fs, colW = g.colW;
+    var rightEdge = g.rightEdge;
+    var top = g.top;
+
+    if (DBG) {
+      c.strokeStyle = '#ff00ff'; c.lineWidth = 4;
+      for (var di = 1; di <= 2; di++) {
+        c.beginPath(); c.moveTo(U[di] * BW, 0); c.lineTo(U[di] * BW, BH); c.stroke();
+      }
+      c.strokeStyle = '#00ffff'; c.lineWidth = 2;
+      for (var ci = 0; ci < g.colX.length; ci++) {
+        c.beginPath(); c.moveTo(g.colX[ci], 0); c.lineTo(g.colX[ci], BH); c.stroke();
+      }
+    }
+
+    c.font = font(700, fs);
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+
+    for (var k = 0; k < n; k++) {
+      var ch = chars[k];
+      if (ch === " ") continue;
+      var col = Math.floor(k / rows);
+      var row = k % rows;
+      var x = rightEdge - colW * 0.5 - col * colW;
+      var y = top + lineH * 0.5 + row * lineH;
+      var tk = times[k];
+      var lit = tk != null && S.t >= tk - 0.001;
+      if (lit) {
+        if (k === act) {
+          c.fillStyle = "rgb(" + Math.round(AC.r * 0.34 + INK.r * 0.66) + "," +
+            Math.round(AC.g * 0.34 + INK.g * 0.66) + "," +
+            Math.round(AC.b * 0.34 + INK.b * 0.66) + ")";
+        } else {
+          c.fillStyle = "rgb(" + INK.r + "," + INK.g + "," + INK.b + ")";
+        }
+        c.globalAlpha = 1;
+      } else {
+        c.fillStyle = "rgb(" + INK.r + "," + INK.g + "," + INK.b + ")";
+        c.globalAlpha = 0.32;
+      }
+      c.fillText(ch, x, y);
+    }
+    c.globalAlpha = 1;
+
+    if (pageNo > 0) {
+      c.textAlign = "right";
+      c.textBaseline = "alphabetic";
+      c.font = font(700, 34, true);
+      c.fillStyle = accentA(0.9);
+      c.fillText(pad2(pageNo), BW - 50, BH - 44);
+      c.fillStyle = "rgba(26,24,20,0.30)";
+      c.font = font(400, 22, true);
+      c.fillText("/ " + pad2(S.lines.length), BW - 50 - 74, BH - 44);
+    }
+  }
+
+  /* ---------- 7) 三维 ---------- */
+  function project(p, st) {
+    var qx = p.x - CAM.tx, qy = p.y, qz = p.z;
+    var cy = Math.cos(st.yaw), sy = Math.sin(st.yaw);
+    var x1 = qx * cy - qz * sy;
+    var z1 = qx * sy + qz * cy;
+    var cp = Math.cos(st.pitch), sp = Math.sin(st.pitch);
+    var y2 = qy * cp - z1 * sp;
+    var z2 = qy * sp + z1 * cp;
+    var d = st.dist - z2;
+    if (d < 0.12) return null;
+    var k = st.f / d;
+    return { x: CAM.ox + x1 * k, y: CAM.oy - y2 * k, d: d, k: k };
+  }
+
+  function rotY(x, z, a) {
+    var ca = Math.cos(a), sa = Math.sin(a);
+    return { x: x * ca + z * sa, z: -x * sa + z * ca };
+  }
+
+  function sheetGrid(amp) {
+    var hw = SHEET_W * 0.5, hh = SHEET_H * 0.5;
+    var xs = [-hw], zx = [0];
+    for (var k = 0; k < 3; k++) {
+      var lx = (U[k + 1] - U[k]) * SHEET_W;
+      var ax = cl(PANG[k] * amp, -1.0, 1.0);
+      xs.push(xs[k] + lx * Math.cos(ax));
+      zx.push(zx[k] - lx * Math.sin(ax));
+    }
+    var ys = [hh], zy = [0];
+    for (var j = 0; j < 2; j++) {
+      var ly = (V[j + 1] - V[j]) * SHEET_H;
+      var ay = cl(VANG[j] * amp * 0.85, -1.0, 1.0);
+      ys.push(ys[j] - ly * Math.cos(ay));
+      zy.push(zy[j] - ly * Math.sin(ay));
+    }
+    var cx = (xs[0] + xs[3]) * 0.5, cz = (zx[0] + zx[3]) * 0.5;
+    var cy = (ys[0] + ys[2]) * 0.5, ccy = (zy[0] + zy[2]) * 0.5;
+    var g = [];
+    for (var i = 0; i < 4; i++) {
+      g.push([]);
+      for (var m = 0; m < 3; m++) {
+        g[i].push({ x: xs[i] - cx, y: ys[m] - cy, z: (zx[i] - cz) + (zy[m] - ccy) });
+      }
+    }
+    return g;
+  }
+
+  function worldPoint(g, i, j, layer) {
+    var ox = layer * 0.006, oy = -layer * 0.019, oz = -layer * 0.052;
+    var cr = Math.cos(ROLL), sr = Math.sin(ROLL);
+    var p = g[i][j];
+    var xr = p.x * cr - p.y * sr;
+    var yr = p.x * sr + p.y * cr;
+    var r = rotY(xr, p.z, ANG);
+    return { x: r.x + ox, y: yr + oy, z: r.z + oz };
+  }
+
+  function cellWorld(g, i, j, layer) {
+    return [worldPoint(g, i, j + 1, layer), worldPoint(g, i + 1, j + 1, layer),
+      worldPoint(g, i + 1, j, layer), worldPoint(g, i, j, layer)];
+  }
+
+  function normalOf(wp) {
+    var ax = wp[1].x - wp[0].x, ay = wp[1].y - wp[0].y, az = wp[1].z - wp[0].z;
+    var bx = wp[3].x - wp[0].x, by = wp[3].y - wp[0].y, bz = wp[3].z - wp[0].z;
+    var nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+    var l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    return { x: nx / l, y: ny / l, z: nz / l };
+  }
+
+  function projectAll(wp, st) {
+    var out = [], dsum = 0;
+    for (var k = 0; k < 4; k++) {
+      var pr = project(wp[k], st);
+      if (!pr) return null;
+      out.push(pr);
+      dsum += pr.d;
+    }
+    out.depth = dsum / 4;
+    return out;
+  }
+
+  function quadPath(pp) {
+    ctx.beginPath();
+    ctx.moveTo(pp[0].x, pp[0].y);
+    ctx.lineTo(pp[1].x, pp[1].y);
+    ctx.lineTo(pp[2].x, pp[2].y);
+    ctx.lineTo(pp[3].x, pp[3].y);
+    ctx.closePath();
+  }
+
+  function triAffine(img, s0x, s0y, s1x, s1y, s2x, s2y, d0x, d0y, d1x, d1y, d2x, d2y, rx, ry, rw, rh) {
+    var den = s0x * (s1y - s2y) + s1x * (s2y - s0y) + s2x * (s0y - s1y);
+    if (!den) return;
+    var a = (d0x * (s1y - s2y) + d1x * (s2y - s0y) + d2x * (s0y - s1y)) / den;
+    var b = (d0y * (s1y - s2y) + d1y * (s2y - s0y) + d2y * (s0y - s1y)) / den;
+    var c = (d0x * (s2x - s1x) + d1x * (s0x - s2x) + d2x * (s1x - s0x)) / den;
+    var d = (d0y * (s2x - s1x) + d1y * (s0x - s2x) + d2y * (s1x - s0x)) / den;
+    var e = (d0x * (s1x * s2y - s2x * s1y) + d1x * (s2x * s0y - s0x * s2y) + d2x * (s0x * s1y - s1x * s0y)) / den;
+    var f = (d0y * (s1x * s2y - s2x * s1y) + d1y * (s2x * s0y - s0x * s2y) + d2y * (s0x * s1y - s1x * s0y)) / den;
+    ctx.save();
+    ctx.transform(a, b, c, d, e, f);
+    ctx.drawImage(img, rx, ry, rw, rh, rx, ry, rw, rh);
+    ctx.restore();
+  }
+
+  function texQuad(img, sx0, sy0, sx1, sy1, p0, p1, p2, p3) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.lineTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.lineTo(p3.x, p3.y);
+    ctx.closePath();
+    ctx.clip();
+    triAffine(img, sx0, sy0, sx1, sy0, sx1, sy1, p0.x, p0.y, p1.x, p1.y, p2.x, p2.y, sx0, sy0, sx1 - sx0, sy1 - sy0);
+    triAffine(img, sx0, sy0, sx1, sy1, sx0, sy1, p0.x, p0.y, p2.x, p2.y, p3.x, p3.y, sx0, sy0, sx1 - sx0, sy1 - sy0);
+    ctx.restore();
+  }
+
+  function texTri(img, s0x, s0y, s1x, s1y, s2x, s2y, d0x, d0y, d1x, d1y, d2x, d2y, rx, ry, rw, rh) {    var den = s0x * (s1y - s2y) + s1x * (s2y - s0y) + s2x * (s0y - s1y);
+    if (!den) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(d0x, d0y);
+    ctx.lineTo(d1x, d1y);
+    ctx.lineTo(d2x, d2y);
+    ctx.closePath();
+    ctx.clip();
+    var a = (d0x * (s1y - s2y) + d1x * (s2y - s0y) + d2x * (s0y - s1y)) / den;
+    var b = (d0y * (s1y - s2y) + d1y * (s2y - s0y) + d2y * (s0y - s1y)) / den;
+    var c = (d0x * (s2x - s1x) + d1x * (s0x - s2x) + d2x * (s1x - s0x)) / den;
+    var d = (d0y * (s2x - s1x) + d1y * (s0x - s2x) + d2y * (s1x - s0x)) / den;
+    var e = (d0x * (s1x * s2y - s2x * s1y) + d1x * (s2x * s0y - s0x * s2y) + d2x * (s0x * s1y - s1x * s0y)) / den;
+    var f = (d0y * (s1x * s2y - s2x * s1y) + d1y * (s2x * s0y - s0x * s2y) + d2y * (s0x * s1y - s1x * s0y)) / den;
+    ctx.transform(a, b, c, d, e, f);
+    ctx.drawImage(img, rx, ry, rw, rh, rx, ry, rw, rh);
+    ctx.restore();
+  }
+
+  function paperBase(pp, shade) {
+    var r = Math.round(248 * shade), g = Math.round(242 * shade), b = Math.round(229 * shade);
+    ctx.fillStyle = "rgb(" + r + "," + g + "," + b + ")";
+    quadPath(pp);
+    ctx.fill();
+  }
+
+  function drawPanelTex(pp, sxA, sxB, syA, syB, shade, strips) {
+    var STRIPS = strips || 16;
+    var topL = pp[3], topR = pp[2], botL = pp[0], botR = pp[1];
+    for (var j = 0; j < STRIPS; j++) {
+      var u0 = j / STRIPS, u1 = Math.min(1, (j + 1) / STRIPS + 0.012);
+      var a0 = { x: lerp(topL.x, topR.x, u0), y: lerp(topL.y, topR.y, u0) };
+      var a1 = { x: lerp(topL.x, topR.x, u1), y: lerp(topL.y, topR.y, u1) };
+      var b0 = { x: lerp(botL.x, botR.x, u0), y: lerp(botL.y, botR.y, u0) };
+      var b1 = { x: lerp(botL.x, botR.x, u1), y: lerp(botL.y, botR.y, u1) };
+      var sx0 = sxA + (sxB - sxA) * u0;
+      var sx1 = sxA + (sxB - sxA) * u1;
+      texTri(bake, sx0, syA, sx1, syA, sx1, syB, a0.x, a0.y, a1.x, a1.y, b1.x, b1.y, sx0, syA, sx1 - sx0, syB - syA);
+      texTri(bake, sx0, syA, sx1, syB, sx0, syB, a0.x, a0.y, b1.x, b1.y, b0.x, b0.y, sx0, syA, sx1 - sx0, syB - syA);
+    }
+    ctx.fillStyle = "rgba(44,32,18," + Math.max(0, 1 - shade).toFixed(3) + ")";
+    quadPath(pp);
+    ctx.fill();
+  }
+
+  function drawPlainPanel(pp, shade) {
+    var r = Math.round(250 * shade), g = Math.round(244 * shade), b = Math.round(232 * shade);
+    var lx = (pp[0].x + pp[3].x) / 2, ly = (pp[0].y + pp[3].y) / 2;
+    var rx = (pp[1].x + pp[2].x) / 2, ry = (pp[1].y + pp[2].y) / 2;
+    var grd = ctx.createLinearGradient(lx, ly, rx, ry);
+    addStop(grd, 0, "rgb(" + Math.round(r * 0.95) + "," + Math.round(g * 0.95) + "," + Math.round(b * 0.95) + ")");
+    addStop(grd, 0.5, "rgb(" + r + "," + g + "," + b + ")");
+    addStop(grd, 1, "rgb(" + Math.round(r * 0.88) + "," + Math.round(g * 0.88) + "," + Math.round(b * 0.88) + ")");
+    ctx.fillStyle = grd;
+    quadPath(pp);
+    ctx.fill();
+    if (paperTile) {
+      var pat = (ctx === mainCtx) ? paperPatMain : (paperPatAlt || (paperPatAlt = ctx.createPattern(paperTile, "repeat")));
+      if (pat) {
+        ctx.save();
+        quadPath(pp);
+        ctx.clip();
+        ctx.globalAlpha = 0.45;
+        ctx.fillStyle = pat;
+        ctx.fillRect(0, 0, W, H);
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      }
+    }
+  }
+
+  function drawCreaseV(pp, amp) {
+    var bl = pp[0], tl = pp[3], br = pp[1], tr = pp[2];
+    var dl = { x: lerp(bl.x, br.x, 0.09), y: lerp(bl.y, br.y, 0.09) };
+    var dt = { x: lerp(tl.x, tr.x, 0.09), y: lerp(tl.y, tr.y, 0.09) };
+    var ga = 0.06 + 0.08 * cl(Math.abs(amp), 0, 1.2);
+    var g = ctx.createLinearGradient(bl.x, bl.y, dl.x, dl.y);
+    addStop(g, 0, "rgba(10,8,6," + ga.toFixed(3) + ")");
+    addStop(g, 0.5, "rgba(10,8,6," + (ga * 0.42).toFixed(3) + ")");
+    addStop(g, 1, "rgba(10,8,6,0)");
+    ctx.beginPath();
+    ctx.moveTo(bl.x, bl.y);
+    ctx.lineTo(tl.x, tl.y);
+    ctx.lineTo(dt.x, dt.y);
+    ctx.lineTo(dl.x, dl.y);
+    ctx.closePath();
+    ctx.fillStyle = g;
+    ctx.fill();
+    creaseLine(bl, tl, amp);
+  }
+
+  function drawCreaseH(pp, amp) {
+    var bl = pp[0], br = pp[1], tl = pp[3];
+    var dl = { x: lerp(bl.x, tl.x, 0.07), y: lerp(bl.y, tl.y, 0.07) };
+    var dt = { x: lerp(br.x, pp[2].x, 0.07), y: lerp(br.y, pp[2].y, 0.07) };
+    var ga = 0.04 + 0.05 * cl(Math.abs(amp), 0, 1.2);
+    var g = ctx.createLinearGradient(bl.x, bl.y, dl.x, dl.y);
+    addStop(g, 0, "rgba(10,8,6," + ga.toFixed(3) + ")");
+    addStop(g, 0.5, "rgba(10,8,6," + (ga * 0.42).toFixed(3) + ")");
+    addStop(g, 1, "rgba(10,8,6,0)");
+    ctx.beginPath();
+    ctx.moveTo(bl.x, bl.y);
+    ctx.lineTo(br.x, br.y);
+    ctx.lineTo(dt.x, dt.y);
+    ctx.lineTo(dl.x, dl.y);
+    ctx.closePath();
+    ctx.fillStyle = g;
+    ctx.fill();
+    creaseLine(bl, br, amp);
+  }
+
+  function creaseLine(a, b, amp) {
+    var bk = Math.max(0, Math.min(1, beat));
+    var hi = 0.18 + 0.10 * cl(Math.abs(amp), 0, 1) + bk * 0.26;
+    ctx.strokeStyle = "rgba(" + Math.round(255 + (AC.r - 255) * bk * 0.7) + "," +
+      Math.round(252 + (AC.g - 252) * bk * 0.7) + "," +
+      Math.round(240 + (AC.b - 240) * bk * 0.7) + "," + hi.toFixed(3) + ")";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+
+  function cellShade(nrm, layer) {
+    var dot = nrm.x * LIGHT.x + nrm.y * LIGHT.y + nrm.z * LIGHT.z;
+    var sh = 0.30 + 0.66 * cl(dot, 0, 1);
+    if (layer > 0) sh *= Math.max(0.30, 0.66 - layer * 0.05);
+    return cl(sh, 0.10, 1);
+  }
+
+  /* ---------- 8) 场景 ---------- */
+  function camState(now) {
+    CAM.tx = RM ? 0 : Math.sin(now * 0.00009) * 0.022 + ptr.tx * 0.018;
+    return {
+      yaw: CAM.yaw + (RM ? 0 : Math.sin(now * 0.00011) * 0.07) + ptr.tx * 0.02 + kick * 0.016,
+      pitch: CAM.pitch + (RM ? 0 : Math.sin(now * 0.00007) * 0.014),
+      dist: CAM.dist * (1 - (RM ? 0 : kick * 0.04 + Math.sin(now * 0.00007) * 0.012)),
+      f: CAM.f
+    };
+  }
+
+  function renderScene(now) {
+    var st = camState(now);
+
+    var amp = (P.paper === "fold") ? (FLAT ? 0 : foldAmp) : 0;
+    if (!S.lines.length) amp *= 0.34;
+
+    var beatGlow = RM ? 0 : Math.exp(-(now - beatAt) / 280) * beatAmp;
+    if (beatGlow > 0.001) amp *= (1 + beatGlow * 0.07);
+
+    var grid = sheetGrid(amp);
+
+    var cells = [];
+    for (var j = 0; j <= BACK_SHEETS; j++) {
+      for (var i = 0; i < 3; i++) {
+        for (var rr = 0; rr < 2; rr++) {
+          var wp = cellWorld(grid, i, rr, j);
+          var pp = projectAll(wp, st);
+          if (!pp) continue;
+          cells.push({ layer: j, i: i, r: rr, pp: pp, depth: pp.depth, nrm: normalOf(wp) });
+        }
+      }
+    }
+    if (!cells.length) return;
+    cells.sort(function (a, b) { return b.depth - a.depth; });
+
+    for (var s = BACK_SHEETS; s >= 0; s--) {
+      var q0 = project(worldPoint(grid, 0, 0, s), st);
+      var q1 = project(worldPoint(grid, 3, 0, s), st);
+      var q2 = project(worldPoint(grid, 3, 2, s), st);
+      var q3 = project(worldPoint(grid, 0, 2, s), st);
+      if (!q0 || !q1 || !q2 || !q3) continue;
+      ctx.save();
+      ctx.shadowColor = s === 0 ? "rgba(0,0,0,0.62)" : "rgba(0,0,0,0.16)";
+      ctx.shadowBlur = s === 0 ? 46 : 10;
+      ctx.shadowOffsetX = s === 0 ? 14 : 4;
+      ctx.shadowOffsetY = s === 0 ? 30 : 8;
+      ctx.beginPath();
+      ctx.moveTo(q0.x, q0.y);
+      ctx.lineTo(q1.x, q1.y);
+      ctx.lineTo(q2.x, q2.y);
+      ctx.lineTo(q3.x, q3.y);
+      ctx.closePath();
+      if (s === 0) {
+        ctx.fillStyle = "rgba(0,0,0,0.02)";
+        ctx.fill();
+      } else {
+        ctx.fillStyle = "rgb(" + Math.round(232 - s * 2) + "," + Math.round(224 - s * 2) + "," + Math.round(206 - s * 2) + ")";
+        ctx.fill();
+      }
+      ctx.restore();
+      if (s > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(q0.x, q0.y);
+        ctx.lineTo(q1.x, q1.y);
+        ctx.lineTo(q2.x, q2.y);
+        ctx.lineTo(q3.x, q3.y);
+        ctx.closePath();
+        ctx.strokeStyle = "rgba(66,56,40,0.22)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    var textA = transOn ? 1 : smooth(0, 0.32, (now - swapAt) / 1000);
+
+    ctx.save();
+
+    for (var ci = 0; ci < cells.length; ci++) {
+      var cc = cells[ci];
+      var shade = cellShade(cc.nrm, cc.layer);
+      if (cc.layer === 0 && bake) {
+        paperBase(cc.pp, shade);
+        drawPanelTex(cc.pp, U[cc.i] * BW, U[cc.i + 1] * BW, V[cc.r] * BH, V[cc.r + 1] * BH, shade, amp > 0.02 ? 16 : 1);
+      } else if (cc.layer === 0) {
+        drawPlainPanel(cc.pp, shade);
+      } else {
+        ctx.fillStyle = "rgb(" + Math.round(243 * shade) + "," + Math.round(236 * shade) + "," + Math.round(219 * shade) + ")";
+        quadPath(cc.pp);
+        ctx.fill();
+      }
+      if (amp > 0.02) {
+        if (cc.i > 0) drawCreaseV(cc.pp, amp);
+        if (cc.r > 0) drawCreaseH(cc.pp, amp);
+      }
+      if (cc.layer === 0 && textA < 1) {
+        ctx.fillStyle = "rgba(246,241,229," + ((1 - textA) * 0.95).toFixed(3) + ")";
+        quadPath(cc.pp);
+        ctx.fill();
+      }
+      if (cc.layer === 0 && DBG) {
+        ctx.strokeStyle = '#00ff88';
+        ctx.lineWidth = 2;
+        quadPath(cc.pp);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+
+    if (DBG && GEOM) {
+      ctx.strokeStyle = '#ff33cc';
+      ctx.lineWidth = 1.5;
+      for (var mk = 0; mk < GEOM.colX.length; mk++) {
+        for (var mr = 0; mr < GEOM.rows; mr++) {
+          var sx = GEOM.colX[mk];
+          var sy = GEOM.top + GEOM.lineH * (mr + 0.5);
+          var ci2 = 0, cr2 = 0;
+          while (ci2 < 2 && sx > U[ci2 + 1] * BW) ci2++;
+          while (cr2 < 1 && sy > V[cr2 + 1] * BH) cr2++;
+          var uu = cl((sx - U[ci2] * BW) / Math.max(1, (U[ci2 + 1] - U[ci2]) * BW), 0, 1);
+          var vv = cl((sy - V[cr2] * BH) / Math.max(1, (V[cr2 + 1] - V[cr2]) * BH), 0, 1);
+          var mpp = projectAll(cellWorld(grid, ci2, cr2, 0), st);
+          if (!mpp) continue;
+          var tx2 = lerp(mpp[3].x, mpp[2].x, uu), ty2 = lerp(mpp[3].y, mpp[2].y, uu);
+          var bx2 = lerp(mpp[0].x, mpp[1].x, uu), by2 = lerp(mpp[0].y, mpp[1].y, uu);
+          var px2 = lerp(tx2, bx2, vv), py2 = lerp(ty2, by2, vv);
+          ctx.beginPath();
+          ctx.moveTo(px2 - 7, py2); ctx.lineTo(px2 + 7, py2);
+          ctx.moveTo(px2, py2 - 7); ctx.lineTo(px2, py2 + 7);
+          ctx.stroke();
+        }
+      }
+    }
+
+  }
+
+  /* ---------- 8.2) 捏团抛出 ---------- */
+  function surfacePoint(grid, u, v) {
+    var i = (u < U[1]) ? 0 : (u < U[2] ? 1 : 2);
+    var j = (v < V[1]) ? 0 : 1;
+    var uu = cl((u - U[i]) / Math.max(0.0001, U[i + 1] - U[i]), 0, 1);
+    var vv = cl((v - V[j]) / Math.max(0.0001, V[j + 1] - V[j]), 0, 1);
+    var tl = worldPoint(grid, i, j, 0);
+    var tr = worldPoint(grid, i + 1, j, 0);
+    var br = worldPoint(grid, i + 1, j + 1, 0);
+    var bl = worldPoint(grid, i, j + 1, 0);
+    var tx = lerp(tl.x, tr.x, uu), ty = lerp(tl.y, tr.y, uu), tz = lerp(tl.z, tr.z, uu);
+    var bx = lerp(bl.x, br.x, uu), by = lerp(bl.y, br.y, uu), bz = lerp(bl.z, br.z, uu);
+    return { x: lerp(tx, bx, vv), y: lerp(ty, by, vv), z: lerp(tz, bz, vv) };
+  }
+
+  function buildPlanes() {
+    PLANES = [];
+    var seed = (Math.random() * 4294967296) >>> 0 || 20261104;
+    function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+    var axis = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    for (var k = 0; k < axis.length; k++) {
+      PLANES.push({ x: axis[k][0], y: axis[k][1], z: axis[k][2], d: 0.295 + rnd() * 0.04 });
+    }
+    for (var m2 = 0; m2 < 6; m2++) {
+      var zz = rnd() * 1.5 - 0.75;
+      var aa = rnd() * Math.PI * 2;
+      var rr = Math.sqrt(Math.max(0, 1 - zz * zz));
+      PLANES.push({ x: Math.cos(aa) * rr, y: zz, z: Math.sin(aa) * rr, d: 0.33 + rnd() * 0.045 });
+    }
+  }
+
+  function crumplePoint(u, v, e, spin, shrink) {
+    var lo = (u - 0.5) * Math.PI * 1.74;
+    var la = (v - 0.5) * Math.PI * 1.5;
+    var cw = Math.cos(la), sw = Math.sin(la);
+    var nx = Math.sin(lo) * cw, ny = sw, nz = Math.cos(lo) * cw;
+    var R = 1e9, k, p, dot, rk;
+    for (k = 0; k < PLANES.length; k++) {
+      p = PLANES[k];
+      dot = nx * p.x + ny * p.y + nz * p.z;
+      if (dot > 0.18) {
+        rk = p.d / dot;
+        if (rk < R) R = rk;
+      }
+    }
+    if (!(R < 1e8)) R = 0.32;
+    var wob = 1 + 0.045 * Math.sin(u * 29.3 + 1.7) * Math.sin(v * 22.1 + 0.4) +
+      0.025 * Math.sin(u * 12.7 - v * 16.9 + 2.3);
+    R *= 0.97 * wob * shrink;
+    var px = nx * R, py = ny * R, pz = nz * R;
+    var r = rotY(px, pz, spin);
+    return { x: r.x, y: py, z: r.z };
+  }
+
+  function drawCrumple(now, e) {
+    if (!crumpleSrc || !(crumpleSrc.width > 0)) return;
+    var st = camState(now);
+    var grid = sheetGrid(P.paper === "fold" ? snapAmp : 0);
+
+    var m = smooth(0, 1, cl(e / 0.34, 0, 1));
+    var tt = cl((e - 0.34) / 0.66, 0, 1);
+    var et = Math.pow(tt, 1.08);
+    var spin = throwDir * (e * 6 + tt * 12);
+    var shrink = 1 - 0.34 * et;
+    var roll = throwDir * et * 1.9;
+
+    var ox = throwDir * et * 4.0;
+    var oy = et * 1.12 + tt * tt * 0.06;
+    var oz = -0.12 * et;
+    var cr = Math.cos(roll), sr = Math.sin(roll);
+
+    var N = 17, M = 22;
+    var pts = [], i, j;
+    for (j = 0; j <= M; j++) {
+      for (i = 0; i <= N; i++) {
+        var u = i / N, v = j / M;
+        var f = surfacePoint(grid, u, v);
+        var b = crumplePoint(u, v, e, spin, shrink);
+        var x = lerp(f.x, b.x, m) + ox;
+        var y = lerp(f.y, b.y, m) + oy;
+        var z = lerp(f.z, b.z, m) + oz;
+        var xr = (x - ox) * cr - (y - oy) * sr + ox;
+        var yr = (x - ox) * sr + (y - oy) * cr + oy;
+        var wp = { x: xr, y: yr, z: z };
+        var pr = project(wp, st);
+        pts.push(pr ? { x: pr.x, y: pr.y, d: pr.d, w: wp } : null);
+      }
+    }
+
+    var quads = [];
+    for (j = 0; j < M; j++) {
+      for (i = 0; i < N; i++) {
+        var a0 = pts[j * (N + 1) + i];
+        var a1 = pts[j * (N + 1) + i + 1];
+        var a2 = pts[(j + 1) * (N + 1) + i + 1];
+        var a3 = pts[(j + 1) * (N + 1) + i];
+        if (!a0 || !a1 || !a2 || !a3) continue;
+        var minX = Math.min(a0.x, a1.x, a2.x, a3.x), maxX = Math.max(a0.x, a1.x, a2.x, a3.x);
+        var minY = Math.min(a0.y, a1.y, a2.y, a3.y), maxY = Math.max(a0.y, a1.y, a2.y, a3.y);
+        if (maxX < -40 || minX > W + 40 || maxY < -40 || minY > H + 40) continue;
+        quads.push({
+          bl: a3, br: a2, tr: a1, tl: a0,
+          depth: (a0.d + a1.d + a2.d + a3.d) * 0.25,
+          nrm: normalOf([a3.w, a2.w, a1.w, a0.w]),
+          sx0: (i / N) * CSW, sx1: ((i + 1) / N) * CSW,
+          sy0: (j / M) * CSH, sy1: ((j + 1) / M) * CSH
+        });
+      }
+    }
+    if (!quads.length) return;
+    quads.sort(function (p1, p2) { return p2.depth - p1.depth; });
+    if (DBG) window.__cr = { e: e, m: m, et: et, n: quads.length, q0: quads[0], ox: ox, oy: oy };
+
+    var c0 = project({ x: ox, y: oy + 0.30, z: oz }, st);
+    if (c0) {
+      var rr = 150 + 70 * et;
+      var gs = ctx.createRadialGradient(c0.x, c0.y - 26, 0, c0.x, c0.y - 26, rr);
+      addStop(gs, 0, "rgba(0,0,0,0.44)");
+      addStop(gs, 1, "rgba(0,0,0,0)");
+      ctx.fillStyle = gs;
+      ctx.beginPath();
+      ctx.ellipse(c0.x, c0.y - 26, rr, rr * 0.86, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    var c1 = project({ x: ox, y: oy, z: oz }, st);
+    if (c1 && et < 0.98) {
+      var r2 = 92 + 40 * et;
+      var gp = ctx.createRadialGradient(c1.x, c1.y, 0, c1.x, c1.y, r2);
+      addStop(gp, 0, "rgba(236,228,210," + (0.92 * (1 - et)).toFixed(3) + ")");
+      addStop(gp, 0.70, "rgba(222,212,192," + (0.70 * (1 - et)).toFixed(3) + ")");
+      addStop(gp, 1, "rgba(210,199,178,0)");
+      ctx.fillStyle = gp;
+      ctx.beginPath();
+      ctx.arc(c1.x, c1.y, r2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    for (var q = 0; q < quads.length; q++) {
+      var Q = quads[q];
+      var pp = [Q.bl, Q.br, Q.tr, Q.tl];
+      var sh = 0.70 + 0.30 * cellShade(Q.nrm, 0);
+      ctx.fillStyle = "rgb(" + Math.round(244 * sh) + "," + Math.round(237 * sh) + "," + Math.round(222 * sh) + ")";
+      quadPath(pp);
+      ctx.fill();
+      texQuad(crumpleSrc, Q.sx0, Q.sy0, Q.sx1, Q.sy1, Q.tl, Q.tr, Q.br, Q.bl);
+      ctx.fillStyle = "rgba(44,32,18," + (Math.max(0, 1 - sh) * 0.42).toFixed(3) + ")";
+      quadPath(pp);
+      ctx.fill();
+    }
+  }
+
+  /* ---------- 8.5) 调试 ---------- */
+  var DBG = false;
+  try { DBG = location.search.indexOf('dbg') >= 0; } catch (e) {}
+  var FLAT = false;
+  try { FLAT = location.search.indexOf('flat') >= 0; } catch (e) {}
+  if (DBG) {
+    window.__geo = function () {
+      return { U: U.slice(), V: V.slice(), amp: foldAmp, roll: ROLL, ang: ANG, bj: !!bake };
+    };
+  }
+
+  /* ---------- 9) 界面 ---------- */
+  function drawBackground() {
+    ctx.fillStyle = "#08080A";
+    ctx.fillRect(0, 0, W, H);
+    var g = ctx.createRadialGradient(CAM.ox, CAM.oy, 0, CAM.ox, CAM.oy, Math.max(W, H) * 0.64);
+    addStop(g, 0, "rgba(255,243,218,0.14)");
+    addStop(g, 0.44, "rgba(255,240,212,0.05)");
+    addStop(g, 1, "rgba(255,240,212,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawMeta() {
+    var mx, top, nameSize, artSize, labelSize;
+    if (portrait) {
+      mx = W * 0.072; top = H * 0.070;
+      labelSize = Math.max(9, W * 0.023);
+      nameSize = cl(W * 0.060, 19, 32);
+      artSize = cl(W * 0.036, 12, 17);
+    } else {
+      mx = W * 0.062; top = H * 0.155;
+      labelSize = Math.max(9, W * 0.0074);
+      nameSize = cl(W * 0.021, 21, 38);
+      artSize = cl(W * 0.0105, 12, 17);
+    }
+
+    ctx.fillStyle = accentA(0.9);
+    ctx.fillRect(mx, top - labelSize * 0.78, labelSize * 0.86, labelSize * 0.86);
+    drawSpaced("NOW PLAYING", mx + labelSize * 1.7, top, labelSize, "rgba(242,239,231,0.44)", labelSize * 0.44);
+
+    var name = SONG.name || "未知曲目";
+    var maxW = portrait ? W * 0.86 : Math.min(W * 0.33, 500);
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.font = font(700, nameSize);
+    ctx.fillStyle = "rgba(244,241,233,0.95)";
+    ctx.fillText(ellipsize(name, maxW), mx, top + nameSize * 1.85);
+
+    if (SONG.artists) {
+      ctx.font = font(400, artSize);
+      ctx.fillStyle = "rgba(244,241,233,0.48)";
+      ctx.fillText(ellipsize(SONG.artists, maxW), mx, top + nameSize * 1.85 + artSize * 1.9);
+    }
+  }
+
+  function drawSpaced(text, x, y, size, color, track) {
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.font = font(600, size, true);
+    ctx.fillStyle = color;
+    var cx = x;
+    for (var i = 0; i < text.length; i++) {
+      ctx.fillText(text.charAt(i), cx, y);
+      cx += ctx.measureText(text.charAt(i)).width + track;
+    }
+  }
+
+  function ellipsize(text, maxW) {
+    if (ctx.measureText(text).width <= maxW) return text;
+    for (var i = text.length - 1; i > 0; i--) {
+      var s = text.slice(0, i) + "…";
+      if (ctx.measureText(s).width <= maxW) return s;
+    }
+    return "…";
+  }
+
+  function drawProgress() {
+    var mx = portrait ? W * 0.072 : W * 0.062;
+    var py = portrait ? H * 0.925 : H * 0.875;
+    var pw = portrait ? W * 0.856 : Math.min(W * 0.29, 440);
+    var dur = META.duration;
+    var ratio = dur > 0 ? cl(S.t / dur, 0, 1) : 0;
+
+    ctx.fillStyle = "rgba(242,239,231,0.13)";
+    ctx.fillRect(mx, py, pw, 1);
+    if (ratio > 0) {
+      var px = mx + pw * ratio;
+      ctx.fillStyle = accentA(0.95);
+      ctx.fillRect(mx, py - 0.5, Math.max(2, pw * ratio), 2);
+      ctx.fillStyle = "rgba(248,244,235,0.92)";
+      ctx.fillRect(px - 1.5, py - 6, 3, 13);
+    }
+
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.font = font(400, Math.max(10, W * 0.0082), true);
+    ctx.fillStyle = "rgba(242,239,231,0.40)";
+    ctx.fillText(fmtTime(S.t), mx, py + 27);
+    ctx.textAlign = "right";
+    ctx.fillText(dur > 0 ? fmtTime(dur) : "--:--", mx + pw, py + 27);
+
+    if (!S.playing) {
+      ctx.textAlign = "left";
+      ctx.font = font(600, Math.max(9, W * 0.0072), true);
+      ctx.fillStyle = accentA(0.8);
+      ctx.fillText("PAUSED", mx, py - 16);
+    }
+  }
+
+  function drawOverlay() {
+    var vg = ctx.createRadialGradient(W * 0.5, H * 0.48, Math.min(W, H) * 0.30, W * 0.5, H * 0.48, Math.max(W, H) * 0.80);
+    addStop(vg, 0, "rgba(0,0,0,0)");
+    addStop(vg, 0.60, "rgba(0,0,0,0.20)");
+    addStop(vg, 1, "rgba(0,0,0,0.64)");
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+
+    if (grainPat) {
+      ctx.save();
+      ctx.globalAlpha = 0.05;
+      ctx.fillStyle = grainPat;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+  }
+
+  /* ---------- 10) 主循环 ---------- */
+  function updateFold(now) {
+    var p = 0;
+    var line = S.lines[S.idx >= 0 ? S.idx : 0];
+    if (S.lines.length && line) {
+      var d = line.dur > 0 ? line.dur : 3.4;
+      p = cl((S.t - line.t) / Math.max(d, 1.0), 0, 1);
+    }
+    var target = 0.74;
+    if (S.lines.length && line) {
+      target = 0.90 + 0.20 * (1 - smooth(0.03, 0.46, p)) + 0.10 * smooth(0.68, 0.98, p);
+    }
+    if (RM) target = 0.62;
+    target += RM ? 0 : ptr.ty * 0.05;
+
+    foldAmp += (target - foldAmp) * (RM ? 1 : 0.10);
+    if (!isFinite(foldAmp)) foldAmp = 0.8;
+    foldAmp = cl(foldAmp, 0.3, 1.25);
+  }
+
+  function frame(now) {
+    var js0 = performance.now();
+    try {
+      ptr.tx += (ptr.x - ptr.tx) * 0.05;
+      ptr.ty += (ptr.y - ptr.ty) * 0.05;
+
+      if (S.idx !== lastIdxShown) {
+        var jump = Math.abs(S.idx - lastIdxShown);
+        if (bctxPrev && bake) {
+          bctxPrev.setTransform(1, 0, 0, 1, 0, 0);
+          bctxPrev.clearRect(0, 0, BW, BH);
+          try { bctxPrev.drawImage(bake, 0, 0); } catch (eS) {}
+          if (!crumpleSrc) {
+            crumpleSrc = document.createElement("canvas");
+            crumpleSrc.width = CSW;
+            crumpleSrc.height = CSH;
+          }
+          var csx = crumpleSrc.getContext("2d");
+          if (csx) {
+            csx.setTransform(1, 0, 0, 1, 0, 0);
+            csx.clearRect(0, 0, CSW, CSH);
+            try { csx.drawImage(bake, 0, 0, BW, BH, 0, 0, CSW, CSH); } catch (eT) {}
+          }
+        }
+        transOn = (P.swap === "crumple") && !RM && lastIdxShown >= 0 && S.idx >= 0 && jump <= 2;
+        buildPlanes();
+        throwDir = Math.random() < 0.5 ? -1 : 1;
+        transAt = now;
+        snapAmp = foldAmp;
+        lastIdxShown = S.idx;
+        swingStart = now;
+        swapAt = now;
+        bakeKey = "";
+      }
+      var kp = cl((now - swingStart) / 1100, 0, 1);
+      kick = (1 - kp) * (1 - kp);
+      if (RM) kick = 0;
+
+      beat = cl(1 - (now - beatAt) / 320, 0, 1) * beatAmp;
+
+      updateFold(now);
+      bakePage();
+
+      var te = transOn ? (now - transAt) / TRANS_DUR : 2;
+      if (DBG && window.__tf != null && window.__tf >= 0 && window.__tf <= 1.5) {
+        transOn = true;
+        te = window.__tf;
+      } else if (te >= 1) { transOn = false; te = 2; }
+      if (DBG) window.__tstate = { on: transOn, te: te };
+
+      drawBackground();
+      renderScene(now);
+      if (transOn) drawCrumple(now, te);
+      drawMeta();
+      drawProgress();
+      drawOverlay();
+
+      S.frames++;
+    } catch (e) {
+      errLog(e);
+    }
+    S.js = performance.now() - js0;
+    requestAnimationFrame(frame);
+  }
+
+  /* ---------- 11) 消息 ---------- */
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    for (var guard = 0; guard < 64 && lo <= hi; guard++) {
+      var m = (lo + hi) >> 1;
+      if (a[m].t <= t + 0.02) { best = m; lo = m + 1; } else { hi = m - 1; }
+    }
+    return best;
+  }
+
+  function onInit(p) {
+    var song = (p && p.song && typeof p.song === "object") ? p.song : {};
+
+    SONG.name = (typeof song.name === "string") ? song.name : "";
+    var ar = song.artists;
+    if (Array.isArray(ar)) {
+      var names = [];
+      for (var ai = 0; ai < ar.length && ai < 8; ai++) {
+        if (typeof ar[ai] === "string" && ar[ai]) names.push(ar[ai]);
+      }
+      SONG.artists = names.join(" / ");
+    } else {
+      SONG.artists = (typeof ar === "string") ? ar : "";
+    }
+
+    setAccent(p && p.accent);
+
+    var dur = Number(p && p.duration);
+    META.duration = isFinite(dur) && dur > 0 ? dur : 0;
+
+    var src = (p && Array.isArray(p.lines)) ? p.lines : [];
+    var out = [];
+    for (var i = 0; i < src.length && i < 4000; i++) {
+      var l = src[i];
+      if (!l || typeof l !== "object") continue;
+      var lt = Number(l.t);
+      var ld = Number(l.dur);
+      out.push({
+        t: isFinite(lt) ? lt : 0,
+        dur: isFinite(ld) ? ld : 0,
+        text: (l.text === null || l.text === undefined) ? "" : String(l.text),
+        chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null
+      });
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    S.lines = out;
+
+    if (typeof p.playing === "boolean") S.playing = p.playing;
+    else S.playing = true;
+
+    S.idx = idxAt(S.t);
+    lastIdxShown = -99;
+    swingStart = performance.now();
+    transOn = false;
+    bakeKey = "";
+  }
+
+  function onTick(p) {
+    var t = Number(p && p.time);
+    if (isFinite(t)) S.t = t;
+    if (typeof p.playing === "boolean") {
+      if (S.playing !== p.playing) bakeKey = "";
+      S.playing = p.playing;
+    }
+    var i = idxAt(S.t);
+    if (i !== S.idx) S.idx = i;
+  }
+
+  addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === "init") {
+        onInit(p);
+      } else if (d.type === "tick") {
+        onTick(p);
+      } else if (d.type === "beat") {
+        if (!RM) {
+          var lv = Number(p.level);
+          beatAt = performance.now();
+          beatAmp = isFinite(lv) ? cl(lv, 0, 1) : 0.4;
+        }
+      } else if (d.type === "live") {
+        if (typeof p.playing === "boolean" && p.playing !== S.playing) S.playing = p.playing;
+      } else if (d.type === "setting") {
+        var kk = p.key, vv = p.value;
+        if (kk === "paper" && (vv === "ruled" || vv === "fold")) {
+          if (P.paper !== vv) {
+            P.paper = vv;
+            bakeKey = "";
+            transOn = false;
+            swapAt = performance.now();
+          }
+        } else if (kk === "swap" && (vv === "crumple" || vv === "flash")) {
+          P.swap = vv;
+          if (vv === "flash") transOn = false;
+        }
+      }
+    } catch (e) {
+      errLog(e);
+    }
+  });
+
+  /* ---------- 12) 交互 ---------- */
+  function activity() {
+    var n = performance.now();
+    if (n - lastAct < 180) return;
+    lastAct = n;
+    try { parent.postMessage({ __c100: 1, type: "activity" }, "*"); } catch (e) {}
+  }
+  addEventListener("mousemove", function (ev) {
+    activity();
+    ptr.x = (ev.clientX / Math.max(1, W)) * 2 - 1;
+    ptr.y = (ev.clientY / Math.max(1, H)) * 2 - 1;
+  }, { passive: true });
+  addEventListener("mousedown", activity, { passive: true });
+  addEventListener("touchstart", activity, { passive: true });
+  addEventListener("touchmove", function (ev) {
+    activity();
+    var t = ev.touches && ev.touches[0];
+    if (t) {
+      ptr.x = (t.clientX / Math.max(1, W)) * 2 - 1;
+      ptr.y = (t.clientY / Math.max(1, H)) * 2 - 1;
+    }
+  }, { passive: true });
+
+  addEventListener("keydown", function (ev) {
+    activity();
+    if (ev.code === "Space" || ev.key === " " || ev.key === "Spacebar") {
+      ev.preventDefault();
+      try { parent.postMessage({ __c100: 1, type: "key", payload: { key: "Space" } }, "*"); } catch (e) {}
+    }
+  });
+
+  addEventListener("resize", resize);
+
+  /* ---------- 13) 启动 ---------- */
+  bake = document.createElement("canvas");
+  bake.width = BW;
+  bake.height = BH;
+  bctx = bake.getContext("2d");
+
+  bakePrev = document.createElement("canvas");
+  bakePrev.width = BW;
+  bakePrev.height = BH;
+  bctxPrev = bakePrev.getContext("2d");
+
+  resize();
+  buildGrain();
+  bakeKey = "";
+  bakePage();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

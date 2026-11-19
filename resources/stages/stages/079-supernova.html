@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>超新星</title>
+<style>
+  html,body{margin:0;height:100%;background:#030206;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(116% 94% at 50% 50%,transparent 26%,rgba(4,2,8,.55) 74%,rgba(1,0,3,.97))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(220,210,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   lyra14 · 超新星 —— 字是**激波扫过去那一瞬**被点亮的，不是先有字再有光
+   ---------------------------------------------------------------------------
+   物理：中心一次爆发，球状激波以接近恒定的速度向外扫。距离 d 处的物质在
+   t = t0 + d/v 被扫到 —— 那一刻它被加热到极亮（冲击帧），然后按指数冷却。
+   所以整行字是"从爆发中心一圈一圈被点着"的：近的字先亮、远的后亮，
+   而且亮起来的位置永远在**一个正在扩大的圆环**上。
+
+   实现（很便宜，不需要粒子物理）：
+     · 字形采样点各自算 d 和 t_hit
+     · 亮度 = 冲击尖峰 exp(-|t-t_hit|/0.05) + 余辉 exp(-(t-t_hit)/1.1)
+     · 按亮度分 4 档批量 fill
+     · 另有一批碎屑粒子沿径向飞出（带拖尾），以及 3 圈激波环
+     · 换句 = 一次新的爆发（中心移到新字上），白闪 + 负片闪 + 方向震动 + 顿帧
+
+   AE 手法：冲击帧 / 负片闪白（整屏反相一帧）/ 焦距突变（爆开时 cz 猛拉到 1.14
+   再弹回）/ 定向震动 / 动态模糊（碎屑拖尾）/ 升格（爆开瞬间物理 0.35 倍速）
+
+   配色：白热 + 冷紫残辉
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+let W = 0, H = 0, DPR = 1;
+let bgCv = null;
+let L = null, curIdx = -1;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBg();
+  initDebris();
+  if (L && curIdx >= 0) assignLine(curIdx);
+}
+addEventListener('resize', resize);
+
+let lines = [];
+let accent = [214, 200, 255];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* ---- 分词 ---- */
+let DICT = null;
+fetch('/segdict.bin').then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); }).catch(() => {});
+const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+function isWord(s, i, Ln) {
+  if (!DICT) return false;
+  const h = fnv(s.substr(i, Ln));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) { const m = (lo + hi) >> 1, v = DICT[m]; if (v === h) return true; if (v < h) lo = m + 1; else hi = m - 1; }
+  return false;
+}
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, text.length - i); Ln >= 2; Ln--) if (isWord(text, i, Ln)) { hit = Ln; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, j); Ln >= 2; Ln--) if (isWord(text, j - Ln, Ln)) { hit = Ln; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+function isLatin(text) { let la = 0, cjk = 0; for (let i = 0; i < text.length; i++) { const c = text[i]; if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++; else if (c >= '\u4e00' && c <= '\u9fff') cjk++; } return la > cjk; }
+function latinSpans(text) {
+  const out = []; let i = 0;
+  while (i < text.length) { if (SPACE.test(text[i])) { i++; continue; } let j = i; while (j < text.length && !SPACE.test(text[j])) j++; out.push({ i0: i, i1: j }); i = j; }
+  return out;
+}
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+const countChars = (s) => { let n = 0; for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++; return n; };
+function groupByWords(text) {
+  const words = segWords(text), out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos; pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; } else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+function groupByRule(text) {
+  const out = []; let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const s = PUNCT.test(text[i]) || SPACE.test(text[i]);
+    if (!s) chars++;
+    if (s && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!s && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+const spansForLine = (t) => (isLatin(t) ? latinSpans(t) : (DICT ? groupByWords(t) : groupByRule(t)));
+
+/* ---- 字形采样 ---- */
+const offCv = document.createElement('canvas');
+const octx = offCv.getContext('2d', { willReadFrequently: true });
+const FONT = (px, wt) => `${wt || 800} ${px}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+function wrapText(text, fs, maxW, wt) {
+  octx.font = FONT(fs, wt);
+  const latin = isLatin(text);
+  const rows = []; let start = 0, w = 0;
+  for (let i = 0; i < text.length; i++) {
+    const cw = octx.measureText(text[i]).width;
+    if (!cw) continue;
+    if (w + cw > maxW && i > start) {
+      let brk = i;
+      if (latin) { let j = i; while (j > start && !SPACE.test(text[j])) j--; if (j > start) brk = j; }
+      rows.push({ i0: start, i1: brk, w: octx.measureText(text.slice(start, brk)).width });
+      start = brk; w = 0;
+      while (start < text.length && SPACE.test(text[start])) start++;
+      if (start >= text.length) break;
+      i = start - 1; continue;
+    }
+    w += cw;
+  }
+  if (start < text.length) rows.push({ i0: start, i1: text.length, w: octx.measureText(text.slice(start)).width });
+  for (const r of rows) while (r.i1 - r.i0 > 1 && SPACE.test(text[r.i0])) r.i0++;
+  return rows.length ? rows : [{ i0: 0, i1: text.length, w: octx.measureText(text).width }];
+}
+function sampleGlyph(text, opt) {
+  opt = opt || {};
+  const wt = opt.weight || 800;
+  let fs = opt.fs || 92;
+  const maxW = opt.maxW || Math.min(W * 0.70, 1120);
+  const maxH = opt.maxH || H * 0.46;
+  let rows = wrapText(text, fs, maxW, wt);
+  let lh = fs * 1.16;
+  if (rows.length * lh > maxH) { fs *= maxH / (rows.length * lh); rows = wrapText(text, fs, maxW, wt); lh = fs * 1.16; }
+  octx.font = FONT(fs, wt);
+  const widest = Math.max(1, ...rows.map((r) => octx.measureText(text.slice(r.i0, r.i1)).width));
+  const padW = Math.ceil(widest) + 24, padH = Math.ceil(lh * rows.length) + 12;
+  offCv.width = padW; offCv.height = padH;
+  octx.font = FONT(fs, wt);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.clearRect(0, 0, padW, padH);
+  const n = text.length;
+  const charCx = new Float32Array(n), charCy = new Float32Array(n);
+  const rowMaps = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r], str = text.slice(row.i0, row.i1);
+    const cy = padH / 2 + (r - (rows.length - 1) / 2) * lh;
+    octx.fillText(str, padW / 2, cy);
+    const x0 = (padW - row.w) / 2, map = new Int16Array(padW).fill(-1);
+    let acc = 0;
+    for (let i = row.i0; i < row.i1; i++) {
+      const cw = octx.measureText(text[i]).width;
+      charCx[i] = x0 + acc + cw / 2 - padW / 2; charCy[i] = cy - padH / 2;
+      for (let x = Math.max(0, Math.floor(x0 + acc)); x < Math.min(padW, Math.ceil(x0 + acc + cw)); x++) map[x] = i;
+      acc += cw;
+    }
+    rowMaps.push({ y0: cy - lh / 2, y1: cy + lh / 2, map });
+  }
+  const d = octx.getImageData(0, 0, padW, padH).data;
+  const pxA = [], pyA = [], ownA = [];
+  const step = opt.step || 3;
+  for (let y = 0; y < padH; y += step) {
+    let rm = null;
+    for (let r = 0; r < rowMaps.length; r++) { const m = rowMaps[r]; if (y >= m.y0 && y < m.y1) { rm = m; break; } }
+    if (!rm) continue;
+    const map = rm.map, base = y * padW;
+    for (let x = 0; x < padW; x += step) {
+      if (d[(base + x) * 4 + 3] <= 128) continue;
+      const c = map[x]; if (c < 0) continue;
+      pxA.push(x - padW / 2); pyA.push(y - padH / 2); ownA.push(c);
+    }
+  }
+  return { px: Float32Array.from(pxA), py: Float32Array.from(pyA), own: Int16Array.from(ownA),
+           pc: pxA.length, n, charCx, charCy, fs, w: widest, h: lh * rows.length, rows: rows.length };
+}
+
+let brewIdx = -1, lastT = -1;
+const hintShow = (s, o) => { hint.textContent = s; hint.style.opacity = o; };
+
+/* ---- 相机 ---- */
+const cam = { x: 0, y: 0, tx: 0, ty: 0, z: 1, tz: 1, vz: 0, sh: 0, dirx: 0, diry: 0, shx: 0, shy: 0 };
+function camShake(dx, dy, amp) { const l = Math.hypot(dx, dy) || 1; cam.dirx = dx / l; cam.diry = dy / l; cam.sh = Math.min(30, Math.max(cam.sh, amp)); }
+function camUpdate(dt, T) {
+  const ke = 1 - Math.pow(0.002, dt);
+  cam.x += ((cam.tx || W / 2) - cam.x) * ke * 0.9;
+  cam.y += ((cam.ty || H / 2) - cam.y) * ke * 0.9;
+  cam.vz += ((cam.tz - cam.z) * 190 - cam.vz * 18) * dt;
+  cam.z += cam.vz * dt;
+  cam.sh *= Math.pow(0.000035, dt);
+  const wob = Math.sin(T * 61.7) * 0.6 + Math.sin(T * 42.1 + 1.3) * 0.4;
+  cam.shx = cam.dirx * cam.sh * wob;
+  cam.shy = cam.diry * cam.sh * wob;
+}
+
+/* ---- 顿帧 / 闪白 / 负片 ---- */
+const AE = { freeze: 0, flash: 0, invert: 0, slow: 0 };
+const hitStop = (s) => { AE.freeze = Math.max(AE.freeze, s); };
+const flash = (v) => { AE.flash = Math.max(AE.flash, v); };
+
+/* ---- 激波状态 ---- */
+let blastX = 0, blastY = 0, blastT = -99, blastV = 1500;   // 爆心 / 起始时刻 / 波速 px/s
+let spanFired = new Uint8Array(0);
+let charChars = null;
+let charGlow = new Float32Array(0);
+let charDist = new Float32Array(0);      // 每个字到爆心的距离（决定被扫到的时刻）
+let charHit = new Float32Array(0);       // 每个字的命中时刻
+let spans = [];
+let blockGx = 0, blockGy = 0;
+
+/* ---- 碎屑 ---- */
+const ND = 260;
+const dx2 = new Float32Array(ND), dy2 = new Float32Array(ND), dvx = new Float32Array(ND), dvy = new Float32Array(ND);
+const dlf = new Float32Array(ND), dsz = new Float32Array(ND);
+function initDebris() {
+  for (let i = 0; i < ND; i++) { dlf[i] = 0; dx2[i] = -9999; dy2[i] = -9999; dsz[i] = rnd(0.8, 2.2); }
+}
+function burstDebris(n, power) {
+  for (let k = 0; k < n; k++) {
+    const i = (Math.random() * ND) | 0;
+    const a = rnd(0, 6.2832);
+    const sp = rnd(320, 1500) * power;
+    dx2[i] = blastX; dy2[i] = blastY;
+    dvx[i] = Math.cos(a) * sp; dvy[i] = Math.sin(a) * sp;
+    dlf[i] = rnd(0.7, 1.8);
+  }
+}
+
+let bgGrad = null;
+function buildBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  const bw = Math.round(W / 2), bh = Math.round(H / 2);
+  bgCv.width = bw; bgCv.height = bh;
+  const g = bgCv.getContext('2d');
+  const grd = g.createRadialGradient(bw / 2, bh / 2, 0, bw / 2, bh / 2, Math.max(bw, bh) * 0.72);
+  grd.addColorStop(0, '#0d0a18');
+  grd.addColorStop(0.45, '#06040e');
+  grd.addColorStop(1, '#020106');
+  g.fillStyle = grd; g.fillRect(0, 0, bw, bh);
+}
+
+/* ---- 布局 ---- */
+let prep = null;
+function prepLine(idx) {
+  const line = lines[idx];
+  if (!line || !line.text) return null;
+  const text = line.text;
+  const latin = isLatin(text);
+  const fs0 = latin ? 76 : (text.length <= 10 ? 100 : text.length <= 16 ? 86 : 72);
+  const g = sampleGlyph(text, { fs: fs0, maxW: Math.min(W * 0.70, 1120), maxH: H * 0.44 });
+  if (!g.pc) return null;
+  g.text = text;
+  charChars = line.chars && line.chars.length === text.length ? line.chars : null;
+  const raw = spansForLine(text);
+  const spanOf = new Int16Array(g.n).fill(-1);
+  const spList = [];
+  for (let k = 0; k < raw.length; k++) {
+    const s = raw[k];
+    if (!s || s.i1 <= s.i0) continue;
+    let t;
+    if (charChars && charChars[s.i0] && typeof charChars[s.i0].t === 'number') t = charChars[s.i0].t;
+    else t = line.t + (line.dur || 4) * (s.i0 / Math.max(1, text.length));
+    spList.push({ i0: s.i0, i1: s.i1, t });
+    for (let c = s.i0; c < s.i1; c++) spanOf[c] = spList.length - 1;
+  }
+  if (!spList.length) return null;
+  for (let k = 1; k < spList.length; k++) if (spList[k].t < spList[k - 1].t) spList[k].t = spList[k - 1].t;
+  return { idx, g, spans: spList, spanOf, cc: charChars };
+}
+
+function assignLine(idx) {
+  const use = (prep && prep.idx === idx) ? prep : prepLine(idx);
+  if (!use) { L = null; return; }
+  const g = use.g;
+  L = g; spans = use.spans; charChars = use.cc;
+  charGlow = new Float32Array(g.n);
+  spanFired = new Uint8Array(spans.length);
+  blockGx = W / 2;
+  blockGy = H * 0.455;
+  /* 爆心放在字块中心偏上，让激波从中间向两边扫 */
+  blastX = blockGx; blastY = blockGy;
+  blastT = now();
+  blastV = Math.max(W, H) * 0.55;
+  charDist = new Float32Array(g.n);
+  charHit = new Float32Array(g.n);
+  for (let c = 0; c < g.n; c++) {
+    const dx = g.charCx[c], dy = g.charCy[c];
+    charDist[c] = Math.hypot(dx, dy);
+    charHit[c] = blastT + charDist[c] / blastV;
+  }
+  cam.tz = 1.0;
+}
+
+/* ============================ 主循环 ============================ */
+let last = performance.now();
+let T0 = 0;
+
+function frame(nowMs) {
+  const dtReal = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; T0 += dtReal;
+  if (AE.freeze > 0) AE.freeze -= dtReal;
+  let dt = AE.freeze > 0 ? 0 : dtReal;
+  if (AE.slow > 0) { AE.slow -= dtReal; dt *= 0.35; }
+
+  const T = now();
+  timing(T);
+
+  let ccur = 0;
+  if (L && curIdx >= 0) {
+    if (charChars) { for (let k = 0; k < charChars.length; k++) if (charChars[k].t <= T) ccur = k; }
+    else ccur = Math.min(L.n - 1, Math.floor(clamp01((T - lines[curIdx].t) / Math.max(0.3, lines[curIdx].dur || 4)) * L.n));
+  }
+  cam.tx = W / 2 + ((L ? blockGx + L.charCx[ccur] : W / 2) - W / 2) * 0.3;
+  cam.ty = H / 2 + ((L ? blockGy + L.charCy[ccur] : H / 2) - H / 2) * 0.3;
+  camUpdate(dtReal, T0);
+  const z = cam.z, shx = cam.shx, shy = cam.shy;
+
+  if (L) {
+    if (charChars) for (let c = 0; c < L.n; c++) charGlow[c] = charChars[c] ? clamp01((T - charChars[c].t) / 0.22) : 0;
+    else {
+      const lt = lines[curIdx] ? lines[curIdx].t : 0, ld = lines[curIdx] ? (lines[curIdx].dur || 4) : 4;
+      for (let c = 0; c < L.n; c++) charGlow[c] = clamp01((T - lt - ld * 0.85 * c / L.n) / 0.3);
+    }
+  }
+
+  /* 每团到点 = 一次新爆发 */
+  if (L && curIdx >= 0) {
+    for (let k = 0; k < spans.length; k++) {
+      if (spanFired[k] || T < spans[k].t) continue;
+      spanFired[k] = 1;
+      const first = k === 0;
+      const s = spans[k];
+      let mx = 0, my = 0, cnt = 0;
+      for (let c = s.i0; c < s.i1; c++) { mx += L.charCx[c]; my += L.charCy[c]; cnt++; }
+      blastX = blockGx + mx / Math.max(1, cnt);
+      blastY = blockGy + my / Math.max(1, cnt);
+      blastT = T;
+      /* 爆心移动后重算命中时刻：这就是"字被激波一圈圈点着"的排程 */
+      for (let c = 0; c < L.n; c++) {
+        const d = Math.hypot(L.charCx[c] - (blastX - blockGx), L.charCy[c] - (blastY - blockGy));
+        charDist[c] = d;
+        charHit[c] = blastT + d / blastV;
+      }
+      hitStop(first ? 0.075 : 0.035);
+      flash(first ? 1.0 : 0.5);
+      AE.invert = first ? 0.9 : 0.35;          // 负片闪
+      AE.slow = first ? 0.30 : 0.16;
+      cam.tz = first ? 1.14 : 1.06;
+      camShake(Math.cos(k * 2.3), Math.sin(k * 2.3), first ? 22 : 12);
+      burstDebris(first ? 150 : 70, first ? 1.3 : 0.7);
+    }
+    cam.tz += (1.0 - cam.tz) * Math.min(1, dtReal * 2.0);
+  }
+
+  /* 碎屑 */
+  if (dt > 0) {
+    for (let i = 0; i < ND; i++) {
+      if (dlf[i] <= 0) continue;
+      dx2[i] += dvx[i] * dt; dy2[i] += dvy[i] * dt;
+      dvx[i] *= 0.985; dvy[i] *= 0.985;
+      dlf[i] -= dt;
+    }
+  }
+
+  /* ---- 绘制 ---- */
+  const [ar, ag2, ab] = accent;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#030206';
+  ctx.fillRect(0, 0, W, H);
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+
+  const bcx = W / 2 + shx + (blastX - cam.x) * z;
+  const bcy = H / 2 + shy + (blastY - cam.y) * z;
+  const shockR = Math.max(0, (T - blastT)) * blastV * z;    // 当前激波半径（屏幕像素）
+
+  ctx.globalCompositeOperation = 'lighter';
+
+  /* ① 激波环：主环 + 内侧两颗更暗的（叠出"有厚度"） */
+  if (shockR > 4 && shockR < Math.max(W, H) * 2) {
+    ctx.strokeStyle = `rgba(255,255,255,${clamp01(0.55 - shockR / (Math.max(W, H) * 1.4)).toFixed(3)})`;
+    ctx.lineWidth = 3.2 * z;
+    ctx.beginPath(); ctx.arc(bcx, bcy, shockR, 0, 6.2832); ctx.stroke();
+    ctx.strokeStyle = `rgba(${Math.min(255, ar)},${Math.min(255, ag2 - 30)},${Math.min(255, ab - 20)},0.20)`;
+    ctx.lineWidth = 12 * z;
+    ctx.beginPath(); ctx.arc(bcx, bcy, shockR * 0.97, 0, 6.2832); ctx.stroke();
+  }
+
+  /* ② 碎屑：沿速度拉成短线（动态模糊） */
+  ctx.strokeStyle = 'rgba(255,246,235,0.75)';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for (let i = 0; i < ND; i++) {
+    if (dlf[i] <= 0) continue;
+    const sx = (dx2[i] - cam.x) * z + W / 2 + shx, sy = (dy2[i] - cam.y) * z + H / 2 + shy;
+    if (sx < -40 || sx > W + 40 || sy < -40 || sy > H + 40) continue;
+    const tl = 0.022 * Math.min(1, dlf[i]);
+    ctx.moveTo(sx - dvx[i] * tl * z, sy - dvy[i] * tl * z);
+    ctx.lineTo(sx, sy);
+  }
+  ctx.stroke();
+
+  /* ③ 字：亮度 = 冲击尖峰 + 指数余辉。分 4 档批量 fill */
+  if (L) {
+    for (let band = 0; band < 4; band++) {
+      const cols = [
+        `rgba(${Math.min(255, ar - 60)},${Math.min(255, ag2 - 70)},${Math.min(255, ab - 30)},0.30)`,
+        `rgba(${Math.min(255, ar - 20)},${Math.min(255, ag2 - 24)},${Math.min(255, ab + 4)},0.55)`,
+        `rgba(${Math.min(255, ar + 20)},${Math.min(255, ag2 + 10)},${Math.min(255, ab + 10)},0.85)`,
+        'rgba(255,255,255,1)',
+      ];
+      ctx.fillStyle = cols[band];
+      ctx.beginPath();
+      let any = false;
+      for (let k = band; k < L.pc; k += 4) {
+        const c = L.own[k];
+        const th = charHit[c];
+        const dt2 = T - th;
+        let I = 0;
+        if (dt2 >= 0) {
+          I = Math.exp(-dt2 / 0.045) * 1.0 + Math.exp(-dt2 / 2.6) * 0.72;
+        } else {
+          I = Math.exp(-(-dt2) / 0.10) * 0.14;         // 还没被扫到：极暗的底
+        }
+        I += charGlow[c] * 0.30;                        // YRC 逐字再加一点
+        const b = I > 0.78 ? 3 : I > 0.42 ? 2 : I > 0.16 ? 1 : 0;
+        if (b !== band) continue;
+        const wx = blockGx + L.px[k], wy = blockGy + L.py[k];
+        const sx = (wx - cam.x) * z + W / 2 + shx, sy = (wy - cam.y) * z + H / 2 + shy;
+        if (sx < -8 || sx > W + 8 || sy < -8 || sy > H + 8) continue;
+        const s = (1.7 + I * 2.6) * z;
+        ctx.rect(sx - s * 0.5, sy - s * 0.5, s, s);
+        any = true;
+      }
+      if (any) ctx.fill();
+    }
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* 负片闪：整屏反相一帧（冲击帧的经典做法） */
+  if (AE.invert > 0.01) {
+    ctx.globalCompositeOperation = 'difference';
+    ctx.fillStyle = `rgba(255,255,255,${(AE.invert * 0.85).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+    AE.invert *= Math.pow(0.000004, dtReal);
+  }
+  if (AE.flash > 0.012) {
+    ctx.fillStyle = `rgba(255,248,240,${(AE.flash * 0.22).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    AE.flash *= Math.pow(0.0000025, dtReal);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; L = null; prep = null; }
+  lastT = T;
+  let c = curIdx;
+  while (c + 1 < lines.length && T >= lines[c + 1].t) c++;
+  if (c !== curIdx) {
+    curIdx = c; brewIdx = -1; prep = null;
+    if (curIdx >= 0) { assignLine(curIdx); hintShow('', 0); }
+    else hintShow(lines.length ? '等待第一句…' : '这首没有歌词', 0.5);
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    if (T >= lines[nx].t - Math.min(1.5, Math.max(0.55, gap * 0.5))) { brewIdx = nx; prep = prepLine(nx); }
+  }
+}
+
+/* ---- 通信协议 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length >= 3) accent = p.accent;
+    curIdx = -1; brewIdx = -1; lastT = -1; L = null; prep = null;
+    AE.invert = 0; AE.flash = 0;
+    clockT = 0; clockAt = performance.now();
+    hintShow(lines.length ? '等待第一句…' : '这首没有歌词', lines.length ? 1 : 0.5);
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.6;
+    camShake(Math.cos(T0), Math.sin(T0), 2 + lv * 4);
+    flash(lv * 0.22);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  curIdx, n: lines.length, pc: L ? L.pc : 0, spans: spans.length,
+  z: +cam.z.toFixed(3), shock: Math.round(Math.max(0, now() - blastT) * blastV), t: +now().toFixed(2),
+});
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

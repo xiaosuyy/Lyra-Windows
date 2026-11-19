@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>折光筑</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#efeae0;}
+  body{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;}
+  #c{position:fixed;left:0;top:0;width:100%;height:100%;display:block;}
+  #ui{position:fixed;left:0;top:0;right:0;bottom:0;pointer-events:none;z-index:2;}
+  #lyr{
+    position:absolute;left:6.4vw;bottom:12vh;width:min(42vw,560px);
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Source Han Sans SC","Noto Sans CJK SC",system-ui,sans-serif;
+    color:#1b1712;
+  }
+  #lyr::before{
+    content:"";position:absolute;left:-24px;top:-0.2em;bottom:-0.2em;width:1px;
+    background:linear-gradient(180deg,rgba(27,23,18,0),rgba(27,23,18,.26) 18%,rgba(27,23,18,.26) 82%,rgba(27,23,18,0));
+  }
+  .ly{display:block;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;}
+  #prev{font-size:clamp(12px,1.15vw,17px);line-height:1.7;letter-spacing:.14em;
+        color:rgba(27,23,18,.36);min-height:1.7em;margin-bottom:.7em;
+        opacity:0;transition:opacity .6s ease;}
+  #cur{font-size:clamp(22px,min(3.9vw,7.2vh),52px);font-weight:600;line-height:1.42;
+       letter-spacing:.045em;color:#17130e;max-height:54vh;overflow:hidden;}
+  #cur.mid{font-size:clamp(18px,min(2.9vw,5.3vh),39px);line-height:1.5;letter-spacing:.02em;}
+  #cur.small{font-size:clamp(15px,min(2.1vw,4vh),28px);line-height:1.62;letter-spacing:0;}
+  #next{font-size:clamp(12px,1.15vw,17px);line-height:1.7;letter-spacing:.14em;
+        color:rgba(27,23,18,.26);min-height:1.7em;margin-top:.85em;
+        opacity:0;transition:opacity .6s ease;}
+  #cur .ch{opacity:.22;transition:opacity .26s linear;}
+  #cur .ch.on{opacity:1;}
+  #cap{
+    position:absolute;right:4.2vw;top:5vh;text-align:right;
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+    font-size:10px;letter-spacing:.42em;text-transform:uppercase;
+    color:rgba(27,23,18,.34);opacity:0;transition:opacity 1.2s ease;
+  }
+  #empty{
+    position:absolute;left:0;right:0;bottom:15vh;text-align:center;display:none;
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+    color:rgba(27,23,18,.42);
+  }
+  #emptyMark{
+    display:block;letter-spacing:.68em;text-indent:.68em;
+    font-size:clamp(11px,1.05vw,14px);
+  }
+  #emptySub{
+    display:block;margin-top:1.4em;letter-spacing:.3em;text-indent:.3em;
+    font-size:clamp(9px,.78vw,11px);color:rgba(27,23,18,.24);
+  }
+  #emptyLine{
+    display:block;width:1px;height:56px;margin:0 auto 2.2em;
+    background:linear-gradient(180deg,rgba(27,23,18,0),rgba(27,23,18,.34));
+  }
+  @media (max-aspect-ratio: 1/1){
+    #lyr{left:8vw;bottom:11vh;width:78vw;}
+    #lyr::before{left:-16px;}
+    #cap{top:4vh;right:6vw;}
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div id="lyr">
+    <div class="ly" id="prev"></div>
+    <div class="ly" id="cur"></div>
+    <div class="ly" id="next"></div>
+  </div>
+  <div id="empty">
+    <span id="emptyLine"></span>
+    <span id="emptyMark">器 乐</span>
+    <span id="emptySub">此 曲 无 词</span>
+  </div>
+  <div id="cap"></div>
+</div>
+<script>
+(function(){
+'use strict';
+
+/* ---------- state ---------- */
+var S = {
+  lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0,
+  duration: 0, rm: false, ready: false, lastTick: 0, inited: false,
+  accent: [190,182,166], text: '', title: ''
+};
+var VW = 1600, VH = 900;
+var view = { w: 1440, h: 900, dpr: 1, sx: 1, sy: 1, cam: 1, tx: 0, ty: 0 };
+
+var cvs = document.getElementById('c');
+var ctx = cvs.getContext('2d', { alpha: false });
+var stat = document.createElement('canvas');
+var sctx = stat.getContext('2d');
+var elPrev = document.getElementById('prev');
+var elCur = document.getElementById('cur');
+var elNext = document.getElementById('next');
+var elEmpty = document.getElementById('empty');
+var elCap = document.getElementById('cap');
+var grain = null;
+
+/* ---------- self-check hook: defined ONCE, unconditionally ---------- */
+window.__stage = function(){
+  return {
+    lines: S.lines.length,
+    idx: S.idx,
+    t: S.t,
+    playing: S.playing,
+    frames: S.frames,
+    js: S.js,
+    err: '',
+    text: S.text,
+    gl: false,
+    rm: S.rm
+  };
+};
+
+/* ---------- helpers ---------- */
+function num(v, d){ v = Number(v); return isFinite(v) ? v : d; }
+function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+
+function makeGrain(){
+  var n = 96, c = document.createElement('canvas');
+  c.width = n; c.height = n;
+  var g = c.getContext('2d');
+  var img = g.createImageData(n, n), d = img.data;
+  for (var i = 0; i < d.length; i += 4){
+    var v = 118 + (Math.random() * 2 - 1) * 46;
+    d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 30;
+  }
+  g.putImageData(img, 0, 0);
+  return ctx.createPattern(c, 'repeat');
+}
+
+/* ---------- static architecture, painted once per resize ---------- */
+var C = {
+  wall: '#eee9df', wall2: '#e6e0d3', floor: '#e4dece',
+  lit: '#f9f6ee', p2: '#e3dccd', p3: '#cdc5b4', p4: '#aea595', p5: '#8b8273',
+  edge: '#fdfbf4', ink: '#1b1712'
+};
+
+function poly(g, pts, fill){
+  g.beginPath();
+  g.moveTo(pts[0][0], pts[0][1]);
+  for (var i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.closePath();
+  if (fill) { g.fillStyle = fill; g.fill(); }
+}
+
+function paintStatic(){
+  var d = view.dpr;
+  var pw = Math.max(1, Math.round(view.w * d));
+  var ph = Math.max(1, Math.round(view.h * d));
+  if (stat.width !== pw) stat.width = pw;
+  if (stat.height !== ph) stat.height = ph;
+  var g = sctx;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, pw, ph);
+  applyCam(g); // now in 1600x900 design space
+
+  /* wall */
+  var wg = g.createLinearGradient(0, 0, 0, 900);
+  wg.addColorStop(0, '#f1ece2');
+  wg.addColorStop(0.62, C.wall);
+  wg.addColorStop(1, '#e9e3d6');
+  g.fillStyle = wg;
+  g.fillRect(0, 0, VW, VH);
+
+  /* floor */
+  var fg = g.createLinearGradient(0, 690, 0, 900);
+  fg.addColorStop(0, '#e9e3d5');
+  fg.addColorStop(1, '#ded7c7');
+  poly(g, [[0, 690], [1600, 690], [1600, 900], [0, 900]], fg);
+  g.fillStyle = 'rgba(120,110,94,.26)';
+  g.fillRect(0, 689, VW, 1.2);
+
+  /* --- pleated paper relief on the left wall: the "origami" mass --- */
+  (function pleats(){
+    var n = 17, x0 = -70, x1 = 700, i;
+    var step = (x1 - x0) / n;
+    var top = [], bot = [];
+    for (i = 0; i <= n; i++){
+      top.push(128 + Math.sin(i * 0.62) * 16 + Math.sin(i * 1.7 + 1) * 5);
+      bot.push(352 + Math.sin(i * 0.38 + 0.9) * 46 + Math.cos(i * 1.1) * 12);
+    }
+    var shades = ['#f2ece0', '#dcd4c2', '#c9c0ad', '#e6dfd0'];
+    for (i = 0; i < n; i++){
+      var ax = x0 + step * i, bx = ax + step;
+      var fill = shades[(i * 3 + (i % 5)) % shades.length];
+      poly(g, [[ax, top[i]], [bx, top[i + 1]], [bx, bot[i + 1]], [ax, bot[i]]], fill);
+      /* bright fold edge */
+      g.beginPath();
+      g.moveTo(ax, top[i]); g.lineTo(ax, bot[i]);
+      g.strokeStyle = (i % 2 === 0) ? 'rgba(255,253,246,.92)' : 'rgba(126,117,101,.30)';
+      g.lineWidth = (i % 2 === 0) ? 2 : 1;
+      g.stroke();
+    }
+    /* the base line of the relief, and its soft cast shadow on the wall */
+    g.beginPath();
+    g.moveTo(x0, bot[0]);
+    for (i = 1; i <= n; i++) g.lineTo(x0 + step * i, bot[i]);
+    g.strokeStyle = 'rgba(110,102,88,.34)'; g.lineWidth = 1.4; g.stroke();
+    var sh = g.createLinearGradient(0, 340, 0, 452);
+    sh.addColorStop(0, 'rgba(140,132,116,.22)');
+    sh.addColorStop(1, 'rgba(140,132,116,0)');
+    g.fillStyle = sh;
+    g.beginPath();
+    g.moveTo(x0, bot[0]);
+    for (i = 1; i <= n; i++) g.lineTo(x0 + step * i, bot[i]);
+    g.lineTo(x1, bot[n] + 96);
+    g.lineTo(x0, bot[0] + 96);
+    g.closePath();
+    g.fill();
+  })();
+
+  /* far thin fin, left of the monolith */
+  poly(g, [[556, 262], [582, 250], [582, 690], [556, 690]], C.p3);
+  g.fillStyle = C.lit;
+  g.fillRect(556, 262, 2.6, 428);
+
+  /* monolith: folded paper prism */
+  poly(g, [[1000, 190], [1230, 158], [1392, 214], [1152, 250]], C.lit);          /* top fold */
+  var ff = g.createLinearGradient(896, 0, 1252, 0);
+  ff.addColorStop(0, '#eae3d4');
+  ff.addColorStop(0.55, '#e0d9c9');
+  ff.addColorStop(1, '#d3cbba');
+  poly(g, [[896, 690], [1000, 190], [1230, 158], [1252, 690]], ff);              /* front face */
+  poly(g, [[1230, 158], [1392, 214], [1404, 690], [1252, 690]], C.p4);          /* right facet */
+  g.strokeStyle = 'rgba(253,251,244,.95)'; g.lineWidth = 2.4;
+  g.beginPath(); g.moveTo(1230, 158); g.lineTo(1252, 690); g.stroke();          /* fold edge */
+  g.strokeStyle = 'rgba(139,130,115,.28)'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(1000, 190); g.lineTo(1152, 250); g.stroke();
+
+  /* bamboo / woven lattice on the front face (static) */
+  g.save();
+  poly(g, [[896, 690], [1000, 190], [1230, 158], [1252, 690]]);
+  g.clip();
+  g.strokeStyle = 'rgba(155,146,130,.30)';
+  g.lineWidth = 1;
+  var i;
+  for (i = -40; i <= 40; i++){
+    var x = 1040 + i * 15;
+    g.beginPath(); g.moveTo(x, 150); g.lineTo(x - 26, 700); g.stroke();
+  }
+  g.strokeStyle = 'rgba(120,111,96,.16)';
+  for (i = 0; i <= 46; i++){
+    var y = 170 + i * 12;
+    g.beginPath(); g.moveTo(860, y); g.lineTo(1290, y - 30); g.stroke();
+  }
+  g.restore();
+
+  /* the vertical light slit, far right */
+  var bw = g.createLinearGradient(1400, 0, 1530, 0);
+  bw.addColorStop(0, 'rgba(255,253,244,0)');
+  bw.addColorStop(0.62, 'rgba(255,253,244,.92)');
+  bw.addColorStop(1, 'rgba(255,253,244,0)');
+  g.fillStyle = bw;
+  g.fillRect(1400, 120, 130, 590);
+  g.fillStyle = 'rgba(255,255,250,.96)';
+  g.fillRect(1454, 150, 7, 552);
+  g.fillStyle = 'rgba(139,130,115,.22)';
+  g.fillRect(1447, 150, 4, 552);
+  g.fillRect(1464, 150, 3, 552);
+
+  /* base shadow line under the monolith */
+  g.fillStyle = 'rgba(120,110,94,.16)';
+  g.fillRect(896, 688, 508, 5);
+
+  /* the horizontal ceiling seam: the second axis of the light */
+  g.fillStyle = 'rgba(255,255,250,.90)';
+  g.fillRect(0, 92, 1412, 3);
+  g.fillStyle = 'rgba(255,255,250,.42)';
+  g.fillRect(0, 95, 1412, 7);
+  g.fillStyle = 'rgba(110,102,88,.30)';
+  g.fillRect(0, 102, 1412, 1.6);
+  var cs = g.createLinearGradient(0, 104, 0, 210);
+  cs.addColorStop(0, 'rgba(120,112,96,.20)');
+  cs.addColorStop(1, 'rgba(120,112,96,0)');
+  g.fillStyle = cs;
+  g.fillRect(0, 104, 1412, 106);
+
+  /* the hard triangle the pleats throw onto the wall */
+  var tg = g.createLinearGradient(180, 300, 760, 690);
+  tg.addColorStop(0, 'rgba(120,112,96,.26)');
+  tg.addColorStop(1, 'rgba(120,112,96,.04)');
+  poly(g, [[150, 372], [640, 690], [150, 690]], tg);
+  /* its lit rim */
+  g.strokeStyle = 'rgba(255,253,246,.55)';
+  g.lineWidth = 1.2;
+  g.beginPath();
+  g.moveTo(150, 372); g.lineTo(640, 690);
+  g.stroke();
+
+  /* corner falloff, top-left: the room receding */
+  var cg = g.createRadialGradient(-40, -60, 40, -40, -60, 760);
+  cg.addColorStop(0, 'rgba(96,89,76,.20)');
+  cg.addColorStop(0.55, 'rgba(96,89,76,.06)');
+  cg.addColorStop(1, 'rgba(96,89,76,0)');
+  g.fillStyle = cg;
+  g.fillRect(0, 0, 900, 700);
+
+  /* paper grain — drawn in screen space so it stays fine at any camera scale */
+  if (grain){
+    g.setTransform(d * 1, 0, 0, d * 1, 0, 0);
+    g.globalAlpha = 0.42;
+    g.fillStyle = grain;
+    g.fillRect(0, 0, view.w, view.h);
+    g.globalAlpha = 1;
+  }
+}
+
+/* camera: maps the 1600x900 design space onto the viewport */
+function applyCam(g){
+  g.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  g.translate(view.tx, view.ty);
+  g.scale(view.sx * view.cam, view.sy * view.cam);
+}
+
+/* ---------- resize ---------- */
+function resize(){
+  var w = Math.max(1, window.innerWidth || 1440);
+  var h = Math.max(1, window.innerHeight || 900);
+  if (!isFinite(w) || w <= 0) w = 1440;
+  if (!isFinite(h) || h <= 0) h = 900;
+  view.w = w; view.h = h;
+  view.dpr = clamp(window.devicePixelRatio || 1, 1, 2);
+
+  /* camera: "cover" the viewport with the design space. Landscape keeps the whole
+     composition; portrait crops to the folded facet + light slit so the mobile
+     frame is still architecture rather than empty wall. */
+  var portrait = h > w * 1.02;
+  var cam = Math.max(w / VW, h / VH);
+  if (!isFinite(cam) || cam <= 0) cam = 1;
+  view.cam = cam;
+  var sw = VW * cam, sh = VH * cam;
+  var ax = portrait ? 0.90 : 0.5;
+  var ay = portrait ? 0.5 : 0.5;
+  view.tx = (w - sw) * ax;
+  view.ty = (h - sh) * ay;
+  if (!isFinite(view.tx)) view.tx = 0;
+  if (!isFinite(view.ty)) view.ty = 0;
+  view.sx = 1;
+  view.sy = 1;
+
+  cvs.width = Math.max(1, Math.round(w * view.dpr));
+  cvs.height = Math.max(1, Math.round(h * view.dpr));
+  cvs.style.width = w + 'px';
+  cvs.style.height = h + 'px';
+  paintStatic();
+}
+
+/* ---------- dynamic layer ---------- */
+var FRONT = [[896, 690], [1000, 190], [1230, 158], [1252, 690]];
+
+var M = {
+  clock: 0,     // seconds since boot, always advancing (breathing)
+  sweep: 0.5,   // 0..1 light-sheet position across the wall
+  blade: 0,     // 0..1 extra contrast on beat
+  joy: 0,       // eased audio energy
+  flash: 0,     // beat flash
+  turn: 0       // 0..1 fold sweep on line change
+};
+
+function softLightSheet(g, cx, cy, ang, alpha, col){
+  /* plain source-over wash: same monotone lift as a soft-light blend, but it
+     does not force a full-canvas blend pass every frame at 165Hz */
+  g.save();
+  g.translate(cx, cy);
+  g.rotate(ang);
+  var lg = g.createLinearGradient(-760, 0, 760, 0);
+  lg.addColorStop(0, 'rgba(' + col + ',0)');
+  lg.addColorStop(0.30, 'rgba(' + col + ',' + (alpha * 0.35).toFixed(3) + ')');
+  lg.addColorStop(0.50, 'rgba(' + col + ',' + alpha.toFixed(3) + ')');
+  lg.addColorStop(0.70, 'rgba(' + col + ',' + (alpha * 0.32).toFixed(3) + ')');
+  lg.addColorStop(1, 'rgba(' + col + ',0)');
+  g.fillStyle = lg;
+  g.fillRect(-820, -620, 1640, 1240);
+  g.restore();
+}
+
+function darkBlade(g, cx, cy, ang, alpha){
+  g.save();
+  g.translate(cx, cy);
+  g.rotate(ang);
+  var lg = g.createLinearGradient(-620, 0, 620, 0);
+  lg.addColorStop(0, 'rgba(120,112,96,0)');
+  lg.addColorStop(0.46, 'rgba(120,112,96,' + (alpha * 0.30).toFixed(3) + ')');
+  lg.addColorStop(0.56, 'rgba(120,112,96,' + (alpha * 0.42).toFixed(3) + ')');
+  lg.addColorStop(0.70, 'rgba(120,112,96,' + (alpha * 0.22).toFixed(3) + ')');
+  lg.addColorStop(1, 'rgba(120,112,96,0)');
+  g.fillStyle = lg;
+  g.fillRect(-700, -620, 1400, 1240);
+  g.restore();
+}
+
+function drawCrease(g, k){
+  /* light folding across the front paper face: a sliding crease + its edge */
+  g.save();
+  poly(g, FRONT);
+  g.clip();
+  var x = 1000 + k * 210;
+  var sk = -0.055;
+  g.beginPath();
+  g.moveTo(x, 150);
+  g.lineTo(x + 22, 150);
+  g.lineTo(x - 60 + 22, 700);
+  g.lineTo(x - 60, 700);
+  g.closePath();
+  g.fillStyle = 'rgba(74,68,56,.15)';
+  g.fill();
+  g.beginPath();
+  g.moveTo(x + 23, 150);
+  g.lineTo(x - 37, 700);
+  g.strokeStyle = 'rgba(255,252,242,.85)';
+  g.lineWidth = 1.6;
+  g.stroke();
+  /* a second, fainter fold */
+  g.beginPath();
+  g.moveTo(x + 74, 150);
+  g.lineTo(x + 14, 700);
+  g.strokeStyle = 'rgba(255,252,242,.30)';
+  g.lineWidth = 1;
+  g.stroke();
+  g.restore();
+}
+
+function drawGroundShadows(g, k){
+  /* three crisp grey triangles thrown on the floor by the slit light */
+  g.save();
+  var i, base, len, top, a;
+  for (i = 0; i < 3; i++){
+    base = 940 + i * 176 + k * 26;
+    len = 210 + i * 54;
+    top = 690;
+    a = 0.12 + i * 0.026;
+    var lg = g.createLinearGradient(base, 0, base - len, 0);
+    lg.addColorStop(0, 'rgba(112,104,90,' + a.toFixed(3) + ')');
+    lg.addColorStop(1, 'rgba(112,104,90,0)');
+    g.fillStyle = lg;
+    g.beginPath();
+    g.moveTo(base, top);
+    g.lineTo(base + 150 - i * 20, top);
+    g.lineTo(base - len + 120, 900);
+    g.lineTo(base - len, 900);
+    g.closePath();
+    g.fill();
+  }
+  g.restore();
+}
+
+function drawBeam(g, k, a){
+  /* Two hard-edged shafts of daylight falling from the slit. They are pure
+     polygons with a short gradient — no blur pass, so it costs almost nothing. */
+  var shift = (k - 0.5) * 46;
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+
+  /* shaft A: the long one that crosses the whole floor */
+  var LG = g.createLinearGradient(1456, 150, 640, 900);
+  LG.addColorStop(0, 'rgba(255,251,238,' + (0.26 * a).toFixed(3) + ')');
+  LG.addColorStop(0.55, 'rgba(255,251,238,' + (0.10 * a).toFixed(3) + ')');
+  LG.addColorStop(1, 'rgba(255,251,238,0)');
+  g.fillStyle = LG;
+  g.beginPath();
+  g.moveTo(1452, 152);
+  g.lineTo(1460, 152);
+  g.lineTo(742 + shift, 900);
+  g.lineTo(560 + shift, 900);
+  g.closePath();
+  g.fill();
+
+  /* shaft B: the short bright wedge, the actual "cut" */
+  var LG2 = g.createLinearGradient(1456, 150, 1180, 720);
+  LG2.addColorStop(0, 'rgba(255,252,242,' + (0.34 * a).toFixed(3) + ')');
+  LG2.addColorStop(0.6, 'rgba(255,252,242,' + (0.13 * a).toFixed(3) + ')');
+  LG2.addColorStop(1, 'rgba(255,252,242,0)');
+  g.fillStyle = LG2;
+  g.beginPath();
+  g.moveTo(1452, 152);
+  g.lineTo(1460, 152);
+  g.lineTo(1206 + shift * 0.6, 726);
+  g.lineTo(1120 + shift * 0.6, 726);
+  g.closePath();
+  g.fill();
+  g.restore();
+}
+
+/* a hard diagonal edge where the great shadow begins — the composition's spine */
+function drawCutEdge(g, k, a){
+  var x0 = 300 + k * 260;
+  g.save();
+  var lg = g.createLinearGradient(x0 - 240, 0, x0 + 40, 0);
+  lg.addColorStop(0, 'rgba(96,89,76,0)');
+  lg.addColorStop(0.78, 'rgba(96,89,76,' + (0.10 * a).toFixed(3) + ')');
+  lg.addColorStop(1, 'rgba(96,89,76,' + (0.20 * a).toFixed(3) + ')');
+  g.fillStyle = lg;
+  g.beginPath();
+  g.moveTo(x0 - 240, 0);
+  g.lineTo(x0 + 40, 0);
+  g.lineTo(x0 - 250, 690);
+  g.lineTo(x0 - 560, 690);
+  g.closePath();
+  g.fill();
+  /* the lit rim just past the edge */
+  g.strokeStyle = 'rgba(255,253,246,' + (0.5 * a).toFixed(3) + ')';
+  g.lineWidth = 1.6;
+  g.beginPath();
+  g.moveTo(x0 + 40, 0);
+  g.lineTo(x0 - 250, 690);
+  g.stroke();
+  g.restore();
+}
+
+/* a paper fold sweeping across the frame on each new line — the "page turn" */
+function drawFoldTurn(g, k){
+  var p = M.turn;                       // 0..1, fired on line change
+  if (p <= 0.001) return;
+  var e = 1 - Math.pow(1 - p, 2);
+  var x = -140 + e * (VW + 280);
+  g.save();
+  var lg = g.createLinearGradient(x - 150, 0, x + 150, 0);
+  lg.addColorStop(0, 'rgba(112,104,90,0)');
+  lg.addColorStop(0.44, 'rgba(112,104,90,' + (0.16 * (1 - p * 0.6)).toFixed(3) + ')');
+  lg.addColorStop(0.5, 'rgba(112,104,90,' + (0.22 * (1 - p * 0.6)).toFixed(3) + ')');
+  lg.addColorStop(0.56, 'rgba(112,104,90,' + (0.14 * (1 - p * 0.6)).toFixed(3) + ')');
+  lg.addColorStop(1, 'rgba(112,104,90,0)');
+  g.fillStyle = lg;
+  g.beginPath();
+  g.moveTo(x - 150, -60);
+  g.lineTo(x + 150, -60);
+  g.lineTo(x + 90, VH + 60);
+  g.lineTo(x - 210, VH + 60);
+  g.closePath();
+  g.fill();
+  g.globalAlpha = 0.5 * (1 - p);
+  g.strokeStyle = 'rgba(255,253,246,1)';
+  g.lineWidth = 2;
+  g.beginPath();
+  g.moveTo(x + 150, -60);
+  g.lineTo(x + 90, VH + 60);
+  g.stroke();
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+function drawProgress(g){
+  /* screen space: stays pinned to the viewport corner at any aspect ratio */
+  var w = clamp(view.w * 0.24, 120, 420);
+  var x0 = view.w - Math.min(view.w * 0.06, 56) - w;
+  var y = view.h - Math.min(view.h * 0.06, 54);
+  var pr = 0;
+  if (S.duration > 0) pr = clamp(S.t / S.duration, 0, 1);
+  else if (S.lines.length) pr = clamp((S.idx + 1) / Math.max(1, S.lines.length), 0, 1);
+  g.fillStyle = 'rgba(27,23,18,.13)';
+  g.fillRect(x0, y, w, 1);
+  g.fillStyle = 'rgba(27,23,18,.44)';
+  g.fillRect(x0, y, Math.max(1, w * pr), 1);
+  var i;
+  g.fillStyle = 'rgba(27,23,18,.18)';
+  for (i = 0; i <= 10; i++) g.fillRect(x0 + (w / 10) * i, y - 3, 1, 3);
+  g.fillStyle = 'rgba(27,23,18,.6)';
+  g.fillRect(x0 + w * pr - 0.5, y - 6, 1.6, 6);
+}
+
+function drawDynamic(){
+  var g = ctx;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(stat, 0, 0, cvs.width, cvs.height);
+  applyCam(g);
+
+  var k = M.sweep;                       // 0..1
+  var breathe = 0.5 + 0.5 * Math.sin(M.clock * 0.55);
+  var amp = S.rm ? 0.35 : 1;
+  var a = (0.55 + 0.35 * breathe) * (1 + M.blade * 0.45);
+
+  /* 1. the light sheet crossing the wall — kept right of the lyric column so
+     the text stays on calm, steady tone */
+  softLightSheet(g, 860 + k * 330, 290, -0.30, (0.24 + 0.10 * breathe) * amp, '255,255,255');
+  /* 2. the spine: the hard edge of the great shadow */
+  drawCutEdge(g, k, amp);
+  /* 3. its opposite shadow mass */
+  darkBlade(g, 300 + k * 300, 430, -0.30, (0.26 + 0.10 * M.blade) * amp);
+  /* 4. the daylight shafts */
+  drawBeam(g, k, a);
+  /* 5. crease sliding over the folded face */
+  drawCrease(g, k);
+  /* 5b. the page turn when the line changes */
+  drawFoldTurn(g, k);
+  /* 6. crisp floor shadows */
+  drawGroundShadows(g, k);
+  /* 7. discrete progress hairline (viewport space) */
+  g.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  drawProgress(g);
+}
+
+/* ---------- lyrics ---------- */
+function buildChars(line){
+  var el = elCur;
+  el.textContent = '';
+  var txt = line.text || '';
+  var frag = document.createDocumentFragment();
+  var times = new Array(txt.length);
+  var chars = line.chars;
+  var ok = chars && chars.length === txt.length;
+  var start = line.t, end = start + line.dur;
+  var span = Math.max(0.001, end - start);
+  for (var i = 0; i < txt.length; i++){
+    var sp = document.createElement('span');
+    sp.className = 'ch';
+    sp.textContent = txt.charAt(i);
+    frag.appendChild(sp);
+    if (ok){
+      var ct = num(chars[i] && chars[i].t, NaN);
+      times[i] = isFinite(ct) ? ct : start + span * (i / Math.max(1, txt.length));
+    } else {
+      times[i] = start + span * (i / Math.max(1, txt.length));
+    }
+  }
+  el.appendChild(frag);
+  /* static NodeList of char spans only: <br>s inserted later by fitLyric
+     must not shift the per-character timing indices */
+  line._spans = el.querySelectorAll('.ch');
+  line._times = times;
+  line._lit = -1;
+  /* long lines step down a size instead of spilling out of the frame */
+  el.className = 'ly' + (txt.length > 24 ? ' mid' : '') + (txt.length > 44 ? ' small' : '');
+  fitLyric(el, txt, line);
+}
+/* If even the smallest step still overflows the frame, break the line at
+   punctuation (never mid-word) into at most 3 pieces. */
+function fitLyric(el, txt, line){
+  if (!el || !txt) return;
+  var maxH = Math.max(72, (window.innerHeight || 900) * 0.48);
+  if (el.scrollHeight <= maxH || txt.length < 20) return;
+  var cuts = ['，', '。', '？', '！', '、', '；', '：', ',', '.', '?', '!', ' ', '　'];
+  var parts = [], rest = txt, guard = 0;
+  var target = Math.ceil(txt.length / 3);
+  while (rest.length && guard < 6 && parts.length < 3){
+    guard++;
+    if (rest.length <= target * 1.35){ parts.push(rest); break; }
+    var cut = -1, i;
+    for (i = target; i < rest.length; i++){
+      if (cuts.indexOf(rest.charAt(i)) >= 0){ cut = i + 1; break; }
+    }
+    if (cut < 0) cut = target;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest.length && parts.length < 3) parts.push(rest);
+  if (parts.length < 2) return;
+  /* Per-character spans stay exactly as they are; we only insert breaks
+     between them, so the yrc timing table and the lit-index walk stay valid. */
+  var spans = [], j;
+  var nodes = el.childNodes;
+  for (j = 0; j < nodes.length; j++) spans.push(nodes[j]);
+  var idx = 0;
+  for (j = 0; j < parts.length - 1; j++){
+    idx += parts[j].length;
+    var s = spans[idx];
+    if (s && s.parentNode === el){
+      el.insertBefore(document.createElement('br'), s);
+    }
+  }
+}
+
+function renderLines(){
+  var i = S.idx;
+  var L = S.lines;
+  S.text = (i >= 0 && L[i]) ? (L[i].text || '') : '';
+  elCur.textContent = '';
+  elPrev.textContent = i > 0 ? (L[i - 1].text || '') : '';
+  elPrev.style.opacity = i > 0 ? '1' : '0';
+  var nxt = i + 1 < L.length ? L[i + 1] : (i < 0 && L.length ? L[0] : null);
+  elNext.textContent = nxt ? (nxt.text || '') : '';
+  elNext.style.opacity = nxt ? '1' : '0';
+  if (i >= 0 && L[i]) buildChars(L[i]);
+}
+
+function tickLyrics(){
+  var i = S.idx;
+  var line = i >= 0 ? S.lines[i] : null;
+  if (!line || !line._times){ return; }
+  var spans = line._spans, times = line._times, lit = line._lit;
+  var t = S.t;
+  while (lit + 1 < times.length && times[lit + 1] <= t){
+    lit++;
+    if (spans[lit]) spans[lit].className = 'ch on';
+  }
+  line._lit = lit;
+}
+
+function updateIdx(){
+  var L = S.lines, t = S.t, lo = 0, hi = L.length - 1, ans = -1;
+  while (lo <= hi){
+    var mid = (lo + hi) >> 1;
+    if (L[mid].t <= t + 0.02){ ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  if (ans !== S.idx){
+    S.idx = ans;
+    S.text = ans >= 0 ? (L[ans].text || '') : '';
+    renderLines();
+    M.turn = 0.001;
+  }
+}
+
+/* ---------- init ---------- */
+function onInit(p){
+  p = p || {};
+  var arr = Array.isArray(p.lines) ? p.lines : [];
+  var n = Math.min(arr.length, 1200);
+  var out = [];
+  var lastT = 0;
+  for (var i = 0; i < n; i++){
+    var L = arr[i] || {};
+    var text = L.text == null ? '' : String(L.text);
+    var t = num(L.t, NaN);
+    if (!isFinite(t) || t < 0) t = lastT;
+    var dur = num(L.dur, NaN);
+    if (!isFinite(dur) || dur <= 0) dur = 4;
+    var chars = null;
+    if (Array.isArray(L.chars) && L.chars.length === text.length && text.length){
+      chars = L.chars;
+    }
+    out.push({ t: t, dur: dur, text: text, chars: chars, _spans: null, _times: null, _lit: -1 });
+    lastT = t + dur;
+  }
+  S.lines = out;
+  S.duration = num(p.duration, 0);
+  if (!(S.duration > 0)) S.duration = lastT > 0 ? lastT : 0;
+  /* re-init may carry a seek position; keep it, but never let it go backwards
+     into an invalid value */
+  var t0 = num(p.time, NaN);
+  if (isFinite(t0) && t0 >= 0) S.t = t0;
+  var ac = Array.isArray(p.accent) ? p.accent : null;
+  if (ac && ac.length >= 3){
+    S.accent = [clamp(num(ac[0], 190), 0, 255), clamp(num(ac[1], 182), 0, 255), clamp(num(ac[2], 166), 0, 255)];
+  }
+  var song = p.song || {};
+  var nm = song.name == null ? '' : String(song.name);
+  S.title = nm;
+  elCap.textContent = nm;
+  elCap.style.opacity = nm ? '1' : '0';
+
+  /* missing `playing` means "this song is playing" — never inherit a stale pause */
+  S.playing = (typeof p.playing === 'boolean') ? p.playing : true;
+
+  var has = S.lines.length > 0;
+  elEmpty.style.display = has ? 'none' : 'block';
+  document.getElementById('lyr').style.display = has ? 'block' : 'none';
+  S.idx = -1;
+  S.text = '';
+  elCur.className = 'ly';
+  elPrev.textContent = ''; elNext.textContent = ''; elCur.textContent = '';
+  M.turn = 0;
+  updateIdx();
+  renderLines();
+  paintStatic();
+}
+
+/* ---------- messages ---------- */
+var readySent = false;
+function sendReady(){
+  if (readySent) return;
+  readySent = true;
+  try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }
+  catch (e){ console.error('[473] ready post failed', e); }
+}
+
+window.addEventListener('message', function(ev){
+  var d = ev && ev.data;
+  if (!d || d.__c100 !== 1) return;
+  try {
+    if (d.type === 'init'){
+      onInit(d.payload);
+      S.inited = true;
+    } else if (d.type === 'tick'){
+      var p = d.payload || {};
+      var t = num(p.time, S.t);
+      if (isFinite(t)) S.t = t;
+      if (typeof p.playing === 'boolean') S.playing = p.playing;
+      S.lastTick = performance.now();
+      updateIdx();
+      tickLyrics();
+    } else if (d.type === 'beat'){
+      var bp = d.payload || {};
+      var lv = clamp(num(bp.level, 0.5), 0, 1);
+      M.blade = Math.max(M.blade, 0.25 + lv * 0.85);
+      M.flash = Math.max(M.flash, lv);
+    } else if (d.type === 'live'){
+      var lp = d.payload || {};
+      if (typeof lp.playing === 'boolean') S.playing = lp.playing;
+      var ll = clamp(num(lp.level, 0.4), 0, 1);
+      M.joy += (ll - M.joy) * 0.12;
+    }
+  } catch (e){
+    console.error('[473] message handler error', e);
+  }
+}, false);
+
+/* ---------- loop ---------- */
+var lastNow = 0;
+function frame(now){
+  requestAnimationFrame(frame);
+  var t0 = performance.now();
+  S.frames++;
+  if (!lastNow) lastNow = t0;
+  var dt = clamp(t0 - lastNow, 0, 64);
+  lastNow = t0;
+
+  if (S.frames === 1) sendReady();
+
+  if (S.playing && S.lastTick > 0){
+    S.t += dt / 1000;
+    if (S.duration > 0 && S.t > S.duration) S.t = S.duration;
+    updateIdx();
+    tickLyrics();
+  }
+
+  /* motion state — always advances, even when paused, so the frame never freezes */
+  M.clock += dt / 1000;
+  var ms = S.rm ? 0.10 : 1;
+  /* the light sheet drifts on two slow, incommensurate periods: it never
+     visibly loops, and any three screenshots at different times differ */
+  M.sweep = 0.5
+    + 0.34 * Math.sin(M.clock * 0.19) * ms
+    + 0.13 * Math.sin(M.clock * 0.53 + 1.7) * ms
+    + M.blade * 0.05;
+  if (M.sweep < 0) M.sweep = 0;
+  if (M.sweep > 1) M.sweep = 1;
+  M.blade += (0 - M.blade) * 0.10;
+  M.flash += (0 - M.flash) * 0.14;
+  if (M.turn > 0){
+    M.turn += (1.06 - M.turn) * 0.045;
+    if (M.turn >= 1) M.turn = 0;
+  }
+  if (M.blade < 0.001) M.blade = 0;
+
+  drawDynamic();
+  S.js = performance.now() - t0;
+}
+
+/* ---------- boot ---------- */
+try {
+  if (window.matchMedia){
+    var mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+    S.rm = !!(mq && mq.matches);
+    if (mq && mq.addEventListener){
+      mq.addEventListener('change', function(e){ S.rm = !!e.matches; });
+    }
+  }
+} catch (e){ console.error('[473] motion query failed', e); }
+
+try { grain = makeGrain(); } catch (e){ console.error('[473] grain failed', e); }
+
+try {
+  resize();
+  window.addEventListener('resize', function(){
+    try { resize(); } catch (e){ console.error('[473] resize failed', e); }
+  }, false);
+} catch (e){ console.error('[473] boot resize failed', e); }
+
+requestAnimationFrame(frame);
+setTimeout(sendReady, 700);
+setTimeout(function(){ updateIdx(); renderLines(); }, 0);
+
+})();
+</script>
+</body>
+</html>

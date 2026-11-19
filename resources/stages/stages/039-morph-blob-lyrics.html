@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>形变团块</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:4;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,205,210,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+  body{background:radial-gradient(110% 90% at 50% 45%,#090b14,#04050a 70%)}
+  /* 这里原来有 filter:blur(30px)：图层是 inset:-20%（比屏幕还大）且带 transform 动画，
+     软件光栅下每一帧都要重跑一次 2000x1300 的高斯模糊 ≈ 40ms/帧，
+     整站被它一个人压在 21fps。径向渐变本身就是连续渐隐的，模糊没有可见收益 → 去掉，
+     需要更柔的地方用更多色标解决。改完实测 60fps（vsync 上限）。 */
+  #aur{position:fixed;inset:-20%;pointer-events:none;z-index:1;
+    background:radial-gradient(38% 34% at 26% 36%,rgba(38,120,140,.13),rgba(38,120,140,.045) 42%,transparent 70%),
+               radial-gradient(40% 32% at 74% 66%,rgba(90,60,160,.13),rgba(90,60,160,.045) 42%,transparent 70%);
+    animation:aur 22s ease-in-out infinite alternate}
+  @keyframes aur{from{transform:translate3d(-2%,1%,0) scale(1)}to{transform:translate3d(2%,-2%,0) scale(1.08)}}
+  #vig{position:fixed;inset:0;pointer-events:none;z-index:2;
+    background:radial-gradient(120% 100% at 50% 50%,transparent 42%,rgba(3,4,8,.55) 82%,rgba(3,4,8,.9))}
+  #hud{position:fixed;top:20px;right:22px;z-index:5;text-align:right;
+    font:500 10px/1.9 ui-monospace,Consolas,monospace;letter-spacing:.09em;
+    color:rgba(198,206,228,.44);pointer-events:none}
+  #hud b{display:block;margin-bottom:4px;font-weight:600;letter-spacing:.22em;
+    color:rgba(240,243,252,.9)}
+  #hud em{font-style:normal;color:rgba(130,235,230,.75)}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="aur"></div>
+<div id="vig"></div>
+<div id="hud"><b>MORPH BLOB</b><span id="stat">-- CELL</span><br><em id="mode">IDLE</em></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   039 · 形变团块 —— 笔画外面裹着一层会自己形变的膜
+   ---------------------------------------------------------------------------
+   核心机制：**局部凸包膜 + 内部空腔（membrane + lumen）**。
+   膜不再整句一条——那样 41 字长句的凸包就是一个裹住全屏的大矩形。现在**每个词团
+   各长一条自己那条局部凸包**（GD 个方向取团内已浮现格位的最远点），十几条贴字块的
+   小膜拼成一行；字本身是膜内部的**空腔**：格位连成路径，nonzero 并成一块实心，
+   字是"膜里被掏空的那块"。踩拍时膜相干地"鼓"一下再缩回。
+
+   精修记录：① 长句折行——>16 字 2 排、>30 字 3 排，glyphRows 直接采出**屏幕坐标**
+     的多排点集（旧版单排 + 二次缩放把 41 字压成 392×121 细块，已修）；
+     格位密度 2400→4000；点径 3.2→4.6（点互相搭接成实心笔画，旧版是稀疏点阵）；
+   ② YRC 逐团浮现——每格位记录所属词团（分词词典 /segdict.bin，抄自 004；
+     理由：逐字浮现把词拆成 2~3 次微小形变，机关枪感；按团浮现膜的"生长感"连贯，
+     无词典自动回退均分）团首字 chars[i0].t 时刻该团格位弹出（0.3s 过冲），
+     未唱格位不撑膜不挖腔 → 膜随歌词一点一点从旧形变到整句形状；
+   ③ beat 相干鼓包保留（puff 沿中心外推）；morph 期间旧→新位置错峰插值不变。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const statEl = document.getElementById('stat');
+const modeEl = document.getElementById('mode');
+
+let W = 0, H = 0, DPR = 1;
+const PI = Math.PI, TAU = PI * 2;
+const MAXP = 6000;            // 格位上限：长句 3 排时 4000 点间距 ≈6.4px 会"串珠"；6000 → ≈5.2px 连成实心
+const MORPH = 0.92;          // 换句形变时长（秒）
+
+let accent = [120, 220, 230];
+let bgc = '#05060a';
+let glow = null, glowW = 0, glowH = 0;
+/* 空腔路径：Path2D 没有"清空"接口（rect(0,0,0,0) 是追加一个退化子路径，不是 reset），
+   复用同一张就会每帧往上叠 900 个圆 —— 路径无限增长，光栅化越来越慢，帧率随时间跌到个位数。
+   所以每帧新建一张（下面 frame 里），并缓存膜渐变（gradient 只跟 gcx/gcy/accent 有关）。 */
+let hullGrd = null;
+
+/* 膜：**每个词团各自一条局部凸包**（旧版整句一个凸包 → 长句直接变成大矩形）。
+   团内沿 GD 个方向取最远格位，连成贴字块的小膜；团与团之间留出呼吸缝。 */
+const MAXGB = 48;             // 词团上限
+const GBROW = 4;              // 每个词团最多跨几条排（跨排必须拆膜，否则凸包会跨行拉出大三角）
+const MAXGK = MAXGB * GBROW;  // 膜单元上限（团 × 排）
+const GD = 36;                // 每个团的轮廓方向数
+const wob = new Float32Array(GD);
+const gDirX = new Float32Array(GD), gDirY = new Float32Array(GD);
+const gBestV = new Float32Array(MAXGK * GD);
+const gBestX = new Float32Array(MAXGK * GD);
+const gBestY = new Float32Array(MAXGK * GD);
+const gSumX = new Float64Array(MAXGK), gSumY = new Float64Array(MAXGK);
+const gCnt = new Int32Array(MAXGK);
+let hasHull = false;
+
+/* 格位 */
+const px = new Float32Array(MAXP), py = new Float32Array(MAXP);   // 旧位置
+const qx = new Float32Array(MAXP), qy = new Float32Array(MAXP);   // 新位置
+const st = new Float32Array(MAXP);                                // 错峰起点（0..0.45）
+const wf = new Float32Array(MAXP);                                // 呼吸相位
+const cellGrp = new Int16Array(MAXP);                             // 每格位所属"词团×排"膜单元
+let ng = 0;                                                       // 本句膜单元数（团×排）
+let ngroups = 0;                                                  // 本句词团数（只用于 __stage 汇报）
+let n = 0;
+
+let gcx = 0, gcy = 0;        // 字形中心
+let morphT = 0;              // 形变已进行时长
+let puff = 0;                // 踩拍的鼓包量
+let born = new Float64Array(MAXP);   // 每格位的浮现时刻（YRC 团首）
+let yrcFlag = false;
+let gInfo = { pts: [], cx: 0, cy: 0 };
+let lh = 100, gap = 30, stackH = 100;   // 排几何（glyphRows 里填）
+let fsCur = 100;
+
+const PI2 = PI * 2;
+for (let i = 0; i < GD; i++) {
+  const a = i / GD * PI2;
+  gDirX[i] = Math.cos(a); gDirY[i] = Math.sin(a);
+  wob[i] = Math.sin(a * 3) * 0.5 + Math.sin(a * 5 + 1.1) * 0.3 + Math.sin(a * 8 + 2.3) * 0.2;
+}
+
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function smooth(t) { return t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t); }
+
+/* ============================================================================
+   分词（抄自 004-sand-lyrics.html，纯函数原样搬）：
+   词团一起浮现的理由——逐字浮现时 2~3 字的词被拆成 2~3 次微小形变，读感是
+   "机关枪"；按团浮现，膜整体一点一点长出词的形状，"生长感"才连贯。
+   词典拿不到（file://）自动回退按标点/字数硬切，形态不崩。
+   ========================================================================== */
+let DICT = null;
+fetch('/segdict.bin')
+  .then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); })
+  .catch(() => {});
+
+const fnv = (s) => {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+};
+
+function isWord(s, i, L) {
+  const h = fnv(s.substr(i, L));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1, v = DICT[m];
+    if (v === h) return true;
+    if (v < h) lo = m + 1; else hi = m - 1;
+  }
+  return false;
+}
+
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let L = Math.min(4, text.length - i); L >= 2; L--) if (isWord(text, i, L)) { hit = L; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let L = Math.min(4, j); L >= 2; L--) if (isWord(text, j - L, L)) { hit = L; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+
+function isLatin(text) {
+  let la = 0, cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++;
+    else if (c >= '\u4e00' && c <= '\u9fff') cjk++;
+  }
+  return la > cjk;
+}
+
+function latinSpans(text) {
+  const out = [];
+  let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i;
+    while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j });
+    i = j;
+  }
+  return out;
+}
+
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+
+function countChars(s) {
+  let n2 = 0;
+  for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n2++;
+  return n2;
+}
+
+function groupByWords(text) {
+  const words = segWords(text);
+  const out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos;
+    pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; }
+    else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+
+function groupByRule(text) {
+  const out = [];
+  let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const sep = PUNCT.test(c) || SPACE.test(c);
+    if (!sep) chars++;
+    if (sep && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!sep && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+
+function spansForLine(text) {
+  if (isLatin(text)) return latinSpans(text);
+  return DICT ? groupByWords(text) : groupByRule(text);
+}
+
+function comp(v) { const s = Math.round(clamp(v, 0, 255)).toString(16); return s.length < 2 ? '0' + s : s; }
+/* 通道必须夹在 0..255：accent[i]+40 这类偏移会超过 255，
+   而非法的颜色字符串会被浏览器**静默忽略**（fillStyle/strokeStyle 保持上一次的值，
+   addColorStop 则直接抛 SyntaxError）—— 这正是之前那串颜色报错的来源。 */
+function rgb(r, g, b) { return 'rgb(' + (clamp(r, 0, 255) | 0) + ',' + (clamp(g, 0, 255) | 0) + ',' + (clamp(b, 0, 255) | 0) + ')'; }
+function rgba(r, g, b, a) { return 'rgba(' + (clamp(r, 0, 255) | 0) + ',' + (clamp(g, 0, 255) | 0) + ',' + (clamp(b, 0, 255) | 0) + ',' + a + ')'; }
+
+/* ---- 字形采样（步长 2 ≤ 颗粒直径；支持多排） ---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const FONTF = (fs) => '700 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+/* ---------- 长句折行：>16 字 2 排、>30 字 3 排，尽量不从拉丁词中间断开 ---------- */
+function splitRows(text) {
+  const want = text.length > 30 ? 3 : (text.length > 16 ? 2 : 1);
+  if (want === 1) return [{ text: text, off: 0 }];
+  const LAT = /[A-Za-z0-9'’]/;
+  const parts = [];
+  let start = 0;
+  for (let p = 1; p <= want; p++) {
+    let cut = (p === want) ? text.length : Math.round(text.length * p / want);
+    if (p < want) {
+      if (LAT.test(text[cut - 1]) && text[cut] && LAT.test(text[cut])) {
+        let best = -1;
+        for (let d = 1; d <= 8 && best < 0; d++) {
+          if (cut - d > start + 3 && /\s/.test(text[cut - d])) best = cut - d;
+          else if (cut + d < text.length - 3 && /\s/.test(text[cut + d])) best = cut + d + 1;
+        }
+        if (best > 0) cut = best;
+      }
+    }
+    parts.push({ text: text.slice(start, cut), off: start });
+    start = cut;
+  }
+  return parts.filter((r) => r.text.length);
+}
+
+/* 整句（多排）采成点集，坐标已经是屏幕系（含各排偏移），中心点在返回值里 */
+function glyphRows(text) {
+  if (!text) return { pts: [], cx: W / 2, cy: H * 0.47 };
+  const rowsArr = splitRows(text);
+  const R = rowsArr.length;
+  const maxRow = Math.max(...rowsArr.map((r) => r.text.length));
+  const F = 104;
+  const maxW = Math.min(W * 0.86, 1300);
+  octx.font = FONTF(F);
+  let maxRowW = 1;
+  for (const r of rowsArr) maxRowW = Math.max(maxRowW, octx.measureText(r.text).width);
+  let fs = maxRowW > maxW ? F * (maxW / maxRowW) : F;
+  const lhK = 1.30, gapK = 0.36;
+  const totalH = R * lhK * fs + (R - 1) * gapK * fs;
+  const maxH = H * 0.62;
+  if (totalH > maxH) fs *= maxH / totalH;
+  fs = Math.max(20, fs);
+  fsCur = fs;
+  lh = fs * lhK; gap = fs * gapK;
+  stackH = R * lh + (R - 1) * gap;
+  const yTop = H * 0.47 - stackH / 2;
+  const pts = [];
+  for (let ri = 0; ri < R; ri++) {
+    const r = rowsArr[ri];
+    const w = Math.ceil(octx.measureText(r.text).width) + 8;
+    const h = Math.ceil(lh);
+    off.width = Math.max(4, w); off.height = Math.max(4, h);
+    octx.clearRect(0, 0, off.width, off.height);
+    octx.font = FONTF(fs);
+    octx.textAlign = 'center'; octx.textBaseline = 'middle';
+    octx.fillStyle = '#fff';
+    octx.fillText(r.text, off.width / 2, h / 2);
+    const d = octx.getImageData(0, 0, off.width, off.height).data;
+    const rowW = Math.min(off.width - 8, Math.ceil(octx.measureText(r.text).width));
+    const left = W / 2 - rowW / 2;
+    const rowCy = yTop + ri * (lh + gap) + lh / 2;
+    const step = 2;    for (let y = 0; y < h; y += step)
+      for (let x = 0; x < off.width; x += step)
+        if (d[(y * off.width + x) * 4 + 3] > 128)
+          pts.push(left + (x + 4 - off.width / 2), rowCy + (y + 4 - h / 2));
+  }
+  return { pts: pts, cx: W / 2, cy: H * 0.47 };
+}
+
+/* 把旧格位挪到新字形：错峰 + 记录新字形中心 */
+function loadText(line) {
+  const text = (typeof line === 'string' ? line : (line && line.text)) || '';
+  gInfo = glyphRows(text);
+  const pts = gInfo.pts;
+  const pc = pts.length / 2;
+  if (!pc) { n = 0; return; }
+  const k = Math.min(MAXP, pc);
+  /* 等间隔取样：直接 (i % pc) 会把字压扁成一条带 */
+  let sx = 0, sy = 0;
+  const idx = new Int32Array(k);
+  for (let i = 0; i < k; i++) {
+    const p = (Math.floor(i * pc / k) % pc) * 2;
+    idx[i] = p;
+    sx += pts[p]; sy += pts[p + 1];
+  }
+  sx /= k; sy /= k;
+  /* 归一化 + 按比例重映射（不用 Math.max/min 硬夹） */
+  let mx = 1e-6;
+  for (let i = 0; i < k; i++) {
+    const dx = pts[idx[i]] - sx, dy = pts[idx[i] + 1] - sy;
+    const d2 = dx * dx + dy * dy;
+    if (d2 > mx) mx = d2;
+  }
+  const rr = Math.sqrt(mx);
+  /* glyphRows 返回的已经是**屏幕坐标**（折行/字号/排布都在里面算好了），
+     这里绝不能再按单排半径缩放 —— 旧代码把整叠 323px 高的字块又压了 0.55 倍，
+     41 字长句就缩成了屏幕中央 392×121 的一小块。 */
+  const sc = 1;
+  const ncx = gInfo.cx, ncy = gInfo.cy;
+  /* YRC：每格位记录它所属字/词团的浮现时刻（浮现将逐团点亮，不再整句一起） */
+  const fullText = (typeof line === 'string' ? line : (line && line.text)) || '';
+  const chars = line && line.chars && line.chars.length === fullText.length ? line.chars : null;
+  yrcFlag = !!chars;
+  const dur = line && line.dur > 0 ? line.dur : 4;
+  const lineT = line && line.t ? line.t : 0;
+  const nChars = fullText.length || 1;
+  const charAt = new Float64Array(nChars);
+  for (let q = 0; q < nChars; q++) charAt[q] = chars ? chars[q].t : lineT + dur * q / nChars;
+  /* 词团（可选）：每格位取团首时刻 —— 团一起浮现，不机关枪 */
+  const spans = spansForLine(fullText);
+  const spanHead = new Int16Array(nChars);
+  const gOf = new Int16Array(nChars);            // 字 → 词团序号
+  for (let g = 0; g < spans.length; g++) {
+    const sp = spans[g];
+    for (let q = sp.i0; q < sp.i1; q++) { spanHead[q] = sp.i0; gOf[q] = g; }
+  }
+  ngroups = Math.min(MAXGB, spans.length);
+  ng = Math.min(MAXGK, spans.length * GBROW);
+  /* 屏幕点 → 全局字索引：按 x 在它那排的列位（用与 glyphRows 相同的排几何） */
+  const rowsArr = splitRows(fullText);
+  const rowBounds = [];
+  {
+    octx.font = FONTF(fsCur);
+    for (const r of rowsArr) {
+      const bnd = [0];
+      for (let q = 1; q <= r.text.length; q++) bnd.push(octx.measureText(r.text.substring(0, q)).width);
+      rowBounds.push({ bnd: bnd, rowW: bnd[bnd.length - 1] });
+    }
+  }
+  /* 旧位置：如果本来没有格位，就从中心附近"炸开" */
+  for (let i = 0; i < k; i++) {
+    const ox = n > 0 && i < n ? qx[i] : ncx + (Math.random() - 0.5) * 40;
+    const oy = n > 0 && i < n ? qy[i] : ncy + (Math.random() - 0.5) * 40;
+    px[i] = ox; py[i] = oy;
+    qx[i] = ncx + (pts[idx[i]] - sx) * sc;
+    qy[i] = ncy + (pts[idx[i] + 1] - sy) * sc;
+    st[i] = ((qx[i] - (ncx - W * 0.4)) / (W * 0.8)) * 0.34;
+    if (st[i] < 0) st[i] = 0; else if (st[i] > 0.34) st[i] = 0.34;
+    wf[i] = (i * 2.399963) % TAU;
+    /* 该格位属于哪个字：按屏幕 x 找到它那排的列（几何同 glyphRows） */
+    const sxp = qx[i], syp = qy[i];
+    let ri = Math.floor((syp - (ncy - stackH / 2)) / (lh + gap));
+    ri = Math.max(0, Math.min(rowsArr.length - 1, ri));
+    const rb = rowBounds[ri];
+    const lx = sxp - (W / 2 - rb.rowW / 2);
+    let lo = 0, hi = rowsArr[ri].text.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (rb.bnd[m] <= lx) lo = m; else hi = m - 1; }
+    const gi = Math.min(nChars - 1, rowsArr[ri].off + lo);
+    born[i] = charAt[spanHead[gi]];      // 团首字的时刻：整团一起浮出来
+    cellGrp[i] = Math.min(MAXGK - 1, (gOf[gi] | 0) * GBROW + ri);   // 词团×排：跨排不共用一条膜
+  }
+  n = k;
+  gcx = ncx; gcy = ncy;
+  hullGrd = buildHullGrd();
+  morphT = 0;
+  hasHull = n > 0;
+}
+
+function globalProgress() { return smooth(clamp(morphT / MORPH, 0, 1)); }
+
+/* 膜渐变只跟 gcx/gcy（换句才变）和 accent 有关 → 换句时建一次，不要每帧 createLinearGradient */
+function buildHullGrd() {
+  const grd = ctx.createLinearGradient(gcx, gcy - 260, gcx, gcy + 260);
+  grd.addColorStop(0, rgba(accent[0] + 22, accent[1] + 10, accent[2], 0.62));
+  grd.addColorStop(0.55, rgba(accent[0], accent[1], accent[2], 0.40));
+  grd.addColorStop(1, rgba(accent[0] * 0.5, accent[1] * 0.5, accent[2] * 0.7, 0.30));
+  return grd;
+}
+
+function buildGlow() {
+  glowW = Math.max(64, Math.round(W * 0.75));
+  glowH = Math.max(48, Math.round(H * 0.6));
+  glow = document.createElement('canvas');
+  glow.width = glowW; glow.height = glowH;
+  const g = glow.getContext('2d');
+  const r = g.createRadialGradient(glowW / 2, glowH / 2, 0, glowW / 2, glowH / 2, glowW / 2);
+  r.addColorStop(0, rgba(accent[0], accent[1], accent[2], 0.30));
+  r.addColorStop(0.42, rgba(accent[0], accent[1], accent[2], 0.11));
+  r.addColorStop(1, rgba(accent[0], accent[1], accent[2], 0));
+  g.fillStyle = r; g.fillRect(0, 0, glowW, glowH);
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildGlow();
+  /* 尺寸变了：把当前这句重新落位（旧膜直接冻住当起点） */
+  if (n && curIdx >= 0 && lines[curIdx]) {
+    const oldN = n;
+    for (let i = 0; i < oldN; i++) { px[i] = qx[i]; py[i] = qy[i]; }
+    loadText(lines[curIdx]);
+  }
+}
+
+let curText = '';
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ---- 节奏 ---- */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; n = 0; hasHull = false; curText = ''; puff = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      curText = lines[ci].text;
+      loadText(lines[ci]);          // 旧格位 → 新字形（同时整块重建膜）
+    } else {
+      n = 0; hasHull = false; curText = '';
+    }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) brewIdx = nx;
+  }
+}
+
+let last = performance.now();
+let t0 = 0;
+let T = 0;
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  T = now();
+  timing(T);
+  morphT += dt;
+  puff *= Math.pow(0.02, dt);
+
+  const g = globalProgress();
+  const breathe = 1 + Math.sin(t0 * 1.15) * 0.16;
+  const wobA = (5.5 + puff * 0.35) * breathe;
+
+  /* ---- 背景 ---- */
+  ctx.fillStyle = bgc;
+  ctx.fillRect(0, 0, W, H);
+  if (glow) {
+    ctx.globalCompositeOperation = 'screen';
+    ctx.drawImage(glow, (W - glowW) / 2, H * 0.47 - glowH / 2, glowW, glowH);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  if (n && hasHull) {
+    /* 膜按**词团**分别长：每团只包自己那几个字，41 字长句就是十几条小膜拼成一行，
+       再也不会被整句凸包拉成一个盖住全屏的大矩形。
+       膜随 YRC 生长：团内已浮现的格位才撑膜，没唱到的团没有膜。 */
+    const Tt = T;
+    gCnt.fill(0); gSumX.fill(0); gSumY.fill(0); gBestV.fill(-1e18);
+    /* 凸包只要支撑点：格位多时隔几个采样一次（6000 全量 ×36 方向 = 21 万次/帧，帧率就是从这里掉的） */
+    const hstep = n > 3200 ? 3 : 1;
+    for (let i = 0; i < n; i += hstep) {
+      if (Tt < born[i]) continue;
+      const gi = cellGrp[i];
+      if (gi < 0 || gi >= ng) continue;
+      gCnt[gi]++;
+      gSumX[gi] += qx[i]; gSumY[gi] += qy[i];
+      const base = gi * GD;
+      const x = qx[i], y = qy[i];
+      for (let d = 0; d < GD; d++) {
+        const v = x * gDirX[d] + y * gDirY[d];
+        const bi = base + d;
+        if (v > gBestV[bi]) { gBestV[bi] = v; gBestX[bi] = x; gBestY[bi] = y; }
+      }
+    }
+    ctx.beginPath();
+    let drawn = 0;
+    for (let gi = 0; gi < ng; gi++) {
+      const c = gCnt[gi];
+      if (c < 5) continue;                       // 还没成形的小团先不画膜
+      const cxx = gSumX[gi] / c, cyy = gSumY[gi] / c;
+      const base = gi * GD;
+      for (let d = 0; d < GD; d++) {
+        const b = base + d;
+        let x = gBestX[b], y = gBestY[b];
+        let nx2 = x - cxx, ny2 = y - cyy;
+        const dd = Math.sqrt(nx2 * nx2 + ny2 * ny2) || 1;
+        const w = 8 + wob[(d + gi * 7) % GD] * wobA * 0.5;
+        x += nx2 / dd * w; y += ny2 / dd * w;
+        if (d === 0) { ctx.moveTo(x, y); drawn = 1; } else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+    }
+    if (drawn) {
+      ctx.fillStyle = hullGrd || (hullGrd = buildHullGrd());
+      ctx.fill();
+    }
+
+    /* ---- 内部空腔：格位连成一条路径一次填充（4 段/格，够圆） ----
+       nonzero 才能把 900 个重叠圆并成一块实心的字；evenodd 会让重叠区互相抵消，
+       字就变成一片雪花噪点（这就是之前看到的"噪点棒"）。
+       另外 Path2D 无法清空，必须每帧新建一张，否则同一张路径会无限累积。
+       YRC：格位在它所属词团的 chars 时刻**弹出**（scale 0→1 的过冲），
+       未浮现的格位不画 —— 字是随歌词一点一点长出来的。 */
+    const R = 4.4;                 // 点径：间距 ≈5.2px 时要 4.4 才能连成实心笔画（3.2 是稀疏点阵，5.5+ 会填平字腔）
+    const hole = new Path2D();
+    for (let i = 0; i < n; i++) {
+      const age = T - born[i];
+      if (age < -0.06) continue;                    // 还没唱到：膜里没有这块
+      const p = clamp((morphT - st[i]) / (MORPH - 0.34), 0, 1);
+      const e = smooth(p);
+      let x = px[i] + (qx[i] - px[i]) * e;
+      let y = py[i] + (qy[i] - py[i]) * e;
+      /* 浮现过冲：age 0→0.3s 时半径从 0 弹到 1.35 再回 1 */
+      let rr2 = R;
+      if (age < 0.30) {
+        const q2 = age / 0.30;
+        rr2 = R * (q2 < 0.6 ? (q2 / 0.6) * 1.35 : 1.35 - 0.35 * (q2 - 0.6) / 0.4);
+        if (rr2 < 0.2) rr2 = 0.2;
+      }
+      hole.moveTo(x + rr2, y);
+      hole.arc(x, y, rr2, 0, TAU);
+    }
+    ctx.fillStyle = 'rgba(5,7,12,0.92)';
+    ctx.fill(hole);
+
+    /* ---- 膜的内缘：一条路径一次描边（字的外圈被点亮，空腔才读得出来） ---- */
+    ctx.strokeStyle = rgba(accent[0] + 40, accent[1] + 30, accent[2] + 20, 0.42);
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(240,255,255,0.10)';
+    ctx.lineWidth = 3.2;
+    ctx.stroke();
+  }
+
+  if (curIdx >= 0) {
+    modeEl.textContent = morphT < MORPH ? 'MORPHING' : 'HELD';
+    statEl.textContent = n + ' CELL' + (n === 1 ? '' : 'S');
+  } else {
+    modeEl.textContent = 'IDLE';
+    statEl.textContent = '-- CELL';
+  }
+
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) { accent = p.accent; buildGlow(); }
+    n = 0; hasHull = false; curText = ''; puff = 0; morphT = MORPH;
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：整张膜沿中心向外鼓一下，不是逐颗乱踢 */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    puff = 16 + 34 * lv;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+addEventListener('resize', resize);
+
+window.__stage = () => {
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < n; i++) {
+    if (qx[i] < mnX) mnX = qx[i]; if (qx[i] > mxX) mxX = qx[i];
+    if (qy[i] < mnY) mnY = qy[i]; if (qy[i] > mxY) mxY = qy[i];
+  }
+  return {
+    lines: lines.length, cur: curIdx, brew: brewIdx, t: +now().toFixed(2),
+    cells: n, hull: hasHull ? ngroups : 0, morph: +clamp(morphT / MORPH, 0, 1).toFixed(2),
+    yrc: yrcFlag, seg: !!DICT,
+    box: n ? { x: +mnX.toFixed(1), y: +mnY.toFixed(1), w: +(mxX - mnX).toFixed(1), h: +(mxY - mnY).toFixed(1) } : null
+  };
+};
+</script>
+</body>
+</html>

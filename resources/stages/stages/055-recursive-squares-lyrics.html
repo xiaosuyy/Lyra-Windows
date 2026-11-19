@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>递归方块</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(205,210,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   055 · 递归方块 —— 一次**自适应细分**把整句话切成方块，再逐字点亮
+   ----------------------------------------------------------------------------
+   核心机制：屏幕上没有一个粒子，只有矩形。整句词先排成 1~3 行，取一个刚好
+   罩住字块的外框，然后递归细分：每一块切成 3×3（小块切 2×2）的子块，只保留
+   与字形有交集的那些，空白处直接丢掉。于是"哪里该细、哪里该粗"完全由字形
+   决定 —— 笔画穿过的地方被切到第 6 层，字缝里只剩几个大方块。
+   每个方块记住自己落在哪个字上、在第几层、DFS 里第几个。
+
+   字怎么来：**逐字点亮**。第 k 个字在 chars[k].t 那一刻，落在它身上的方块
+   按层从粗到细、按 DFS 顺序依次亮起（像一棵用矩形搭的树从句首分叉出来）。
+   整句唱完时，最细那层方块正好把字形"框"出来 —— 不是点阵，是**尺度**。
+   字本身亮在方块之上，读得清。
+
+   和 017（Truchet）的区别：那是等大格子的图案；这里尺寸随内容变化，
+   而且亮的时间是逐字的。
+
+   分词：不用 —— 生成系统类逐字点亮更自然，一个字一片方块。
+
+   精修记录：
+   ① 逐字时刻统一走 charTimes()（chars 长度与正文相等且可解析才采信，单调钳位，
+      否则 t+dur*k/n 均分回退）；方块按"自己属于哪个字"取时刻，
+      window.__stage().yrc 暴露是否走 YRC。
+   ② 阅读优先：1~3 行、取放得下的最大字号、行内居中；暗描边 + 暗场保证方块
+      再密也读得清；未唱到的字保持 0.62 可见度，句尾整句仍在。
+   ③ 动效：整棵树随 beat 相干胀缩 + 镜头缓慢缩放漂移，方块各自 0.28s 弹出，
+      进场 0.26s 淡入。
+   ④ 性能：方块按层合批成 7 条 Path2D，每帧每层一次 fill；细分只在换句/尺寸
+      变化时算一次。
+   ========================================================================== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hint = document.getElementById('hint');
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+/* ---- 画布 ---- */
+let W = 0, H = 0, DPR = 1;
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+function fit() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(320, innerWidth); H = Math.max(240, innerHeight);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+fit();
+
+/* ================= 排版：1~3 行，逐字绝对坐标 ================= */
+const FAMILY = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif';
+const FONT = (fs) => '800 ' + fs.toFixed(1) + 'px ' + FAMILY;
+const om = document.createElement('canvas').getContext('2d');
+
+function layout(text, availW, availH, maxRows, cy) {
+  const s = text;
+  if (!/\S/.test(s)) return null;
+  const n = s.length;
+  om.font = FONT(100);
+  let best = 0, bestR = 1;
+  for (let r = 1; r <= maxRows; r++) {
+    const per = Math.ceil(n / r);
+    const wPer = om.measureText(s.slice(0, Math.min(n, per))).width / 100 || 0.01;
+    const f = Math.min(availW / wPer, availH / (r * 1.34), 96);
+    if (f > best) { best = f; bestR = r; }
+  }
+  let fs = Math.max(13, best);
+  let ranges = null;
+  for (let guard = 0; guard < 30; guard++) {
+    om.font = FONT(fs);
+    const total = om.measureText(s).width;
+    const cap = Math.max(fs * 2.2, Math.min(availW, total / bestR * 1.04));
+    const rr = [];
+    let start = 0;
+    while (start < n) {
+      let lo = start + 1, hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (om.measureText(s.slice(start, mid)).width <= cap) lo = mid; else hi = mid - 1;
+      }
+      let end = Math.max(start + 1, lo);
+      const sp = s.lastIndexOf(' ', end - 1);
+      if (sp > start + Math.max(2, (end - start) * 0.5)) end = sp;
+      rr.push([start, end]);
+      start = end;
+    }
+    if (rr.length <= maxRows) { ranges = rr; break; }
+    fs *= 0.9;
+    if (fs < 13) { fs = 13; ranges = rr; break; }
+  }
+  if (!ranges) return null;
+  const lh = fs * 1.34;
+  const rows = [];
+  let maxw = 0;
+  om.font = FONT(fs);
+  for (let q = 0; q < ranges.length; q++) {
+    const a = ranges[q][0], b = ranges[q][1];
+    let x = 0;
+    const chars = [];
+    for (let i = a; i < b; i++) {
+      const ch = s[i];
+      const w = om.measureText(ch).width;
+      chars.push({ ch, x, w, k: i });
+      x += w;
+    }
+    if (x > maxw) maxw = x;
+    rows.push({ chars, w: x });
+  }
+  const blockH = rows.length * lh;
+  const y0 = cy - blockH / 2;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const rx = (W - row.w) / 2;
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      c.ax = rx + c.x + c.w / 2;
+      c.ay = y0 + r * lh + lh / 2;
+    }
+  }
+  return { rows, fs, lh, blockW: maxw, blockH, cy };
+}
+
+function charTimes(line, n) {
+  const out = new Float32Array(Math.max(1, n));
+  const chs = line ? line.chars : null;
+  const base = line ? (isFinite(line.t) ? line.t : 0) : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* ================= 递归细分 ================= */
+const CAP = 3400;
+const MAXD = 6;
+const MSTEP = 2;
+let nx_ = null, ny_ = null, nwe_ = null, nhe_ = null, nd_ = null, no_ = null, nt_ = null;
+let nn = 0, maxDepth = 0;
+let mask = null, maskW = 0, maskH = 0;
+let rx0 = 0, ry0 = 0, rw = 0, rh = 0;
+let accent = [205, 210, 255];
+let hueBase = 235;
+let pulse = 0, time = 0, dtG = 0.016;
+let curLyric = null, pend = null;
+
+const paths = [];
+for (let d = 0; d <= MAXD; d++) paths.push(new Path2D());
+const COL = [], EDGE = [];
+function buildPalette() {
+  hueBase = hueOf(accent);
+  COL.length = 0; EDGE.length = 0;
+  for (let d = 0; d <= MAXD; d++) {
+    COL.push('hsla(' + ((hueBase + d * 9) % 360).toFixed(0) + ',' + (58 + d * 2.5).toFixed(0) + '%,' +
+             (11 + d * 4.6).toFixed(0) + '%,0.94)');
+    EDGE.push('hsla(' + ((hueBase + 10 + d * 9) % 360).toFixed(0) + ',94%,' +
+              (62 + d * 3).toFixed(0) + '%,0.26)');
+  }
+}
+function hueOf(rgb) {
+  const r = rgb[0] / 255, g = rgb[1] / 255, b = rgb[2] / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  if (d < 1e-4) return 235;
+  let h;
+  if (mx === r) h = ((g - b) / d) % 6;
+  else if (mx === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return h;
+}
+buildPalette();
+
+/** 整块字 → 0/1 掩膜（按屏幕像素 /MSTEP，坐标系就是外框） */
+function blockMask(L) {
+  const cw = Math.max(4, Math.round(rw)), chh = Math.max(4, Math.round(rh));
+  const cv = document.createElement('canvas');
+  cv.width = cw; cv.height = chh;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (let r = 0; r < L.rows.length; r++) {
+    const row = L.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      g.font = FONT(L.fs);
+      g.fillStyle = '#fff';
+      g.fillText(c.ch, c.ax - rx0, c.ay - ry0);
+    }
+  }
+  const d = g.getImageData(0, 0, cw, chh).data;
+  const mw = Math.ceil(cw / MSTEP), mh = Math.ceil(chh / MSTEP);
+  const m = new Uint8Array(mw * mh);
+  for (let y = 0; y < mh; y++) {
+    const py = Math.min(chh - 1, y * MSTEP);
+    for (let x = 0; x < mw; x++) {
+      const px = Math.min(cw - 1, x * MSTEP);
+      if (d[(py * cw + px) * 4 + 3] > 110) m[y * mw + x] = 1;
+    }
+  }
+  mask = m; maskW = mw; maskH = mh;
+}
+
+/** 这块方框和字形有交集吗 */
+function hits(x, y, w, h) {
+  if (!mask) return true;
+  const sx = rw / maskW, sy = rh / maskH;
+  const ax = Math.floor((x - rx0) / sx), ay = Math.floor((y - ry0) / sy);
+  const bx = Math.ceil((x + w - rx0) / sx), by = Math.ceil((y + h - ry0) / sy);
+  const x0 = Math.max(0, ax), x1 = Math.min(maskW, bx);
+  const y0 = Math.max(0, ay), y1 = Math.min(maskH, by);
+  for (let my = y0; my < y1; my++) {
+    const yo = my * maskW;
+    for (let mx = x0; mx < x1; mx++) if (mask[yo + mx]) return true;
+  }
+  return false;
+}
+
+function buildLyric(ln, idx) {
+  const text = (ln && ln.text) || '';
+  const n = text.length;
+  if (!n) return null;
+  const ct = charTimes(ln, n);
+  const lay = layout(text, Math.min(W * 0.86, 1320), Math.min(H * 0.34, 350), 3, H * 0.46);
+  if (!lay) return null;
+  const pad = Math.max(16, lay.fs * 0.30);
+  rx0 = Math.min(...lay.rows.map((r, i) => (W - r.w) / 2)) - pad;
+  ry0 = lay.cy - lay.blockH / 2 - pad;
+  rw = Math.max(...lay.rows.map((r) => r.w)) + pad * 2;
+  rh = lay.blockH + pad * 2;
+  const L = {
+    line: ln, t0: isFinite(ln.t) ? ln.t : 0, dur: ln.dur || 4, text, n, yrc: ct.yrc,
+    ct: ct.t, rows: lay.rows, fs: lay.fs, lh: lay.lh, cy: lay.cy,
+    boxes: [], scrim: makeScrim(lay.blockW, lay.blockH)
+  };
+  blockMask(L);
+
+  if (!nx_) {
+    nx_ = new Float32Array(CAP); ny_ = new Float32Array(CAP); nwe_ = new Float32Array(CAP);
+    nhe_ = new Float32Array(CAP); nd_ = new Uint8Array(CAP); no_ = new Int32Array(CAP);
+    nt_ = new Float32Array(CAP);
+  }
+  /* 每个字的中心与半宽：方块中心落在谁身上就算谁的 */
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      if (!/\S/.test(c.ch)) continue;
+      L.boxes.push({ ax: c.ax, ay: c.ay, hw: Math.max(c.w, lay.fs * 0.8) * 0.5,
+                     hh: lay.lh * 0.5, k: c.k, t: isFinite(ct.t[c.k]) ? ct.t[c.k] : 0 });
+    }
+  }
+  function ownerOf(x, y) {
+    let best = -1, bd = 1e18;
+    for (let i = 0; i < L.boxes.length; i++) {
+      const b = L.boxes[i];
+      const dx = Math.max(0, Math.abs(x - b.ax) - b.hw);
+      const dy = Math.max(0, Math.abs(y - b.ay) - b.hh);
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bd) { bd = d2; best = i; }
+    }
+    return best;
+  }
+
+  nn = 0; maxDepth = 0;
+  let order = 0;
+  function rec(x, y, w, h, depth) {
+    if (nn >= CAP || w < 3 || h < 3) return;
+    if (!hits(x, y, w, h)) return;
+    const i = nn++;
+    const inset = depth === 0 ? 0 : Math.min(3.2, w * 0.05);
+    nx_[i] = x + inset; ny_[i] = y + inset;
+    nwe_[i] = w - inset * 2; nhe_[i] = h - inset * 2;
+    nd_[i] = depth; no_[i] = order++;
+    const b = ownerOf(x + w * 0.5, y + h * 0.5);
+    nt_[i] = b >= 0 ? L.boxes[b].t : L.t0;
+    if (depth > maxDepth) maxDepth = depth;
+    if (depth >= MAXD || Math.min(w, h) < 5) return;
+    /* 按长宽比切：宽条切列、竖条切行、接近方形才切 2×2 —— 切出来的块才接近方块 */
+    let nc = 2, nr = 2;
+    if (w > h * 1.45) { nc = Math.min(3, Math.max(2, Math.round(w / h))); nr = 1; }
+    else if (h > w * 1.45) { nr = Math.min(3, Math.max(2, Math.round(h / w))); nc = 1; }
+    const gap = Math.min(w, h) * 0.08;
+    const cw2 = (w - gap * (nc - 1)) / nc;
+    const ch2 = (h - gap * (nr - 1)) / nr;
+    for (let j = 0; j < nr; j++) {
+      for (let k = 0; k < nc; k++) {
+        rec(x + k * (cw2 + gap), y + j * (ch2 + gap), cw2, ch2, depth + 1);
+      }
+    }
+  }
+  rec(rx0, ry0, rw, rh, 0);
+  /* 节点拷进这一句自己的数组：酝酿下一句时会重建全局缓冲，不能共用 */
+  L.count = nn; L.maxDepth = maxDepth;
+  L.nx = new Float32Array(nn); L.nx.set(nx_.subarray(0, nn));
+  L.ny = new Float32Array(nn); L.ny.set(ny_.subarray(0, nn));
+  L.nw = new Float32Array(nn); L.nw.set(nwe_.subarray(0, nn));
+  L.nh = new Float32Array(nn); L.nh.set(nhe_.subarray(0, nn));
+  L.nd = new Uint8Array(nn); L.nd.set(nd_.subarray(0, nn));
+  L.nt = new Float32Array(nn); L.nt.set(nt_.subarray(0, nn));
+  L.nodes = nn;
+  L.rx0 = rx0; L.ry0 = ry0; L.rw = rw; L.rh = rh;
+  return L;
+}
+
+function prepare(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  pend = buildLyric(ln, idx);
+}
+function startLine(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  curLyric = (pend && pend.line === ln) ? pend : buildLyric(ln, idx);
+  pend = null;
+  hint.style.opacity = '0';
+}
+function release() { curLyric = null; pend = null; nn = 0; mask = null; }
+
+/* ================= 节奏 ================= */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; release(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci); else release();
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prepare(nx); }
+  }
+}
+
+/* ================= 背景 ================= */
+let bgGrad = null, halo = null, vg = null, dots = null;
+function buildGrads() {
+  bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrad.addColorStop(0, '#06070e');
+  bgGrad.addColorStop(0.6, '#080a14');
+  bgGrad.addColorStop(1, '#05060c');
+  halo = ctx.createRadialGradient(W * 0.5, H * 0.46, 0, W * 0.5, H * 0.46, Math.max(W, H) * 0.55);
+  halo.addColorStop(0, 'rgba(' + (accent[0] * 0.34 + 60 | 0) + ',' + (accent[1] * 0.30 + 55 | 0) + ',' +
+                       (accent[2] * 0.42 + 70 | 0) + ',0.13)');
+  halo.addColorStop(1, 'rgba(90,120,220,0)');
+  vg = ctx.createRadialGradient(W * 0.5, H * 0.48, Math.min(W, H) * 0.30,
+                                W * 0.5, H * 0.48, Math.max(W, H) * 0.82);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(2,3,8,0.46)');
+  dots = new Path2D();
+  const gap = 28;
+  for (let y = gap * 0.5; y < H; y += gap)
+    for (let x = gap * 0.5; x < W; x += gap) dots.rect(x, y, 1.1, 1.1);
+}
+
+function makeScrim(bw, bh) {
+  const pad = 54;
+  const w = bw + pad * 2, h = bh + pad * 2;
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(w * DPR));
+  c.height = Math.max(2, Math.round(h * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const rx = w * 0.5, ry = Math.max(h * 0.38, 1);
+  g.save();
+  g.translate(w / 2, h / 2);
+  g.scale(1, ry / rx);
+  const rg = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+  rg.addColorStop(0, 'rgba(5,7,14,0.60)');
+  rg.addColorStop(0.62, 'rgba(5,7,14,0.42)');
+  rg.addColorStop(1, 'rgba(5,7,14,0)');
+  g.fillStyle = rg;
+  g.beginPath(); g.arc(0, 0, rx, 0, TAU); g.fill();
+  g.restore();
+  return { cv: c, w, h };
+}
+
+/* ================= 绘制 ================= */
+const litCount = new Int32Array(MAXD + 1);
+const seen = [];
+
+function drawBlocks(T) {
+  const L = curLyric;
+  if (!L || !L.count) return;
+  const app = clamp((T - L.t0) / 0.26, 0, 1);
+  const ap = 0.34 + 0.66 * (app * app * (3 - 2 * app));
+  if (L.scrim) {
+    ctx.globalAlpha = 0.96 * ap;
+    ctx.drawImage(L.scrim.cv, 0, 0, L.scrim.cv.width, L.scrim.cv.height,
+                  W / 2 - L.scrim.w / 2, L.cy - L.scrim.h / 2, L.scrim.w, L.scrim.h);
+    ctx.globalAlpha = 1;
+  }
+  /* 镜头：整棵树缓慢缩放 + 漂移，beat 再胀一点 */
+  const MN = L.count, MD = L.maxDepth;
+  const NX = L.nx, NY = L.ny, NW = L.nw, NH = L.nh, ND = L.nd, NT = L.nt;
+  const sc = 1 + pulse * 0.026 + 0.006 * Math.sin(time * 0.19);
+  const cx = L.rx0 + L.rw * 0.5, cyy = L.ry0 + L.rh * 0.5;
+  const dx = Math.sin(time * 0.14) * 7, dy = Math.cos(time * 0.11) * 5;
+
+  for (let d = 0; d <= MD; d++) { paths[d] = new Path2D(); litCount[d] = 0; }
+  seen.length = 0;
+  for (let i = 0; i < MN; i++) {
+    const t0 = NT[i] + ND[i] * 0.022;
+    const pr = (T - t0) / 0.28;
+    if (pr <= 0) continue;
+    const e = pr >= 1 ? 1 : 1 - Math.pow(1 - pr, 3);
+    const sw = NW[i] * (0.62 + 0.32 * e), sh = NH[i] * (0.62 + 0.32 * e);
+    const x = NX[i] + (NW[i] - sw) * 0.5, y = NY[i] + (NH[i] - sh) * 0.5;
+    const fx = cx + (x - cx) * sc + dx, fy = cyy + (y - cyy) * sc + dy;
+    const d = ND[i];
+    paths[d].rect(fx, fy, sw * sc, sh * sc);
+    litCount[d]++;
+    if (e > 0.05 && e < 0.995 && seen.indexOf(d) < 0) seen.push(d);
+  }
+  ctx.globalAlpha = ap;
+  ctx.globalCompositeOperation = 'lighter';
+  for (let d = 0; d <= MD; d++) {
+    if (!litCount[d]) continue;
+    ctx.fillStyle = COL[d];
+    ctx.fill(paths[d]);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  for (let i = 0; i < seen.length; i++) {
+    ctx.strokeStyle = EDGE[seen[i]];
+    ctx.lineWidth = 1;
+    ctx.stroke(paths[seen[i]]);
+  }
+  ctx.globalAlpha = 1;
+}
+
+let lastFs = -1;
+function drawText(T) {
+  const L = curLyric;
+  if (!L || !L.rows) return;
+  const app = clamp((T - L.t0) / 0.26, 0, 1);
+  const ap = 0.34 + 0.66 * (app * app * (3 - 2 * app));
+  let curCh = -1;
+  for (let k = 0; k < L.n; k++) if (T >= L.ct[k]) curCh = k;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  lastFs = -1;
+  for (let r = 0; r < L.rows.length; r++) {
+    const row = L.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      const k = c.k;
+      const lit = T >= L.ct[k];
+      const isCur = k === curCh;
+      const fsz = L.fs * (isCur ? 1.06 : 1);
+      if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+      ctx.globalAlpha = ap;
+      ctx.lineWidth = Math.max(2, fsz * 0.11);
+      ctx.strokeStyle = 'rgba(5,7,14,0.88)';
+      ctx.strokeText(c.ch, c.ax, c.ay);
+      ctx.fillStyle = isCur ? 'rgba(250,252,255,0.99)'
+        : lit ? 'rgba(214,226,255,0.95)'
+          : 'rgba(150,164,196,0.62)';
+      ctx.fillText(c.ch, c.ax, c.ay);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ---- 消息 ---- */
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent && p.accent.length === 3) accent = p.accent;
+    buildPalette();
+    buildGrads();
+    release();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.5;
+    pulse = Math.min(1, pulse + 0.28 + lv * 0.46);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ---- 主循环 ---- */
+let last = performance.now();
+function frame(nowMs) {
+  dtG = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  time += dtG;
+  pulse *= Math.exp(-dtG * 3.0);
+  const T = now();
+  timing(T);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrad || '#06070e';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(140,160,220,0.10)';
+  ctx.fill(dots);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = halo;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+
+  if (curLyric && curLyric.count) {
+    /* 根外框虚线 */
+    ctx.setLineDash([3, 7]);
+    ctx.strokeStyle = 'rgba(160,190,255,0.16)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(curLyric.rx0 + 0.5, curLyric.ry0 + 0.5, curLyric.rw - 1, curLyric.rh - 1);
+    ctx.setLineDash([]);
+    drawBlocks(T);
+  }
+  drawText(T);
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => {
+  fit(); buildGrads();
+  if (curLyric && curLyric.line) curLyric = buildLyric(curLyric.line, curIdx >= 0 ? curIdx : 0);
+});
+buildGrads();
+requestAnimationFrame(frame);
+
+window.__stage = () => {
+  let lit = 0;
+  if (curLyric) for (let k = 0; k < curLyric.n; k++) if (now() >= curLyric.ct[k]) lit++;
+  return {
+    lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+    yrc: !!(curLyric && curLyric.yrc), n: curLyric ? curLyric.n : 0,
+    fs: curLyric ? +curLyric.fs.toFixed(1) : 0,
+    rows: curLyric ? curLyric.rows.length : 0, lit, nodes: curLyric ? curLyric.count : 0, maxDepth: curLyric ? curLyric.maxDepth : 0
+  };
+};
+</script>
+</body>
+</html>

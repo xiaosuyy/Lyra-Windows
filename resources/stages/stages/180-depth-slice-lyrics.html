@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>纵深切片歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;color:rgba(150,190,255,.28);
+        letter-spacing:.16em;pointer-events:none;transition:opacity .6s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   220 · 纵深切片 —— 一句词被复制成 13 层沿 z 等距的切片，相机在切片之间推进
+
+   机制一句话：同一张字形贴在 13 个不同的 z 平面上；相机沿视线连续推轨
+   （27 单位/秒，带呼吸与踩拍前冲），每层按 1/z 透视缩放、按离焦量分级模糊、
+   按距离加雾。三维感来自**切片之间的空隙**（层间视差、雾、穿过层的尘），
+   而不是把字做大；层位置按 camZ 取模，所以焦点平面永远压着一张清晰切片 ——
+   字在任何时刻都是原尺寸、可读的那一版。
+
+   实现要点：
+   · 4 份预烘字形：清晰版（DPR 分辨率）+ 3 档模糊版（1.6 / 4 / 9 px），
+     每层按 |rel - focus| 选档，避免每帧 filter blur（那是帧杀手）。
+   · 层的绘制顺序严格由远到近（source-over），近层自然遮住远层 —— 这才是
+     "走廊"而不是"发光叠加"。
+   · 尘分两批：位于焦点平面之前的画在字之上（真遮挡），之后的画在字之下。
+   · 换句时 reveal 在 0.45s 内把整条走廊淡入，字不会"啪"地出现。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 1, H = 1, DPR = 1, VX = 1, VY = 1, VYV = 1;
+const RM = (() => { try { return matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; } })();
+
+/* ---------------------------- 颜色 ---------------------------- */
+let ACC = [128, 178, 255];
+let FOG = [4, 7, 14];
+let dustCol = 'rgba(210,232,255,';
+function buildColors() {
+  const r = ACC[0] | 0, g = ACC[1] | 0, b = ACC[2] | 0;
+  FOG = [Math.min(40, 2 + r * 0.055) | 0, Math.min(46, 3 + g * 0.062) | 0, Math.min(62, 6 + b * 0.075) | 0];
+  dustCol = 'rgba(' + Math.min(255, r + 96) + ',' + Math.min(255, g + 62) + ',' + Math.min(255, b + 24) + ',';
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(2, window.innerWidth);
+  H = Math.max(2, window.innerHeight);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  VX = W / 2;
+  VY = H * 0.515;      // 焦点平面上字块的中心
+  VYV = H * 0.075;    // 灭点：在字的**上方**。切片越远，中心越往这里收 —— 走廊就是这么分开的
+  buildBG();
+  needRebake = true;
+}
+
+/* 背景：一层深空渐变 + 一个呼吸的椭圆光带（只在 resize / 换色时重建） */
+let bgGrad = null, bandGrad = null;
+function buildBG() {
+  const g = ctx.createRadialGradient(VX, VY, 0, VX, VY, Math.max(W, H) * 0.78);
+  g.addColorStop(0, 'rgb(' + (FOG[0] + 12) + ',' + (FOG[1] + 16) + ',' + (FOG[2] + 26) + ')');
+  g.addColorStop(0.42, 'rgb(' + (FOG[0] + 5) + ',' + (FOG[1] + 8) + ',' + (FOG[2] + 13) + ')');
+  g.addColorStop(1, 'rgb(' + FOG[0] + ',' + FOG[1] + ',' + FOG[2] + ')');
+  bgGrad = g;
+  const b = ctx.createRadialGradient(VX, VYV, 0, VX, VYV, 1);
+  b.addColorStop(0, 'rgba(' + Math.min(255, ACC[0] + 30) + ',' + Math.min(255, ACC[1] + 24) + ',' + Math.min(255, ACC[2] + 10) + ',0.18)');
+  b.addColorStop(1, 'rgba(' + ACC[0] + ',' + ACC[1] + ',' + ACC[2] + ',0)');
+  bandGrad = b;
+}
+
+/* ============================================================================
+   排版：逐字测量 + 自动折行 + 定字号（长句折行，绝不缩成蚂蚁）
+   ========================================================================== */
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+const fontStr = (fs) => '800 ' + fs + 'px ' + FAMILY;
+const TRACK = 0.035;
+const OPUNCT = '，。、；：！？）】》」』”’,.!?;:)]}%…';
+const LPUNCT = '（【《「『“‘({[';
+const measCtx = document.createElement('canvas').getContext('2d');
+
+function measureStr(s, fs) {
+  measCtx.font = fontStr(fs);
+  let w = 0;
+  for (let i = 0; i < s.length; i++) w += measCtx.measureText(s[i]).width + fs * TRACK;
+  return Math.max(0, w - fs * TRACK);
+}
+
+function splitRows(s, L) {
+  const n = s.length, cuts = [];
+  for (let i = 1; i < L; i++) {
+    let c = Math.round(i * n / L);
+    while (c < n && OPUNCT.indexOf(s[c]) >= 0) c++;
+    if (c > 0 && c < n && LPUNCT.indexOf(s[c - 1]) >= 0) c--;
+    if (c <= 0 || c >= n) continue;
+    if (cuts.length && c <= cuts[cuts.length - 1]) continue;
+    cuts.push(c);
+  }
+  const rows = [];
+  let prev = 0;
+  for (let i = 0; i < cuts.length; i++) { rows.push(s.slice(prev, cuts[i])); prev = cuts[i]; }
+  rows.push(s.slice(prev));
+  return rows.filter((r) => r.length > 0);
+}
+
+/** 返回 { rows, fs, lh, bw, bh, ox, oy } —— 纯排版，不碰画布 */
+function layout(raw) {
+  if (!raw) return null;
+  let s = raw.replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const n = s.length;
+  const maxW = Math.min(W * 0.66, 980);
+  const maxH = H * 0.34;
+  const maxL = n <= 12 ? 1 : (n <= 24 ? 2 : 3);
+
+  let best = null;
+  for (let L = 1; L <= maxL; L++) {
+    if (L > 1 && n < L + 2) continue;
+    const rows = splitRows(s, L);
+    let w100 = 0;
+    for (let i = 0; i < rows.length; i++) w100 = Math.max(w100, measureStr(rows[i], 100));
+    let fs = Math.min(maxW / (Math.max(1, w100) / 100), maxH / (1.22 * rows.length), 168);
+    if (fs < 24) continue;
+    if (best && fs < best.fs * 1.07) continue;
+    best = { rows: rows, L: rows.length, fs: fs };
+  }
+  if (!best) {
+    let w100 = Math.max(1, measureStr(s, 100));
+    best = { rows: [s], L: 1, fs: Math.max(20, Math.min(maxW / (w100 / 100), maxH / 1.22, 168)) };
+  }
+  const fs = best.fs, lh = fs * 1.22;
+  measCtx.font = fontStr(fs);
+  const rows = [];
+  let bw = 0;
+  for (let r = 0; r < best.rows.length; r++) {
+    const txt = best.rows[r], chars = [];
+    let x = 0;
+    for (let k = 0; k < txt.length; k++) {
+      const c = txt[k], wch = measCtx.measureText(c).width;
+      if (c !== ' ') chars.push({ c: c, x: x, w: wch });
+      x += wch + fs * TRACK;
+    }
+    const rw = Math.max(0, x - fs * TRACK);
+    rows.push({ chars: chars, w: rw, ly: (r + 0.5) * lh });
+    if (rw > bw) bw = rw;
+  }
+  const bh = lh * rows.length;
+  return { rows: rows, fs: fs, lh: lh, bw: Math.max(1, bw), bh: bh, ox: (W - bw) / 2, oy: H * 0.515 - bh / 2 };
+}
+
+/* ============================================================================
+   预烘：清晰版 + 三档模糊版（每句只做一次，放在 brew 阶段）
+   ========================================================================== */
+function paintRows(g, lay, ox, oy) {
+  g.font = fontStr(lay.fs);
+  g.textAlign = 'left';
+  g.textBaseline = 'middle';
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let k = 0; k < row.chars.length; k++) g.fillText(row.chars[k].c, ox + row.chars[k].x, oy + row.ly);
+  }
+}
+
+const BLUR = [1.6, 4.0, 9.0];
+function bakeLine(text) {
+  const lay = layout(text);
+  if (!lay) return null;
+  const pad = Math.round(lay.fs * 0.34) + 20;
+  const bw = Math.ceil(lay.bw) + pad * 2;
+  const bh = Math.ceil(lay.bh) + pad * 2;
+  if (bw < 8 || bh < 8) return null;
+
+  /* 清晰版按 DPR 烘，放大时才不糊 */
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(bw * DPR));
+  c.height = Math.max(2, Math.round(bh * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.fillStyle = '#fff';
+  paintRows(g, lay, pad, pad);
+
+  /* 模糊版按 CSS 分辨率烘就够（本来就是糊的） */
+  const soft = [];
+  for (let i = 0; i < 3; i++) {
+    const bc = document.createElement('canvas');
+    bc.width = Math.max(2, Math.round(bw));
+    bc.height = Math.max(2, Math.round(bh));
+    const bg = bc.getContext('2d');
+    /* 回声层用冷一档的主色，不当第二张白字 —— 空气中的远处本来就偏冷偏暗 */
+    bg.filter = 'blur(' + BLUR[i] + 'px)';
+    bg.fillStyle = 'rgb(' + Math.min(255, ACC[0] + 78) + ',' + Math.min(255, ACC[1] + 92) + ',' + Math.min(255, ACC[2] + 96) + ')';
+    paintRows(bg, lay, pad, pad);
+    bg.filter = 'none';
+    soft.push(bc);
+  }
+  /* 主色发光层：只给焦点层用（lighter 叠在字下面），让白字"被光照着"而不是平涂 */
+  const gc = document.createElement('canvas');
+  gc.width = Math.max(2, Math.round(bw));
+  gc.height = Math.max(2, Math.round(bh));
+  const gg = gc.getContext('2d');
+  gg.filter = 'blur(' + Math.max(6, Math.round(lay.fs * 0.10)) + 'px)';
+  gg.fillStyle = 'rgb(' + Math.min(255, ACC[0] + 40) + ',' + Math.min(255, ACC[1] + 34) + ',' + Math.min(255, ACC[2] + 18) + ')';
+  paintRows(gg, lay, pad, pad);
+  gg.filter = 'none';
+
+  return { lay: lay, crisp: c, soft: soft, glow: gc, bw: bw, bh: bh, pad: pad };
+}
+
+/* ============================================================================
+   状态 / 时钟
+   ========================================================================== */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+let G = null, prep = null, prepIdx = -1, needRebake = false;
+let reveal = 0;                 // 换句淡入 0→1
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let vT = 0;                     // 视觉时钟：暂停时几乎停住（0.10 倍速的呼吸）
+let beat = 0;
+
+function timing(T) {
+  if (!lines.length) { if (G) { G = null; curIdx = -1; } return; }
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; prep = null; prepIdx = -1; G = null; reveal = 0; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      G = (prep && prepIdx === ci) ? prep : bakeLine(lines[ci].text);
+      reveal = 0;
+    } else { G = null; }
+    prep = null; prepIdx = -1;
+    hint.style.opacity = ci >= 0 ? '0' : '1';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(1.7, Math.max(0.55, gap * 0.62));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prep = bakeLine(lines[nx].text); prepIdx = nx; }
+  }
+}
+
+/* ---------------------------- 尘 ---------------------------- */
+const DN = 820;
+const dWX = new Float32Array(DN), dWY = new Float32Array(DN), dWZ = new Float32Array(DN), dSP = new Float32Array(DN);
+function seedDust() {
+  for (let i = 0; i < DN; i++) {
+    dWX[i] = (Math.random() - 0.5) * 2600;
+    dWY[i] = (Math.random() - 0.5) * 1700;
+    dWZ[i] = 260 + Math.random() * 3800;
+    dSP[i] = 0.35 + Math.random() * 0.9;
+  }
+}
+seedDust();
+
+/* ---------------------------- 层 ---------------------------- */
+/* ---------------------------- 层 ----------------------------
+   9 张切片，间距 460；相机沿 z 连续推轨（27 单位/秒），切片因此不停地
+   从远处飘向镜头。**关键**：层的位置按 camZ 取模，所以任何时刻都有一张
+   切片停在焦点平面（rel≈1180 → 缩放 ≈1:1、清晰版），字永远是原大小可读的；
+   其余切片只是它前后 ±115 的通透回声。 */
+const K = 9;
+const SP = 460;
+const PERIOD = K * SP;
+const LZ = new Float32Array(K);
+for (let i = 0; i < K; i++) LZ[i] = i * SP;
+const FOCAL = 1180;             // 透视焦距
+const FOCUS_D = 1180;           // 焦点平面：s = FOCAL/rel，rel=FOCUS_D 时正好 1:1
+const SMAX = 1.55;              // 比这更大的近层直接不画（已经糊满屏、也没有信息）
+const NEAR_CUT = 760;           // rel 小于它就不画（s > 1.55）
+
+/* 每帧收集可见层（≤ 13 个，对象全部预分配，帧里不 new） */
+const _pool = [];
+for (let i = 0; i < K; i++) _pool.push({ i: 0, rel: 0, s: 0, a: 0, v: 0 });
+const _tmp = [];
+function layersSorted(camZ, rev) {
+  _tmp.length = 0;
+  if (!G) return _tmp;
+  const phase = ((camZ % SP) + SP) % SP;
+  for (let i = 0; i < K; i++) {
+    let rel = 200 + LZ[i] - phase;
+    if (rel < 200) rel += PERIOD;
+    if (rel < NEAR_CUT) continue;
+    const s = FOCAL / rel;
+    const d = rel - FOCUS_D, ad = d < 0 ? -d : d;
+    let a;
+    if (d >= 0) a = 0.90 * Math.exp(-d / 900);
+    else a = 0.34 * Math.exp(d / 380);
+    /* 近端再淡出一次，别在 NEAR_CUT 处"啪"地消失 */
+    if (rel < NEAR_CUT + 320) a *= (rel - NEAR_CUT) / 320;
+    if (a <= 0.02) continue;
+    a *= rev;
+    const o = _pool[_tmp.length];
+    o.i = i; o.rel = rel; o.s = s;
+    o.a = a > 0.94 ? 0.94 : a;
+    /* 焦点附近用清晰版，往外按离焦量分三档模糊 */
+    o.v = ad < 150 ? 0 : (ad < 520 ? 1 : (ad < 1250 ? 2 : 3));
+    _tmp.push(o);
+  }
+  _tmp.sort((p, q) => q.rel - p.rel);
+  return _tmp;
+}
+
+/* ---------------------------- 主循环 ---------------------------- */
+let last = performance.now();
+let frames = 0;
+let raf = 0;
+
+function frame(ms) {
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms;
+  frames++;
+  vT += dt * (playing ? 1 : 0.10);
+  beat *= Math.exp(-dt * 3.2);
+  if (needRebake) {
+    needRebake = false;
+    if (curIdx >= 0 && lines[curIdx]) { G = bakeLine(lines[curIdx].text); reveal = 1; }
+  }
+  const T = now();
+  timing(T);
+  if (reveal < 1) reveal = Math.min(1, reveal + dt / 0.45);
+
+  /* --- 相机：连续推轨 + 一点正弦呼吸 + 踩拍前冲 ---
+     层位置按 camZ 取模，所以焦点平面永远压着一张清晰切片，字始终是原大小。 */
+  const speed = RM ? 7 : 27;
+  const camZ = vT * speed + (RM ? 30 : 120) * Math.sin(vT * 0.21) + beat * 34;
+
+  /* --- 背景 --- */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  /* --- 焦点光带：字背后的一团呼吸光，给走廊一个"出口" ---
+     只当底子（0.2 上下的加色），绝不能抢字的对比度 */
+  if (G) {
+    const rr = Math.min(W, H) * (0.40 + 0.02 * Math.sin(vT * 0.5));
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.save();
+    ctx.translate(VX, VYV + (VY - VYV) * 0.55);
+    ctx.scale(rr, rr * 0.30);
+    ctx.fillStyle = bandGrad;
+    ctx.globalAlpha = 0.14 + beat * 0.18;
+    ctx.beginPath();
+    ctx.arc(0, 0, 1, 0, 6.2832);
+    ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  const list = layersSorted(camZ, reveal);
+
+  /* --- 焦点之后的尘（在字下面） --- */
+  drawDust(dt, camZ, false);
+
+  /* --- 层：远 → 近，source-over --- */
+  ctx.globalCompositeOperation = 'source-over';
+  if (G) {
+    for (let k = 0; k < list.length; k++) {
+      const L = list[k];
+      const img = L.v === 0 ? G.crisp : G.soft[L.v - 1];
+      const w = G.bw * L.s, h = G.bh * L.s;
+      /* 绕灭点投影：远层的字块中心被拉向 VYV（画面上方），所以小图不会被大图完全盖住 */
+      const cy = VYV + (VY - VYV) * L.s;
+      if (L.v === 0 && G.glow) {
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = Math.min(0.85, L.a * 0.62);
+        ctx.drawImage(G.glow, VX - w / 2, cy - h / 2, w, h);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+      ctx.globalAlpha = L.a;
+      ctx.drawImage(img, VX - w / 2, cy - h / 2, w, h);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* --- 焦点之前的尘（盖在字上，真遮挡） --- */
+  drawDust(dt, camZ, true);
+
+  raf = requestAnimationFrame(frame);
+}
+
+/* 尘也进同一条"走廊"：rel 取模循环，前/后按焦点平面分成两批 */
+const DUST_PERIOD = 4200;
+function drawDust(dt, camZ, front) {
+  const drift = (RM ? 8 : 42) * dt;
+  ctx.globalCompositeOperation = 'lighter';
+  for (let pass = 0; pass < 2; pass++) {
+    ctx.fillStyle = dustCol + (pass ? '0.50' : '0.22') + ')';
+    const sz = pass ? 2.0 : 1.2;
+    for (let i = 0; i < DN; i++) {
+      dWZ[i] -= drift * dSP[i] * 4;
+      let rel = (dWZ[i] - camZ * 0.9) % DUST_PERIOD;
+      if (rel < 0) rel += DUST_PERIOD;
+      rel += 130;
+      const isFront = rel < FOCUS_D - 260;
+      if (isFront !== front) continue;
+      const s = FOCAL / rel;
+      const x = VX + dWX[i] * s, y = VYV + dWY[i] * s;
+      if (x < -8 || x > W + 8 || y < -8 || y > H + 8) continue;
+      const a = Math.min(1, 120 / rel);
+      if ((a > 0.5) !== (pass === 1)) continue;
+      const r = sz * (0.5 + s * 0.55);
+      ctx.fillRect(x, y, r, r);
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------------------- 输入 / 协议 ---------------------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; prep = null; prepIdx = -1; G = null; reveal = 0;
+    clockT = 0; clockAt = performance.now();
+    if (p.accent && p.accent.length >= 3) { ACC = [p.accent[0] | 0, p.accent[1] | 0, p.accent[2] | 0]; buildColors(); buildBG(); }
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.45';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    beat = Math.min(1.1, beat + 0.28 + (d.payload.level || 0) * 0.5);
+  } else if (d.type === 'live') {
+    /* 低频给一点雾的厚度（不参与字形） */
+    const lv = d.payload || {};
+    if (typeof lv.bass === 'number') beat = Math.max(beat, Math.min(0.7, lv.bass * 0.8));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+addEventListener('pagehide', () => { cancelAnimationFrame(raf); });
+
+resize();
+buildColors();
+buildBG();
+raf = requestAnimationFrame(frame);
+
+window.__stage = () => {
+  const camZ = vT * (RM ? 7 : 27) + (RM ? 30 : 120) * Math.sin(vT * 0.21) + beat * 34;
+  const list = layersSorted(camZ, 1);
+  return {
+    lines: lines.length, idx: curIdx, curIdx: curIdx, t: +now().toFixed(2), playing: playing,
+    frames: frames, layers: list.length, focusLayer: G ? 1 : 0, reveal: +reveal.toFixed(2),
+    vT: +vT.toFixed(2), camZ: Math.round(camZ)
+  };
+};
+</script>
+</body>
+</html>

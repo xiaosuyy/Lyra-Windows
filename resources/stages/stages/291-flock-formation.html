@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>一群鸟此刻的队形</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0814;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);pointer-events:none;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(255,255,255,.22);transition:opacity .8s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ────────────────────────────────────────────────────────────────────────────
+   协议层（照抄，别改）：init / tick / beat / live → ready / activity / key
+   ──────────────────────────────────────────────────────────────────────────── */
+const cv = document.getElementById('c');
+const hint = document.getElementById('hint');
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, bass = 0, treb = 0, frames = 0, jsMs = 0, errMsg = '';
+let readySent = false, dirty = true, raf = 0;
+
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const on = (e) => { RM = !!e.matches; };
+    if (mq.addEventListener) mq.addEventListener('change', on); else if (mq.addListener) mq.addListener(on);
+  }
+} catch (_) {}
+
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+/* ────────────────────────────────────────────────────────────────────────────
+   ↓↓↓ 你的实现 ↓↓↓  从这里往下随便写，上面一行都别改
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/* 这一件的前提：
+   字不是画在什么上的。字是十万只各自在飞的东西，此刻碰巧同意待在同一个位置上——
+   它们随时会散。你看的是黄昏最后一点光里，一群鸟的队形。
+*/
+
+const gl = cv.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false });
+
+const COLS = 900, ROWS = 112, N = COLS * ROWS;
+const CELL = 140, CHH = 168;
+const DEG = Math.PI / 180;
+
+function m4persp(o, fovy, asp, n, f) {
+  const t = 1 / Math.tan(fovy * 0.5);
+  o[0] = t / asp; o[1] = 0; o[2] = 0; o[3] = 0;
+  o[4] = 0; o[5] = t; o[6] = 0; o[7] = 0;
+  o[8] = 0; o[9] = 0; o[10] = (f + n) / (n - f); o[11] = -1;
+  o[12] = 0; o[13] = 0; o[14] = 2 * f * n / (n - f); o[15] = 0;
+  return o;
+}
+function m4look(o, e, c, u) {
+  let zx = e[0] - c[0], zy = e[1] - c[1], zz = e[2] - c[2];
+  let l = Math.hypot(zx, zy, zz) || 1; zx /= l; zy /= l; zz /= l;
+  let xx = u[1] * zz - u[2] * zy, xy = u[2] * zx - u[0] * zz, xz = u[0] * zy - u[1] * zx;
+  l = Math.hypot(xx, xy, xz) || 1; xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  o[0] = xx; o[1] = yx; o[2] = zx; o[3] = 0;
+  o[4] = xy; o[5] = yy; o[6] = zy; o[7] = 0;
+  o[8] = xz; o[9] = yz; o[10] = zz; o[11] = 0;
+  o[12] = -(xx * e[0] + xy * e[1] + xz * e[2]);
+  o[13] = -(yx * e[0] + yy * e[1] + yz * e[2]);
+  o[14] = -(zx * e[0] + zy * e[1] + zz * e[2]);
+  o[15] = 1;
+  return o;
+}
+function m4mul(o, a, b) {
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a || 1e-6), 0, 1); return t * t * (3 - 2 * t); };
+
+/* ── 底：黄昏的天。上面一层紫，靠近地平线发粉，底下是压黑的地面 ──────────── */
+const SVS = `#version 300 es
+precision highp float;
+out vec2 vUv;
+void main(){
+  vec2 c = vec2(gl_VertexID == 1 || gl_VertexID == 3 ? 1.0 : -1.0,
+                gl_VertexID < 2 ? -1.0 : 1.0);
+  vUv = c * 0.5 + 0.5;
+  gl_Position = vec4(c, 0.0, 1.0);
+}`;
+
+const SFS = `#version 300 es
+precision highp float;
+uniform float uMode, uAspect, uShift, uTime;
+in vec2 vUv;
+out vec4 o;
+float hash(vec2 p){ return fract(sin(dot(p, vec2(31.7, 197.3))) * 43758.5453); }
+void main(){
+  if (uMode < 0.5) {
+    float y = clamp(vUv.y, 0.0, 1.0);
+    vec3 low  = vec3(0.115, 0.055, 0.115);
+    vec3 high = vec3(0.030, 0.022, 0.075);
+    vec3 c = mix(low, high, pow(y, 0.75));
+    /* 地平线附近的一层灰粉雾 + 一颗快落下去的光 */
+    float hz = exp(-pow((y - 0.235) * 5.4, 2.0));
+    c += vec3(0.30, 0.16, 0.20) * hz * 0.75;
+    float gx = vUv.x - 0.30;
+    c += vec3(0.42, 0.24, 0.26) * exp(-(gx * gx * 5.5 + pow((y - 0.245) * 9.0, 2.0))) * 0.9;
+    /* 云：几道横着的、被最后一瞬光染到的带 */
+    for (int i = 0; i < 3; i++) {
+      float fy = 0.30 + float(i) * 0.105;
+      float band = exp(-pow((y - fy - 0.012 * sin(vUv.x * 4.0 + float(i))) * 34.0, 2.0));
+      band *= smoothstep(0.0, 0.35, vUv.x) * smoothstep(1.0, 0.55, vUv.x);
+      c += vec3(0.16, 0.085, 0.115) * band * (0.9 - float(i) * 0.22);
+    }
+    /* 地面：一条压黑的地平线，上面几个远处的灯 */
+    float ground = smoothstep(0.155, 0.120, y);
+    vec3 gcol = vec3(0.020, 0.014, 0.026);
+    float gl1 = step(0.994, hash(floor(vUv * vec2(260.0, 160.0)) + 7.0)) * ground;
+    gcol += vec3(0.55, 0.34, 0.30) * gl1 * 0.7;
+    c = mix(c, gcol, ground);
+    c *= 0.93 + 0.14 * hash(floor(vUv * vec2(700.0, 440.0)));
+    o = vec4(c, 1.0);
+  } else {
+    float d = length((vUv - 0.5) * vec2(uAspect, 1.0));
+    float a = smoothstep(0.60, 1.15, d) * 0.35;
+    o = vec4(vec3(0.02, 0.015, 0.035), a);
+  }
+}`;
+
+/* ── 字：十万只鸟。每只都在自己打转、扇翅膀，队形只是此刻的巧合 ─────────── */
+const VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec4 aG;
+layout(location=1) in vec4 aR;
+uniform mat4 uVP;
+uniform vec3 uRight, uUp;
+uniform float uT, uNCh, uFade, uPulse, uDs;
+uniform float uCharT[24];
+out vec2 vQ;
+out vec2 vTuv;
+out float vA;
+out float vFlap;
+void main(){
+  float cw = 9.6 / uNCh;
+  float th = cw * 1.2;
+  int ci = int(clamp(floor(aG.x * uNCh), 0.0, uNCh - 1.0));
+  float t0 = uCharT[ci];
+  float rv = smoothstep(t0, t0 + 0.70, uT);
+  float e = 1.0 - rv;
+
+  /* 还没飞到位：从更远的地方、散着飞过来 */
+  vec2 gp = vec2((aG.x - 0.5) * 9.6, (aG.y - 0.5) * th);
+  gp.x *= 1.16;
+  gp.y *= 0.70;
+  float ax = gp.x / 5.4;
+  gp.y += 0.58 * ax * ax;
+  gp.x += gp.y * 0.15;
+  vec3 base = vec3(gp.x, gp.y, (aG.z - 0.5) * 1.1);
+  base += vec3((aR.x - 0.5) * 5.0, (aR.y - 0.5) * 3.0, (aR.z - 0.5) * 6.0) * e * e;
+
+  /* 每只鸟自己的小轨道 + 扇翅 */
+  float ph = aR.w * 6.2831853;
+  base.x += sin(uT * (0.7 + aR.x) + ph) * 0.035;
+  base.y += cos(uT * (0.6 + aR.y * 0.8) + ph * 1.3) * 0.030;
+
+  vec2 corner = vec2(gl_VertexID == 1 || gl_VertexID == 3 ? 1.0 : -1.0,
+                     gl_VertexID < 2 ? -1.0 : 1.0);
+  float sz = (9.6 / 900.0) * (2.05 + 1.35 * aR.y);
+  vec3 wp = base + uRight * (corner.x * sz) + uUp * (corner.y * sz * 0.75);
+
+  gl_Position = uVP * vec4(wp, 1.0);
+  vQ = corner;
+  vTuv = vec2(aG.x, 1.0 - aG.y);
+  vA = uFade * rv * (0.75 + 0.35 * aR.x) * (1.0 + uPulse * 0.25);
+  vFlap = 0.35 + 0.65 * abs(sin(uT * (2.4 + aR.y * 2.0) + ph));
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+in vec2 vQ;
+in vec2 vTuv;
+in float vA;
+in float vFlap;
+out vec4 o;
+void main(){
+  float m = texture(uTex, vTuv).r;
+  float md = smoothstep(0.14, 0.92, m);
+  /* 一只鸟：两条翅膀拼成的 V，加一个小身子 */
+  float wing = abs(vQ.y + vFlap * abs(vQ.x) * 1.5 - 0.10);
+  float body = 1.0 - smoothstep(0.10, 0.30, length(vQ * vec2(1.0, 1.7)));
+  float sh = (1.0 - smoothstep(0.16, 0.42, wing)) + body * 1.2;
+  sh = clamp(sh, 0.0, 1.4);
+  vec3 col = mix(vec3(1.00, 0.86, 0.86), vec3(1.0, 0.96, 0.92), md);
+  o = vec4(col * (md * sh * 0.235) * vA, 1.0);
+}`;
+
+/* ── 装配 ─────────────────────────────────────────────────────────────── */
+let prog = null, sprog = null, vao = null, svao = null, vbo = null, tex = null;
+const U = {}, SU = {};
+const tcv = document.createElement('canvas');
+const tctx = tcv.getContext('2d');
+let lineArr = null, lineT = [], texLine = -1;
+
+function compile() {
+  const sh = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      errMsg = 'shader: ' + (gl.getShaderInfoLog(s) || '').slice(0, 160);
+      return null;
+    }
+    return s;
+  };
+  const build = (vs, fs, names, dst) => {
+    const v = sh(gl.VERTEX_SHADER, vs), f = sh(gl.FRAGMENT_SHADER, fs);
+    if (!v || !f) return null;
+    const p = gl.createProgram();
+    gl.attachShader(p, v); gl.attachShader(p, f); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { errMsg = 'link: ' + (gl.getProgramInfoLog(p) || '').slice(0, 160); return null; }
+    names.forEach((k) => { dst[k] = gl.getUniformLocation(p, k); });
+    return p;
+  };
+  prog = build(VS, FS, ['uVP', 'uRight', 'uUp', 'uT', 'uNCh', 'uFade', 'uPulse', 'uDs', 'uTex'], U);
+  U.uCharT = prog ? gl.getUniformLocation(prog, 'uCharT[0]') : null;
+  sprog = build(SVS, SFS, ['uMode', 'uAspect', 'uShift', 'uTime'], SU);
+  if (!prog || !sprog) return;
+
+  svao = gl.createVertexArray();
+
+  const data = new Float32Array(N * 8);
+  let s = 3089;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  let o = 0;
+  for (let j = 0; j < ROWS; j++) {
+    for (let i = 0; i < COLS; i++) {
+      data[o] = (i + 0.5 + (rnd() - 0.5) * 1.2) / COLS;
+      data[o + 1] = (j + 0.5 + (rnd() - 0.5) * 1.2) / ROWS;
+      data[o + 2] = rnd();
+      data[o + 3] = rnd();
+      data[o + 4] = rnd(); data[o + 5] = rnd(); data[o + 6] = rnd(); data[o + 7] = rnd();
+      o += 8;
+    }
+  }
+  vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 32, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 16);
+  gl.vertexAttribDivisor(0, 1);
+  gl.vertexAttribDivisor(1, 1);
+  gl.bindVertexArray(null);
+
+  tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.clearColor(0.06, 0.04, 0.09, 1);
+}
+
+function prepLines() {
+  lineT = [];
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i], next = lines[i + 1];
+    const cps = Array.from(String(L.text || ''));
+    const n = Math.min(24, Math.max(1, cps.length));
+    const dur = (typeof L.dur === 'number' && L.dur > 0.4) ? L.dur : (next ? next.t - L.t : 3.6);
+    const per = Math.max(0.075, dur * 0.55 / n);
+    const ct = new Float32Array(24);
+    for (let k = 0; k < 24; k++) ct[k] = 1e6;
+    for (let k = 0; k < n; k++) {
+      let t = L.t + k * per;
+      if (L.chars && L.chars[k] && typeof L.chars[k].t === 'number') t = L.chars[k].t;
+      ct[k] = t;
+    }
+    const end = next ? next.t : L.t + Math.max(3.2, dur);
+    lineT.push({ t0: L.t, vis: L.t, t1: end, n, ct });
+  }
+}
+
+function buildLineTex(i) {
+  const LT = lineT[i];
+  if (!LT || !gl) return;
+  const cps = Array.from(String(lines[i].text || ''));
+  const n = Math.max(1, Math.min(24, cps.length));
+  const w = n * CELL;
+  if (tcv.width !== w || tcv.height !== CHH) { tcv.width = w; tcv.height = CHH; }
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  tctx.fillStyle = '#000';
+  tctx.fillRect(0, 0, w, CHH);
+  tctx.fillStyle = '#fff';
+  tctx.textAlign = 'center';
+  tctx.textBaseline = 'middle';
+  tctx.font = '700 128px "Microsoft YaHei","PingFang SC","Heiti SC","Noto Sans SC",system-ui,sans-serif';
+  for (let k = 0; k < n; k++) tctx.fillText(cps[k], k * CELL + CELL * 0.5, CHH * 0.5 + 5);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tcv);
+}
+
+/* 三个站位：整片天里的一群 / 抬头跟着鸟群 / 贴着鸟看 */
+const SHOTS = [
+  { e: [0.30, 0.55, 13.3], t: [1.05, 1.15, 0.0], f: 40 },
+  { e: [0.30, 0.30, 9.4], t: [0.75, 0.85, 0.0], f: 40 },
+  { e: [2.30, 0.95, 4.3], t: [-1.15, 0.55, 0.0], f: 48 }
+];
+const TH0 = 4.0, TH1 = 8.2, BL = 1.05;
+
+let vpM = new Float32Array(16), pM = new Float32Array(16), vM = new Float32Array(16);
+let eye = [0, 0, 10], tgt = [0, 0, 0];
+
+function cameraFor(v) {
+  let s = 0, k = 1;
+  if (v >= TH1) { s = 2; k = sstep(0, 1, (v - TH1) / BL); }
+  else if (v >= TH0) { s = 1; k = sstep(0, 1, (v - TH0) / BL); }
+  const A = SHOTS[Math.max(0, s - 1)], B = SHOTS[s];
+  const kk = s === 0 ? 1 : k;
+  for (let a = 0; a < 3; a++) {
+    eye[a] = A.e[a] + (B.e[a] - A.e[a]) * kk;
+    tgt[a] = A.t[a] + (B.t[a] - A.t[a]) * kk;
+  }
+  eye[0] += Math.sin(v * 0.23) * 0.09;
+  eye[1] += Math.sin(v * 0.18 + 1.7) * 0.06;
+  return (A.f + (B.f - A.f) * kk) * DEG;
+}
+
+function draw() {
+  if (!gl || !prog || !sprog) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.disable(gl.BLEND);
+  gl.useProgram(sprog);
+  gl.bindVertexArray(svao);
+  gl.uniform1f(SU.uMode, 0);
+  gl.uniform1f(SU.uAspect, W / H);
+  gl.uniform1f(SU.uShift, 0);
+  gl.uniform1f(SU.uTime, vT);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  if (lineArr !== lines) { prepLines(); lineArr = lines; texLine = -1; }
+  if (idx < 0 || !lineT[idx]) { gl.bindVertexArray(null); return; }
+  if (texLine !== idx) { buildLineTex(idx); texLine = idx; }
+
+  const T = now();
+  const LT = lineT[idx];
+  const fade = sstep(0, 0.26, T - LT.vis) * (1 - sstep(LT.t1 - 0.30, LT.t1, T));
+
+  const fov = cameraFor(vT);
+  m4persp(pM, fov, W / H, 0.05, 120);
+  m4look(vM, eye, tgt, [0, 1, 0]);
+  m4mul(vpM, pM, vM);
+
+  let fwd = [tgt[0] - eye[0], tgt[1] - eye[1], tgt[2] - eye[2]];
+  let l = Math.hypot(fwd[0], fwd[1], fwd[2]) || 1;
+  fwd = [fwd[0] / l, fwd[1] / l, fwd[2] / l];
+  let rgt = [-fwd[2], 0, fwd[0]];
+  l = Math.hypot(rgt[0], rgt[1], rgt[2]) || 1;
+  rgt = [rgt[0] / l, rgt[1] / l, rgt[2] / l];
+  const upv = [rgt[1] * fwd[2] - rgt[2] * fwd[1], rgt[2] * fwd[0] - rgt[0] * fwd[2], rgt[0] * fwd[1] - rgt[1] * fwd[0]];
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.uniformMatrix4fv(U.uVP, false, vpM);
+  gl.uniform3f(U.uRight, rgt[0], rgt[1], rgt[2]);
+  gl.uniform3f(U.uUp, upv[0], upv[1], upv[2]);
+  gl.uniform1f(U.uT, T);
+  gl.uniform1f(U.uNCh, LT.n);
+  gl.uniform1f(U.uFade, fade);
+  gl.uniform1f(U.uPulse, beatPulse);
+  gl.uniform1f(U.uDs, Math.hypot(eye[0], eye[1], eye[2]));
+  gl.uniform1fv(U.uCharT, LT.ct);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(U.uTex, 0);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, N);
+
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(sprog);
+  gl.bindVertexArray(svao);
+  gl.uniform1f(SU.uMode, 1);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+}
+
+try {
+  if (gl) compile(); else errMsg = 'no webgl2';
+} catch (e) { errMsg = 'setup: ' + (e && e.message ? e.message : e); }
+
+let last = performance.now();
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  vT = RM ? T * 0.24 : T;
+  if (playing) { beatPulse *= Math.exp(-dt * 3.6); bass *= Math.exp(-dt * 0.08); treb *= Math.exp(-dt * 0.10); }
+
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) { idx = ci; dirty = true; }
+
+  try { if (playing || dirty) { draw(); dirty = false; } }
+  catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   协议（照抄，别改）
+   ──────────────────────────────────────────────────────────────────────────── */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9; vT = 0; beatPulse = 0; bass = 0; treb = 0;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now();
+    playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5); dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, Math.min(1, l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, Math.min(1, l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx]) ? lines[idx].text : '',
+  gl: !!gl, rm: RM, vT: +vT.toFixed(2)
+});
+
+resize();
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

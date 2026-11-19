@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>加载动画博物馆</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(109,118,148,.34);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   033 · 加载动画博物馆 —— 每个采样点都是一枚小小的加载动画
+   ---------------------------------------------------------------------------
+   核心机制：**点阵微型加载器 + 相干充能波**。
+   参考文件是一墙加载动画（圆环/弹跳点/声波条/涟漪/追光点/雷达/充电格…）。
+   这里把"一个加载动画"缩小到 6px，复制到字形的每一个采样点上：
+     · 未充能的点是**一枚自转的小刻度**（角度 = t·2.6 + 距离·0.03，
+       相位随距离平滑变化，所以整片刻度是在"走波"，不是各转各的）；
+     · 一圈**充能波**从字形中心向外扩张，波前扫过的点开始充能，
+       刻度一边转一边长成实心点 —— 字的可见部分就是"已经加载完的部分"；
+     · 所以字是"被加载出来"的，而不是"被画出来"的。
+   踩拍不重置（否则永远加载不完），而是放出一圈**相干脉冲环**：
+   环扫过的点亮度被顶一下 —— 这正是参考文件里的 `.ping` 展品。
+
+   精修记录（批次B）：① **逐字显形接 YRC** —— 每个采样点记录自己属于
+   第几个字；充能不再是"从中心按距离扩散"，而是"该字的 chars[k].t 到点、
+   它的点才开始充能"（无 chars 按 t + dur*i/n 均分）；字内点用 0.15s 的
+   小 stagger 铺开，充能观感仍是波、但节奏跟着唱词走。环进度（HUD 电量格
+   + 百分比）按当前句 YRC 字时间插值。② 长句折行 —— 单行横贯裁字，
+   改为行数按目标块 aspect 决定的多行布局采样。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+const PI = Math.PI, TAU = PI * 2;
+const MAXP = 2800;
+const BAND = 120;                    // 充能波前宽度（px）
+const CHARGE = 1.15;                 // 整句充满所需秒数
+const NBH = 8;                       // 色相档数
+
+let bg = null, accent = [140, 170, 255];
+
+/* 两个缓冲：cur 正在显示，next 正在酝酿；换句交换，旧的当场释放
+   （md = 这一句的最远点距离；ci = 采样点属于第几个字；
+   st = 字内充能 stagger；ct = 逐字充能时刻表） */
+const A = { x: new Float32Array(MAXP), y: new Float32Array(MAXP), d: new Float32Array(MAXP), hb: new Uint8Array(MAXP), ci: new Uint16Array(MAXP), st: new Float32Array(MAXP), ct: null, n: 0, md: 1 };
+const B = { x: new Float32Array(MAXP), y: new Float32Array(MAXP), d: new Float32Array(MAXP), hb: new Uint8Array(MAXP), ci: new Uint16Array(MAXP), st: new Float32Array(MAXP), ct: null, n: 0, md: 1 };
+let cur = A, nxt = B;
+
+const boost = new Uint8Array(MAXP);
+const bIdx = [];
+for (let i = 0; i < NBH; i++) bIdx.push(new Int32Array(MAXP));
+const bCnt = new Int32Array(NBH);
+
+/* 色相档颜色（由 accent 推） */
+let hue0 = 220;
+let colDot = [], colTick = 'rgba(120,150,230,0.42)', colFaint = 'rgba(150,170,220,0.13)';
+
+function buildColors() {
+  const r = accent[0] / 255, g = accent[1] / 255, b = accent[2] / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), dd = mx - mn;
+  let h = 0;
+  if (dd > 1e-6) {
+    if (mx === r) h = 60 * (((g - b) / dd) % 6);
+    else if (mx === g) h = 60 * ((b - r) / dd + 2);
+    else h = 60 * ((r - g) / dd + 4);
+  }
+  if (h < 0) h += 360;
+  hue0 = h;
+  colDot = [];
+  for (let i = 0; i < NBH; i++) {
+    const t = (i / (NBH - 1)) * 2 - 1;                 // -1 .. 1
+    const hh = ((h + 26 + t * 74) % 360 + 360) % 360;
+    colDot.push('hsl(' + hh.toFixed(0) + ', 92%, 66%)');
+  }
+  colTick = 'hsla(' + ((h + 20) % 360).toFixed(0) + ', 70%, 62%, 0.40)';
+  colFaint = 'hsla(' + ((h + 10) % 360).toFixed(0) + ', 45%, 70%, 0.14)';
+}
+
+/* ---- 字形采样（多行布局）----
+   行数按目标块 aspect 决定。返回 { pts, charIdx }，
+   charIdx[i] = 第 i 个采样点属于原文第几个字。 */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const BREAK33 = /[\s，。！？、；：,.!?;:…—～·「」『』（）()《》【】]/;
+function splitRows33(text) {
+  const L = text.length;
+  if (L < 10) return [text];
+  const R = Math.max(2, Math.min(5, Math.ceil(Math.sqrt(L / 2))));
+  const rows = [];
+  let prev = 0;
+  for (let r = 1; r < R; r++) {
+    const ideal = prev + Math.round((L - prev) / (R - r + 1));
+    let i = ideal;
+    for (const d of [0, 1, 2, 3, -1, -2, -3]) {
+      const j = ideal + d;
+      if (j > prev && j < L && (BREAK33.test(text[j - 1]) || BREAK33.test(text[j]))) { i = j; break; }
+    }
+    i = Math.max(prev + 1, Math.min(L - (R - r), i));
+    rows.push(text.slice(prev, i));
+    prev = i;
+  }
+  rows.push(text.slice(prev));
+  return rows;
+}
+function glyphPoints(text) {
+  const rows = splitRows33(text);
+  const F = 96;
+  const maxW = Math.min(W * 0.78, 1150);
+  octx.font = '800 ' + F + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  let w = 1;
+  for (const r of rows) w = Math.max(w, Math.ceil(octx.measureText(r).width) + 8);
+  const lh = F * 1.18;
+  const fs = w > maxW ? F * (maxW / w) : F;
+  const scale = fs / F;
+  const h = Math.ceil(lh * rows.length * scale) + 8;
+  const w2 = Math.ceil(w * scale) + 8;
+  off.width = w2; off.height = h;
+  octx.clearRect(0, 0, w2, h);
+  octx.font = '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  /* 逐字绘制：采样后 charIdx 直接回填 */
+  const pts = [];
+  const charIdx = [];
+  const step = 2;
+  let y = h / 2 - (rows.length - 1) * lh * scale / 2;
+  let ci = 0;
+  for (const row of rows) {
+    const rw = octx.measureText(row).width;
+    let x = w2 / 2 - rw / 2;
+    for (let k = 0; k < row.length; k++, ci++) {
+      const ch = row[k];
+      if (ch === ' ') continue;
+      const cw = octx.measureText(ch).width;
+      octx.fillText(ch, x + cw / 2, y);
+      x += cw;
+      const gx0 = Math.max(0, Math.floor(x - cw - 1)), gx1 = Math.min(w2, Math.ceil(x + 1));
+      const gy0 = Math.max(0, Math.floor(y - fs * 0.72)), gy1 = Math.min(h, Math.ceil(y + fs * 0.72));
+      const img = octx.getImageData(gx0, gy0, gx1 - gx0, gy1 - gy0).data;
+      const gw = gx1 - gx0;
+      for (let yy = 0; yy < gy1 - gy0; yy += step)
+        for (let xx = 0; xx < gw; xx += step)
+          if (img[(yy * gw + xx) * 4 + 3] > 128) {
+            pts.push(gx0 + xx - w2 / 2, gy0 + yy - h / 2);
+            charIdx.push(ci);
+          }
+    }
+    y += lh * scale;
+  }
+  return { pts, charIdx };
+}
+
+function sampleInto(dst, text, line) {
+  const g = glyphPoints(text || '');
+  const pts = g.pts;
+  const pc = pts.length / 2;
+  dst.n = 0; dst.ct = null;
+  if (!pc) return;
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < pc; i++) {
+    const x = pts[i * 2], y = pts[i * 2 + 1];
+    if (x < mnX) mnX = x; if (x > mxX) mxX = x;
+    if (y < mnY) mnY = y; if (y > mxY) mxY = y;
+  }
+  const cx = (mnX + mxX) / 2, cy = (mnY + mxY) / 2;
+  const n = Math.min(MAXP, pc);
+  /* 逐字充能时刻表：chars[k].t；无 chars 按 t + dur*i/n 均分 */
+  const L = (text || '').length;
+  const chs = line && line.chars && line.chars.length === L ? line.chars : null;
+  const t0 = line ? line.t : 0;
+  const dur = Math.max(0.8, (line && line.dur) || 2.4);
+  const ct = new Float32Array(L);
+  let prev = 0;
+  for (let i = 0; i < L; i++) {
+    let t = chs && isFinite(+chs[i].t) ? +chs[i].t : t0 + dur * 0.80 * (i / Math.max(1, L));
+    if (!(t >= t0)) t = t0;
+    if (t < prev) t = prev;
+    prev = t;
+    ct[i] = t;
+  }
+  dst.ct = ct; dst.yrc = !!chs;
+  let md = 1;
+  for (let i = 0; i < n; i++) {
+    const p = (Math.floor(i * pc / n) % pc) * 2;   // 等间隔取样
+    const X = pts[p] - cx, Y = pts[p + 1] - cy;
+    dst.x[i] = X; dst.y[i] = Y;
+    const dd = Math.sqrt(X * X + Y * Y);
+    dst.d[i] = dd;
+    if (dd > md) md = dd;
+    /* 色相沿水平方向扫过（参考文件里每格一个 --h） */
+    const nx = (mxX - mnX) > 1 ? X / ((mxX - mnX) * 0.5) : 0;
+    let hb = Math.round((nx * 0.5 + 0.5) * (NBH - 1));
+    if (hb < 0) hb = 0; else if (hb > NBH - 1) hb = NBH - 1;
+    dst.hb[i] = hb;
+    /* 该点所属的字 + 字内 0.15s 小 stagger（充能观感仍是波） */
+    dst.ci[i] = g.charIdx[Math.floor(i * pc / n) % pc] || 0;
+    dst.st[i] = ((i % 7) / 7) * 0.15;
+  }
+  dst.n = n; dst.md = md;
+}
+
+function buildBG() {
+  bg = document.createElement('canvas');
+  bg.width = Math.max(4, Math.round(W)); bg.height = Math.max(4, Math.round(H));
+  const g = bg.getContext('2d');
+  const w = bg.width, h = bg.height, m = Math.max(w, h);
+  g.fillStyle = '#05060a'; g.fillRect(0, 0, w, h);
+  let r = g.createRadialGradient(w * 0.5, h * -0.1, 0, w * 0.5, h * -0.1, m * 0.7);
+  r.addColorStop(0, 'rgba(90,100,220,0.11)'); r.addColorStop(0.55, 'rgba(90,100,220,0)');
+  g.fillStyle = r; g.fillRect(0, 0, w, h);
+  r = g.createRadialGradient(w * 0.85, h, 0, w * 0.85, h, m * 0.6);
+  r.addColorStop(0, 'rgba(140,80,200,0.09)'); r.addColorStop(0.6, 'rgba(140,80,200,0)');
+  g.fillStyle = r; g.fillRect(0, 0, w, h);
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBG();
+}
+buildColors();
+resize();
+addEventListener('resize', resize);
+
+/* ---- 节奏 ---- */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+let lineT = -1;                      // 当前句开唱时刻
+let cx0 = 0, cy0 = 0;                // 字形中心（屏幕坐标）
+const pings = [];                    // 相干脉冲环 {r, a}
+let loadedFrac = 0;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; cur.n = 0; nxt.n = 0; pings.length = 0; lineT = -1;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      const tmp = cur; cur = nxt; nxt = tmp;      // 交换缓冲，旧的当场释放
+      nxt.n = 0;
+      /* 拖进度条回来时这一句没酝酿过，这里补采样一次，否则整句空白 */
+      if (!cur.n) sampleInto(cur, lines[ci].text, lines[ci]);
+      lineT = lines[ci].t;
+      pings.length = 0;
+      pings.push({ r: 0, a: 1 });
+    } else { cur.n = 0; lineT = -1; }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      sampleInto(nxt, lines[nx].text, lines[nx]);   // 提前算好下一句的采样点
+    }
+  }
+}
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+
+  ctx.drawImage(bg, 0, 0, W, H);
+
+  const n = cur.n;
+  if (n) {
+    const gcx = W / 2, gcy = H * 0.5;
+    cx0 = gcx; cy0 = gcy;
+
+    /* 逐字充能：该字的 YRC 时刻到点（+字内小 stagger）→ 点开始充能，
+       0.35s 长成实心。充能观感是一波字内点亮、字接字推进 */
+    const ct = cur.ct;
+    const CHG = 0.35;
+
+    /* 脉冲环推进 + 逐点 boost */
+    for (let i = pings.length - 1; i >= 0; i--) {
+      const p = pings[i];
+      p.r += (cur.md + BAND) * dt / 0.9;
+      p.a -= dt / 1.1;
+      if (p.a <= 0 || p.r > cur.md + BAND * 2) pings.splice(i, 1);
+    }
+    boost.fill(0, 0, n);
+    for (let k = 0; k < pings.length; k++) {
+      const p = pings[k], rr2 = 34;
+      for (let i = 0; i < n; i++) {
+        const dd = cur.d[i] - p.r;
+        if (dd > -rr2 && dd < rr2) {
+          const v = Math.round((1 - Math.abs(dd) / rr2) * 255 * p.a);
+          if (v > boost[i]) boost[i] = v > 255 ? 255 : v;
+        }
+      }
+    }
+
+    let loaded = 0;
+
+    /* ① 未充能的点：自转小刻度，全部合成一条 path 一次 stroke */
+    ctx.strokeStyle = colTick;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    let anyTick = false;
+    for (let i = 0; i < n; i++) {
+      let ld = -1;
+      if (ct) {
+        const t0i = ct[cur.ci[i] % ct.length] + cur.st[i];
+        ld = (T - t0i) / CHG;
+      } else {
+        ld = (T - lineT - cur.st[i]) / (CHARGE / Math.max(1, n / 40));
+      }
+      if (ld > 0.92) continue;
+      const L = ld < 0 ? 0 : ld;
+      const a = t0 * 2.6 + cur.d[i] * 0.03;
+      const r = 2.0 + 2.6 * L;
+      const X = gcx + cur.x[i], Y = gcy + cur.y[i];
+      const ca = Math.cos(a) * r, sa = Math.sin(a) * r;
+      ctx.moveTo(X - ca, Y - sa);
+      ctx.lineTo(X + ca, Y + sa);
+      anyTick = true;
+    }
+    if (anyTick) ctx.stroke();
+
+    /* ② 还没开始充能的点：一颗很暗的占位点（把字的轮廓先暗示出来） */
+    ctx.fillStyle = colFaint;
+    for (let i = 0; i < n; i++) {
+      let ld;
+      if (ct) {
+        const t0i = ct[cur.ci[i] % ct.length] + cur.st[i];
+        ld = (T - t0i) / CHG;
+      } else {
+        ld = (T - lineT - cur.st[i]) / (CHARGE / Math.max(1, n / 40));
+      }
+      if (ld > 0.3) continue;
+      ctx.fillRect(gcx + cur.x[i] - 0.7, gcy + cur.y[i] - 0.7, 1.4, 1.4);
+    }
+
+    /* ③ 已充能的点：按色相档合批，一次 fillStyle 画一批 */
+    bCnt.fill(0);
+    for (let i = 0; i < n; i++) {
+      let ld;
+      if (ct) {
+        const t0i = ct[cur.ci[i] % ct.length] + cur.st[i];
+        ld = (T - t0i) / CHG;
+      } else {
+        ld = (T - lineT - cur.st[i]) / (CHARGE / Math.max(1, n / 40));
+      }
+      if (ld <= 0.3) continue;
+      if (ld > 0.92) loaded++;
+      const b = cur.hb[i];
+      bIdx[b][bCnt[b]++] = i;
+    }
+    for (let b = 0; b < NBH; b++) {
+      const c = bCnt[b];
+      if (!c) continue;
+      ctx.fillStyle = colDot[b];
+      const list = bIdx[b];
+      for (let j = 0; j < c; j++) {
+        const i = list[j];
+        let ld;
+        if (ct) {
+          const t0i = ct[cur.ci[i] % ct.length] + cur.st[i];
+          ld = (T - t0i) / CHG;
+        } else {
+          ld = (T - lineT - cur.st[i]) / (CHARGE / Math.max(1, n / 40));
+        }
+        if (ld > 1) ld = 1;
+        const sz = 1.5 + 2.7 * ld + (boost[i] / 255) * 1.8;
+        const hf = sz * 0.5;
+        ctx.fillRect(gcx + cur.x[i] - hf, gcy + cur.y[i] - hf, sz, sz);
+      }
+    }
+    loadedFrac = n ? (loaded / n) : 0;
+
+    /* ④ 脉冲环：一条 path 一次 stroke */
+    if (pings.length) {
+      ctx.strokeStyle = 'hsla(' + ((hue0 + 30) % 360).toFixed(0) + ', 92%, 68%, 0.5)';
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      for (let k = 0; k < pings.length; k++) {
+        const p = pings[k];
+        ctx.moveTo(gcx + p.r, gcy);
+        ctx.arc(gcx, gcy, p.r, 0, TAU);
+      }
+      ctx.globalAlpha = 0.55;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  } else {
+    loadedFrac = 0;
+  }
+
+  drawHUD();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---- HUD：真实数据（已充能点数比例） ---- */
+function drawHUD() {
+  const x0 = 22, y0 = 24;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.font = '600 11px ui-monospace,"Cascadia Code",Consolas,monospace';
+  ctx.fillStyle = 'rgba(109,118,148,0.95)';
+  ctx.fillText('LOADER MUSEUM', x0, y0);
+  ctx.fillStyle = 'rgba(170,179,214,0.95)';
+  ctx.fillText('· 十二件展品', x0 + 116, y0);
+
+  const N = 12, cw = 15, ch = 17, gp = 4, by = y0 + 15;
+  const on = Math.round(loadedFrac * N);
+  for (let i = 0; i < N; i++) {
+    const x = x0 + i * (cw + gp);
+    if (i < on) {
+      ctx.fillStyle = colDot[Math.min(NBH - 1, Math.floor(i * NBH / N))];
+      ctx.globalAlpha = 0.92;
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.07)';
+      ctx.globalAlpha = 1;
+    }
+    rr(ctx, x, by, cw, ch, 3.5);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  rr(ctx, x0 + N * (cw + gp) - gp + 2, by + ch * 0.28, 3.5, ch * 0.44, 1.5);
+  ctx.fill();
+
+  ctx.font = '600 11px ui-monospace,"Cascadia Code",Consolas,monospace';
+  ctx.fillStyle = 'rgba(170,179,214,0.9)';
+  ctx.fillText((loadedFrac * 100).toFixed(1) + '%  ' +
+    (loadedFrac >= 0.999 ? 'READY' : 'CHARGING'), x0 + N * (cw + gp) + 14, by + ch / 2);
+}
+
+function rr(g, x, y, w, h, r) {
+  const k = Math.min(r, w * 0.5, h * 0.5);
+  g.beginPath();
+  g.moveTo(x + k, y);
+  g.arcTo(x + w, y, x + w, y + h, k);
+  g.arcTo(x + w, y + h, x, y + h, k);
+  g.arcTo(x, y + h, x, y, k);
+  g.arcTo(x, y, x + w, y, k);
+  g.closePath();
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) { accent = p.accent; buildColors(); }
+    cur.n = 0; nxt.n = 0; pings.length = 0; lineT = -1; loadedFrac = 0;
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：一圈脉冲环从字形中心扩散，环上的点被顶亮一下（不重置充能） */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    if (pings.length < 4) pings.push({ r: 0, a: 0.55 + 0.45 * lv });
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => {
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < cur.n; i++) {
+    const X = cx0 + cur.x[i], Y = cy0 + cur.y[i];
+    if (X < mnX) mnX = X; if (X > mxX) mxX = X;
+    if (Y < mnY) mnY = Y; if (Y > mxY) mxY = Y;
+  }
+  return {
+    lines: lines.length, cur: curIdx, brew: brewIdx, t: +now().toFixed(2),
+    pts: cur.n, loaded: +loadedFrac.toFixed(3), pings: pings.length, yrc: !!cur.yrc,
+    scrBox: cur.n ? { x: mnX, y: mnY, w: mxX - mnX, h: mxY - mnY } : null
+  };
+};
+</script>
+</body>
+</html>

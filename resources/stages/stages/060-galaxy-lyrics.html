@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>星系歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(200,212,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   060 · 星系歌词 —— 字是一道**驻波**（密度波），不是一堆物质
+
+   星体不走"轨道半径+角度"那一套，而是每颗各占一条**很扁的椭圆**：
+   椭圆的一端落在字形的采样点上（远心端），另一端落在星系核球里（近心端）。
+   星体沿椭圆来回跑，但速度按 1/|dP/dψ| 分布 —— 在两端慢、中间快，
+   于是**远心端自然积起一道密度脊**。
+
+   关键在这一点：位置只由 ψ 的**分布**决定，而不是由哪颗星在哪决定。
+   所有星用同一个速率律，ψ 的分布不变 → 整幅图案**静止不动**，
+   而物质在穿过它。这就是密度波：字不动，星在流。
+   （远心端比近心端更密，因为速率律里 ψ=0 那一侧更慢 —— 核球不会抢戏。）
+
+   和 001-010 的区别：没有吸引、没有目标点云、没有成形/消散阶段。
+   字是一个**统计结构**，任何时候都有星在进来、有星在出去，图案却纹丝不动。
+
+   为什么快：12 个色档各一条 Path2D、各一次 fill（坑⑨⑩）；
+   每颗星每帧只有一对 sin/cos；色档用距离平方分档，连开方都省了。
+
+   精修记录：① YRC 逐字密度涨落 —— 远心端采样点记下"自己属于第几个字"（orbC，排版表二分反查），
+   第 k 字在 chars[k].t - 0.10 那一刻起：这个字的星把椭圆短轴收窄（脊更锐）、
+   远心端驻留更久（速率律乘 0.55）、色档往内提 —— 于是这个字的密度脊"鼓"起来又稳住；
+   同时叠一记 0.45s 的字形亮闪（"第 k 字成立"的视觉落点）。无 chars 按 t+dur*k/n 均分回退，
+   __stage 增 yrc。② 长句折 1~3 行（41 字 = 14/14/13 @ ~86px）——
+   旧版一行只有 ~30px、采样点摊平，字根本不成形。③ 镜头：整盘缓慢推拉（1.0~1.03），
+   踩拍仍是整盘一起鼓（相干）。
+   分词：不使用。逐字时刻已到字，按词团只会让密度涨落的节奏变粗。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+let CX = 0, CY = 0, RMAX = 300, SQUASH = 0.78;
+
+const N = 9000, ARMS = 4, NB = 12, HALO = 700;
+let orb = null, orbT = null;         // 每颗星 6 个数：cx,cy, ax,ay, bx,by
+let psi = null, om = null;
+let offx = null, offy = null;
+let hx = null, hy = null, ha = null;
+
+let accent = [255, 214, 128];
+const cols = [];
+const szs = [];
+let bgGrad = null, nebGrad = null, coreGrad = null, vigGrad = null;
+let bgCv = null, vigCv = null;      // 底 + 星云 + 核球 / 暗角，烘成两张整屏图，每帧各一次 drawImage
+
+let pulse = 0, morphK = 1, fdt = 0.016;
+const mouse = { x: 0, y: 0, has: false };
+
+/* ---------------- 排版 / 逐字时间 / 逐字采样 ----------------
+   长句折 1~3 行；"哪个采样点属于哪个字"用排版表二分反查，不做逐字读回。 */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const pcan = document.createElement('canvas');
+const pctx = pcan.getContext('2d', { willReadFrequently: true });
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+
+let lay = null, ctArr = null, curYrc = false, ampN = 0, lit = 0;
+let orbC = null;                     // 每颗星属于哪个字（255 = 旋臂/晕）
+let dboost = new Float32Array(1);    // 每字的密度涨落量（0..1）
+let glint = [];                      // 刚成立的那几个字：0.45s 的字形亮闪
+let prePts = null, prePc = 0, preA = null, preIdx = -1, prePtChar = null, preLay = null, preN = 0;
+
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+/* chars 必须与正文逐字等长、每个 t 有限才采信，并单调钳位；否则 t+dur*k/n 均分回退 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+function makeLayout(text, idx) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.80, 1440);
+  const maxH = H * 0.54;
+  octx.font = fontOf(100);
+  let widest = 1;
+  for (let r = 0; r < nr; r++) widest = Math.max(widest, octx.measureText(rows[r]).width);
+  let fs = Math.min(100 * maxW / widest, maxH / (nr * 1.24), 136);
+  fs = Math.max(22, Math.floor(fs));
+  octx.font = fontOf(fs);
+  const LH = fs * 1.24;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let minX = 1e9, maxX = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      if (x < minX) minX = x;
+      if (x + w > maxX) maxX = x + w;
+      x += w; gi++;
+    }
+    rowsOut.push({ y: y, g: gr, w: wsum });
+  }
+  const minY = y0 - fs * 0.52, maxY = y0 + (nr - 1) * LH + fs * 0.52;
+  const gcx = (minX + maxX) / 2, gcy = (minY + maxY) / 2;
+  const A = placeAnchor(anchors[idx % anchors.length], (maxX - minX) / 2, (maxY - minY) / 2, gcx, gcy);
+  const dx = Math.max(-W * 0.04, Math.min(W * 0.04, (A.x - gcx) * 0.5));
+  const dy = Math.max(-H * 0.05, Math.min(H * 0.05, (A.y - gcy) * 0.5));
+  for (let u = 0; u < glyphs.length; u++) { glyphs[u].x += dx; glyphs[u].y += dy; }
+  for (let r = 0; r < rowsOut.length; r++) {
+    rowsOut[r].y += dy;
+    for (let j = 0; j < rowsOut[r].g.length; j++) { rowsOut[r].g[j].x0 += dx; rowsOut[r].g[j].x1 += dx; }
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length,
+           font: fontOf(fs), cx: gcx + dx, cy: gcy + dy,
+           minX: minX + dx, maxX: maxX + dx, minY: minY + dy, maxY: maxY + dy };
+}
+
+function charAt(L, x, y) {
+  if (!L || !L.rows.length) return 255;
+  let bi = 0, bd = 1e9;
+  for (let r = 0; r < L.rows.length; r++) {
+    const d = Math.abs(y - L.rows[r].y);
+    if (d < bd) { bd = d; bi = r; }
+  }
+  const g = L.rows[bi].g;
+  if (!g.length) return 255;
+  if (x <= g[0].x0) return g[0].i;
+  const last = g.length - 1;
+  if (x >= g[last].x1) return g[last].i;
+  let lo = 0, hi = last;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < x) lo = m + 1; else hi = m; }
+  return g[lo].i;
+}
+
+/* 酝酿：只做最贵的那一步（栅格化字形 + 取点 + 逐点认字），存起来等句首用。
+   取点在字形包围盒里做，不读整屏；点已换算成世界坐标，assign 里 A = (0,0)。 */
+function prepPoints(idx) {
+  prePts = null; prePc = 0; preA = null; preIdx = idx; prePtChar = null; preLay = null; preN = 0;
+  if (idx < 0 || !lines[idx] || !lines[idx].text) return;
+  const L = makeLayout(lines[idx].text, idx);
+  if (!L) return;
+  preLay = L;
+  const bx0 = Math.max(0, Math.floor(L.minX)), bx1 = Math.min(W, Math.ceil(L.maxX));
+  const by0 = Math.max(0, Math.floor(L.minY)), by1 = Math.min(H, Math.ceil(L.maxY));
+  const w = Math.max(1, bx1 - bx0), h = Math.max(1, by1 - by0);
+  pcan.width = w; pcan.height = h;
+  pctx.setTransform(1, 0, 0, 1, 0, 0);
+  pctx.clearRect(0, 0, w, h);
+  pctx.font = L.font;
+  pctx.textAlign = 'center'; pctx.textBaseline = 'middle';
+  pctx.fillStyle = '#fff';
+  for (let u = 0; u < L.glyphs.length; u++) {
+    const g = L.glyphs[u];
+    pctx.fillText(g.ch, g.x - bx0, g.y - by0);
+  }
+  const d = pctx.getImageData(0, 0, w, h).data;
+  const pts = [], pch = [];
+  const st = 3;
+  for (let y = 0; y < h; y += st) {
+    for (let x = 0; x < w; x += st) {
+      if (d[(y * w + x) * 4 + 3] > 128) {
+        const px = x + bx0, py = y + by0;
+        pts.push(px, py);
+        pch.push(charAt(L, px, py));
+      }
+    }
+  }
+  if (!pch.length) return;
+  prePts = new Float32Array(pts);
+  prePc = pch.length;
+  prePtChar = new Uint8Array(pch);
+  preA = { x: 0, y: 0 };
+  preN = L.n;
+  lay = L;
+}
+
+/* ---------------- 锚点 ---------------- */
+const anchors = [];
+for (let i = 0; i < 96; i++) {
+  const g = i * 2.399963;
+  const rr = 0.30 + 0.70 * (((i * 37) % 97) / 97);
+  anchors.push({ nx: Math.cos(g) * rr, ny: Math.sin(g) * rr * 0.66 });
+}
+function placeAnchor(a, hw, hh, gcx, gcy) {
+  const M = 60;
+  const x0 = M + hw - gcx, x1 = W - M - hw - gcx;
+  const y0 = M + hh - gcy, y1 = H - M - hh - gcy;
+  return {
+    x: x1 > x0 ? x0 + (a.nx * 0.5 + 0.5) * (x1 - x0) : W / 2 - gcx,
+    y: y1 > y0 ? y0 + (a.ny * 0.5 + 0.5) * (y1 - y0) : H / 2 - gcy,
+  };
+}
+
+/* ---------------- 给每颗星重新指定一条椭圆 ----------------
+   远心端 = 字形采样点（等间隔取样，坑⑥）或旋臂上的点；
+   近心端 = 核球里的随机点。椭圆 = 以两者中点为心、两者连线为长轴、
+   短轴 = 长轴 × q（q 很小 → 针状轨道 → 密度脊又窄又锐）。 */
+function assign(idx, instant) {
+  let pts = null, pc = 0, A = null, pch = null;
+  if (idx >= 0 && preIdx === idx && prePts) { pts = prePts; pc = prePc; A = preA; pch = prePtChar; }
+  else if (idx >= 0) { prepPoints(idx); if (prePts) { pts = prePts; pc = prePc; A = preA; pch = prePtChar; } }
+  if (!orbC) orbC = new Uint8Array(N);
+  const NG = pts ? Math.round(N * 0.78) : 0;
+  let gi = 0;
+  for (let i = 0; i < N; i++) {
+    const o = i * 6;
+    let gx, gy, cc = 255;
+    if (pts && i < NG) {
+      /* 等间隔取样 —— 直接 (k % pc) 会把字压扁成一条带（坑⑥） */
+      const pi = Math.floor(gi * pc / NG) % pc;
+      gi++;
+      gx = A.x + pts[pi * 2];
+      gy = A.y + pts[pi * 2 + 1];
+      cc = pch ? pch[pi] : 255;
+    } else {
+      const rn = Math.pow(Math.random(), 0.58) * RMAX;
+      const arm = (Math.random() * ARMS) | 0;
+      const th = arm * 6.283185 / ARMS + Math.pow(rn / RMAX, 0.9) * 5.4 + (Math.random() - 0.5) * 0.6;
+      gx = CX + Math.cos(th) * rn;
+      gy = CY + Math.sin(th) * rn;
+    }
+    orbC[i] = cc;
+    if (cc !== 255) {
+      /* 字上的星：驻波轨道 —— 中心就是采样点，半长轴只有几个像素，
+         所以密度脊**钉在笔画上不动**（物质在穿过它、图案不动），字才认得出。
+         逐字涨落时轨道再收（draw 里的 orbitK）。 */
+      const rr = 0.6 + Math.random() * 1.8;
+      const ang = Math.random() * 6.283185;
+      const ax2 = Math.cos(ang) * rr, ay2 = Math.sin(ang) * rr;
+      const q2 = 0.30 + Math.random() * 0.30;
+      orbT[o] = gx; orbT[o + 1] = gy;
+      orbT[o + 2] = ax2; orbT[o + 3] = ay2;
+      orbT[o + 4] = -ay2 * q2; orbT[o + 5] = ax2 * q2;
+    } else {
+      /* 近心端：核球里的一个点 */
+      const ea = Math.random() * 6.283185;
+      const er = (0.05 + Math.random() * 0.17) * RMAX;
+      const ex = CX + Math.cos(ea) * er, ey = CY + Math.sin(ea) * er;
+      /* 椭圆：长轴 A 向量，短轴 = 垂直方向 × q（针状轨道 → 脊窄而锐） */
+      const ax = (gx - ex) * 0.5, ay = (gy - ey) * 0.5;
+      const q = 0.035 + Math.random() * 0.022;
+      orbT[o] = (gx + ex) * 0.5;
+      orbT[o + 1] = (gy + ey) * 0.5;
+      orbT[o + 2] = ax;
+      orbT[o + 3] = ay;
+      orbT[o + 4] = -ay * q;
+      orbT[o + 5] = ax * q;
+    }
+  }
+  if (instant) { orb.set(orbT); }
+  else morphK = 0;
+}
+
+/* ψ 初值按**速率律的平衡分布**采（拒绝采样：密度 ∝ 1/rate）—— 否则要等几十秒才收敛，
+   前 10 秒画面里根本没有字。 */
+function samplePsi() {
+  let u = 0;
+  for (let i = 0; i < 80; i++) {
+    u = Math.random() * 6.283185;
+    const c = Math.cos(u);
+    const rate = 0.10 + 0.95 * (1 - c) * (1 - c);
+    if (Math.random() < (1 / rate) / 10) return u;
+  }
+  return u;
+}
+
+/* ---------------- 分配 ---------------- */
+function buildCols() {
+  const A0 = [255, 214, 128], B0 = [242, 244, 255], C0 = [116, 156, 255];
+  cols.length = 0; szs.length = 0;
+  for (let b = 0; b < NB; b++) {
+    const u = b / (NB - 1);
+    let r, g, bl;
+    if (u < 0.5) {
+      const k = u * 2;
+      r = A0[0] + (B0[0] - A0[0]) * k; g = A0[1] + (B0[1] - A0[1]) * k; bl = A0[2] + (B0[2] - A0[2]) * k;
+    } else {
+      const k = (u - 0.5) * 2;
+      r = B0[0] + (C0[0] - B0[0]) * k; g = B0[1] + (C0[1] - B0[1]) * k; bl = B0[2] + (C0[2] - B0[2]) * k;
+    }
+    if (u < 0.34) {
+      const k = (1 - u / 0.34) * 0.45;
+      r = r * (1 - k) + accent[0] * k;
+      g = g * (1 - k) + accent[1] * k;
+      bl = bl * (1 - k) + accent[2] * k;
+    }
+    cols.push('rgba(' + (r | 0) + ',' + (g | 0) + ',' + (bl | 0) + ',' + (0.92 - u * 0.42).toFixed(2) + ')');
+    szs.push(2.1 - u * 0.95);
+  }
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CX = W * 0.5; CY = H * 0.5;
+  RMAX = Math.min(W, H) * 0.47;
+
+  if (!orb) {
+    orb = new Float32Array(N * 6); orbT = new Float32Array(N * 6);
+    psi = new Float32Array(N); om = new Float32Array(N);
+    offx = new Float32Array(N); offy = new Float32Array(N);
+    hx = new Float32Array(HALO); hy = new Float32Array(HALO); ha = new Float32Array(HALO);
+    for (let i = 0; i < N; i++) {
+      psi[i] = samplePsi();
+      om[i] = 0.55 * (0.9 + Math.random() * 0.2);
+    }
+    for (let i = 0; i < HALO; i++) {
+      const a = Math.random() * 6.283185;
+      const r = Math.pow(Math.random(), 0.55) * 1.45;
+      hx[i] = Math.cos(a) * r;
+      hy[i] = Math.sin(a) * r * (0.72 + Math.random() * 0.5);
+      ha[i] = 0.04 + Math.random() * 0.3;
+    }
+  }
+
+  /* 色档：内圈暖金 → 中圈白 → 外圈蓝（和参考源一致的星系配色），主色只染内圈 */
+  buildCols();
+
+  bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrad.addColorStop(0, '#05060a'); bgGrad.addColorStop(0.6, '#06070d'); bgGrad.addColorStop(1, '#04050a');
+  nebGrad = ctx.createRadialGradient(CX + W * 0.1, CY - H * 0.08, 0, CX, CY, RMAX * 1.8);
+  nebGrad.addColorStop(0, 'rgba(96,88,190,0.10)');
+  nebGrad.addColorStop(0.6, 'rgba(60,70,150,0.05)');
+  nebGrad.addColorStop(1, 'rgba(20,24,60,0)');
+  coreGrad = ctx.createRadialGradient(CX, CY, 0, CX, CY, RMAX * 0.46);
+  coreGrad.addColorStop(0, 'rgba(255,238,196,0.40)');
+  coreGrad.addColorStop(0.22, 'rgba(255,208,138,0.18)');
+  coreGrad.addColorStop(1, 'rgba(255,190,120,0)');
+  vigGrad = ctx.createRadialGradient(CX, CY, Math.min(W, H) * 0.3, CX, CY, Math.max(W, H) * 0.82);
+  vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
+  vigGrad.addColorStop(1, 'rgba(1,2,8,0.55)');
+
+  /* 两张整屏静态层：三张全屏渐变 + 暗角本来每帧要填四次，现在每帧两次 drawImage */
+  bgCv = document.createElement('canvas');
+  bgCv.width = cv.width; bgCv.height = cv.height;
+  const bx = bgCv.getContext('2d');
+  bx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bx.fillStyle = bgGrad; bx.fillRect(0, 0, W, H);
+  bx.fillStyle = nebGrad; bx.fillRect(0, 0, W, H);
+  bx.globalCompositeOperation = 'lighter';
+  bx.fillStyle = coreGrad; bx.fillRect(0, 0, W, H);
+  vigCv = document.createElement('canvas');
+  vigCv.width = cv.width; vigCv.height = cv.height;
+  const vx = vigCv.getContext('2d');
+  vx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  vx.fillStyle = vigGrad; vx.fillRect(0, 0, W, H);
+
+  assign(curIdx, true);
+  setLine(curIdx);
+  curLay = preLay;
+}
+addEventListener('resize', resize);
+
+/* ---------------- 绘制 ---------------- */
+const buckets = [];
+function draw() {
+  const invD2 = NB / (RMAX * RMAX * 1.35);
+  /* 轨道参数永远向 orbT 指数逼近：换句时整盘星一起滑过去（相干），
+     收敛后图案完全静止 —— 这就是"密度波"该有的样子 */
+  const k1 = 1 - Math.exp(-fdt * 5.0);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  /* 镜头：整盘缓慢横移（只做整像素平移 —— 全屏层一旦进缩放就会走重采样，软件渲染下很贵） */
+  const panX = Math.round(Math.sin(t0 * 0.037) * W * 0.006);
+  const panY = Math.round(Math.cos(t0 * 0.029) * H * 0.005);
+  ctx.save();
+  ctx.translate(panX, panY);
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+
+  /* 星系晕：远处静态星，整片缓慢自转 */
+  const hg = t0 * 0.02, hc = Math.cos(hg), hs = Math.sin(hg);
+  const hPath = new Path2D();
+  for (let i = 0; i < HALO; i++) {
+    const x = hx[i] * hc - hy[i] * hs, y = hx[i] * hs + hy[i] * hc;
+    const s = 1.1 + ha[i] * 1.6;
+    hPath.rect(CX + x * RMAX - s * 0.5, CY + y * RMAX - s * 0.5, s, s);
+  }
+  ctx.fillStyle = 'rgba(207,216,255,0.55)';
+  ctx.fill(hPath);
+
+
+  /* 12 档色桶：一次遍历把星塞进各自的 Path2D，然后 12 次 fill */
+  for (let b = 0; b < NB; b++) buckets[b] = new Path2D();
+  const sq = SQUASH * (1 + pulse * 0.10);
+  const bs = 1 + pulse * 0.16;
+  const mHas = mouse.has;
+  const arc = orb, art = orbT;
+  for (let i = 0; i < N; i++) {
+    const o = i * 6;
+    arc[o] += (art[o] - arc[o]) * k1;
+    arc[o + 1] += (art[o + 1] - arc[o + 1]) * k1;
+    arc[o + 2] += (art[o + 2] - arc[o + 2]) * k1;
+    arc[o + 3] += (art[o + 3] - arc[o + 3]) * k1;
+    arc[o + 4] += (art[o + 4] - arc[o + 4]) * k1;
+    arc[o + 5] += (art[o + 5] - arc[o + 5]) * k1;
+    /* 逐字密度涨落：这个字一亮，它的星把短轴收紧、远心端驻留更久 = 脊更密更亮 */
+    const cc = orbC ? orbC[i] : 255;
+    const db = cc < ampN ? dboost[cc] : 0;
+    const c = Math.cos(psi[i]), s2 = Math.sin(psi[i]);
+    /* ψ 速率：两端慢、中间快 —— 密度脊就积在"慢"的那一处（ψ=0 = 远心端 = 字） */
+    psi[i] += om[i] * (0.10 + 0.95 * (1 - c) * (1 - c)) * fdt * (1 - db * 0.35);
+    if (psi[i] > 6.283185) psi[i] -= 6.283185;
+    const qs = bs * (1 - db * 0.42);
+    const orbitK = cc < ampN ? (1 - db * 0.30) : 1;
+    let X = arc[o] + (c * arc[o + 2] + s2 * arc[o + 4] * qs) * orbitK;
+    let Y = arc[o + 1] + (c * arc[o + 3] + s2 * arc[o + 5] * qs) * orbitK;
+    Y = CY + (Y - CY) * sq;
+
+    if (mHas) {
+      const dx = mouse.x - X, dy = mouse.y - Y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < 32400 && d2 > 1) {
+        const d = Math.sqrt(d2);
+        const f = 1 - d / 180;
+        offx[i] += (dx / d) * f * f * 3.4;
+        offy[i] += (dy / d) * f * f * 3.4;
+      }
+    }
+    offx[i] *= 0.93; offy[i] *= 0.93;
+    X += offx[i]; Y += offy[i];
+
+    const dxm = X - CX, dym = (Y - CY) * 1.7;
+    let b = (dxm * dxm + dym * dym) * invD2 | 0;
+    if (cc < ampN) {
+      /* 字上的星不受"离核心多远"决定颜色 —— 否则整句都是最外圈那档暗蓝。
+         亮起来的字往内两档（暖白），没亮的是中间档（冷白，仍读得出） */
+      b = Math.max(0, 4 - ((db * 4) | 0));
+    } else if (db > 0.02) b -= (db * 2.4) | 0;
+    if (b > NB - 1) b = NB - 1; else if (b < 0) b = 0;
+    const sz = cc < ampN ? szs[b] * 1.5 : szs[b];
+    buckets[b].rect(X - sz * 0.5, Y - sz * 0.5, sz, sz);
+  }
+  for (let b = 0; b < NB; b++) {
+    ctx.fillStyle = cols[b];
+    ctx.fill(buckets[b]);
+  }
+
+  /* 第 k 字成立时的那一记亮闪（0.5s 内的字形残光，给"这个字起来了"一个落点） */
+  if (glint.length) {
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (let i = glint.length - 1; i >= 0; i--) {
+      const g = glint[i];
+      const age = t0 - g.t0;
+      if (age > 0.5) { glint.splice(i, 1); continue; }
+      const a = 1 - age / 0.5;
+      ctx.font = g.font;
+      ctx.fillStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',' + (0.05 * a).toFixed(3) + ')';
+      ctx.fillText(g.ch, g.x, g.y);
+      ctx.fillStyle = 'rgba(255,248,232,' + (0.09 * a).toFixed(3) + ')';
+      ctx.fillText(g.ch, g.x, g.y);
+    }
+  }
+
+  /* 核心亮点 */
+  ctx.fillStyle = coreGrad;
+  const cr = RMAX * 0.05 * (1 + pulse * 0.4);
+  ctx.beginPath();
+  ctx.arc(CX, CY, cr, 0, 6.283185);
+  ctx.fill();
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
+  if (vigCv) ctx.drawImage(vigCv, 0, 0, W, H);
+}
+
+/* ---------------- 时间 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let pendIdx = -1;
+let curLay = null;
+
+/* 逐字成立：dboost 立刻跳到 1（密度脊"鼓"起来），再衰到 0.38 的余量 */
+function updChars(T) {
+  if (!ctArr || !ampN) return;
+  let c = 0;
+  for (let k = 0; k < ampN; k++) {
+    const on = T >= ctArr[k] - 0.10;
+    if (on) {
+      c++;
+      if (dboost[k] < 0.02) {
+        dboost[k] = 1;
+        const g = curLay ? curLay.glyphs[k] : null;
+        if (g) {
+          glint.push({ ch: g.ch, x: g.x, y: g.y, font: curLay.font, t0: t0 });
+          if (glint.length > 4) glint.shift();
+        }
+      }
+    }
+  }
+  if (c > lit) lit = c;
+}
+function decayBoost(dt, T) {
+  if (!ctArr || !ampN) return;
+  const k1 = 1 - Math.exp(-dt * 1.7);
+  for (let k = 0; k < ampN; k++) {
+    if (T < ctArr[k] - 0.10) { dboost[k] = 0; continue; }
+    const tgt = T >= ctArr[k] + 0.85 ? 0.38 : 1;
+    dboost[k] += (tgt - dboost[k]) * k1;
+  }
+}
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pendIdx = -1;
+    /* 拖进度条：整盘轨道重排（旧的远心端全部释放，重新认领） */
+    ctArr = null; ampN = 0; lit = 0; curYrc = false; curLay = null; glint.length = 0;
+    preIdx = -1;
+    assign(-1, true);
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    /* 显示切到第 ci 句：把远心端重新认领到新字形的采样点上。
+       不是瞬切 —— orb 会向 orbT 指数逼近，整盘星一起滑过去（相干） */
+    assign(ci, false);
+    setLine(ci);
+    curLay = preLay;
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx2 = curIdx + 1;
+  if (nx2 < lines.length && brewIdx !== nx2) {
+    const gap = lines[nx2].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx2].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx2].t - lead) {
+      brewIdx = nx2;
+      /* 提前把采样点算好（glyphPoints 有 getImageData，放在句首会顶一帧） */
+      if (pendIdx !== nx2) { pendIdx = nx2; prepPoints(nx2); }
+    }
+  }
+}
+
+/* 酝酿：只做最贵的那一步（栅格化字形 + 取点 + 逐点认字），存起来等句首用 */
+function setLine(idx) {
+  ctArr = null; curYrc = false; ampN = 0; lit = 0; glint.length = 0;
+  if (idx < 0 || !lines[idx] || !lines[idx].text) return;
+  if (preIdx !== idx || !preN) prepPoints(idx);
+  if (!preN) return;
+  const ct = charTimes(lines[idx], preN);
+  ctArr = ct.t; curYrc = ct.ok; ampN = preN;
+  if (dboost.length < ampN) dboost = new Float32Array(ampN + 8);
+  for (let k = 0; k < dboost.length; k++) dboost[k] = 0;
+}
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt; fdt = dt;
+  const T = now();
+
+  timing(T);
+  pulse *= Math.exp(-dt * 2.4);
+  if (morphK < 1) morphK = Math.min(1, morphK + dt / 0.9);
+  updChars(T);
+  decayBoost(dt, T);
+
+  draw();
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 启动 ---------------- */
+lines = [];
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', (e) => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.has = true; ping(); }, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; pendIdx = -1;
+    if (p.accent) {
+      const a = p.accent;
+      accent = [
+        Math.min(255, Math.round(a[0] * 0.40 + 255 * 0.60)),
+        Math.min(255, Math.round(a[1] * 0.40 + 214 * 0.60)),
+        Math.min(255, Math.round(a[2] * 0.40 + 128 * 0.60)),
+      ];
+    }
+    /* 清掉所有粒子/结构：轨道参数重新洗牌 */
+    prePts = null; prePc = 0; preA = null; preIdx = -1; prePtChar = null; preLay = null; preN = 0;
+    ctArr = null; ampN = 0; lit = 0; curYrc = false; curLay = null; glint.length = 0;
+    buildCols();
+    for (let i = 0; i < N; i++) { offx[i] = 0; offy[i] = 0; psi[i] = samplePsi(); }
+    assign(-1, true);
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：整盘星一起"鼓"一下 —— 短轴同时放大、亮度同时抬，
+       相干，不是逐颗乱踢（坑⑬） */
+    pulse = Math.min(1.4, pulse + 0.5 + (d.payload.level || 0) * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  stars: N, halo: HALO, morph: +morphK.toFixed(2), pulse: +pulse.toFixed(2),
+  pc: prePc, t: +now().toFixed(2),
+  yrc: curYrc, yrcLen: lines[curIdx] && lines[curIdx].chars ? lines[curIdx].chars.length : 0,
+  lit: lit, chars: ampN, rows: curLay ? curLay.nr : 0, fs: curLay ? +curLay.fs.toFixed(1) : 0,
+  db: ampN ? +dboost[ampN - 1].toFixed(2) : 0, glint: glint.length,
+});
+</script>
+</body>
+</html>

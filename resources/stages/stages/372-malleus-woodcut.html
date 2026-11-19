@@ -1,0 +1,1546 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>女巫之锤</title>
+<style>
+  @font-face { font-family: 'StageBlackletter'; src: url('./assets/372-blackletter.woff2') format('woff2'); font-display: swap; }
+  html, body { margin: 0; height: 100%; background: #e7dfca; overflow: hidden; }
+  #plate { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="plate" width="1440" height="900"></canvas>
+<script>
+window.__stage = function () {
+  var s = window.__stageState || {};
+  return {
+    lines: (s.lines && s.lines.length) || 0,
+    idx: typeof s.idx === 'number' ? s.idx : -1,
+    t: s.time || 0,
+    playing: !!s.playing,
+    frames: s.frames || 0,
+    js: s.jsMs || 0,
+    err: s.err || '',
+    text: s.text || '',
+    gl: false,
+    rm: !!s.reduced
+  };
+};
+
+(function () {
+  'use strict';
+
+  var state = {
+    lines: [], idx: -1, time: 0, duration: 0, playing: true,
+    frames: 0, jsMs: 0, err: '', text: '', reduced: false,
+    songName: '', stampAt: 0, pulse: 0, bass: 0, level: 0, treble: 0,
+    beatIndex: 0, clock: 0, lineCache: null, cacheWidth: 0, dust: null, hasInit: false
+  };
+  window.__stageState = state;
+
+  var canvas = document.getElementById('plate');
+  var ctx = canvas && canvas.getContext ? canvas.getContext('2d') : null;
+
+  var lastErrorAt = 0;
+  function reportError(where, error) {
+    var message = (error && error.message) ? error.message : String(error);
+    if (state.err.length < 180) state.err = where + ': ' + message;
+    var nowMs = Date.now();
+    if (nowMs - lastErrorAt >= 1000) {
+      lastErrorAt = nowMs;
+      try { console.error('[stage372] ' + where + ': ' + message); } catch (ignored) {}
+    }
+  }
+
+  if (!ctx) {
+    reportError('boot', new Error('canvas 2d context unavailable'));
+    return;
+  }
+
+  var INK = [19, 16, 13];
+  var PAPER = [232, 223, 203];
+  var accent = [120, 96, 64];
+
+  function clampNumber(value, low, high) {
+    var number = Number(value);
+    if (!isFinite(number)) return low;
+    return Math.min(high, Math.max(low, number));
+  }
+
+  function isDrawable(source) {
+    return !!source && source.width > 0 && source.height > 0 &&
+      typeof source.getContext === 'function';
+  }
+
+  function currentStamp() {
+    if (window.performance && typeof window.performance.now === 'function') {
+      return window.performance.now();
+    }
+    return Date.now();
+  }
+
+  var readySent = false;
+  function signalReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }
+    catch (error) { reportError('ready', error); }
+  }
+
+  var layout = { w: 1440, h: 900, dpr: 1 };
+  var plate = document.createElement('canvas');
+  var plateCtx = plate.getContext('2d');
+
+  var IMG_ASPECT = 626 / 888;
+  var geom = null;
+  var grainTile = null;
+  var hero = { canvas: null, ready: false, failed: false, image: null };
+  var knight = { canvas: null, ready: false, failed: false, image: null };
+
+  function clamp01(value) {
+    var number = Number(value);
+    if (!isFinite(number)) return 0;
+    return Math.min(1, Math.max(0, number));
+  }
+
+  function ink(alpha) {
+    return 'rgba(' + INK[0] + ',' + INK[1] + ',' + INK[2] + ',' + clamp01(alpha) + ')';
+  }
+
+  function paperColor(alpha) {
+    return 'rgba(' + PAPER[0] + ',' + PAPER[1] + ',' + PAPER[2] + ',' + clamp01(alpha) + ')';
+  }
+
+  function accentColor(alpha) {
+    return 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',' + clamp01(alpha) + ')';
+  }
+
+  function serifFont(size, weight) {
+    return (weight || 400) + ' ' + size.toFixed(1) + 'px "Songti SC", "STSong", "Noto Serif CJK SC", "Noto Serif SC", "SimSun", serif';
+  }
+
+  function blackletterFont(size) {
+    return '400 ' + size.toFixed(1) + 'px "StageBlackletter", "Songti SC", serif';
+  }
+
+  function makeRandom(seed) {
+    var value = seed >>> 0;
+    return function () {
+      value = (value * 1664525 + 1013904223) >>> 0;
+      return value / 4294967296;
+    };
+  }
+
+  function drawSpacedText(pen, text, centerX, baselineY, spacing) {
+    var glyphs = String(text).split('');
+    var widths = [];
+    var total = 0;
+    var index;
+    for (index = 0; index < glyphs.length; index++) {
+      var glyphWidth = pen.measureText(glyphs[index]).width;
+      widths.push(glyphWidth);
+      total += glyphWidth;
+    }
+    var gap = Math.max(-3, Number(spacing) || 0);
+    total += gap * Math.max(0, glyphs.length - 1);
+    var x = centerX - total / 2;
+    var previousAlign = pen.textAlign;
+    pen.textAlign = 'left';
+    for (index = 0; index < glyphs.length; index++) {
+      pen.fillText(glyphs[index], x, baselineY);
+      x += widths[index] + gap;
+    }
+    pen.textAlign = previousAlign;
+  }
+
+  function buildGrain() {
+    var size = 160;
+    var layer = document.createElement('canvas');
+    layer.width = size;
+    layer.height = size;
+    var context = layer.getContext('2d');
+    var image = context.createImageData(size, size);
+    var data = image.data;
+    var random = makeRandom(372111);
+    for (var offset = 0; offset < data.length; offset += 4) {
+      var noise = random();
+      data[offset] = 92;
+      data[offset + 1] = 76;
+      data[offset + 2] = 54;
+      data[offset + 3] = noise < 0.52 ? 0 : Math.round((noise - 0.52) * 2 * 30);
+    }
+    context.putImageData(image, 0, 0);
+    grainTile = layer;
+  }
+
+  function computeGeometry() {
+    var width = layout.w;
+    var height = layout.h;
+    var margin = clampNumber(Math.min(width, height) * 0.040, 11, 46);
+    var band = clampNumber(Math.min(width, height) * 0.014, 5, 15);
+    var innerX = margin + band;
+    var innerY = margin + band;
+    var innerW = Math.max(60, width - innerX * 2);
+    var innerH = Math.max(60, height - innerY * 2);
+    var portrait = width / height < 1.06;
+    var headH = clampNumber(innerH * (portrait ? 0.17 : 0.15), 46, 104);
+    var footH = clampNumber(innerH * 0.09, 32, 72);
+    var bodyTop = innerY + headH;
+    var bodyH = Math.max(80, innerH - headH - footH);
+    var captionH = clampNumber(headH * 0.26, 12, 24);
+    var geometry = {
+      w: width, h: height, margin: margin, band: band, portrait: portrait,
+      innerX: innerX, innerY: innerY, innerW: innerW, innerH: innerH,
+      headH: headH, footH: footH, bodyTop: bodyTop, bodyH: bodyH,
+      captionH: captionH, plate: null, text: null
+    };
+    var plateHeight;
+    var plateWidth;
+    var plateX;
+    var plateY;
+    if (!portrait) {
+      var textGap = clampNumber(innerW * 0.045, 16, 54);
+      plateHeight = Math.min(bodyH * 0.90 - captionH, (innerW * 0.32) / IMG_ASPECT);
+      plateHeight = Math.max(18, Math.min(plateHeight, bodyH * 0.96));
+      plateWidth = plateHeight * IMG_ASPECT;
+      plateX = innerX + Math.min(innerW * 0.02, 20);
+      plateY = bodyTop + Math.max(0, (bodyH - plateHeight - captionH) * 0.45);
+      var textX = plateX + plateWidth + textGap;
+      geometry.plate = { x: plateX, y: plateY, w: plateWidth, h: plateHeight };
+      geometry.text = {
+        x: textX, y: bodyTop,
+        w: Math.max(120, innerX + innerW - textX),
+        h: bodyH
+      };
+    } else {
+      plateHeight = Math.min(bodyH * 0.34, (innerW * 0.66) / IMG_ASPECT);
+      plateHeight = Math.max(18, Math.min(plateHeight, bodyH * 0.42));
+      plateWidth = plateHeight * IMG_ASPECT;
+      plateX = innerX + (innerW - plateWidth) * 0.5;
+      plateY = bodyTop + 2;
+      var textTop = plateY + plateHeight + captionH + clampNumber(innerH * 0.02, 6, 20);
+      geometry.plate = { x: plateX, y: plateY, w: plateWidth, h: plateHeight };
+      geometry.text = {
+        x: innerX, y: textTop,
+        w: innerW,
+        h: Math.max(80, bodyTop + bodyH - textTop)
+      };
+    }
+    return geometry;
+  }
+
+  function paintPaper(pen, width, height) {
+    pen.fillStyle = 'rgb(' + PAPER[0] + ',' + PAPER[1] + ',' + PAPER[2] + ')';
+    pen.fillRect(0, 0, width, height);
+
+    var random = makeRandom(3722016);
+    var stains = Math.min(9, 4 + Math.round((width * height) / 420000));
+    for (var index = 0; index < stains; index++) {
+      var centerX = random() * width;
+      var centerY = random() * height;
+      var radius = (0.12 + random() * 0.22) * Math.max(width, height) * 0.5;
+      var stainAlpha = 0.035 + random() * 0.05;
+      var stain = makeGradient(pen, function () {
+        var built = pen.createRadialGradient(centerX, centerY, radius * 0.1, centerX, centerY, radius);
+        addStop(built, 0, 'rgba(122,94,58,' + stainAlpha.toFixed(3) + ')');
+        addStop(built, 1, 'rgba(122,94,58,0)');
+        return built;
+      });
+      if (!stain) continue;
+      pen.fillStyle = stain;
+      pen.fillRect(centerX - radius, centerY - radius, radius * 2, radius * 2);
+    }
+
+    if (isDrawable(grainTile)) {
+      var pattern = pen.createPattern(grainTile, 'repeat');
+      if (pattern) {
+        pen.save();
+        pen.globalAlpha = 0.62;
+        pen.fillStyle = pattern;
+        pen.fillRect(0, 0, width, height);
+        pen.restore();
+      }
+    }
+
+    var speckles = Math.min(140, 40 + Math.round((width * height) / 26000));
+    pen.fillStyle = ink(0.16);
+    for (var spot = 0; spot < speckles; spot++) {
+      var spotX = random() * width;
+      var spotY = random() * height;
+      var spotR = 0.4 + random() * 1.5;
+      pen.beginPath();
+      pen.arc(spotX, spotY, spotR, 0, Math.PI * 2);
+      pen.fill();
+    }
+
+    var edge = makeGradient(pen, function () {
+      var built = pen.createLinearGradient(0, 0, 0, height);
+      addStop(built, 0, 'rgba(84,62,34,0.16)');
+      addStop(built, 0.16, 'rgba(84,62,34,0)');
+      addStop(built, 0.85, 'rgba(84,62,34,0)');
+      addStop(built, 1, 'rgba(84,62,34,0.20)');
+      return built;
+    });
+    if (edge) {
+      pen.fillStyle = edge;
+      pen.fillRect(0, 0, width, height);
+    }
+
+    var sideEdge = makeGradient(pen, function () {
+      var built = pen.createLinearGradient(0, 0, width, 0);
+      addStop(built, 0, 'rgba(84,62,34,0.15)');
+      addStop(built, 0.10, 'rgba(84,62,34,0)');
+      addStop(built, 0.90, 'rgba(84,62,34,0)');
+      addStop(built, 1, 'rgba(84,62,34,0.15)');
+      return built;
+    });
+    if (sideEdge) {
+      pen.fillStyle = sideEdge;
+      pen.fillRect(0, 0, width, height);
+    }
+  }
+
+  function paintFrame(pen, width, height) {
+    var margin = geom.margin;
+    var band = geom.band;
+    var innerW = width - margin * 2;
+    var innerH = height - margin * 2;
+
+    pen.save();
+    pen.fillStyle = 'rgb(' + INK[0] + ',' + INK[1] + ',' + INK[2] + ')';
+    pen.fillRect(margin, margin, innerW, band);
+    pen.fillRect(margin, height - margin - band, innerW, band);
+    pen.fillRect(margin, margin, band, innerH);
+    pen.fillRect(width - margin - band, margin, band, innerH);
+
+    pen.beginPath();
+    pen.rect(margin, margin, innerW, band);
+    pen.rect(margin, height - margin - band, innerW, band);
+    pen.rect(margin, margin, band, innerH);
+    pen.rect(width - margin - band, margin, band, innerH);
+    pen.save();
+    pen.clip();
+    pen.strokeStyle = paperColor(0.16);
+    pen.lineWidth = 1;
+    for (var line = -innerH; line < width + innerH; line += 5) {
+      pen.beginPath();
+      pen.moveTo(line, 0);
+      pen.lineTo(line + height, height);
+      pen.stroke();
+    }
+    pen.restore();
+    pen.restore();
+
+    pen.strokeStyle = ink(0.94);
+    pen.lineWidth = 1;
+    var outerRule = margin + band + Math.max(2, band * 0.35);
+    pen.strokeRect(outerRule, outerRule, width - outerRule * 2, height - outerRule * 2);
+    pen.strokeRect(margin - Math.max(2, band * 0.3), margin - Math.max(2, band * 0.3),
+      width - 2 * (margin - Math.max(2, band * 0.3)), height - 2 * (margin - Math.max(2, band * 0.3)));
+
+    var corner = Math.max(9, band * 2.2);
+    var corners = [
+      [outerRule, outerRule], [width - outerRule, outerRule],
+      [outerRule, height - outerRule], [width - outerRule, height - outerRule]
+    ];
+    for (var index = 0; index < corners.length; index++) {
+      var cornerX = corners[index][0];
+      var cornerY = corners[index][1];
+      pen.fillStyle = 'rgb(' + INK[0] + ',' + INK[1] + ',' + INK[2] + ')';
+      pen.fillRect(cornerX - corner / 2, cornerY - corner / 2, corner, corner);
+      pen.strokeStyle = paperColor(0.85);
+      pen.lineWidth = 1;
+      pen.beginPath();
+      pen.moveTo(cornerX - corner * 0.28, cornerY - corner * 0.28);
+      pen.lineTo(cornerX + corner * 0.28, cornerY + corner * 0.28);
+      pen.moveTo(cornerX + corner * 0.28, cornerY - corner * 0.28);
+      pen.lineTo(cornerX - corner * 0.28, cornerY + corner * 0.28);
+      pen.stroke();
+      pen.beginPath();
+      pen.arc(cornerX, cornerY, corner * 0.13, 0, Math.PI * 2);
+      pen.fillStyle = paperColor(0.9);
+      pen.fill();
+    }
+  }
+
+  function paintHeader(pen) {
+    var centerX = geom.innerX + geom.innerW / 2;
+    var titleSize = clampNumber(geom.headH * 0.50, 15, 42);
+    pen.textBaseline = 'alphabetic';
+    pen.fillStyle = ink(0.93);
+    pen.font = blackletterFont(titleSize);
+    drawSpacedText(pen, 'MALLEVS · MALEFICARVM', centerX, geom.innerY + titleSize * 0.94, titleSize * 0.055);
+
+    var ruleY = geom.innerY + titleSize * 1.24;
+    var ruleHalf = Math.min(geom.innerW * 0.34, titleSize * 12);
+    pen.strokeStyle = ink(0.7);
+    pen.lineWidth = 1;
+    pen.beginPath();
+    pen.moveTo(centerX - ruleHalf, ruleY);
+    pen.lineTo(centerX - titleSize * 0.6, ruleY);
+    pen.moveTo(centerX + titleSize * 0.6, ruleY);
+    pen.lineTo(centerX + ruleHalf, ruleY);
+    pen.stroke();
+    pen.save();
+    pen.translate(centerX, ruleY);
+    pen.rotate(Math.PI / 4);
+    pen.fillStyle = ink(0.8);
+    pen.fillRect(-titleSize * 0.12, -titleSize * 0.12, titleSize * 0.24, titleSize * 0.24);
+    pen.restore();
+
+    var subtitleSize = clampNumber(titleSize * 0.29, 8.5, 12.5);
+    pen.font = serifFont(subtitleSize, 500);
+    pen.fillStyle = ink(0.62);
+    drawSpacedText(pen, 'DE LAMIIS ET PYTHONICIS MVLERIBVS', centerX, ruleY + subtitleSize * 1.9, subtitleSize * 0.28);
+
+    if (geom.innerW > 560) {
+      var noteSize = clampNumber(subtitleSize * 0.92, 7.5, 11);
+      pen.font = serifFont(noteSize, 400);
+      pen.fillStyle = ink(0.5);
+      pen.textAlign = 'left';
+      pen.fillText('ANNO · M · CD · LXXXVI', geom.innerX + 10, ruleY + noteSize * 1.85);
+      pen.textAlign = 'right';
+      pen.fillText('LIBER · PRIMVS', geom.innerX + geom.innerW - 10, ruleY + noteSize * 1.85);
+      pen.textAlign = 'center';
+    }
+
+    var markY = geom.innerY + geom.headH - Math.max(10, geom.headH * 0.16);
+    var markCount = 9;
+    var markGap = clampNumber(geom.headH * 0.36, 8, 20);
+    var markSize = clampNumber(titleSize * 0.075, 2, 3.6);
+    for (var markIndex = 0; markIndex < markCount; markIndex++) {
+      var markX = centerX + (markIndex - (markCount - 1) / 2) * markGap * 2;
+      pen.fillStyle = ink(markIndex % 3 === 0 ? 0.42 : 0.24);
+      pen.beginPath();
+      if (markIndex % 3 === 0) {
+        pen.arc(markX, markY, markSize, 0, Math.PI * 2);
+      } else {
+        pen.rect(markX - markSize * 0.7, markY - markSize * 0.7, markSize * 1.4, markSize * 1.4);
+      }
+      pen.fill();
+    }
+  }
+
+  function drawCover(pen, source, x, y, width, height, cropInset) {
+    if (!isDrawable(source) || width <= 1 || height <= 1) return false;
+    var insetX = source.width * clamp01(cropInset);
+    var insetY = source.height * clamp01(cropInset);
+    var sourceWidth = Math.max(1, source.width - insetX * 2);
+    var sourceHeight = Math.max(1, source.height - insetY * 2);
+    var targetRatio = width / height;
+    var sourceRatio = sourceWidth / sourceHeight;
+    var sw = sourceWidth;
+    var sh = sourceHeight;
+    var sx = insetX;
+    var sy = insetY;
+    if (sourceRatio > targetRatio) {
+      sw = sourceHeight * targetRatio;
+      sx = insetX + (sourceWidth - sw) / 2;
+    } else {
+      sh = sourceWidth / targetRatio;
+      sy = insetY + (sourceHeight - sh) / 2;
+    }
+    pen.save();
+    pen.beginPath();
+    pen.rect(x, y, width, height);
+    pen.clip();
+    pen.drawImage(source, sx, sy, sw, sh, x, y, width, height);
+    pen.restore();
+    return true;
+  }
+
+  function paintHeroPlate(pen) {
+    var target = geom.plate;
+    if (!target) return;
+    pen.fillStyle = ink(0.14);
+    pen.fillRect(target.x + 4, target.y + 5, target.w, target.h);
+
+    pen.strokeStyle = ink(0.95);
+    pen.lineWidth = 2;
+    pen.strokeRect(target.x, target.y, target.w, target.h);
+
+    var inset = clampNumber(target.w * 0.035, 4, 9);
+    var imageX = target.x + inset;
+    var imageY = target.y + inset;
+    var imageW = target.w - inset * 2;
+    var imageH = target.h - inset * 2;
+
+    pen.fillStyle = paperColor(0.55);
+    pen.fillRect(imageX, imageY, imageW, imageH);
+
+    var painted = drawCover(pen, hero.canvas, imageX, imageY, imageW, imageH, 0.02);
+    if (!painted) {
+      pen.save();
+      pen.beginPath();
+      pen.rect(imageX, imageY, imageW, imageH);
+      pen.clip();
+      pen.strokeStyle = ink(0.30);
+      pen.lineWidth = 1;
+      var step = Math.max(5, Math.round(imageW / 24));
+      for (var line = -imageH; line < imageW + imageH; line += step) {
+        pen.beginPath();
+        pen.moveTo(imageX + line, imageY);
+        pen.lineTo(imageX + line - imageH, imageY + imageH);
+        pen.stroke();
+      }
+      pen.restore();
+      pen.fillStyle = ink(0.45);
+      pen.font = serifFont(clampNumber(imageW * 0.07, 7, 12), 500);
+      pen.textAlign = 'center';
+      pen.fillText(hero.failed ? 'IMAGO · DEEST' : 'IMAGO · FIT', imageX + imageW / 2, imageY + imageH / 2);
+      pen.textAlign = 'center';
+    }
+
+    pen.strokeStyle = ink(0.72);
+    pen.lineWidth = 1;
+    pen.strokeRect(imageX, imageY, imageW, imageH);
+    pen.strokeRect(target.x + inset * 0.4, target.y + inset * 0.4,
+      target.w - inset * 0.8, target.h - inset * 0.8);
+
+    var cornerSize = clampNumber(target.w * 0.036, 5, 11);
+    var plateCorners = [
+      [target.x, target.y], [target.x + target.w, target.y],
+      [target.x, target.y + target.h], [target.x + target.w, target.y + target.h]
+    ];
+    for (var cornerIndex = 0; cornerIndex < plateCorners.length; cornerIndex++) {
+      var cornerX = plateCorners[cornerIndex][0];
+      var cornerY = plateCorners[cornerIndex][1];
+      pen.fillStyle = 'rgb(' + INK[0] + ',' + INK[1] + ',' + INK[2] + ')';
+      pen.fillRect(cornerX - cornerSize * 0.5, cornerY - cornerSize * 0.5, cornerSize, cornerSize);
+      pen.fillStyle = paperColor(0.92);
+      pen.beginPath();
+      pen.moveTo(cornerX, cornerY - cornerSize * 0.22);
+      pen.lineTo(cornerX + cornerSize * 0.22, cornerY);
+      pen.lineTo(cornerX, cornerY + cornerSize * 0.22);
+      pen.lineTo(cornerX - cornerSize * 0.22, cornerY);
+      pen.closePath();
+      pen.fill();
+    }
+
+    var captionText = 'SABBATVM · MALEFICARVM';
+    var fleuronY = target.y + target.h + geom.captionH * 0.20;
+    pen.fillStyle = ink(0.5);
+    pen.fillRect(target.x + target.w * 0.10, fleuronY - 0.5, target.w * 0.13, 1);
+    pen.fillRect(target.x + target.w * 0.77, fleuronY - 0.5, target.w * 0.13, 1);
+
+    var captionSize = clampNumber(target.w * 0.055, 7, 11.5);
+    captionSize = Math.min(captionSize, target.w * 0.94 / (captionText.length * 0.80));
+    pen.font = serifFont(captionSize, 500);
+    pen.fillStyle = ink(0.7);
+    drawSpacedText(pen, captionText, target.x + target.w / 2,
+      target.y + target.h + geom.captionH * 0.95, captionSize * 0.22);
+  }
+
+  function paintRules(pen) {
+    var ruleY = geom.bodyTop - Math.max(4, geom.headH * 0.10);
+    pen.strokeStyle = ink(0.28);
+    pen.lineWidth = 1;
+    pen.beginPath();
+    pen.moveTo(geom.innerX + 6, ruleY);
+    pen.lineTo(geom.innerX + geom.innerW - 6, ruleY);
+    pen.stroke();
+    pen.beginPath();
+    pen.moveTo(geom.innerX + 6, ruleY);
+    pen.lineTo(geom.innerX + 6, ruleY + 4);
+    pen.moveTo(geom.innerX + geom.innerW - 6, ruleY);
+    pen.lineTo(geom.innerX + geom.innerW - 6, ruleY + 4);
+    pen.stroke();
+
+    if (!geom.portrait && geom.text) {
+      var columnX = geom.text.x - clampNumber(geom.innerW * 0.022, 8, 26);
+      pen.strokeStyle = ink(0.18);
+      pen.beginPath();
+      pen.moveTo(columnX, geom.bodyTop + 6);
+      pen.lineTo(columnX, geom.bodyTop + geom.bodyH - 6);
+      pen.stroke();
+      pen.save();
+      pen.translate(columnX, geom.bodyTop + 6);
+      pen.rotate(Math.PI / 4);
+      pen.fillStyle = 'rgb(' + PAPER[0] + ',' + PAPER[1] + ',' + PAPER[2] + ')';
+      pen.fillRect(-3, -3, 6, 6);
+      pen.strokeStyle = ink(0.3);
+      pen.strokeRect(-3, -3, 6, 6);
+      pen.restore();
+    }
+  }
+
+  function paintSigil(pen) {
+    var target = geom.text;
+    if (!target) return;
+    var radius = Math.min(target.w * 0.34, target.h * 0.36);
+    if (radius < 30) return;
+    var centerX = target.x + target.w / 2;
+    var centerY = target.y + target.h / 2;
+    pen.save();
+    pen.strokeStyle = ink(0.085);
+    pen.lineWidth = 1;
+    pen.beginPath();
+    pen.arc(centerX, centerY, radius, 0, Math.PI * 2);
+    pen.stroke();
+    pen.beginPath();
+    pen.arc(centerX, centerY, radius * 0.83, 0, Math.PI * 2);
+    pen.stroke();
+
+    pen.strokeStyle = ink(0.065);
+    pen.beginPath();
+    for (var step = 0; step < 40; step++) {
+      var tickAngle = step * Math.PI / 20;
+      var inner = radius * 0.83;
+      var outer = radius * (step % 5 === 0 ? 0.98 : 0.92);
+      pen.moveTo(centerX + Math.cos(tickAngle) * inner, centerY + Math.sin(tickAngle) * inner);
+      pen.lineTo(centerX + Math.cos(tickAngle) * outer, centerY + Math.sin(tickAngle) * outer);
+    }
+    pen.stroke();
+
+    pen.strokeStyle = ink(0.075);
+    pen.beginPath();
+    for (var vertex = 0; vertex <= 5; vertex++) {
+      var angle = -Math.PI / 2 + vertex * 4 * Math.PI / 5;
+      var pointX = centerX + Math.cos(angle) * radius * 0.83;
+      var pointY = centerY + Math.sin(angle) * radius * 0.83;
+      if (vertex === 0) pen.moveTo(pointX, pointY);
+      else pen.lineTo(pointX, pointY);
+    }
+    pen.stroke();
+
+    pen.fillStyle = ink(0.10);
+    for (var dot = 0; dot < 5; dot++) {
+      var dotAngle = -Math.PI / 2 + dot * 2 * Math.PI / 5;
+      pen.beginPath();
+      pen.arc(centerX + Math.cos(dotAngle) * radius * 0.93, centerY + Math.sin(dotAngle) * radius * 0.93,
+        Math.max(1.4, radius * 0.012), 0, Math.PI * 2);
+      pen.fill();
+    }
+    pen.restore();
+  }
+
+  function paintPlate() {
+    if (!geom || layout.w < 2 || layout.h < 2) return;
+    var width = layout.w;
+    var height = layout.h;
+    plateCtx.setTransform(layout.dpr, 0, 0, layout.dpr, 0, 0);
+    plateCtx.clearRect(0, 0, width, height);
+    paintPaper(plateCtx, width, height);
+    paintFrame(plateCtx, width, height);
+    paintHeader(plateCtx);
+    paintRules(plateCtx);
+    paintSigil(plateCtx);
+    paintHeroPlate(plateCtx);
+  }
+
+  function rebuildPlate() {
+    try {
+      geom = computeGeometry();
+      paintPlate();
+      buildGlowLayer();
+    } catch (error) {
+      reportError('plate', error);
+    }
+  }
+
+  function resize() {
+    var width = window.innerWidth;
+    var height = window.innerHeight;
+    if (!isFinite(width) || width <= 0) width = 1440;
+    if (!isFinite(height) || height <= 0) height = 900;
+    var dpr = clampNumber(window.devicePixelRatio || 1, 1, 1.5);
+    layout.w = width;
+    layout.h = height;
+    layout.dpr = dpr;
+    canvas.width = Math.max(1, Math.round(width * dpr));
+    canvas.height = Math.max(1, Math.round(height * dpr));
+    canvas.style.width = width + 'px';
+    canvas.style.height = height + 'px';
+    plate.width = canvas.width;
+    plate.height = canvas.height;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    try {
+      rebuildPlate();
+      buildVignetteLayer();
+    } catch (error) {
+      reportError('resize', error);
+    }
+  }
+
+  function engraveImage(image) {
+    if (!image || !image.complete || !(image.naturalWidth > 0) || !(image.naturalHeight > 0)) return null;
+    var longest = Math.max(image.naturalWidth, image.naturalHeight);
+    var ratio = Math.min(1, 1000 / longest);
+    var width = Math.max(8, Math.round(image.naturalWidth * ratio));
+    var height = Math.max(8, Math.round(image.naturalHeight * ratio));
+    var layer = document.createElement('canvas');
+    layer.width = width;
+    layer.height = height;
+    var context = layer.getContext('2d', { willReadFrequently: true });
+    context.drawImage(image, 0, 0, width, height);
+    var pixels = context.getImageData(0, 0, width, height);
+    var data = pixels.data;
+    for (var offset = 0; offset < data.length; offset += 4) {
+      var luma = (data[offset] * 0.299 + data[offset + 1] * 0.587 + data[offset + 2] * 0.114) / 255;
+      var amount = Math.min(1, Math.max(0, (1 - luma) * 1.30 - 0.045));
+      data[offset] = INK[0];
+      data[offset + 1] = INK[1];
+      data[offset + 2] = INK[2];
+      data[offset + 3] = Math.round(amount * 238);
+    }
+    context.putImageData(pixels, 0, 0);
+    return layer;
+  }
+
+  function loadWoodcut(bucket, url) {
+    var image = new Image();
+    image.decoding = 'async';
+    image.onload = function () {
+      try {
+        bucket.image = image;
+        bucket.canvas = engraveImage(image);
+        bucket.ready = !!bucket.canvas;
+        rebuildPlate();
+      } catch (error) {
+        reportError('engrave', error);
+      }
+    };
+    image.onerror = function () {
+      bucket.failed = true;
+      reportError('asset', new Error('load failed: ' + url));
+    };
+    image.src = url;
+  }
+
+  function loadDisplayFont() {
+    if (!document.fonts || typeof document.fonts.load !== 'function') return;
+    document.fonts.load('40px "StageBlackletter"').then(function () {
+      try { rebuildPlate(); } catch (error) { reportError('font', error); }
+    }, function (error) {
+      reportError('font', error);
+    });
+  }
+
+  function applyInit(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    state.hasInit = true;
+    var song = payload.song || {};
+    state.duration = clampNumber(payload.duration, 0, 86400);
+    state.lines = [];
+    var incoming = Array.isArray(payload.lines) ? payload.lines : [];
+    for (var index = 0; index < incoming.length && index < 400; index++) {
+      var item = incoming[index];
+      if (!item || typeof item !== 'object') continue;
+      var text = typeof item.text === 'string' ? item.text : '';
+      state.lines.push({
+        t: clampNumber(item.t, 0, 86400),
+        dur: clampNumber(item.dur, 0, 600),
+        text: text,
+        chars: Array.isArray(item.chars) ? item.chars : null
+      });
+    }
+    state.idx = -1;
+    state.text = '';
+    state.lineCache = null;
+    state.cacheWidth = 0;
+    state.stampAt = currentStamp();
+    if (Array.isArray(payload.accent)) {
+      accent = [
+        Math.round(clampNumber(payload.accent[0], 0, 255)),
+        Math.round(clampNumber(payload.accent[1], 0, 255)),
+        Math.round(clampNumber(payload.accent[2], 0, 255))
+      ];
+    }
+    state.songName = typeof song.name === 'string' ? song.name : '';
+    recomputeIndex();
+    buildGlowLayer();
+  }
+
+  function recomputeIndex() {
+    var lines = state.lines;
+    var nextIndex = -1;
+    for (var index = 0; index < lines.length; index++) {
+      if (state.time >= lines[index].t - 0.05) nextIndex = index;
+    }
+    if (nextIndex !== state.idx || !state.text) {
+      state.idx = nextIndex;
+      state.text = nextIndex >= 0 ? (lines[nextIndex].text || '') : '';
+      state.lineCache = null;
+      state.cacheWidth = 0;
+      state.stampAt = currentStamp();
+    }
+    state.idx = nextIndex;
+  }
+
+  function applyTick(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    var time = Number(payload.time);
+    if (isFinite(time)) state.time = Math.max(0, time);
+    state.playing = payload.playing !== false;
+    recomputeIndex();
+  }
+
+  window.addEventListener('message', function (event) {
+    try {
+      var data = event && event.data;
+      if (!data || data.__c100 !== 1) return;
+      if (data.type === 'init') applyInit(data.payload);
+      else if (data.type === 'tick') applyTick(data.payload);
+      else if (data.type === 'beat') {
+        var beatPayload = data.payload || {};
+        var beatLevel = clamp01(beatPayload.level);
+        state.pulse = Math.max(state.pulse, 0.35 + beatLevel * 0.65);
+        state.beatIndex = Math.round(clampNumber(beatPayload.index, 0, 100000)) || 0;
+      } else if (data.type === 'live') {
+        var livePayload = data.payload || {};
+        state.level = clamp01(livePayload.level);
+        state.bass = clamp01(livePayload.bass);
+        state.treble = clamp01(livePayload.treble);
+        if (typeof livePayload.playing === 'boolean') state.playing = livePayload.playing;
+      }
+    } catch (error) {
+      reportError('message', error);
+    }
+  });
+
+  var motionQuery = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  function syncMotion() {
+    state.reduced = !!(motionQuery && motionQuery.matches);
+  }
+  if (motionQuery && motionQuery.addEventListener) {
+    motionQuery.addEventListener('change', function () {
+      try { syncMotion(); } catch (error) { reportError('motion', error); }
+    });
+  }
+  syncMotion();
+
+  function makeGradient(pen, builder) {
+    try {
+      var gradient = builder();
+      return gradient || null;
+    } catch (error) {
+      reportError('gradient', error);
+      return null;
+    }
+  }
+
+  function addStop(gradient, position, color) {
+    if (!gradient) return;
+    try { gradient.addColorStop(position, color); }
+    catch (error) { reportError('gradient', error); }
+  }
+
+  function romanNumeral(value) {
+    var number = Math.round(clampNumber(value, 1, 399));
+    var pairs = [[100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
+    var result = '';
+    for (var i = 0; i < pairs.length; i++) {
+      var guard = 0;
+      while (number >= pairs[i][0] && guard < 4) {
+        result += pairs[i][1];
+        number -= pairs[i][0];
+        guard += 1;
+      }
+    }
+    return result || 'I';
+  }
+
+  function formatClock(seconds) {
+    var raw = clampNumber(seconds, 0, 359999);
+    var minutes = Math.floor(raw / 60);
+    var rest = Math.floor(raw % 60);
+    return minutes + ':' + (rest < 10 ? '0' : '') + rest;
+  }
+
+  function measureGlyphs(pen, text, size) {
+    var glyphs = [];
+    var chars = String(text).split('');
+    for (var index = 0; index < chars.length; index++) {
+      var glyphWidth = pen.measureText(chars[index]).width;
+      if (chars[index] === ' ') glyphWidth = Math.max(glyphWidth, size * 0.30);
+      glyphs.push({ c: chars[index], w: glyphWidth });
+    }
+    return glyphs;
+  }
+
+  function sumGlyphWidth(glyphs) {
+    var total = 0;
+    for (var index = 0; index < glyphs.length; index++) total += glyphs[index].w;
+    return total;
+  }
+
+  function wrapGlyphs(glyphs, maxWidth) {
+    var rows = [];
+    var current = [];
+    var width = 0;
+    for (var index = 0; index < glyphs.length; index++) {
+      var glyph = glyphs[index];
+      if (current.length > 0 && width + glyph.w > maxWidth) {
+        var breakAt = -1;
+        if (/[A-Za-z0-9]/.test(glyph.c)) {
+          for (var back = current.length - 1; back >= 0; back--) {
+            if (current[back].c === ' ') { breakAt = back; break; }
+          }
+        }
+        if (breakAt > 0) {
+          var tail = current.slice(breakAt + 1);
+          current = current.slice(0, breakAt);
+          rows.push({ glyphs: current, width: sumGlyphWidth(current) });
+          current = tail;
+          current.push(glyph);
+          width = sumGlyphWidth(current);
+        } else {
+          rows.push({ glyphs: current, width: width });
+          current = [glyph];
+          width = glyph.w;
+        }
+      } else {
+        current.push(glyph);
+        width += glyph.w;
+      }
+    }
+    if (current.length > 0) rows.push({ glyphs: current, width: width });
+    return rows;
+  }
+
+  function trimRow(pen, row, maxWidth) {
+    var ellipsisWidth = pen.measureText('…').width;
+    var kept = [];
+    var width = 0;
+    for (var index = 0; index < row.glyphs.length; index++) {
+      var glyph = row.glyphs[index];
+      if (width + glyph.w + ellipsisWidth > maxWidth) break;
+      kept.push(glyph);
+      width += glyph.w;
+    }
+    if (kept.length === row.glyphs.length) return { glyphs: kept, width: width };
+    kept.push({ c: '…', w: ellipsisWidth });
+    return { glyphs: kept, width: width + ellipsisWidth };
+  }
+
+  function fitBlock(pen, text, maxWidth, maxHeight, baseSize, maxRows) {
+    var chosen = null;
+    var size = baseSize;
+    for (var attempt = 0; attempt < 7; attempt++) {
+      pen.font = serifFont(size, 600);
+      var glyphs = measureGlyphs(pen, text, size);
+      var rows = wrapGlyphs(glyphs, maxWidth);
+      var lineHeight = size * 1.42;
+      chosen = { size: size, lineHeight: lineHeight, rows: rows, height: rows.length * lineHeight };
+      if (rows.length <= maxRows && rows.length * lineHeight <= maxHeight) break;
+      size = size * 0.90;
+      if (size < 11) break;
+    }
+    if (!chosen) return null;
+    if (chosen.rows.length > maxRows) chosen.rows = chosen.rows.slice(0, maxRows);
+    for (var rowIndex = 0; rowIndex < chosen.rows.length; rowIndex++) {
+      if (chosen.rows[rowIndex].width > maxWidth) {
+        chosen.rows[rowIndex] = trimRow(pen, chosen.rows[rowIndex], maxWidth);
+      }
+    }
+    chosen.height = chosen.rows.length * chosen.lineHeight;
+    return chosen;
+  }
+
+  function buildCharTimes(line, text) {
+    var times = [];
+    var count = text.length;
+    var source = line && line.chars && line.chars.length ? line.chars : null;
+    var sourceCount = source ? source.length : 0;
+    var duration = (line && line.dur > 0.4) ? line.dur : Math.max(1.1, count * 0.16);
+    var start = line ? clampNumber(line.t, 0, 86400) : 0;
+    for (var index = 0; index < count; index++) {
+      var value = NaN;
+      if (sourceCount > 0) {
+        var mapped = sourceCount === count ? index : Math.min(sourceCount - 1, Math.floor(index * sourceCount / Math.max(1, count)));
+        var entry = source[mapped];
+        value = Number(entry && entry.t);
+      }
+      if (!isFinite(value)) value = start + (index / Math.max(1, count)) * duration * 0.94;
+      times.push(value);
+    }
+    return times;
+  }
+
+  function ensureLineCache() {
+    var rect = geom.text;
+    if (!rect || rect.w < 40 || rect.h < 40) return null;
+    var widthKey = Math.round(rect.w);
+    if (state.lineCache && state.lineCache.index === state.idx && state.cacheWidth === widthKey) {
+      return state.lineCache;
+    }
+    var index = state.idx;
+    var line = index >= 0 ? state.lines[index] : null;
+    var baseSize = clampNumber(Math.min(rect.w / 13.5, layout.h * 0.070), 19, 62);
+    var maxWidth = rect.w * 0.94;
+    var block = null;
+    if (line && line.text) {
+      block = fitBlock(ctx, line.text, maxWidth, rect.h * 0.52, baseSize, 3);
+      if (block) {
+        var charTimes = buildCharTimes(line, line.text);
+        var cursor = 0;
+        for (var rowIndex = 0; rowIndex < block.rows.length; rowIndex++) {
+          var row = block.rows[rowIndex];
+          for (var glyphIndex = 0; glyphIndex < row.glyphs.length; glyphIndex++) {
+            row.glyphs[glyphIndex].t = charTimes[Math.min(cursor, charTimes.length - 1)];
+            cursor += 1;
+          }
+        }
+      }
+    }
+    var prevBlock = null;
+    var nextBlock = null;
+    var size = block ? block.size : baseSize;
+    if (index > 0 && state.lines[index - 1] && state.lines[index - 1].text) {
+      prevBlock = fitBlock(ctx, state.lines[index - 1].text, maxWidth * 0.88, rect.h * 0.20, size * 0.58, 2);
+    }
+    if (index + 1 < state.lines.length && state.lines[index + 1] && state.lines[index + 1].text) {
+      nextBlock = fitBlock(ctx, state.lines[index + 1].text, maxWidth * 0.88, rect.h * 0.20, size * 0.54, 2);
+    }
+    state.lineCache = {
+      index: index, width: widthKey, block: block,
+      prev: prevBlock, next: nextBlock, size: size
+    };
+    state.cacheWidth = widthKey;
+    return state.lineCache;
+  }
+
+  function drawGlyphBlock(pen, block, centerX, topY, alpha, revealed) {
+    if (!block || !block.rows) return;
+    pen.font = serifFont(block.size, 600);
+    pen.textAlign = 'left';
+    pen.textBaseline = 'middle';
+    var rowIndex;
+    var glyphIndex;
+    if (block.rows.length === 0) return;
+    for (rowIndex = 0; rowIndex < block.rows.length; rowIndex++) {
+      var row = block.rows[rowIndex];
+      var baseline = topY + (rowIndex + 0.5) * block.lineHeight;
+      var x = centerX - row.width / 2;
+      for (glyphIndex = 0; glyphIndex < row.glyphs.length; glyphIndex++) {
+        var glyph = row.glyphs[glyphIndex];
+        var inkAmount = 1;
+        if (revealed) {
+          var charTime = Number(glyph.t);
+          inkAmount = isFinite(charTime) ? clamp01((state.time - charTime) / 0.22) : 1;
+          if (inkAmount <= 0) { x += glyph.w; continue; }
+        }
+        pen.fillStyle = ink(alpha * (0.42 + 0.58 * inkAmount));
+        pen.fillText(glyph.c, x, baseline - (revealed ? (1 - inkAmount) * block.size * 0.10 : 0));
+        x += glyph.w;
+      }
+    }
+  }
+
+  function drawStaticBlock(pen, block, centerX, topY, alpha) {
+    if (!block) return;
+    pen.font = serifFont(block.size, 600);
+    pen.textAlign = 'center';
+    pen.textBaseline = 'middle';
+    pen.fillStyle = ink(alpha);
+    for (var rowIndex = 0; rowIndex < block.rows.length; rowIndex++) {
+      var row = block.rows[rowIndex];
+      var baseline = topY + (rowIndex + 0.5) * block.lineHeight;
+      var text = '';
+      for (var glyphIndex = 0; glyphIndex < row.glyphs.length; glyphIndex++) text += row.glyphs[glyphIndex].c;
+      pen.fillText(text, centerX, baseline);
+    }
+  }
+
+  function drawFleuron(pen, centerX, centerY, size, alpha) {
+    pen.save();
+    pen.strokeStyle = ink(alpha);
+    pen.fillStyle = ink(alpha);
+    pen.lineWidth = Math.max(0.8, size * 0.055);
+    pen.beginPath();
+    pen.arc(centerX, centerY, size * 0.30, 0, Math.PI * 2);
+    pen.stroke();
+    pen.beginPath();
+    pen.moveTo(centerX, centerY - size * 0.62);
+    pen.lineTo(centerX + size * 0.30, centerY);
+    pen.lineTo(centerX, centerY + size * 0.62);
+    pen.lineTo(centerX - size * 0.30, centerY);
+    pen.closePath();
+    pen.stroke();
+    for (var index = 0; index < 4; index++) {
+      var angle = index * Math.PI / 2 + Math.PI / 4;
+      pen.beginPath();
+      pen.arc(centerX + Math.cos(angle) * size * 0.48, centerY + Math.sin(angle) * size * 0.48, size * 0.055, 0, Math.PI * 2);
+      pen.fill();
+    }
+    pen.restore();
+  }
+
+  function drawSkull(pen, x, y, size, alpha) {
+    if (size < 2) return;
+    pen.save();
+    pen.fillStyle = ink(alpha);
+    pen.beginPath();
+    pen.arc(x, y - size * 0.10, size * 0.48, Math.PI * 1.02, Math.PI * 1.98);
+    pen.lineTo(x + size * 0.30, y + size * 0.30);
+    pen.lineTo(x - size * 0.30, y + size * 0.30);
+    pen.closePath();
+    pen.fill();
+    pen.fillRect(x - size * 0.16, y + size * 0.28, size * 0.32, size * 0.30);
+    pen.fillStyle = paperColor(0.95);
+    pen.beginPath();
+    pen.arc(x - size * 0.19, y - size * 0.10, size * 0.12, 0, Math.PI * 2);
+    pen.arc(x + size * 0.19, y - size * 0.10, size * 0.12, 0, Math.PI * 2);
+    pen.fill();
+    pen.fillStyle = ink(alpha * 0.85);
+    pen.fillRect(x - size * 0.06, y + size * 0.02, size * 0.12, size * 0.10);
+    pen.restore();
+  }
+
+  function drawEmptyState(pen, rect) {
+    var centerX = rect.x + rect.w / 2;
+    var centerY = rect.y + rect.h * 0.50;
+    var size = clampNumber(Math.min(rect.w * 0.11, rect.h * 0.14), 20, 62);
+    drawFleuron(pen, centerX, centerY - size * 2.2, size * 0.62, 0.55);
+    pen.textAlign = 'center';
+    pen.textBaseline = 'middle';
+    pen.font = blackletterFont(size);
+    pen.fillStyle = ink(0.88);
+    drawSpacedText(pen, 'SILENTIVM', centerX, centerY - size * 0.55, size * 0.07);
+
+    pen.strokeStyle = ink(0.48);
+    pen.lineWidth = 1;
+    pen.beginPath();
+    pen.moveTo(centerX - size * 1.9, centerY + size * 0.10);
+    pen.lineTo(centerX + size * 1.9, centerY + size * 0.10);
+    pen.stroke();
+    pen.save();
+    pen.translate(centerX, centerY + size * 0.10);
+    pen.rotate(Math.PI / 4);
+    pen.fillStyle = ink(0.7);
+    pen.fillRect(-size * 0.07, -size * 0.07, size * 0.14, size * 0.14);
+    pen.restore();
+
+    var chineseSize = clampNumber(size * 0.46, 13, 26);
+    pen.font = serifFont(chineseSize, 600);
+    pen.fillStyle = ink(0.82);
+    drawSpacedText(pen, '此曲无铭文', centerX, centerY + size * 0.85, chineseSize * 0.30);
+
+    var latinSize = clampNumber(size * 0.24, 8, 12);
+    pen.font = serifFont(latinSize, 400);
+    pen.fillStyle = ink(0.45);
+    drawSpacedText(pen, 'NEC VOX · NEC VERBA', centerX, centerY + size * 1.75, latinSize * 0.30);
+  }
+
+  function drawLyrics(pen) {
+    var rect = geom.text;
+    if (!rect) return;
+    if (!state.lines.length) {
+      if (state.hasInit) drawEmptyState(pen, rect);
+      return;
+    }
+    var cache = ensureLineCache();
+    if (!cache) return;
+    var centerX = rect.x + rect.w / 2;
+
+    var elapsed = currentStamp() - state.stampAt;
+    var ease = 1 - Math.pow(1 - clamp01(elapsed / 280), 3);
+    var block = cache.block;
+    var prevBlock = cache.prev;
+    var nextBlock = cache.next;
+    var gap = block ? block.size * 0.85 : 20;
+
+    var prevHeight = prevBlock ? prevBlock.height : 0;
+    var blockHeight = block ? block.height : 0;
+    var nextHeight = nextBlock ? nextBlock.height : 0;
+    var totalHeight = prevHeight + blockHeight + nextHeight + (prevBlock ? gap : 0) + (nextBlock ? gap : 0);
+    if (totalHeight > rect.h * 0.94 && nextBlock) {
+      nextBlock = null;
+      nextHeight = 0;
+      totalHeight = prevHeight + blockHeight + (prevBlock ? gap : 0);
+    }
+    if (totalHeight > rect.h * 0.94 && prevBlock) {
+      prevBlock = null;
+      prevHeight = 0;
+      totalHeight = blockHeight;
+    }
+
+    var topY = rect.y + (rect.h - totalHeight) * 0.5;
+    if (prevBlock) {
+      drawStaticBlock(pen, prevBlock, centerX, topY, 0.30);
+      topY += prevBlock.height + gap;
+    }
+    if (block) {
+      pen.save();
+      pen.translate(0, (1 - ease) * block.size * 0.16);
+      drawGlyphBlock(pen, block, centerX, topY, 0.42 + 0.58 * ease, true);
+      pen.restore();
+      topY += block.height + gap;
+    }
+    if (nextBlock) {
+      drawStaticBlock(pen, nextBlock, centerX, topY, 0.20);
+    }
+
+    if (block && !geom.portrait && rect.w > 420) {
+      var numeralSize = clampNumber(block.size * 0.24, 8, 13);
+      var numeralY = rect.y + (rect.h - totalHeight) * 0.5 + (prevBlock ? prevBlock.height + gap : 0) + block.lineHeight * 0.5;
+      var columnX = rect.x - clampNumber(geom.innerW * 0.022, 8, 26);
+      pen.font = serifFont(numeralSize, 500);
+      pen.fillStyle = ink(0.42);
+      pen.textAlign = 'center';
+      pen.textBaseline = 'middle';
+      pen.fillText(romanNumeral(state.idx + 1), columnX, numeralY);
+      pen.textAlign = 'center';
+    }
+  }
+
+  function ensureDust() {
+    if (state.dust) return;
+    var random = makeRandom(372991);
+    var items = [];
+    for (var index = 0; index < 26; index++) {
+      items.push({
+        x: random(), y: random(),
+        radius: 0.5 + random() * 1.6,
+        driftX: (random() - 0.5) * 0.010,
+        driftY: -0.004 - random() * 0.012,
+        alpha: 0.05 + random() * 0.10
+      });
+    }
+    state.dust = items;
+  }
+
+  function updateDust(deltaMs) {
+    ensureDust();
+    var items = state.dust;
+    var step = clampNumber(deltaMs, 0, 64) / 16.7;
+    for (var index = 0; index < items.length; index++) {
+      var item = items[index];
+      item.x += item.driftX * step * 0.01;
+      item.y += item.driftY * step * 0.01;
+      if (item.y < -0.04) { item.y = 1.04; item.x = Math.random(); }
+      if (item.x < -0.04) item.x = 1.04;
+      if (item.x > 1.04) item.x = -0.04;
+    }
+  }
+
+  function drawDust(pen) {
+    if (state.reduced) return;
+    ensureDust();
+    var items = state.dust;
+    var alphaBoost = 0.6 + state.bass * 0.8;
+    for (var bucket = 0; bucket < 3; bucket++) {
+      pen.fillStyle = ink((0.055 + bucket * 0.045) * alphaBoost);
+      pen.beginPath();
+      for (var index = bucket; index < items.length; index += 3) {
+        var item = items[index];
+        var pointX = item.x * layout.w;
+        var pointY = item.y * layout.h;
+        pen.moveTo(pointX + item.radius, pointY);
+        pen.arc(pointX, pointY, item.radius, 0, Math.PI * 2);
+      }
+      pen.fill();
+    }
+  }
+
+  function drawGlow(pen) {
+    if (!geom || !geom.plate) return;
+    if (!isDrawable(glowLayer && glowLayer.canvas)) return;
+    var flicker = 0.58 + 0.42 * Math.sin(state.clock * 2.7) * Math.cos(state.clock * 1.3 + 0.7);
+    var energy = clamp01(0.32 + state.bass * 0.85 + state.pulse * 0.55);
+    var strength = (state.reduced ? 0.7 : flicker) * energy;
+    if (strength <= 0.02) return;
+    pen.save();
+    pen.globalCompositeOperation = 'multiply';
+    pen.globalAlpha = clamp01(strength);
+    pen.drawImage(glowLayer.canvas, glowLayer.x, glowLayer.y, glowLayer.size, glowLayer.size);
+    pen.restore();
+  }
+
+  function drawFooter(pen) {
+    var baseY = geom.innerY + geom.innerH - geom.footH * 0.46;
+    var left = geom.innerX + geom.band * 0.5;
+    var right = geom.innerX + geom.innerW - geom.band * 0.5;
+    var width = Math.max(40, right - left);
+    var ratio = state.duration > 0 ? clamp01(state.time / state.duration) : 0;
+
+    pen.strokeStyle = ink(0.30);
+    pen.lineWidth = 1;
+    pen.beginPath();
+    pen.moveTo(left, baseY);
+    pen.lineTo(right, baseY);
+    pen.stroke();
+
+    var tickCount = Math.min(48, Math.max(16, Math.round(width / 26)));
+    pen.beginPath();
+    for (var tick = 0; tick <= tickCount; tick++) {
+      var tickX = left + width * (tick / tickCount);
+      var tickHeight = tick % 4 === 0 ? 4 : 2;
+      pen.moveTo(tickX, baseY);
+      pen.lineTo(tickX, baseY - tickHeight);
+    }
+    pen.stroke();
+
+    if (ratio > 0) {
+      pen.strokeStyle = ink(0.86);
+      pen.lineWidth = Math.max(2, geom.band * 0.22);
+      pen.beginPath();
+      pen.moveTo(left, baseY);
+      pen.lineTo(left + width * ratio, baseY);
+      pen.stroke();
+    }
+
+    var markerSize = clampNumber(geom.footH * 0.20, 6, 13);
+    drawSkull(pen, left + width * ratio, baseY - markerSize * 0.72, markerSize, 0.9);
+
+    var timeSize = clampNumber(geom.footH * 0.16, 7.5, 11);
+    pen.font = serifFont(timeSize, 400);
+    pen.textBaseline = 'alphabetic';
+    pen.fillStyle = ink(0.46);
+    pen.textAlign = 'left';
+    pen.fillText(formatClock(state.time), left, baseY - markerSize * 1.6);
+    if (state.duration > 0) {
+      pen.textAlign = 'right';
+      pen.fillText(formatClock(state.duration), right, baseY - markerSize * 1.6);
+    }
+    pen.textAlign = 'center';
+
+    var dialSize = clampNumber(geom.footH * 0.16, 7, 10);
+    var dialCount = 12;
+    var dialWidth = Math.min(width * 0.42, dialCount * dialSize * 3.2);
+    var dialLeft = left + (width - dialWidth) / 2;
+    var active = Math.abs(state.beatIndex) % dialCount;
+    for (var mark = 0; mark < dialCount; mark++) {
+      var markX = dialLeft + dialWidth * (mark + 0.5) / dialCount;
+      var markY = baseY - markerSize * 2.5;
+      var lit = mark === active ? 0.82 : 0.30;
+      pen.fillStyle = ink(lit);
+      pen.beginPath();
+      if (mark % 3 === 0) {
+        pen.arc(markX, markY, dialSize * 0.32, 0, Math.PI * 2);
+        pen.fill();
+      } else if (mark % 3 === 1) {
+        pen.moveTo(markX, markY - dialSize * 0.40);
+        pen.lineTo(markX + dialSize * 0.36, markY + dialSize * 0.28);
+        pen.lineTo(markX - dialSize * 0.36, markY + dialSize * 0.28);
+        pen.closePath();
+        pen.fill();
+      } else {
+        pen.fillRect(markX - dialSize * 0.28, markY - dialSize * 0.28, dialSize * 0.56, dialSize * 0.56);
+      }
+    }
+  }
+
+  var marqueeCache = { unit: '', width: 0, size: 0 };
+  function drawMarquee(pen) {
+    var size = clampNumber(geom.footH * 0.135, 6.5, 9.5);
+    var stripBaseline = geom.innerY + geom.innerH - size * 0.9;
+    var left = geom.innerX + geom.band;
+    var right = geom.innerX + geom.innerW - geom.band;
+    if (right - left < 80) return;
+    var unit = 'DE LAMIIS · ET PYTHONICIS · SABBATVM · MALLEVS · STRIGA · VENEFICIVM · ';
+    if (marqueeCache.unit !== unit || marqueeCache.size !== size) {
+      pen.font = serifFont(size, 400);
+      marqueeCache.unit = unit;
+      marqueeCache.size = size;
+      marqueeCache.width = Math.max(40, pen.measureText(unit).width);
+    }
+    pen.font = serifFont(size, 400);
+    pen.fillStyle = ink(0.36);
+    pen.textAlign = 'left';
+    pen.textBaseline = 'alphabetic';
+    var offset = state.reduced ? 0 : (state.clock * 8) % marqueeCache.width;
+    pen.save();
+    pen.beginPath();
+    pen.rect(left, stripBaseline - size * 1.6, right - left, size * 2.4);
+    pen.clip();
+    for (var x = left - offset; x < right; x += marqueeCache.width) {
+      pen.fillText(unit, x, stripBaseline);
+    }
+    pen.restore();
+  }
+
+  var vignetteLayer = null;
+  var glowLayer = null;
+
+  function buildVignetteLayer() {
+    if (layout.w < 2 || layout.h < 2) return;
+    var layer = document.createElement('canvas');
+    layer.width = Math.max(1, Math.round(layout.w * layout.dpr));
+    layer.height = Math.max(1, Math.round(layout.h * layout.dpr));
+    var layerCtx = layer.getContext('2d');
+    layerCtx.setTransform(layout.dpr, 0, 0, layout.dpr, 0, 0);
+    var centerX = layout.w / 2;
+    var centerY = layout.h / 2;
+    var radius = Math.max(layout.w, layout.h) * 0.74;
+    var gradient = makeGradient(layerCtx, function () {
+      var built = layerCtx.createRadialGradient(centerX, centerY, radius * 0.32, centerX, centerY, radius);
+      addStop(built, 0, 'rgba(34,22,10,0)');
+      addStop(built, 1, 'rgba(34,22,10,0.085)');
+      return built;
+    });
+    if (!gradient) return;
+    layerCtx.fillStyle = gradient;
+    layerCtx.fillRect(0, 0, layout.w, layout.h);
+    vignetteLayer = layer;
+  }
+
+  function buildGlowLayer() {
+    glowLayer = null;
+    if (!geom || !geom.plate) return;
+    var radius = Math.max(12, geom.plate.w * 0.62);
+    var size = Math.max(8, Math.round(radius * 2));
+    var layer = document.createElement('canvas');
+    layer.width = Math.min(2048, Math.round(size * layout.dpr));
+    layer.height = Math.min(2048, Math.round(size * layout.dpr));
+    var layerCtx = layer.getContext('2d');
+    var scale = layer.width / size;
+    layerCtx.setTransform(scale, 0, 0, scale, 0, 0);
+    var gradient = makeGradient(layerCtx, function () {
+      var built = layerCtx.createRadialGradient(radius, radius, radius * 0.05, radius, radius, radius);
+      addStop(built, 0, accentColor(0.30));
+      addStop(built, 0.55, accentColor(0.13));
+      addStop(built, 1, accentColor(0));
+      return built;
+    });
+    if (!gradient) return;
+    layerCtx.fillStyle = gradient;
+    layerCtx.fillRect(0, 0, size, size);
+    glowLayer = { canvas: layer, x: geom.plate.x + geom.plate.w * 0.52 - radius, y: geom.plate.y + geom.plate.h * 0.80 - radius, size: size };
+  }
+
+  function drawVignette(pen) {
+    var amount = clamp01(0.55 + state.pulse * 0.55);
+    if (isDrawable(vignetteLayer)) {
+      pen.save();
+      pen.globalAlpha = amount;
+      pen.drawImage(vignetteLayer, 0, 0, layout.w, layout.h);
+      pen.restore();
+      return;
+    }
+    var centerX = layout.w / 2;
+    var centerY = layout.h / 2;
+    var radius = Math.max(layout.w, layout.h) * 0.74;
+    var gradient = makeGradient(pen, function () {
+      var built = pen.createRadialGradient(centerX, centerY, radius * 0.34, centerX, centerY, radius);
+      addStop(built, 0, 'rgba(38,26,12,0)');
+      addStop(built, 1, 'rgba(38,26,12,0.06)');
+      return built;
+    });
+    if (!gradient) return;
+    pen.fillStyle = gradient;
+    pen.fillRect(0, 0, layout.w, layout.h);
+  }
+
+  function drawPalimpsest(pen) {
+    var target = geom.text;
+    if (!target || !isDrawable(knight.canvas)) return;
+    var height = target.h * 1.04;
+    var width = Math.min(target.w * 0.92, height * (knight.canvas.width / knight.canvas.height) * 1.30);
+    var x = target.x + target.w - width * 0.96;
+    var y = target.y + (target.h - height) * 0.5;
+    pen.save();
+    pen.globalAlpha = state.reduced ? 0.06 : 0.05 + state.pulse * 0.025;
+    pen.beginPath();
+    pen.rect(target.x, target.y, target.w, target.h);
+    pen.clip();
+    pen.drawImage(knight.canvas, x, y, width, height);
+    pen.restore();
+  }
+
+  function drawPlatePulse(pen) {
+    var target = geom.plate;
+    if (!target || state.pulse <= 0.02) return;
+    var strength = clamp01(state.pulse);
+    pen.save();
+    pen.strokeStyle = ink(strength * 0.24);
+    pen.lineWidth = 1 + strength * 2.2;
+    pen.strokeRect(target.x - 2, target.y - 2, target.w + 4, target.h + 4);
+    pen.restore();
+  }
+
+  function drawScene() {
+    var width = layout.w;
+    var height = layout.h;
+    ctx.setTransform(layout.dpr, 0, 0, layout.dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    if (isDrawable(plate)) ctx.drawImage(plate, 0, 0, width, height);
+    if (!geom) return;
+    drawGlow(ctx);
+    drawPalimpsest(ctx);
+    drawPlatePulse(ctx);
+    drawDust(ctx);
+    drawLyrics(ctx);
+    drawFooter(ctx);
+    drawMarquee(ctx);
+    drawVignette(ctx);
+  }
+
+  var lastFrameAt = 0;
+  function loop(nowMs) {
+    window.requestAnimationFrame(loop);
+    var startedAt = currentStamp();
+    var delta = lastFrameAt > 0 ? Math.min(80, Math.max(0, nowMs - lastFrameAt)) : 16;
+    lastFrameAt = nowMs;
+    state.clock += delta / 1000;
+    state.pulse = Math.max(0, state.pulse - delta * 0.0016);
+    updateDust(delta);
+    state.frames += 1;
+    try {
+      drawScene();
+    } catch (error) {
+      reportError('draw', error);
+    }
+    state.jsMs = currentStamp() - startedAt;
+  }
+
+  var resizeTimer = 0;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) window.clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(function () {
+      resizeTimer = 0;
+      try { resize(); } catch (error) { reportError('resize', error); }
+    }, 120);
+  });
+  window.addEventListener('orientationchange', function () {
+    if (resizeTimer) window.clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(function () {
+      resizeTimer = 0;
+      try { resize(); } catch (error) { reportError('resize', error); }
+    }, 200);
+  });
+
+  function bootVisuals() {
+    try {
+      buildGrain();
+    } catch (error) {
+      reportError('grain', error);
+    }
+    try {
+      resize();
+    } catch (error) {
+      reportError('resize', error);
+      layout.w = 1440;
+      layout.h = 900;
+      layout.dpr = 1;
+      canvas.width = 1440;
+      canvas.height = 900;
+      plate.width = 1440;
+      plate.height = 900;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      rebuildPlate();
+      buildVignetteLayer();
+    }
+    try {
+      loadWoodcut(hero, './assets/372-hexen.jpg');
+      loadWoodcut(knight, './assets/372-knight.jpg');
+      loadDisplayFont();
+    } catch (error) {
+      reportError('assets', error);
+    }
+  }
+
+  window.requestAnimationFrame(function () {
+    signalReady();
+    window.requestAnimationFrame(function () {
+      bootVisuals();
+    });
+  });
+  window.setTimeout(signalReady, 800);
+  window.requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

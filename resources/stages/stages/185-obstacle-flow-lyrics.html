@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>绕流歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060b;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;color:rgba(150,190,255,.26);
+        letter-spacing:.16em;pointer-events:none;transition:opacity .6s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   225 · 绕流 —— 一整片气流从左边吹过来，字是挡在气流里的**实体**
+
+   机制一句话：字不画出来，而是当作障碍物放进一股从左到右的粒子流里；
+   粒子撞到笔画会被法向推出去、沿表面滑走、在字后面脱出涡街。于是字是
+   由"粒子绕开的空腔 + 贴着笔画滞止发亮的边框 + 下游的尾迹"三者一起读出来的。
+   → 亮的是被字挡住的那一圈，暗的是字本身； udara 的方向感就是空间感。
+
+   · 法向来自半分辨率掩码的梯度（烘一次），帧里只查表。
+   · 碰撞时把速度切成"法向反弹 + 切向滑移"，再叠一点曲率涡量 → 尾迹会摆。
+   · 字的淡影只给 0.16，主要负责把轮廓钉住，其余交给粒子。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+let W = 1, H = 1, DPR = 1, VX = 1, VY = 1;
+const RM = (() => { try { return matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_) { return false; } })();
+
+let ACC = [126, 178, 255], FOG = [4, 7, 14], ICE = [226, 240, 255];
+function buildColors() {
+  const r = ACC[0] | 0, g = ACC[1] | 0, b = ACC[2] | 0;
+  FOG = [2 + (r * 0.035) | 0, 3 + (g * 0.045) | 0, 7 + (b * 0.06) | 0];
+  ICE = [Math.min(255, Math.round(r * 0.34 + 170)), Math.min(255, Math.round(g * 0.34 + 180)), Math.min(255, Math.round(b * 0.28 + 186))];
+}
+
+/* ---------------- 排版 ---------------- */
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+const fontStr = (fs) => '800 ' + fs + 'px ' + FAMILY;
+const TRACK = 0.035;
+const OPUNCT = '，。、；：！？）】》」』”’,.!?;:)]}%…';
+const LPUNCT = '（【《「『“‘({[';
+const measCtx = document.createElement('canvas').getContext('2d');
+function measureStr(s, fs) {
+  measCtx.font = fontStr(fs);
+  let w = 0;
+  for (let i = 0; i < s.length; i++) w += measCtx.measureText(s[i]).width + fs * TRACK;
+  return Math.max(0, w - fs * TRACK);
+}
+function splitRows(s, L) {
+  const n = s.length, cuts = [];
+  for (let i = 1; i < L; i++) {
+    let c = Math.round(i * n / L);
+    while (c < n && OPUNCT.indexOf(s[c]) >= 0) c++;
+    if (c > 0 && c < n && LPUNCT.indexOf(s[c - 1]) >= 0) c--;
+    if (c <= 0 || c >= n) continue;
+    if (cuts.length && c <= cuts[cuts.length - 1]) continue;
+    cuts.push(c);
+  }
+  const rows = [];
+  let prev = 0;
+  for (let i = 0; i < cuts.length; i++) { rows.push(s.slice(prev, cuts[i])); prev = cuts[i]; }
+  rows.push(s.slice(prev));
+  return rows.filter((r) => r.length > 0);
+}
+function layout(raw) {
+  if (!raw) return null;
+  const s = raw.replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const n = s.length;
+  const maxW = Math.min(W * 0.72, 1060), maxH = H * 0.34;
+  const maxL = n <= 12 ? 1 : (n <= 24 ? 2 : 3);
+  let best = null;
+  for (let L = 1; L <= maxL; L++) {
+    if (L > 1 && n < L + 2) continue;
+    const rows = splitRows(s, L);
+    let w100 = 0;
+    for (let i = 0; i < rows.length; i++) w100 = Math.max(w100, measureStr(rows[i], 100));
+    const fs = Math.min(maxW / (Math.max(1, w100) / 100), maxH / (1.22 * rows.length), 168);
+    if (fs < 24) continue;
+    if (best && fs < best.fs * 1.07) continue;
+    best = { rows: rows, fs: fs };
+  }
+  if (!best) {
+    const w100 = Math.max(1, measureStr(s, 100));
+    best = { rows: [s], fs: Math.max(20, Math.min(maxW / (w100 / 100), maxH / 1.22, 168)) };
+  }
+  const fs = best.fs, lh = fs * 1.22;
+  measCtx.font = fontStr(fs);
+  const rows = [];
+  let bw = 0;
+  for (let r = 0; r < best.rows.length; r++) {
+    const txt = best.rows[r], chars = [];
+    let x = 0;
+    for (let k = 0; k < txt.length; k++) {
+      const c = txt[k], wch = measCtx.measureText(c).width;
+      if (c !== ' ') chars.push({ c: c, x: x, w: wch });
+      x += wch + fs * TRACK;
+    }
+    const rw = Math.max(0, x - fs * TRACK);
+    rows.push({ chars: chars, w: rw, ly: (r + 0.5) * lh });
+    if (rw > bw) bw = rw;
+  }
+  const bh = lh * rows.length;
+  return { rows: rows, fs: fs, lh: lh, bw: Math.max(1, bw), bh: bh };
+}
+function paintRows(g, lay, ox, oy) {
+  g.font = fontStr(lay.fs); g.textAlign = 'left'; g.textBaseline = 'middle';
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let k = 0; k < row.chars.length; k++) g.fillText(row.chars[k].c, ox + row.chars[k].x, oy + row.ly);
+  }
+}
+
+/* ---------------- 掩码 + 法向 ---------------- */
+const MS = 0.5;
+const offCv = document.createElement('canvas');
+const offCtx = offCv.getContext('2d', { willReadFrequently: true });
+let mask = null, gxN = null, gyN = null, mw = 0, mh = 0, mox = 0, moy = 0;
+
+function bakeLine(text) {
+  const lay = layout(text);
+  if (!lay) return null;
+  const pad = Math.round(lay.fs * 0.30) + 18;
+  const bw = Math.ceil(lay.bw) + pad * 2;
+  const bh = Math.ceil(lay.bh) + pad * 2;
+  const gx = VX - bw / 2, gy = VY - bh / 2;
+
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(bw * DPR)); c.height = Math.max(2, Math.round(bh * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.fillStyle = '#fff';
+  paintRows(g, lay, pad, pad);
+
+  /* 轮廓亮边：沿着字的外缘再画一遍模糊的主色，粒子撞上去时"接得住" */
+  const rim = document.createElement('canvas');
+  rim.width = Math.max(2, Math.round(bw)); rim.height = Math.max(2, Math.round(bh));
+  const rg = rim.getContext('2d');
+  rg.setTransform(DPR, 0, 0, DPR, 0, 0);
+  rg.filter = 'blur(' + Math.max(3, Math.round(lay.fs * 0.035)) + 'px)';
+  rg.fillStyle = 'rgb(' + Math.min(255, ACC[0] + 60) + ',' + Math.min(255, ACC[1] + 66) + ',' + Math.min(255, ACC[2] + 46) + ')';
+  paintRows(rg, lay, pad, pad);
+  rg.filter = 'none';
+
+  mw = Math.max(2, Math.round(bw * MS)); mh = Math.max(2, Math.round(bh * MS));
+  offCv.width = mw; offCv.height = mh;
+  offCtx.setTransform(1, 0, 0, 1, 0, 0);
+  offCtx.clearRect(0, 0, mw, mh);
+  offCtx.setTransform(MS, 0, 0, MS, 0, 0);
+  offCtx.fillStyle = '#fff';
+  paintRows(offCtx, lay, pad, pad);
+  mox = gx; moy = gy;
+  const d = offCtx.getImageData(0, 0, mw, mh).data;
+  mask = new Uint8Array(mw * mh);
+  gxN = new Float32Array(mw * mh); gyN = new Float32Array(mw * mh);
+  for (let i = 0, p = 3; i < mw * mh; i++, p += 4) if (d[p] > 110) mask[i] = 1;
+  /* 法向（指向墨迹外）：对掩码做一次平滑再取梯度，边缘才不会有锯齿 */
+  for (let y = 1; y < mh - 1; y++) {
+    for (let x = 1; x < mw - 1; x++) {
+      const i = y * mw + x;
+      let sx = 0, sy = 0, n = 0;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const v = mask[(y + dy) * mw + (x + dx)];
+          if (v) { sx += dx; sy += dy; n++; }
+        }
+      }
+      if (!n) continue;
+      sx /= n; sy /= n;
+      const m = Math.hypot(sx, sy) || 1;
+      /* 邻居重心在笔画内侧，所以取反才是朝外的法向 */
+      gxN[i] = -sx / m; gyN[i] = -sy / m;
+    }
+  }
+  return { lay: lay, crisp: c, rim: rim, bw: bw, bh: bh, gx: gx, gy: gy };
+}
+
+/* ---------------- 粒子 ---------------- */
+const N = 11000;
+const px = new Float32Array(N), py = new Float32Array(N);
+const vx = new Float32Array(N), vy = new Float32Array(N);
+const ppx = new Float32Array(N), ppy = new Float32Array(N);
+const spd = new Float32Array(N), rimT = new Float32Array(N), lf = new Float32Array(N);
+let flow = 170;
+
+function respawn(i, anywhere) {
+  px[i] = anywhere ? Math.random() * W : -20 - Math.random() * 120;
+  py[i] = Math.random() * H;
+  ppx[i] = px[i]; ppy[i] = py[i];
+  vx[i] = flow; vy[i] = 0;
+  spd[i] = 0.6 + Math.random() * 0.8;
+  rimT[i] = 0;
+  lf[i] = 0.5 + Math.random() * 0.5;
+}
+for (let i = 0; i < N; i++) respawn(i, true);
+
+function cellOf(sx, sy) {
+  const i = ((sy - moy) * MS) | 0, j = ((sx - mox) * MS) | 0;
+  if (i < 0 || j < 0 || i >= mh || j >= mw) return -1;
+  return i * mw + j;
+}
+
+/* ---------------- 状态 ---------------- */
+let lines = [], curIdx = -1, brewIdx = -1, lastT = -1;
+let prep = null, prepIdx = -1, glyph = null, reveal = 0, needRebake = false;
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let vT = 0, beat = 0;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  VX = W / 2; VY = H * 0.49;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBG();
+  needRebake = true;
+}
+let bgGrad = null, vigGrad = null;
+function buildBG() {
+  const g = ctx.createLinearGradient(0, 0, W, H);
+  g.addColorStop(0, 'rgb(' + (FOG[0] + 4) + ',' + (FOG[1] + 7) + ',' + (FOG[2] + 13) + ')');
+  g.addColorStop(0.5, 'rgb(' + (FOG[0] + 8) + ',' + (FOG[1] + 12) + ',' + (FOG[2] + 22) + ')');
+  g.addColorStop(1, 'rgb(' + (FOG[0] + 2) + ',' + (FOG[1] + 4) + ',' + (FOG[2] + 9) + ')');
+  bgGrad = g;
+  const v = ctx.createRadialGradient(VX, VY, Math.min(W, H) * 0.28, VX, VY, Math.min(W, H) * 1.05);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(1,2,5,0.60)');
+  vigGrad = v;
+}
+
+function timing(T) {
+  if (!lines.length) { if (glyph) { glyph = null; curIdx = -1; mask = null; } return; }
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; prep = null; prepIdx = -1; glyph = null; mask = null; reveal = 0; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci; brewIdx = -1;
+    glyph = ci >= 0 ? ((prep && prepIdx === ci) ? prep : bakeLine(lines[ci].text)) : null;
+    if (!glyph) mask = null;
+    reveal = 0; prep = null; prepIdx = -1;
+    hint.style.opacity = ci >= 0 ? '0' : '1';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(1.7, Math.max(0.55, gap * 0.62));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prep = bakeLine(lines[nx].text); prepIdx = nx; }
+  }
+}
+
+/* ---------------- 主循环 ---------------- */
+let last = performance.now(), frames = 0, raf = 0;
+const B3X = new Float32Array(N), B3Y = new Float32Array(N), B3P = new Float32Array(N);
+const B3B = new Uint8Array(N);
+
+function frame(ms) {
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  vT += dt * (playing ? 1 : 0.08);
+  beat *= Math.exp(-dt * 3.0);
+  if (needRebake) { needRebake = false; if (curIdx >= 0 && lines[curIdx]) { glyph = bakeLine(lines[curIdx].text); reveal = 1; } else { glyph = null; mask = null; } }
+  timing(now());
+  if (reveal < 1) reveal = Math.min(1, reveal + dt / 0.5);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  /* 字的淡影：只负责把"这里有个实体"交代清楚 */
+  if (glyph) {
+    ctx.globalAlpha = 0.16 * reveal;
+    ctx.drawImage(glyph.crisp, glyph.gx, glyph.gy, glyph.bw, glyph.bh);
+    ctx.globalAlpha = 0.30 * reveal;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(glyph.rim, glyph.gx, glyph.gy, glyph.bw, glyph.bh);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+  }
+
+  const baseFlow = flow * (1 + beat * 0.35) * (RM ? 0.5 : 1);
+  const curlT = vT * 0.9;
+  const dtc = Math.min(dt, 0.033);
+
+  /* --- 推进 --- */
+  for (let i = 0; i < N; i++) {
+    ppx[i] = px[i]; ppy[i] = py[i];
+    let x = px[i], y = py[i], ux = vx[i], uy = vy[i];
+    const cell = cellOf(x, y);
+    let rim = 0;
+    if (cell >= 0) {
+      if (mask[cell]) {
+        /* 撞进笔画：沿法向弹出去，再沿切向滑走（表面滞止） */
+        const nx2 = gxN[cell], ny2 = gyN[cell];
+        const dot = ux * nx2 + uy * ny2;
+        ux = ux - 2 * dot * nx2;
+        uy = uy - 2 * dot * ny2;
+        const tx2 = -ny2, ty2 = nx2;
+        const tan = ux * tx2 + uy * ty2;
+        ux = tx2 * (tan * 0.92 + baseFlow * 0.25) + nx2 * (baseFlow * 0.45);
+        uy = ty2 * (tan * 0.92) + ny2 * (baseFlow * 0.45);
+        x += nx2 * 3.2; y += ny2 * 3.2;
+        rim = 1;
+      } else if (gxN[cell] !== 0 || gyN[cell] !== 0) {
+        /* 贴着表面走的一圈：绕流加速 + 摆动（涡街的种） */
+        const nx2 = gxN[cell], ny2 = gyN[cell];
+        const along = Math.sin(y * 0.045 + curlT * 2.2 + x * 0.01);
+        ux += (baseFlow * 1.25 - ux) * 0.22 + nx2 * along * 26;
+        uy += (-uy) * 0.15 + ny2 * along * 26;
+        rim = 0.55;
+      } else {
+        ux += (baseFlow - ux) * 0.10;
+        uy += (Math.sin(y * 0.012 + curlT) * 7 - uy) * 0.05;
+      }
+    } else {
+      ux += (baseFlow - ux) * 0.10;
+    }
+    rimT[i] *= Math.exp(-dt * 3.4);
+    if (rim > 0) rimT[i] = Math.min(1, rimT[i] + rim * 0.55);
+    vx[i] = ux; vy[i] = uy;
+    x += ux * dtc; y += uy * dtc;
+    if (x > W + 30 || y < -40 || y > H + 40) { respawn(i, false); x = px[i]; y = py[i]; }
+    px[i] = x; py[i] = y;
+  }
+
+  /* --- 绘制：三档合批 --- */
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for (let band = 0; band < 3; band++) {
+    if (band === 0) {
+      ctx.strokeStyle = 'rgba(' + ICE[0] + ',' + ICE[1] + ',' + ICE[2] + ',0.13)';
+      ctx.lineWidth = 1.0;
+    } else if (band === 1) {
+      ctx.strokeStyle = 'rgba(' + Math.min(255, ICE[0] + 8) + ',' + Math.min(255, ICE[1] + 10) + ',' + ICE[2] + ',0.30)';
+      ctx.lineWidth = 1.4;
+    } else {
+      ctx.strokeStyle = 'rgba(' + Math.min(255, ICE[0] + 24) + ',' + Math.min(255, ICE[1] + 20) + ',' + Math.min(255, ICE[2] + 8) + ',' + (0.66 + beat * 0.28).toFixed(3) + ')';
+      ctx.lineWidth = 2.1;
+    }
+    ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      const r = rimT[i];
+      const b = r > 0.42 ? 2 : (r > 0.12 ? 1 : 0);
+      if (b !== band) continue;
+      const x0 = ppx[i], y0 = ppy[i], x1 = px[i], y1 = py[i];
+      /* 尾迹往前多拉 0.05s：170px/s 的速度下大约 9px，才看得出"流向" */
+      const ex = x1 + vx[i] * 0.05, ey = y1 + vy[i] * 0.05;
+      const d2 = (x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0);
+      if (d2 > 3600) { ctx.moveTo(x1, y1); ctx.lineTo(x1 + 0.6, y1); continue; }
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(ex, ey);
+    }
+    ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
+  ctx.globalCompositeOperation = 'source-over';
+
+  ctx.fillStyle = vigGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------- 协议 ---------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; prep = null; prepIdx = -1;
+    glyph = null; mask = null; reveal = 0;
+    clockT = 0; clockAt = performance.now();
+    if (p.accent && p.accent.length >= 3) {
+      ACC = [p.accent[0] | 0, p.accent[1] | 0, p.accent[2] | 0];
+      buildColors(); buildBG();
+    }
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.45';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    beat = Math.min(1.0, beat + 0.3 + (d.payload.level || 0) * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+addEventListener('pagehide', () => { cancelAnimationFrame(raf); });
+
+buildColors();
+resize();
+raf = requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, idx: curIdx, curIdx: curIdx, t: +now().toFixed(2), playing: playing,
+  frames: frames, particles: N, reveal: +reveal.toFixed(2), ink: !!glyph,
+  flow: Math.round(flow), vT: +vT.toFixed(2)
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>布料</title>
+<style>
+  html,body{margin:0;height:100%;background:#06060a;overflow:hidden}
+  body{background:radial-gradient(120% 100% at 50% 44%,#0e0d18,#06060a 74%)}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(110% 92% at 50% 48%,transparent 44%,rgba(3,3,6,.55) 82%,rgba(2,2,4,.92))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(198,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   061 · 布料 —— 布被一针针缝在笔画上，唱到哪字哪块绷紧
+   ---------------------------------------------------------------------------
+   这一版的关键决定（前两版都栽在可读性上）：
+   **结点不是撒在整块画布上再去追笔画，而是直接长在笔画的采样点上。**
+   字形采样点就是"针脚"，结点 = 针脚，网格（距离约束）只连 1.55 个采样步长
+   以内的邻点 —— 于是布本身的拓扑就沿着笔画铺开，一句 41 字的布天生就是
+   这 41 个字的形状，永远整句可读，不需要再垫一层淡字。
+
+   时间怎么演：没唱到的字，结点是**松的**（目标位置在主针脚附近 ±0.6 步长的散点，
+   弹簧很软，还被风吹得微微起伏）—— 看起来这块字还软塌塌、没绷起来；
+   chars[k].t 一到，那一字的结点全部改钉到精确针脚上（弹簧变硬 + 网格拉直），
+   "绷成形"了。整句就是一道从软到硬的波，从左往右扫过去。
+
+   唱完最后一个字 0.55 秒后**松手**：全部结点改回松态并吃到一次向外/向上的冲量，
+   整块布一抖、字形散成一团软丝绸，正好接下一句重建。
+
+   和已有 10 个的区别：001-010 都是"粒子搬到位"；这里字是**布的拓扑**（缝在
+   笔画上的网格），主体是经纬线被绷紧的张力，没有一粒自由粒子。
+   和 043/057 的区别：它们的字是烘上去的图层，这里只有线本身。
+
+   YRC：第 k 字的结点在 chars[k].t 绷紧（提前 ~0.1 秒开始收，收完正好落在字时刻）；
+   缺 chars / 长度不符按 t + dur*k/n 均分。__stage 带 yrc。
+   分词：不使用。布是一根根线绷起来的，逐字绷紧的波本身就是节奏，
+   按词团合并会让波浪变成一块一块的跳变。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const FAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const fontOf = (s) => '800 ' + s.toFixed(1) + 'px ' + FAM;
+
+let W = 0, H = 0, DPR = 1, t0 = 0;
+
+/* ---------------- accent 派生色（一次算好，绝不逐帧拼字符串，坑⑨） ---------------- */
+let accent = [186, 176, 255];
+const C = { hot: '', warm: '', cold: '', dot: '', dotL: '', glow: '', tint: '', silk: '', silkB: '' };
+const mix = (a, b, k) => Math.round(a + (b - a) * k);
+function derive() {
+  const r = accent[0], g = accent[1], b = accent[2];
+  C.hot = 'rgba(' + mix(r, 255, .62) + ',' + mix(g, 255, .62) + ',' + mix(b, 255, .58) + ',0.95)';
+  C.warm = 'rgba(' + mix(r, 255, .30) + ',' + mix(g, 255, .30) + ',' + mix(b, 255, .30) + ',0.52)';
+  C.cold = 'rgba(' + mix(r, 255, .16) + ',' + mix(g, 255, .16) + ',' + mix(b, 255, .16) + ',0.17)';
+  C.dot = 'rgba(' + mix(r, 255, .80) + ',' + mix(g, 255, .80) + ',' + mix(b, 255, .78) + ',0.98)';
+  C.dotL = 'rgba(' + mix(r, 255, .30) + ',' + mix(g, 255, .30) + ',' + mix(b, 255, .30) + ',0.55)';
+  C.glow = 'rgba(' + r + ',' + g + ',' + b + ',';
+  C.tint = 'rgba(' + r + ',' + g + ',' + b + ',';
+  C.silk = 'rgba(' + mix(r, 250, .72) + ',' + mix(g, 248, .72) + ',' + mix(b, 255, .72) + ',';
+  C.silkB = 'rgba(' + mix(r, 236, .60) + ',' + mix(g, 234, .60) + ',' + mix(b, 246, .60) + ',';
+}
+
+/* ---------------- 字形的离屏位图 ---------------- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+/* ---------------- 布局 ---------------- */
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => (i > 0 && i < n && text.charCodeAt(i) >= 0xDC00 && text.charCodeAt(i) <= 0xDFFF) ? i - 1 : i;
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+function makeLayout(text) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const rows = splitRows(s);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.86, 1360);
+  const maxH = H * 0.58;
+  octx.font = fontOf(120);
+  let widest = 1;
+  for (let i = 0; i < nr; i++) widest = Math.max(widest, octx.measureText(rows[i]).width);
+  let fs = Math.min(120 * maxW / widest, maxH / (nr * 1.20), 150);
+  fs = Math.max(20, Math.floor(fs));
+  octx.font = fontOf(fs);
+  let wMax = 1;
+  for (let i = 0; i < nr; i++) wMax = Math.max(wMax, octx.measureText(rows[i]).width);
+  if (wMax > maxW) { fs = Math.max(18, Math.floor(fs * maxW / wMax)); octx.font = fontOf(fs); }
+  const font = fontOf(fs);
+  const LH = fs * 1.20;
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  const glyphs = [], rowsOut = [];
+  let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9, gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r], ws = [];
+    let wsum = 0;
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH, gr = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi });
+      gr.push({ i: gi, x0: x, x1: x + w });
+      x += w; gi++;
+    }
+    if (x - wsum < bx0) bx0 = x - wsum;
+    if (x > bx1) bx1 = x;
+    rowsOut.push({ y: y, g: gr, w: wsum });
+    if (y - fs * 0.68 < by0) by0 = y - fs * 0.68;
+    if (y + fs * 0.68 > by1) by1 = y + fs * 0.68;
+  }
+  return { glyphs: glyphs, rows: rowsOut, fs: fs, LH: LH, nr: nr, n: s.length, font: font, bx0: bx0, bx1: bx1, by0: by0, by1: by1 };
+}
+
+/* ---------------- 字形针脚（扫描顺序；每个点记着属于第几个字） ----------------
+   一张大位图一次 getImageData，比 41 次逐字读回便宜；步长按"整句墨量/预算"反解，
+   墨量占比取 0.45（800 字重 CJK 连同抗锯齿边，实测就是这个数）。 */
+let cloudN = 0;
+function glyphCloud(L, budget) {
+  if (!L) return null;
+  const n = L.glyphs.length;
+  if (!n) return null;
+  let area = 0;
+  for (let i = 0; i < n; i++) area += L.fs * L.fs * 1.30;
+  let S = Math.sqrt(Math.max(1, area * 0.45) / Math.max(240, budget));
+  S = Math.max(2, Math.min(14, Math.round(S)));
+  const pad = 6;
+  const bx = Math.floor(L.bx0) - pad, by = Math.floor(L.by0) - pad;
+  const bw = Math.max(4, Math.ceil(L.bx1 - L.bx0) + pad * 2);
+  const bh = Math.max(4, Math.ceil(L.by1 - L.by0) + pad * 2);
+  if (off.width !== bw || off.height !== bh) { off.width = bw; off.height = bh; }
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, bw, bh);
+  octx.font = L.font; octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  for (let i = 0; i < n; i++) octx.fillText(L.glyphs[i].ch, L.glyphs[i].x - bx, L.glyphs[i].y - by);
+  const d = octx.getImageData(0, 0, bw, bh).data;
+  const xs = [], ys = [], pc = [];
+  const rows = L.rows;
+  for (let y = 0; y < bh; y += S) {
+    const ay = y + by;
+    let best = 0, bd = 1e9;
+    for (let k = 0; k < rows.length; k++) { const dd = Math.abs(rows[k].y - ay); if (dd < bd) { bd = dd; best = k; } }
+    const g = rows[best].g;
+    if (!g.length) continue;
+    const rowOff = y * bw;
+    for (let x = 0; x < bw; x += S) {
+      if (d[(rowOff + x) * 4 + 3] <= 128) continue;
+      const ax = x + bx;
+      let kk;
+      if (ax <= g[0].x0) kk = 0;
+      else if (ax >= g[g.length - 1].x1) kk = g.length - 1;
+      else {
+        let lo = 0, hi = g.length - 1;
+        while (lo < hi) { const m = (lo + hi) >> 1; if (g[m].x1 < ax) lo = m + 1; else hi = m; }
+        kk = lo;
+      }
+      xs.push(ax); ys.push(ay); pc.push(g[kk].i);
+    }
+  }
+  cloudN = xs.length;
+  return { xs: Float32Array.from(xs), ys: Float32Array.from(ys), pc: Int16Array.from(pc), n: xs.length, step: S };
+}
+
+/* ---------------- 逐字时刻 ---------------- */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const chs = line ? line.chars : null;
+  const txt = line ? (line.text || '') : '';
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      if (v > prev) prev = v;
+      out[k] = prev;
+    }
+  }
+  if (!ok) {
+    const base = line ? (+line.t || 0) : 0, dur = (line && line.dur > 0) ? line.dur : 4;
+    for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  }
+  return { t: out, ok: ok };
+}
+
+/* ---------------- 绸面（字的"布身"） ----------------
+   只有网格是读不出 41 个 88px 的字的：采样步长 9px，而笔画只有 9px 宽，
+   网格再密也只是笔画的骨架。所以字下面垫一层**织物贴片**：整句先铺一层半透明
+   丝绸（带斜织纹），唱到第 k 字再把它那一块压紧变亮 —— 可读性由这层保证，
+   机制（针脚网格绷紧）由上层保证。半分辨率、只覆盖字形包围盒，不整屏混合。
+   ---------------------------------------------------------------- */
+let silk = null, silkX = 0, silkY = 0, silkW = 1, silkH = 1, silkA = 0;
+const SILK_S = 0.55;
+function bakeSilk(L) {
+  if (!L) { silk = null; return; }
+  if (!silk) silk = document.createElement('canvas');
+  const pad = 30;
+  silkX = Math.floor(L.bx0 - pad); silkY = Math.floor(L.by0 - pad);
+  silkW = Math.max(8, Math.ceil(L.bx1 - L.bx0 + pad * 2));
+  silkH = Math.max(8, Math.ceil(L.by1 - L.by0 + pad * 2));
+  silk.width = Math.round(silkW * SILK_S); silk.height = Math.round(silkH * SILK_S);
+  const g = silk.getContext('2d');
+  g.setTransform(SILK_S, 0, 0, SILK_S, 0, 0);
+  g.clearRect(0, 0, silkW, silkH);
+  g.font = L.font; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = C.silkB + '0.26)';
+  for (let i = 0; i < L.glyphs.length; i++) g.fillText(L.glyphs[i].ch, L.glyphs[i].x - silkX, L.glyphs[i].y - silkY);
+  /* 斜织纹：只在字形上（source-atop） */
+  g.globalCompositeOperation = 'source-atop';
+  g.lineWidth = 1;
+  g.strokeStyle = 'rgba(255,255,255,0.10)';
+  const p = new Path2D();
+  for (let x = -silkH; x < silkW + silkH; x += 7) { p.moveTo(x, 0); p.lineTo(x + silkH, silkH); }
+  g.stroke(p);
+  g.strokeStyle = 'rgba(255,255,255,0.055)';
+  const q = new Path2D();
+  for (let x = -silkH; x < silkW + silkH; x += 7) { q.moveTo(x, silkH); q.lineTo(x + silkH, 0); }
+  g.stroke(q);
+  g.globalCompositeOperation = 'source-over';
+  silkA = 0;
+}
+function lightSilk(k) {
+  if (!silk || !curLay) return;
+  const gl = curLay.glyphs[k];
+  if (!gl) return;
+  const g = silk.getContext('2d');
+  g.setTransform(SILK_S, 0, 0, SILK_S, 0, 0);
+  g.font = curLay.font; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = C.silk + '0.46)';
+  g.fillText(gl.ch, gl.x - silkX, gl.y - silkY);
+}
+/* ---------------- 布 ---------------- */
+const K_BUDGET = 2050;
+let K = 0, STEP = 8;
+let px = null, py = null, ox = null, oy = null, rX = null, rY = null, lX = null, lY = null;
+let pAct = null, taut = null, heat = null;
+let eA = null, eB = null, eN = 0;
+let pinT = Infinity, released = false, pinLive = 0;
+let windGust = 0, beatP = 0;
+
+const hsh = (i) => {
+  let x = (i * 2654435761) >>> 0;
+  x ^= x >>> 15; x = Math.imul(x, 2246822519) >>> 0;
+  x ^= x >>> 13; return (x >>> 8) / 16777216;
+};
+
+function buildCloth(L, cloud, ct) {
+  if (!cloud || !cloud.n) { K = 0; eN = 0; pinT = Infinity; pinLive = 0; return; }
+  K = cloud.n;
+  STEP = cloud.step || 8;
+  px = new Float32Array(K); py = new Float32Array(K);
+  ox = new Float32Array(K); oy = new Float32Array(K);
+  rX = new Float32Array(K); rY = new Float32Array(K);
+  lX = new Float32Array(K); lY = new Float32Array(K);
+  pAct = new Float32Array(K); taut = new Uint8Array(K); heat = new Uint8Array(K);
+  const nch = L.glyphs.length;
+  const sc = STEP * 0.50;                    /* 松态散开的半径 */
+  for (let j = 0; j < K; j++) {
+    const x = cloud.xs[j], y = cloud.ys[j];
+    rX[j] = x; rY[j] = y;
+    const a = hsh(j) * 6.2832, rr = sc * (0.35 + 0.65 * hsh(j + 7717));
+    lX[j] = x + Math.cos(a) * rr;
+    lY[j] = y + Math.sin(a) * rr * 0.8 - sc * 0.18;
+    px[j] = lX[j]; py[j] = lY[j]; ox[j] = px[j]; oy[j] = py[j];
+    const c = Math.min(nch - 1, cloud.pc[j]);
+    pAct[j] = (ct && ct.length) ? ct[c] : Infinity;
+    taut[j] = 0; heat[j] = 0;
+  }
+  /* 网格：针脚本就落在规则采样格点上，所以直接连**上下左右四个格邻**。
+     不用 k 近邻 —— 近邻会把两条对角线也连上，交成一片 X 形的裂痕，很难看。
+     正交格网 + 字形上的自然空洞，才是织物的样子。 */
+  {
+    const lx0 = Math.floor((L.bx0 - STEP * 2) / STEP), ly0 = Math.floor((L.by0 - STEP * 2) / STEP);
+    const LW = Math.max(2, Math.ceil((L.bx1 + STEP * 2) / STEP) - lx0 + 2);
+    const LH2 = Math.max(2, Math.ceil((L.by1 + STEP * 2) / STEP) - ly0 + 2);
+    const grid = new Int32Array(LW * LH2).fill(-1);
+    const kx = new Int32Array(K), ky = new Int32Array(K);
+    for (let j = 0; j < K; j++) {
+      kx[j] = Math.round(rX[j] / STEP) - lx0;
+      ky[j] = Math.round(rY[j] / STEP) - ly0;
+      if (kx[j] < 0 || ky[j] < 0 || kx[j] >= LW || ky[j] >= LH2) continue;
+      grid[ky[j] * LW + kx[j]] = j;
+    }
+    const A = [], B = [];
+    for (let j = 0; j < K; j++) {
+      const x = kx[j], y = ky[j];
+      if (x < 0 || y < 0 || x >= LW || y >= LH2) continue;
+      if (x + 1 < LW) { const q = grid[y * LW + x + 1]; if (q >= 0) { A.push(j); B.push(q); } }
+      if (y + 1 < LH2) { const q = grid[(y + 1) * LW + x]; if (q >= 0) { A.push(j); B.push(q); } }
+    }
+    eA = Int32Array.from(A); eB = Int32Array.from(B); eN = A.length;
+  }
+
+  let mx = -1e9;
+  for (let j = 0; j < K; j++) if (pAct[j] !== Infinity && pAct[j] > mx) mx = pAct[j];
+  pinT = mx > -1e8 ? mx : Infinity;
+  released = false; pinLive = 0;
+}
+
+function stepCloth(dt, T) {
+  if (!K) return;
+  const wG = windGust;
+  let live = 0;
+  for (let i = 0; i < K; i++) {
+    let vx = (px[i] - ox[i]) * 0.94, vy = (py[i] - oy[i]) * 0.94;
+    if (pAct[i] <= T) {
+      if (!taut[i]) { taut[i] = 1; ox[i] = px[i] - (rX[i] - px[i]) * 0.10; oy[i] = py[i] - (rY[i] - py[i]) * 0.10; }
+      taut[i] = 1; heat[i] = 2; live++;
+      vx += (rX[i] - px[i]) * 0.30;
+      vy += (rY[i] - py[i]) * 0.30;
+    } else {
+      taut[i] = 0; heat[i] = 0;
+      vx += (lX[i] - px[i]) * 0.045;
+      vy += (lY[i] - py[i]) * 0.045;
+      /* 松布：被风带得微微起伏 */
+      const ph = t0 * 1.7 + hsh(i) * 40;
+      vx += Math.sin(ph) * 0.5 + wG * 0.0009;
+      vy += Math.cos(ph * 1.31) * 0.4;
+    }
+    vx *= 0.86; vy *= 0.86;
+    if (vx > 7) vx = 7; else if (vx < -7) vx = -7;
+    if (vy > 7) vy = 7; else if (vy < -7) vy = -7;
+    ox[i] = px[i]; oy[i] = py[i];
+    px[i] += vx;
+    py[i] += vy;
+  }
+  /* 约束：网格边长守恒（缝在笔画上的线不许随便拉长） */
+  const rl = STEP, rl2 = rl * rl;
+  for (let it = 0; it < 3; it++) {
+    for (let c = 0; c < eN; c++) {
+      const a = eA[c], b = eB[c];
+      let dx = px[b] - px[a], dy = py[b] - py[a];
+      const d2 = dx * dx + dy * dy;
+      if (d2 < 1e-6 || d2 > rl2 * 5) continue;
+      const d = Math.sqrt(d2);
+      const diff = (d - rl) / d * 0.40;
+      dx *= diff; dy *= diff;
+      px[a] += dx; py[a] += dy;
+      px[b] -= dx; py[b] -= dy;
+    }
+  }
+  /* 求解器的位移不进入速度（否则自激、布炸开） */
+  for (let i = 0; i < K; i++) { ox[i] = px[i]; oy[i] = py[i]; }
+  /* 松手：最后一字 0.55 秒后全部放开，布一抖散成软丝绸 */
+  if (!released && T > pinT + 0.55) {
+    released = true;
+    for (let i = 0; i < K; i++) {
+      pAct[i] = Infinity; taut[i] = 0; heat[i] = 0;
+      const a = hsh(i) * 6.2832;
+      lX[i] = rX[i] + Math.cos(a) * STEP * 1.7;
+      lY[i] = rY[i] + Math.sin(a) * STEP * 1.7 + STEP * 1.2;
+    }
+  }
+  pinLive = live;
+}
+
+/* ---------------- 背景（静态，1:1 blit；软件光栅下全屏混合就是帧率） ---------------- */
+let bgCv = null;
+function bakeBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  bgCv.width = Math.max(8, cv.width); bgCv.height = Math.max(8, cv.height);
+  const g = bgCv.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const lg = g.createLinearGradient(0, 0, 0, H);
+  lg.addColorStop(0, '#0b0a13'); lg.addColorStop(0.55, '#08070d'); lg.addColorStop(1, '#05050a');
+  g.fillStyle = lg; g.fillRect(0, 0, W, H);
+  const cx = W * 0.5, cy = H * 0.44;
+  const rg = g.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H) * 0.62);
+  rg.addColorStop(0, C.tint + '0.105)');
+  rg.addColorStop(0.5, C.tint + '0.030)');
+  rg.addColorStop(1, C.tint + '0)');
+  g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  /* 织物底纹：两组极淡的斜线 */
+  g.lineWidth = 1;
+  g.strokeStyle = C.tint + '0.030)';
+  const p1 = new Path2D();
+  for (let x = -H; x < W + H; x += 27) { p1.moveTo(x, 0); p1.lineTo(x + H, H); }
+  g.stroke(p1);
+  g.strokeStyle = C.tint + '0.019)';
+  const p2 = new Path2D();
+  for (let x = -H; x < W + H; x += 27) { p2.moveTo(x, H); p2.lineTo(x + H, 0); }
+  g.stroke(p2);
+}
+
+/* ---------------- 时间 / 节奏 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+let curLay = null, curCT = null, curYrc = false, lit = 0;
+let pend = null, pendIdx = -1;
+
+function brewLine(i) {
+  const L = lines[i];
+  const lay = L && L.text ? makeLayout(L.text) : null;
+  pend = lay ? { lay: lay, cloud: glyphCloud(lay, K_BUDGET) } : null;
+  pendIdx = i;
+}
+function applyLine(lay, cloud) {
+  curLay = lay;
+  if (!lay) { curCT = null; curYrc = false; K = 0; eN = 0; return; }
+  const tm = charTimes(lines[curIdx], lay.glyphs.length);
+  curCT = tm.t; curYrc = tm.ok; lit = 0;
+  buildCloth(lay, cloud, curCT);
+  bakeSilk(lay);
+}
+function startLine(i) {
+  if (pendIdx !== i) brewLine(i);
+  const b = pend; pend = null; pendIdx = -1;
+  applyLine(b ? b.lay : null, b ? b.cloud : null);
+}
+function relayout() {
+  if (curIdx >= 0 && lines[curIdx] && lines[curIdx].text) {
+    const lay = makeLayout(lines[curIdx].text);
+    applyLine(lay, lay ? glyphCloud(lay, K_BUDGET) : null);
+    const T = now();
+    lit = 0;
+    bakeSilk(lay);
+    if (curCT) while (lit < curCT.length && T >= curCT[lit]) { lightSilk(lit); lit++; }
+  } else { curLay = null; K = 0; eN = 0; silk = null; }
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; pend = null; pendIdx = -1;
+    curLay = null; curCT = null; lit = 0; K = 0; eN = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci); else { K = 0; eN = 0; silk = null; }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine(nx); }
+  }
+  if (curCT) while (lit < curCT.length && T >= curCT[lit]) { lightSilk(lit); lit++; }
+}
+
+/* ---------------- 绘制 ---------------- */
+let last = performance.now();
+
+function draw(T) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+  else { ctx.fillStyle = '#07060c'; ctx.fillRect(0, 0, W, H); }
+  if (!K) return;
+
+  /* 镜头：极慢的推拉 + 漂移（布和字一起，背景不动 → 视差） */
+  const zoom = 1.008 + 0.014 * Math.sin(t0 * 0.049);
+  const panX = Math.sin(t0 * 0.041) * W * 0.006 + Math.sin(t0 * 0.017) * W * 0.003;
+  const panY = Math.cos(t0 * 0.033) * H * 0.006;
+  ctx.save();
+  ctx.translate(W * 0.5 + panX, H * 0.5 + panY);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W * 0.5, -H * 0.5);
+
+  /* 绸面：字的布身（可读性靠它） */
+  if (silk) {
+    silkA = Math.min(1, silkA + 0.09);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = (0.94 + 0.10 * beatP) * silkA;
+    ctx.drawImage(silk, silkX, silkY, silkW, silkH);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* 网格按"绷没绷紧"三档合批（坑⑨⑩：绝不逐段设颜色） */
+  const pC = new Path2D(), pW = new Path2D(), pH = new Path2D();
+  for (let c = 0; c < eN; c++) {
+    const a = eA[c], b = eB[c];
+    const h = Math.max(heat[a], heat[b]);
+    const p = h === 2 ? pH : (h === 1 ? pW : pC);
+    p.moveTo(px[a], py[a]); p.lineTo(px[b], py[b]);
+  }
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.strokeStyle = C.cold; ctx.lineWidth = 0.9; ctx.stroke(pC);
+  ctx.strokeStyle = C.warm; ctx.lineWidth = 1.05; ctx.stroke(pW);
+  ctx.strokeStyle = C.hot; ctx.lineWidth = 1.25; ctx.stroke(pH);
+
+  /* 绷紧的笔画：一条宽而暗的晕，再加针脚点（两档合批） */
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = C.glow + '0.05)'; ctx.lineWidth = 5.5; ctx.stroke(pH);
+  ctx.strokeStyle = C.warm; ctx.lineWidth = 2.2; ctx.stroke(pH);
+
+  const pDot = new Path2D(), pDotL = new Path2D();
+  for (let i = 0; i < K; i++) {
+    if (taut[i]) pDot.rect(px[i] - 1.15, py[i] - 1.15, 2.3, 2.3);
+    else pDotL.rect(px[i] - 0.7, py[i] - 0.7, 1.4, 1.4);
+  }
+  ctx.fillStyle = C.dotL; ctx.fill(pDotL);
+  ctx.fillStyle = C.dot; ctx.fill(pDot);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
+
+  /* beat：整块画布相干地亮一下（不逐点乱踢，坑⑬） */
+  if (beatP > 0.01) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = C.glow + (0.030 * beatP).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  beatP *= Math.exp(-dt * 2.6);
+  windGust = 60 * Math.sin(t0 * 0.35) + Math.sin(t0 * 0.13) * 40 + beatP * 240;
+  stepCloth(dt, T);
+  draw(T);
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  derive(); bakeBg();
+  if (lines.length) relayout(); else { K = 0; eN = 0; }
+}
+addEventListener('resize', resize);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; pend = null; pendIdx = -1;
+    curLay = null; curCT = null; curYrc = false; lit = 0;
+    K = 0; eN = 0;
+    if (p.accent) accent = p.accent;
+    derive(); bakeBg();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：一阵相干的风把整块布一起吹，同时整体亮一下 */
+    beatP = Math.min(1.4, beatP + 0.42 + (d.payload.level || 0) * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+resize();
+requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx, yrc: !!curYrc,
+  lit: lit, chars: curCT ? curCT.length : 0, rows: curLay ? curLay.nr : 0,
+  fs: curLay ? +curLay.fs.toFixed(1) : 0,
+  knots: K, edges: eN, taut: pinLive, released: released,
+  cloud: cloudN, T: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

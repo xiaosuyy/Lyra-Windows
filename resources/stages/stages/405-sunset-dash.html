@@ -1,0 +1,1560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>落日疾驰</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #07010c; overflow: hidden; }
+  #stage { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="stage" aria-label="落日疾驰"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var DEFAULT_ACCENT = [255, 112, 168];
+  var view = { w: 1440, h: 900, dpr: 1 };
+  var song = { id: '', name: '', artists: '', cover: '' };
+  var lyricLines = [];
+  var lineIndex = -1;
+  var clock = 0;
+  var playing = true;
+  var frames = 0;
+  var jsMs = 0;
+  var errText = '';
+  var accent = DEFAULT_ACCENT.slice();
+  var reducedMotion = false;
+  var lastErrorAt = 0;
+  var readySent = false;
+  var hasInit = false;
+  var rafId = 0;
+  var lastFrameAt = 0;
+  var beatLevel = 0;
+  var beatAge = 99;
+  var liveBass = 0;
+  var liveLevel = 0;
+  var liveBpm = 0;
+
+  var camera = { x: 0, y: 1.9, z: -3.89 };
+  var focalLength = 700;
+  var visualTime = 0;
+  var scene = {
+    horizonY: 0,
+    sunRadius: 0,
+    sunCenterX: 0,
+    sunCenterY: 0,
+    sunSize: 0,
+    skyGradient: null,
+    groundGradient: null,
+    vignette: null,
+    sunCanvas: null,
+    palmCanvas: null,
+    palmHeight: 0,
+    scanlinePattern: null,
+    ridges: [],
+    stars: []
+  };
+
+  function clampNumber(value, low, high) {
+    if (!isFinite(value)) return low;
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+  }
+
+  function toChannel(value, fallback) {
+    var number = Number(value);
+    if (!isFinite(number)) number = fallback;
+    return Math.round(clampNumber(number, 0, 255));
+  }
+
+  function reportError(error) {
+    errText = String((error && error.message) || error || 'unknown');
+    var now = Date.now();
+    if (now - lastErrorAt >= 1000) {
+      lastErrorAt = now;
+      console.error('[405 sunset-dash]', error);
+    }
+  }
+
+  try {
+    reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch (motionError) {
+    reportError(motionError);
+  }
+
+  window.__stage = function () {
+    var text = (lineIndex >= 0 && lyricLines[lineIndex]) ? lyricLines[lineIndex].text : '';
+    return {
+      lines: lyricLines.length,
+      idx: lineIndex,
+      t: clock,
+      playing: playing,
+      frames: frames,
+      js: jsMs,
+      err: errText,
+      text: text,
+      gl: false,
+      rm: reducedMotion
+    };
+  };
+
+  var canvas = document.getElementById('stage');
+  var ctx = canvas ? canvas.getContext('2d') : null;
+  if (!ctx) reportError(new Error('canvas 2d context unavailable'));
+
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try {
+      parent.postMessage({ __c100: 1, type: 'ready' }, '*');
+    } catch (postError) {
+      reportError(postError);
+    }
+  }
+
+  function buildCharTimes(line) {
+    var total = line.text.length;
+    var times = [];
+    var source = line.chars;
+    var index = 0;
+    if (Array.isArray(source) && source.length > 0) {
+      var count = Math.min(source.length, 240);
+      var collected = [];
+      for (index = 0; index < count; index += 1) {
+        var entry = source[index];
+        var at = (entry && typeof entry === 'object') ? Number(entry.t) : NaN;
+        if (!isFinite(at)) at = line.t + (index / Math.max(1, count)) * line.dur;
+        collected.push(at);
+      }
+      for (index = 0; index < total; index += 1) {
+        if (index < collected.length) {
+          times.push(collected[index]);
+        } else {
+          var last = collected[collected.length - 1];
+          var step = collected.length > 1 ? (last - collected[0]) / (collected.length - 1) : 0.2;
+          if (!isFinite(step) || step <= 0) step = 0.2;
+          times.push(last + step * (index - collected.length + 1));
+        }
+      }
+      for (index = 1; index < times.length; index += 1) {
+        if (times[index] < times[index - 1]) times[index] = times[index - 1];
+      }
+    } else {
+      var span = line.dur > 0 ? line.dur : Math.max(1.6, total * 0.24);
+      for (index = 0; index < total; index += 1) {
+        times.push(line.t + (index / Math.max(1, total)) * span * 0.92);
+      }
+    }
+    return times;
+  }
+
+  function normalizeLines(raw) {
+    var out = [];
+    if (!Array.isArray(raw) || raw.length === 0) return out;
+    var limit = Math.min(raw.length, 500);
+    var index = 0;
+    for (index = 0; index < limit; index += 1) {
+      var item = raw[index];
+      if (!item || typeof item !== 'object') continue;
+      var text = (item.text === null || item.text === undefined) ? '' : String(item.text);
+      text = text.replace(/[\s\u00a0]+/g, ' ').trim();
+      if (!text) continue;
+      var start = Number(item.t);
+      if (!isFinite(start) || start < 0) start = 0;
+      var dur = Number(item.dur);
+      if (!isFinite(dur) || dur <= 0) dur = 0;
+      out.push({ t: start, dur: dur, text: text, chars: Array.isArray(item.chars) ? item.chars : null, charTimes: null, end: start });
+    }
+    for (index = 0; index < out.length; index += 1) {
+      if (out[index].dur <= 0) {
+        var next = out[index + 1] ? out[index + 1].t : 0;
+        out[index].dur = next > out[index].t
+          ? (next - out[index].t)
+          : Math.max(1.6, Math.min(6, out[index].text.length * 0.26));
+      }
+      out[index].end = out[index].t + out[index].dur;
+      out[index].charTimes = buildCharTimes(out[index]);
+    }
+    return out;
+  }
+
+  function findLineIndex(time) {
+    var found = -1;
+    for (var index = 0; index < lyricLines.length; index += 1) {
+      if (lyricLines[index].t <= time + 0.0015) found = index;
+      else break;
+    }
+    return found;
+  }
+
+  function readAccent(raw) {
+    if (!Array.isArray(raw) || raw.length < 3) return DEFAULT_ACCENT.slice();
+    var out = [
+      toChannel(raw[0], DEFAULT_ACCENT[0]),
+      toChannel(raw[1], DEFAULT_ACCENT[1]),
+      toChannel(raw[2], DEFAULT_ACCENT[2])
+    ];
+    if (out[0] + out[1] + out[2] < 60) return DEFAULT_ACCENT.slice();
+    return out;
+  }
+
+  function readArtists(raw) {
+    if (Array.isArray(raw)) {
+      var names = [];
+      for (var index = 0; index < Math.min(raw.length, 6); index += 1) {
+        if (raw[index] !== null && raw[index] !== undefined) names.push(String(raw[index]));
+      }
+      return names.join(' / ');
+    }
+    if (raw === null || raw === undefined) return '';
+    return String(raw);
+  }
+
+  function onInit(payload) {
+    var data = (payload && typeof payload === 'object') ? payload : {};
+    var nextSong = (data.song && typeof data.song === 'object') ? data.song : {};
+    var nextId = (nextSong.id === null || nextSong.id === undefined) ? '' : String(nextSong.id);
+    var songChanged = nextId !== song.id;
+    hasInit = true;
+    try {
+      song = {
+        id: nextId,
+        name: nextSong.name ? String(nextSong.name) : '',
+        artists: readArtists(nextSong.artists),
+        cover: nextSong.cover ? String(nextSong.cover) : ''
+      };
+    } catch (songError) {
+      reportError(songError);
+    }
+    try {
+      accent = readAccent(data.accent);
+      paletteCache = null;
+    } catch (accentError) {
+      reportError(accentError);
+    }
+    try {
+      lyricLines = normalizeLines(data.lines);
+    } catch (lineError) {
+      reportError(lineError);
+      lyricLines = [];
+    }
+    try {
+      if (songChanged) clock = 0;
+      lineIndex = findLineIndex(clock);
+      playing = (typeof data.playing === 'boolean') ? data.playing : true;
+    } catch (indexError) {
+      reportError(indexError);
+      lineIndex = -1;
+    }
+    try {
+      layoutLyrics();
+    } catch (layoutError) {
+      reportError(layoutError);
+    }
+  }
+
+  function onTick(payload) {
+    var data = (payload && typeof payload === 'object') ? payload : {};
+    var nextTime = Number(data.time);
+    if (isFinite(nextTime)) clock = nextTime;
+    if (typeof data.playing === 'boolean') playing = data.playing;
+    lineIndex = findLineIndex(clock);
+  }
+
+  function onMessage(event) {
+    var data = event && event.data;
+    if (!data || typeof data !== 'object' || data.__c100 !== 1) return;
+    try {
+      if (data.type === 'init') onInit(data.payload);
+      else if (data.type === 'tick') onTick(data.payload);
+      else if (data.type === 'beat') onBeat(data.payload);
+      else if (data.type === 'live') onLive(data.payload);
+    } catch (handlerError) {
+      reportError(handlerError);
+    }
+  }
+
+  function onBeat(payload) {
+    var data = (payload && typeof payload === 'object') ? payload : {};
+    beatLevel = clampNumber(Number(data.level) || 0, 0, 1);
+    beatAge = 0;
+  }
+
+  function onLive(payload) {
+    var data = (payload && typeof payload === 'object') ? payload : {};
+    liveBass = clampNumber(Number(data.bass) || 0, 0, 1);
+    liveLevel = clampNumber(Number(data.level) || 0, 0, 1);
+    liveBpm = Number(data.bpm) || 0;
+    if (typeof data.playing === 'boolean') playing = data.playing;
+  }
+
+  function resize() {
+    if (!canvas) return;
+    try {
+      var ratio = window.devicePixelRatio || 1;
+      if (!isFinite(ratio) || ratio <= 0) ratio = 1;
+      var width = canvas.clientWidth || window.innerWidth || 0;
+      var height = canvas.clientHeight || window.innerHeight || 0;
+      if (!isFinite(width) || width < 2) width = 1440;
+      if (!isFinite(height) || height < 2) height = 900;
+      view.w = width;
+      view.h = height;
+      view.dpr = Math.min(ratio, 2);
+      canvas.width = Math.max(1, Math.round(width * view.dpr));
+      canvas.height = Math.max(1, Math.round(height * view.dpr));
+      layoutScene();
+      layoutLyrics();
+    } catch (resizeError) {
+      reportError(resizeError);
+    }
+  }
+
+  function clampChannel(value) {
+    return Math.round(clampNumber(Number(value) || 0, 0, 255));
+  }
+
+  function rgbaColor(rgb, alpha) {
+    var red = clampChannel(rgb[0]);
+    var green = clampChannel(rgb[1]);
+    var blue = clampChannel(rgb[2]);
+    var safeAlpha = clampNumber(Number(alpha), 0, 1);
+    return 'rgba(' + red + ',' + green + ',' + blue + ',' + (Math.round(safeAlpha * 1000) / 1000) + ')';
+  }
+
+  function mixColor(first, second, weight) {
+    var amount = clampNumber(Number(weight), 0, 1);
+    return [
+      Math.round(clampChannel(first[0]) * (1 - amount) + clampChannel(second[0]) * amount),
+      Math.round(clampChannel(first[1]) * (1 - amount) + clampChannel(second[1]) * amount),
+      Math.round(clampChannel(first[2]) * (1 - amount) + clampChannel(second[2]) * amount)
+    ];
+  }
+
+  function addColorStops(gradient, stops) {
+    if (!gradient) return;
+    for (var index = 0; index < stops.length; index += 1) {
+      try {
+        gradient.addColorStop(stops[index][0], stops[index][1]);
+      } catch (stopError) {
+        reportError(stopError);
+      }
+    }
+  }
+
+  var paletteCache = null;
+
+  function palette() {
+    if (paletteCache) return paletteCache;
+    var neon = mixColor(accent, [255, 64, 156], 0.62);
+    paletteCache = {
+      neon: neon,
+      neonSoft: mixColor(neon, [255, 255, 255], 0.34),
+      cyan: mixColor([96, 224, 255], accent, 0.22),
+      taillight: [255, 40, 64],
+      haze: [255, 124, 70]
+    };
+    return paletteCache;
+  }
+
+  function projectPoint(pointX, pointY, pointZ) {
+    var depth = pointZ - camera.z;
+    if (!isFinite(depth) || depth < 0.25) depth = 0.25;
+    var scale = focalLength / depth;
+    return {
+      x: view.w * 0.5 + (pointX - camera.x) * scale,
+      y: scene.horizonY - (pointY - camera.y) * scale,
+      scale: scale,
+      depth: depth
+    };
+  }
+
+  function ridgeHeight(x, seed) {
+    var first = Math.sin(x * 1.7 + seed);
+    var second = Math.sin(x * 3.3 + seed * 2.1);
+    var third = Math.sin(x * 7.1 + seed * 0.6);
+    return clampNumber((first * 0.5 + second * 0.32 + third * 0.18) * 0.5 + 0.5, 0, 1);
+  }
+
+  function makeRidges() {
+    var ridges = [];
+    var layers = [
+      { seed: 1.7, height: view.h * 0.062, color: '#320a3d', rim: 'rgba(255, 138, 96, 0.28)' },
+      { seed: 5.3, height: view.h * 0.042, color: '#1a0424', rim: 'rgba(255, 96, 74, 0.20)' }
+    ];
+    for (var layer = 0; layer < layers.length; layer += 1) {
+      var points = [];
+      var steps = 56;
+      for (var step = 0; step <= steps; step += 1) {
+        var ratio = step / steps;
+        var bump = 0.3 + 0.7 * ridgeHeight(ratio * 11 + layer * 4.3, layers[layer].seed);
+        points.push({
+          x: ratio * view.w,
+          y: scene.horizonY - layers[layer].height * bump + view.h * 0.004 * layer
+        });
+      }
+      ridges.push({ points: points, color: layers[layer].color, rim: layers[layer].rim });
+    }
+    return ridges;
+  }
+
+  function makeStars() {
+    var stars = [];
+    var seed = 8841;
+    var total = 110;
+    for (var index = 0; index < total; index += 1) {
+      seed = (seed * 16807) % 2147483647;
+      var starX = seed / 2147483647;
+      seed = (seed * 16807) % 2147483647;
+      var starY = seed / 2147483647;
+      seed = (seed * 16807) % 2147483647;
+      var starR = seed / 2147483647;
+      stars.push({
+        x: starX * view.w,
+        y: starY * scene.horizonY * 0.86,
+        radius: 0.5 + starR * 1.5,
+        phase: starX * 6.283,
+        speed: 0.5 + starR * 1.8
+      });
+    }
+    return stars;
+  }
+
+  function bakeSun() {
+    var radius = scene.sunRadius;
+    if (!(radius > 4)) return null;
+    var pad = radius * 0.08;
+    var size = Math.ceil((radius + pad) * 2);
+    var ratio = view.dpr;
+    var off = document.createElement('canvas');
+    off.width = Math.max(1, Math.round(size * ratio));
+    off.height = Math.max(1, Math.round(size * ratio));
+    var surface = off.getContext('2d');
+    if (!surface) return null;
+    surface.setTransform(ratio, 0, 0, ratio, 0, 0);
+    surface.save();
+    surface.beginPath();
+    surface.arc(size / 2, size / 2, radius, 0, Math.PI * 2);
+    surface.closePath();
+    surface.clip();
+    var disc = surface.createLinearGradient(0, size / 2 - radius, 0, size / 2 + radius);
+    addColorStops(disc, [
+      [0.00, '#fff7cd'],
+      [0.16, '#ffd873'],
+      [0.36, '#ff9c46'],
+      [0.56, '#ff5f4b'],
+      [0.76, '#f02f6c'],
+      [0.90, '#c41f83'],
+      [1.00, '#8a1878']
+    ]);
+    surface.fillStyle = disc;
+    surface.fillRect(0, 0, size, size);
+    var hot = surface.createRadialGradient(size / 2, size / 2 - radius * 0.25, radius * 0.05, size / 2, size / 2 - radius * 0.2, radius * 1.05);
+    addColorStops(hot, [
+      [0.00, 'rgba(255, 255, 226, 0.55)'],
+      [0.55, 'rgba(255, 196, 120, 0.10)'],
+      [1.00, 'rgba(255, 90, 60, 0)']
+    ]);
+    surface.fillStyle = hot;
+    surface.fillRect(0, 0, size, size);
+    surface.globalCompositeOperation = 'destination-out';
+    var bars = 16;
+    for (var bar = 0; bar < bars; bar += 1) {
+      var progress = bar / (bars - 1);
+      var barY = size / 2 - radius * 0.02 + progress * radius * 1.3;
+      var thickness = radius * (0.012 + 0.072 * progress * progress);
+      surface.fillRect(0, barY, size, thickness);
+    }
+    surface.globalCompositeOperation = 'source-over';
+    surface.restore();
+    scene.sunSize = size;
+    return off;
+  }
+
+  function drawPalmSilhouette(surface, baseX, baseY, treeHeight, lean, color) {
+    if (!surface || !(treeHeight > 8)) return;
+    var crownX = baseX + lean * treeHeight * 0.1;
+    var crownY = baseY - treeHeight;
+    var steps = 12;
+    var leftEdge = [];
+    var rightEdge = [];
+    for (var step = 0; step <= steps; step += 1) {
+      var ratio = step / steps;
+      var trunkX = baseX + (crownX - baseX) * ratio * ratio;
+      var trunkY = baseY - treeHeight * ratio;
+      var halfWidth = (1 - ratio * 0.7) * treeHeight * 0.023;
+      leftEdge.push([trunkX - halfWidth, trunkY]);
+      rightEdge.push([trunkX + halfWidth, trunkY]);
+    }
+    surface.beginPath();
+    surface.moveTo(leftEdge[0][0], leftEdge[0][1]);
+    for (var left = 1; left < leftEdge.length; left += 1) {
+      surface.lineTo(leftEdge[left][0], leftEdge[left][1]);
+    }
+    for (var right = rightEdge.length - 1; right >= 0; right -= 1) {
+      surface.lineTo(rightEdge[right][0], rightEdge[right][1]);
+    }
+    surface.closePath();
+    surface.fillStyle = color;
+    surface.fill();
+
+    var fronds = 9;
+    for (var frond = 0; frond < fronds; frond += 1) {
+      var spread = (frond / (fronds - 1)) * 2 - 1;
+      var reach = treeHeight * (0.44 + 0.12 * Math.sin(frond * 1.9));
+      var tipX = crownX + (spread * 0.92 + lean * 0.05) * reach;
+      var tipY = crownY - reach * 0.5 + spread * spread * reach * 0.64;
+      var controlX = crownX + spread * reach * 0.36;
+      var controlY = crownY - reach * 0.62;
+      var spine = [];
+      var samples = 9;
+      for (var sample = 0; sample <= samples; sample += 1) {
+        var along = sample / samples;
+        var inv = 1 - along;
+        spine.push([
+          inv * inv * crownX + 2 * inv * along * controlX + along * along * tipX,
+          inv * inv * crownY + 2 * inv * along * controlY + along * along * tipY
+        ]);
+      }
+      surface.beginPath();
+      surface.moveTo(spine[0][0], spine[0][1]);
+      for (var upper = 1; upper < spine.length; upper += 1) {
+        var widthUp = treeHeight * 0.03 * (1 - upper / spine.length) + 0.6;
+        surface.lineTo(spine[upper][0], spine[upper][1] - widthUp);
+      }
+      for (var lower = spine.length - 1; lower >= 0; lower -= 1) {
+        var widthLow = treeHeight * 0.03 * (1 - lower / spine.length) + 0.6;
+        surface.lineTo(spine[lower][0], spine[lower][1] + widthLow);
+      }
+      surface.closePath();
+      surface.fillStyle = color;
+      surface.fill();
+    }
+  }
+
+  function bakePalms() {
+    scene.palmHeight = view.h * 0.46;
+    if (!(scene.palmHeight > 20)) return null;
+    var off = document.createElement('canvas');
+    off.width = Math.max(1, Math.round(view.w * view.dpr));
+    off.height = Math.max(1, Math.round(scene.palmHeight * view.dpr));
+    var surface = off.getContext('2d');
+    if (!surface) return null;
+    surface.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    drawPalmSilhouette(surface, view.w * 0.045, scene.palmHeight, scene.palmHeight * 0.9, 1, '#0b0113');
+    drawPalmSilhouette(surface, view.w * 0.955, scene.palmHeight, scene.palmHeight * 0.76, -1, '#0b0113');
+    return off;
+  }
+
+  function makeScanlinePattern() {
+    var off = document.createElement('canvas');
+    off.width = 2;
+    off.height = 3;
+    var surface = off.getContext('2d');
+    if (!surface) return null;
+    surface.fillStyle = 'rgba(0, 0, 0, 0)';
+    surface.fillRect(0, 0, 2, 3);
+    surface.fillStyle = 'rgba(6, 0, 12, 0.34)';
+    surface.fillRect(0, 0, 2, 1);
+    try {
+      return ctx.createPattern(off, 'repeat');
+    } catch (patternError) {
+      reportError(patternError);
+      return null;
+    }
+  }
+
+  function layoutScene() {
+    if (!ctx) return;
+    scene.horizonY = view.h * 0.52;
+    focalLength = Math.min(view.h * 0.88, view.w * 0.80);
+    scene.sunRadius = clampNumber(Math.min(view.h * 0.166, view.w * 0.27), 48, 240);
+    scene.sunCenterX = view.w * 0.5;
+    scene.sunCenterY = scene.horizonY - scene.sunRadius * 0.22;
+    paletteCache = null;
+    scene.skyGradient = ctx.createLinearGradient(0, 0, 0, scene.horizonY + 1);
+    addColorStops(scene.skyGradient, [
+      [0.00, '#08010f'],
+      [0.16, '#170327'],
+      [0.32, '#2c0638'],
+      [0.48, '#4f0a45'],
+      [0.62, '#7a1346'],
+      [0.74, '#ab2445'],
+      [0.84, '#d94a3c'],
+      [0.93, '#f87b38'],
+      [1.00, '#ffb45f']
+    ]);
+    scene.groundGradient = ctx.createLinearGradient(0, scene.horizonY - 1, 0, view.h);
+    addColorStops(scene.groundGradient, [
+      [0.00, '#3d0b2c'],
+      [0.10, '#23061f'],
+      [0.28, '#150317'],
+      [0.62, '#0c0210'],
+      [1.00, '#06010a']
+    ]);
+    scene.vignette = ctx.createRadialGradient(
+      view.w * 0.5, view.h * 0.52, Math.min(view.w, view.h) * 0.18,
+      view.w * 0.5, view.h * 0.52, Math.max(view.w, view.h) * 0.78
+    );
+    addColorStops(scene.vignette, [
+      [0.00, 'rgba(0, 0, 0, 0)'],
+      [0.62, 'rgba(4, 0, 10, 0.16)'],
+      [1.00, 'rgba(2, 0, 6, 0.78)']
+    ]);
+    scene.stars = makeStars();
+    scene.ridges = makeRidges();
+    scene.sunCanvas = bakeSun();
+    scene.palmCanvas = bakePalms();
+    scene.scanlinePattern = makeScanlinePattern();
+  }
+
+  function canDraw(source) {
+    return !!source && typeof source.getContext === 'function' && source.width > 0 && source.height > 0;
+  }
+
+  var lyricLayout = { rows: [], fontSize: 0, rowHeight: 0, width: 0, blockHeight: 0 };
+  var lastLaidIndex = -2;
+
+  function lyricFont(size) {
+    return 'italic 700 ' + Math.round(size) + 'px "Arial Black", "Segoe UI Semibold", "PingFang SC", "Microsoft YaHei", sans-serif';
+  }
+
+  function wrapText(text, maxWidth, fontSize) {
+    var rows = [];
+    if (!text) return rows;
+    ctx.font = lyricFont(fontSize);
+    var current = '';
+    var startIndex = 0;
+    var limit = Math.min(text.length, 220);
+    for (var index = 0; index < limit; index += 1) {
+      var next = current + text[index];
+      if (ctx.measureText(next).width > maxWidth && current.length > 1 && rows.length < 3) {
+        var spaceIndex = current.lastIndexOf(' ');
+        if (spaceIndex > 0 && current.length - spaceIndex <= 18 && spaceIndex < current.length - 1) {
+          rows.push({ text: current.slice(0, spaceIndex), start: startIndex });
+          startIndex = startIndex + spaceIndex + 1;
+          current = text.slice(startIndex, index + 1);
+        } else {
+          rows.push({ text: current, start: startIndex });
+          startIndex = index;
+          current = text[index];
+        }
+      } else {
+        current = next;
+      }
+    }
+    if (current) rows.push({ text: current, start: startIndex });
+    if (rows.length === 0) rows.push({ text: '', start: 0 });
+    return rows;
+  }
+
+  function measureRow(row, fontSize) {
+    if (!row || !row.text) return row;
+    ctx.font = lyricFont(fontSize);
+    var widths = [];
+    var total = 0;
+    for (var index = 0; index < row.text.length; index += 1) {
+      var glyphWidth = ctx.measureText(row.text[index]).width;
+      widths.push(glyphWidth);
+      total += glyphWidth;
+    }
+    row.widths = widths;
+    row.total = total;
+    return row;
+  }
+
+  function layoutLyrics() {
+    if (!ctx) return;
+    lastLaidIndex = lineIndex;
+    var maxWidth = Math.min(view.w * 0.82, 1120);
+    var fontSize = clampNumber(view.h * 0.072, 22, 84);
+    var line = (lineIndex >= 0 && lyricLines[lineIndex]) ? lyricLines[lineIndex] : (lyricLines[0] || null);
+    if (!line) {
+      lyricLayout = {
+        rows: [],
+        fontSize: fontSize,
+        rowHeight: fontSize * 1.12,
+        width: maxWidth,
+        blockHeight: 0,
+        nextRow: null,
+        emptyRow: measureRow({ text: '纯 器 乐', start: 0 }, fontSize * 0.94)
+      };
+      return;
+    }
+    var rows = wrapText(line.text, maxWidth, fontSize);
+    for (var attempt = 0; attempt < 8 && rows.length > 2; attempt += 1) {
+      fontSize *= 0.88;
+      rows = wrapText(line.text, maxWidth, fontSize);
+    }
+    if (rows.length > 3) {
+      rows = rows.slice(0, 3);
+      var tailRow = rows[2];
+      tailRow.text = tailRow.text.slice(0, Math.max(1, tailRow.text.length - 1)) + '…';
+    }
+    var rowHeight = fontSize * 1.12;
+    for (var measureIndex = 0; measureIndex < rows.length; measureIndex += 1) {
+      measureRow(rows[measureIndex], fontSize);
+    }
+    var followingLine = (lineIndex >= 0) ? lyricLines[lineIndex + 1] : null;
+    lyricLayout = {
+      rows: rows,
+      fontSize: fontSize,
+      rowHeight: rowHeight,
+      width: maxWidth,
+      blockHeight: Math.max(0, rows.length - 1) * rowHeight,
+      nextRow: followingLine ? measureRow({ text: followingLine.text.slice(0, 60), start: 0 }, fontSize * 0.36) : null,
+      emptyRow: null
+    };
+  }
+
+  function makeChromeGradient(fontSize) {
+    var gradient = ctx.createLinearGradient(0, -fontSize * 0.72, 0, fontSize * 0.66);
+    addColorStops(gradient, [
+      [0.00, '#ffffff'],
+      [0.13, '#ffe9f8'],
+      [0.28, '#a9dcff'],
+      [0.44, '#ffffff'],
+      [0.60, '#d9c9ef'],
+      [0.76, '#fff7ff'],
+      [0.90, '#ffd2e9'],
+      [1.00, '#c2a2dc']
+    ]);
+    return gradient;
+  }
+
+  function drawChromeRow(row, rowY, fontSize, line, litCount, options) {
+    if (!row || !row.text || !(fontSize > 4)) return;
+    var settings = options || {};
+    ctx.save();
+    ctx.font = lyricFont(fontSize);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    var widths = row.widths;
+    var total = row.total || 0;
+    var charIndex = 0;
+    if (!widths || widths.length !== row.text.length || !(total > 0)) {
+      widths = [];
+      total = 0;
+      for (charIndex = 0; charIndex < row.text.length; charIndex += 1) {
+        var glyphWidth = ctx.measureText(row.text[charIndex]).width;
+        widths.push(glyphWidth);
+        total += glyphWidth;
+      }
+    }
+    var positions = [];
+    if (!(total > 0)) {
+      ctx.restore();
+      return;
+    }
+    ctx.translate(view.w / 2, rowY);
+    try {
+      ctx.transform(1, 0, -0.17, 1, 0, 0);
+    } catch (shearError) {
+      reportError(shearError);
+    }
+    var cursor = -total / 2;
+    for (charIndex = 0; charIndex < widths.length; charIndex += 1) {
+      positions.push(cursor);
+      cursor += widths[charIndex];
+    }
+    var outlineWidth = Math.max(1.5, fontSize * 0.075);
+    var chrome = makeChromeGradient(fontSize);
+    var dimFill = settings.dimFill || 'rgba(160, 130, 188, 0.52)';
+
+    if (settings.ghost !== false) {
+      ctx.fillStyle = rgbaColor(palette().cyan, 0.26);
+      ctx.fillText(row.text, -total / 2 + fontSize * 0.035, -fontSize * 0.022);
+    }
+
+    if (litCount > 0) {
+      ctx.strokeStyle = rgbaColor(palette().neon, 0.16 * (1 + beatLevel));
+      ctx.lineWidth = outlineWidth * 2.7;
+      for (charIndex = 0; charIndex < row.text.length; charIndex += 1) {
+        if (row.start + charIndex >= litCount) break;
+        ctx.strokeText(row.text[charIndex], positions[charIndex], 0);
+      }
+    }
+
+    ctx.strokeStyle = 'rgba(11, 1, 17, 0.9)';
+    ctx.lineWidth = outlineWidth;
+    for (charIndex = 0; charIndex < row.text.length; charIndex += 1) {
+      ctx.strokeText(row.text[charIndex], positions[charIndex], 0);
+    }
+
+    if (litCount > 0) {
+      ctx.fillStyle = chrome;
+      for (charIndex = 0; charIndex < row.text.length; charIndex += 1) {
+        if (row.start + charIndex >= litCount) break;
+        ctx.fillText(row.text[charIndex], positions[charIndex], 0);
+      }
+    }
+
+    ctx.fillStyle = dimFill;
+    for (charIndex = 0; charIndex < row.text.length; charIndex += 1) {
+      if (row.start + charIndex < litCount) continue;
+      ctx.fillText(row.text[charIndex], positions[charIndex], 0);
+    }
+    ctx.restore();
+  }
+
+  function drawLaserFrame(centerY, blockHeight, fontSize) {
+    var neon = palette().neon;
+    var cyan = palette().cyan;
+    var pulse = 0.55 + beatLevel * 0.45;
+    var ruleY = Math.max(view.h * 0.088, centerY - blockHeight / 2 - fontSize * 0.94);
+    var halfSpan = Math.min(view.w * 0.3, 470);
+    var ruleGradient = ctx.createLinearGradient(view.w / 2 - halfSpan, 0, view.w / 2 + halfSpan, 0);
+    addColorStops(ruleGradient, [
+      [0.00, 'rgba(0, 0, 0, 0)'],
+      [0.16, rgbaColor(neon, 0.5 * pulse)],
+      [0.50, rgbaColor([255, 242, 252], 0.8 * pulse)],
+      [0.84, rgbaColor(neon, 0.5 * pulse)],
+      [1.00, 'rgba(0, 0, 0, 0)']
+    ]);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = ruleGradient;
+    ctx.lineWidth = Math.max(1, view.h * 0.0016);
+    ctx.beginPath();
+    ctx.moveTo(view.w / 2 - halfSpan, ruleY);
+    ctx.lineTo(view.w / 2 + halfSpan, ruleY);
+    ctx.stroke();
+
+    var triangleHeight = Math.min(view.h * 0.042, 48);
+    var triangleHalf = Math.min(view.w * 0.052, 88);
+    var apexY = Math.max(ruleY - triangleHeight, view.h * 0.03);
+    ctx.lineWidth = Math.max(1, view.h * 0.0015);
+    ctx.strokeStyle = rgbaColor(cyan, 0.5 * pulse);
+    ctx.beginPath();
+    ctx.moveTo(view.w / 2, apexY);
+    ctx.lineTo(view.w / 2 + triangleHalf, ruleY);
+    ctx.lineTo(view.w / 2 - triangleHalf, ruleY);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.strokeStyle = rgbaColor(neon, 0.4 * pulse);
+    ctx.save();
+    ctx.translate(2.5, -2.5);
+    ctx.beginPath();
+    ctx.moveTo(view.w / 2, apexY);
+    ctx.lineTo(view.w / 2 + triangleHalf, ruleY);
+    ctx.lineTo(view.w / 2 - triangleHalf, ruleY);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = rgbaColor([255, 250, 255], 0.55 * pulse);
+    ctx.beginPath();
+    ctx.arc(view.w / 2, ruleY, Math.max(1.4, view.h * 0.0022), 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawSongTitle() {
+    var name = song.name || '';
+    if (!name) return;
+    var label = name.length > 26 ? name.slice(0, 26) + '…' : name;
+    label = label.toUpperCase();
+    var size = clampNumber(view.h * 0.018, 10, 17);
+    ctx.save();
+    ctx.font = '600 ' + Math.round(size) + 'px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    if ('letterSpacing' in ctx) {
+      try {
+        ctx.letterSpacing = Math.round(size * 0.34) + 'px';
+      } catch (spacingError) {
+        reportError(spacingError);
+      }
+    }
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    var titleY = view.h * 0.038;
+    ctx.fillStyle = 'rgba(248, 226, 255, 0.5)';
+    ctx.fillText(label, view.w / 2, titleY);
+    var textWidth = ctx.measureText(label).width;
+    var gap = Math.max(14, size * 1.1);
+    var lineHalf = Math.min(view.w * 0.12, 150);
+    var startX = view.w / 2 + textWidth / 2 + gap;
+    ctx.strokeStyle = rgbaColor(palette().neon, 0.3);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(startX, titleY);
+    ctx.lineTo(startX + lineHalf, titleY);
+    ctx.moveTo(view.w - startX, titleY);
+    ctx.lineTo(view.w - startX - lineHalf, titleY);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawEmptyState(centerY, fontSize) {
+    var emptyRow = lyricLayout.emptyRow || measureRow({ text: '纯 器 乐', start: 0 }, fontSize * 0.94);
+    drawChromeRow(emptyRow, centerY, fontSize * 0.94, null, 6, {});
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '500 ' + Math.round(clampNumber(view.h * 0.019, 10, 18)) + 'px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    if ('letterSpacing' in ctx) {
+      try {
+        ctx.letterSpacing = '3px';
+      } catch (spacingError) {
+        reportError(spacingError);
+      }
+    }
+    ctx.fillStyle = 'rgba(236, 208, 255, 0.44)';
+    ctx.fillText('· 这首歌没有歌词 ·', view.w / 2, centerY + fontSize * 0.92);
+    ctx.restore();
+  }
+
+  function drawLyrics(time) {
+    if (!ctx) return;
+    if (!hasInit) return;
+    var rows = lyricLayout.rows;
+    var fontSize = lyricLayout.fontSize || clampNumber(view.h * 0.072, 22, 84);
+    var blockHeight = lyricLayout.blockHeight || 0;
+    var centerY = view.h * 0.222;
+    drawLaserFrame(centerY, blockHeight, fontSize);
+    drawSongTitle();
+    if (lyricLines.length === 0) {
+      drawEmptyState(centerY, fontSize);
+      return;
+    }
+    var line = (lineIndex >= 0 && lyricLines[lineIndex]) ? lyricLines[lineIndex] : lyricLines[0];
+    if (!line) return;
+    var litCount = 0;
+    if (lineIndex >= 0 && line.charTimes) {
+      for (var index = 0; index < line.charTimes.length; index += 1) {
+        if (line.charTimes[index] <= time) litCount = index + 1;
+        else break;
+      }
+    }
+    if (rows.length === 0) rows = [{ text: line.text, start: 0 }];
+    var arrivalFade = 1;
+    var arrivalShift = 0;
+    if (lineIndex >= 0) {
+      var sinceStart = time - line.t;
+      if (sinceStart < 0.3) {
+        var arrival = clampNumber(sinceStart / 0.3, 0, 1);
+        arrivalFade = 0.45 + 0.55 * arrival;
+        arrivalShift = (1 - arrival) * fontSize * 0.12;
+      }
+    }
+    ctx.save();
+    ctx.globalAlpha = arrivalFade;
+    for (var rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      var rowY = centerY - blockHeight / 2 + rowIndex * lyricLayout.rowHeight + arrivalShift;
+      drawChromeRow(rows[rowIndex], rowY, fontSize, line, litCount, {
+        dimFill: lineIndex < 0 ? 'rgba(212, 190, 238, 0.62)' : null
+      });
+    }
+    ctx.restore();
+    var nextLine = (lineIndex >= 0) ? lyricLines[lineIndex + 1] : null;
+    if (nextLine && rows.length === 1 && lyricLayout.nextRow) {
+      ctx.save();
+      ctx.globalAlpha = 0.5;
+      drawChromeRow(lyricLayout.nextRow, view.h * 0.292, fontSize * 0.36, nextLine, 0, { ghost: false });
+      ctx.restore();
+    }
+  }
+
+  function drawSky() {
+    if (!scene.skyGradient) return;
+    ctx.fillStyle = scene.skyGradient;
+    ctx.fillRect(0, 0, view.w, scene.horizonY + 1);
+  }
+
+  function drawStars() {
+    var list = scene.stars;
+    if (!list || !list.length) return;
+    ctx.save();
+    ctx.fillStyle = '#ffffff';
+    for (var index = 0; index < list.length; index += 1) {
+      var star = list[index];
+      if (!star) continue;
+      var twinkle = reducedMotion
+        ? 0.7
+        : (0.3 + 0.7 * (0.5 + 0.5 * Math.sin(visualTime * star.speed + star.phase)));
+      var fade = clampNumber(1 - star.y / (scene.horizonY * 0.98), 0, 1);
+      if (fade <= 0.02) continue;
+      ctx.globalAlpha = 0.85 * twinkle * fade;
+      ctx.beginPath();
+      ctx.arc(star.x, star.y, star.radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawSun() {
+    var pulse = 1 + beatLevel * 0.55 + liveLevel * 0.15;
+    var glow = ctx.createRadialGradient(
+      scene.sunCenterX, scene.sunCenterY, Math.max(1, scene.sunRadius * 0.45),
+      scene.sunCenterX, scene.sunCenterY, Math.max(2, scene.sunRadius * 3.1)
+    );
+    addColorStops(glow, [
+      [0.00, rgbaColor([255, 152, 82], 0.30 * pulse)],
+      [0.38, rgbaColor([255, 92, 96], 0.11 * pulse)],
+      [1.00, 'rgba(255, 60, 90, 0)']
+    ]);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, view.w, scene.horizonY + 1);
+    ctx.restore();
+    if (canDraw(scene.sunCanvas) && scene.sunSize > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.94 + beatLevel * 0.06;
+      ctx.drawImage(
+        scene.sunCanvas,
+        scene.sunCenterX - scene.sunSize / 2,
+        scene.sunCenterY - scene.sunSize / 2,
+        scene.sunSize,
+        scene.sunSize
+      );
+      ctx.restore();
+    } else {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(scene.sunCenterX, scene.sunCenterY, Math.max(4, scene.sunRadius), 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.fillStyle = '#ff8a45';
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawRidges() {
+    var list = scene.ridges;
+    if (!list || !list.length) return;
+    ctx.save();
+    for (var index = 0; index < list.length; index += 1) {
+      var ridge = list[index];
+      var points = ridge.points;
+      if (!points || points.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, scene.horizonY + 2);
+      for (var step = 0; step < points.length; step += 1) {
+        ctx.lineTo(points[step].x, points[step].y);
+      }
+      ctx.lineTo(points[points.length - 1].x, scene.horizonY + 2);
+      ctx.closePath();
+      ctx.fillStyle = ridge.color;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (var rimStep = 1; rimStep < points.length; rimStep += 1) {
+        ctx.lineTo(points[rimStep].x, points[rimStep].y);
+      }
+      ctx.strokeStyle = ridge.rim;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawPalms() {
+    if (!canDraw(scene.palmCanvas) || !(scene.palmHeight > 4)) return;
+    ctx.save();
+    ctx.drawImage(scene.palmCanvas, 0, scene.horizonY - scene.palmHeight, view.w, scene.palmHeight);
+    ctx.restore();
+  }
+
+  function drawGround() {
+    if (!scene.groundGradient) return;
+    ctx.fillStyle = scene.groundGradient;
+    ctx.fillRect(0, scene.horizonY - 1, view.w, view.h - scene.horizonY + 2);
+  }
+
+  function drawHorizonHaze() {
+    var pulse = 1 + beatLevel * 0.6;
+    var haze = palette().haze;
+    var bandTop = scene.horizonY - view.h * 0.02;
+    var band = ctx.createLinearGradient(0, bandTop, 0, scene.horizonY + view.h * 0.12);
+    addColorStops(band, [
+      [0.00, rgbaColor(haze, 0)],
+      [0.22, rgbaColor(haze, 0.26 * pulse)],
+      [0.55, rgbaColor([255, 86, 120], 0.10)],
+      [1.00, 'rgba(255, 70, 120, 0)']
+    ]);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = band;
+    ctx.fillRect(0, bandTop, view.w, view.h * 0.14);
+    var centralGlow = ctx.createRadialGradient(
+      view.w * 0.5, scene.horizonY, 0,
+      view.w * 0.5, scene.horizonY, Math.max(40, view.w * 0.62)
+    );
+    addColorStops(centralGlow, [
+      [0.00, rgbaColor([255, 214, 168], 0.40 * pulse)],
+      [0.24, rgbaColor([255, 122, 108], 0.15)],
+      [1.00, 'rgba(120, 0, 70, 0)']
+    ]);
+    ctx.fillStyle = centralGlow;
+    ctx.fillRect(0, scene.horizonY - view.h * 0.05, view.w, view.h * 0.12);
+    var roadGlow = ctx.createLinearGradient(0, scene.horizonY, 0, scene.horizonY + view.h * 0.36);
+    addColorStops(roadGlow, [
+      [0.00, rgbaColor([255, 172, 122], 0.24 * pulse)],
+      [0.32, rgbaColor([255, 92, 112], 0.11 * pulse)],
+      [1.00, 'rgba(255, 60, 90, 0)']
+    ]);
+    ctx.fillStyle = roadGlow;
+    var roadHalf = Math.max(24, Math.min(view.w * 0.17, scene.sunRadius * 1.45));
+    ctx.fillRect(view.w / 2 - roadHalf, scene.horizonY, roadHalf * 2, view.h * 0.36);
+    ctx.fillStyle = rgbaColor([255, 228, 192], 0.30 * pulse);
+    ctx.fillRect(0, scene.horizonY - 1, view.w, Math.max(1, view.h * 0.0018));
+    ctx.restore();
+  }
+
+  function drawGrid() {
+    var neon = palette().neon;
+    var cyan = palette().cyan;
+    var coreWidth = Math.max(1, view.h * 0.0017);
+    var glowWidth = coreWidth * 5.5;
+    var speed = reducedMotion ? 1.8 : (5.4 + liveBass * 3.6);
+    var spacing = 2.6;
+    var scroll = (visualTime * speed) % spacing;
+    var depthSteps = 30;
+    var lateralSpacing = 3.4;
+    var lateralCount = 9;
+    var nearZ = -0.55;
+    var splitZ = 7.5;
+    var farZ = 66;
+    var pulse = 1 + beatLevel * 0.4;
+    var index = 0;
+    var lane = 0;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'butt';
+    for (index = 0; index < depthSteps; index += 1) {
+      var depthZ = 1.05 + index * spacing - scroll;
+      if (depthZ < nearZ) continue;
+      var projected = projectPoint(0, 0, depthZ);
+      if (!isFinite(projected.y)) continue;
+      var fade = clampNumber(1 - depthZ / farZ, 0.05, 1);
+      var alpha = (0.08 + 0.72 * fade * fade) * pulse;
+      ctx.strokeStyle = rgbaColor(neon, alpha * 0.20);
+      ctx.lineWidth = glowWidth;
+      ctx.beginPath();
+      ctx.moveTo(0, projected.y);
+      ctx.lineTo(view.w, projected.y);
+      ctx.stroke();
+      ctx.strokeStyle = rgbaColor(neon, alpha * 0.85);
+      ctx.lineWidth = coreWidth;
+      ctx.beginPath();
+      ctx.moveTo(0, projected.y);
+      ctx.lineTo(view.w, projected.y);
+      ctx.stroke();
+    }
+    for (lane = -lateralCount; lane <= lateralCount; lane += 1) {
+      var laneX = lane * lateralSpacing;
+      var nearPoint = projectPoint(laneX, 0, nearZ);
+      var splitPoint = projectPoint(laneX, 0, splitZ);
+      var farPoint = projectPoint(laneX, 0, farZ);
+      if (!isFinite(nearPoint.x) || !isFinite(farPoint.x) || !isFinite(splitPoint.x)) continue;
+      ctx.strokeStyle = rgbaColor(neon, 0.16 * pulse);
+      ctx.lineWidth = coreWidth;
+      ctx.beginPath();
+      ctx.moveTo(splitPoint.x, splitPoint.y);
+      ctx.lineTo(farPoint.x, farPoint.y);
+      ctx.stroke();
+      ctx.strokeStyle = rgbaColor(neon, 0.14 * pulse);
+      ctx.lineWidth = glowWidth;
+      ctx.beginPath();
+      ctx.moveTo(nearPoint.x, nearPoint.y);
+      ctx.lineTo(splitPoint.x, splitPoint.y);
+      ctx.stroke();
+      ctx.strokeStyle = lane === 0
+        ? rgbaColor(mixColor(neon, [255, 246, 255], 0.45), 0.92 * pulse)
+        : rgbaColor(neon, 0.78 * pulse);
+      ctx.lineWidth = lane === 0 ? coreWidth * 1.7 : coreWidth;
+      ctx.beginPath();
+      ctx.moveTo(nearPoint.x, nearPoint.y);
+      ctx.lineTo(splitPoint.x, splitPoint.y);
+      ctx.stroke();
+      ctx.strokeStyle = rgbaColor(cyan, 0.20 * pulse);
+      ctx.lineWidth = coreWidth;
+      ctx.beginPath();
+      ctx.moveTo(nearPoint.x + 2, nearPoint.y);
+      ctx.lineTo(splitPoint.x + 2, splitPoint.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  var carSections = [
+    { z: 0.00, halfWidth: 0.95, roof: 0.94, floor: 0.30 },
+    { z: 0.65, halfWidth: 1.00, roof: 0.97, floor: 0.28 },
+    { z: 1.70, halfWidth: 1.00, roof: 1.02, floor: 0.28 },
+    { z: 2.50, halfWidth: 0.90, roof: 1.09, floor: 0.28 },
+    { z: 3.35, halfWidth: 0.84, roof: 0.86, floor: 0.28 },
+    { z: 4.25, halfWidth: 0.78, roof: 0.68, floor: 0.34 }
+  ];
+
+  function carMotion() {
+    var bob = reducedMotion ? 0 : Math.sin(visualTime * 2.3) * 0.014;
+    var yaw = reducedMotion ? 0 : Math.sin(visualTime * 0.57) * 0.02;
+    return { bob: bob, yaw: yaw, cosYaw: Math.cos(yaw), sinYaw: Math.sin(yaw) };
+  }
+
+  function projectCar(pointX, pointY, pointZ, motion) {
+    var localZ = pointZ - 2.1;
+    var rotatedX = pointX * motion.cosYaw - localZ * motion.sinYaw;
+    var rotatedZ = pointX * motion.sinYaw + localZ * motion.cosYaw;
+    return projectPoint(rotatedX, pointY + motion.bob, rotatedZ + 2.1);
+  }
+
+  function quadPoint(quad, u, v) {
+    var topX = quad[0].x + (quad[1].x - quad[0].x) * u;
+    var topY = quad[0].y + (quad[1].y - quad[0].y) * u;
+    var bottomX = quad[3].x + (quad[2].x - quad[3].x) * u;
+    var bottomY = quad[3].y + (quad[2].y - quad[3].y) * u;
+    return { x: topX + (bottomX - topX) * v, y: topY + (bottomY - topY) * v };
+  }
+
+  function fillQuad(points, fill, stroke, lineWidth) {
+    if (!points || points.length < 3) return;
+    for (var check = 0; check < points.length; check += 1) {
+      if (!points[check] || !isFinite(points[check].x) || !isFinite(points[check].y)) return;
+    }
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (var index = 1; index < points.length; index += 1) {
+      ctx.lineTo(points[index].x, points[index].y);
+    }
+    ctx.closePath();
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+    }
+    if (stroke) {
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lineWidth || 1;
+      ctx.stroke();
+    }
+  }
+
+  function drawCarShadow(motion) {
+    var corners = [
+      projectCar(-1.0, 0, 4.0, motion),
+      projectCar(1.0, 0, 4.0, motion),
+      projectCar(1.0, 0, -0.45, motion),
+      projectCar(-1.0, 0, -0.45, motion)
+    ];
+    fillQuad(corners, 'rgba(4, 0, 8, 0.62)', null, 0);
+    var spillCenter = projectCar(0, 0.02, 0.6, motion);
+    if (isFinite(spillCenter.x) && isFinite(spillCenter.y)) {
+      var spillRadius = Math.max(20, spillCenter.scale * 2.4);
+      var spill = ctx.createRadialGradient(spillCenter.x, spillCenter.y, 0, spillCenter.x, spillCenter.y, spillRadius);
+      addColorStops(spill, [
+        [0.00, rgbaColor(palette().taillight, 0.42)],
+        [0.42, rgbaColor([255, 90, 60], 0.14)],
+        [1.00, 'rgba(255, 60, 60, 0)']
+      ]);
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.beginPath();
+      ctx.ellipse(spillCenter.x, spillCenter.y, spillRadius * 1.25, spillRadius * 0.42, 0, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.fillStyle = spill;
+      ctx.fill();
+      var under = ctx.createRadialGradient(spillCenter.x, spillCenter.y, 0, spillCenter.x, spillCenter.y, spillRadius * 0.8);
+      addColorStops(under, [
+        [0.00, rgbaColor(palette().cyan, 0.16)],
+        [1.00, 'rgba(0, 200, 255, 0)']
+      ]);
+      ctx.fillStyle = under;
+      ctx.beginPath();
+      ctx.ellipse(spillCenter.x, spillCenter.y, spillRadius * 0.7, spillRadius * 0.24, 0, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawCarWheels(motion) {
+    var sides = [-1, 1];
+    for (var index = 0; index < sides.length; index += 1) {
+      var center = projectCar(sides[index] * 0.94, 0.36, 0.55, motion);
+      if (!isFinite(center.x) || !isFinite(center.y) || !(center.scale > 0)) continue;
+      var wheelRadius = 0.36 * center.scale;
+      ctx.save();
+      ctx.beginPath();
+      ctx.ellipse(center.x, center.y, wheelRadius * 0.42, wheelRadius, 0, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.fillStyle = '#050109';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 120, 190, 0.28)';
+      ctx.lineWidth = Math.max(1, wheelRadius * 0.08);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawCarTaillightBloom(quad) {
+    var center = quadPoint(quad, 0.5, 0.4);
+    var edge = quadPoint(quad, 0.98, 0.4);
+    if (!isFinite(center.x) || !isFinite(edge.x)) return;
+    var radius = Math.max(20, Math.abs(edge.x - center.x) * 1.35);
+    var bloom = ctx.createRadialGradient(center.x, center.y, 0, center.x, center.y, radius);
+    addColorStops(bloom, [
+      [0.00, rgbaColor(palette().taillight, 0.34)],
+      [0.45, rgbaColor([255, 70, 70], 0.12)],
+      [1.00, 'rgba(255, 40, 60, 0)']
+    ]);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = bloom;
+    ctx.fillRect(center.x - radius, center.y - radius, radius * 2, radius * 2);
+    ctx.restore();
+  }
+
+  function drawCarRearDetails(quad) {
+    var panelTop = 0.25;
+    var panelBottom = 0.55;
+    fillQuad([
+      quadPoint(quad, 0.05, panelTop),
+      quadPoint(quad, 0.95, panelTop),
+      quadPoint(quad, 0.95, panelBottom),
+      quadPoint(quad, 0.05, panelBottom)
+    ], 'rgba(24, 2, 14, 0.94)', null, 0);
+
+    var side = 0;
+    var cell = 0;
+    for (side = 0; side < 2; side += 1) {
+      var baseU = side === 0 ? 0.075 : 0.555;
+      for (cell = 0; cell < 3; cell += 1) {
+        var barStart = baseU + cell * 0.125;
+        var barEnd = barStart + 0.098;
+        var barQuad = [
+          quadPoint(quad, barStart, 0.29),
+          quadPoint(quad, barEnd, 0.29),
+          quadPoint(quad, barEnd, 0.51),
+          quadPoint(quad, barStart, 0.51)
+        ];
+        fillQuad(barQuad, '#ff2440', 'rgba(255, 214, 224, 0.65)', 1);
+        var barCenter = quadPoint(quad, (barStart + barEnd) / 2, 0.4);
+        var barWidth = Math.abs(barQuad[1].x - barQuad[0].x);
+        if (!isFinite(barCenter.x) || !(barWidth > 0)) continue;
+        var barGlow = ctx.createRadialGradient(barCenter.x, barCenter.y, 0, barCenter.x, barCenter.y, barWidth * 2.6 + 6);
+        addColorStops(barGlow, [
+          [0.00, 'rgba(255, 120, 140, 0.55)'],
+          [0.45, 'rgba(255, 40, 70, 0.20)'],
+          [1.00, 'rgba(255, 20, 60, 0)']
+        ]);
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.fillStyle = barGlow;
+        ctx.fillRect(barCenter.x - barWidth * 3, barCenter.y - barWidth * 3, barWidth * 6, barWidth * 6);
+        ctx.restore();
+      }
+    }
+
+    fillQuad([
+      quadPoint(quad, 0.445, 0.61),
+      quadPoint(quad, 0.555, 0.61),
+      quadPoint(quad, 0.555, 0.79),
+      quadPoint(quad, 0.445, 0.79)
+    ], 'rgba(228, 222, 240, 0.86)', 'rgba(40, 10, 30, 0.7)', 1);
+
+    var bumperLeft = quadPoint(quad, 0.03, 0.87);
+    var bumperRight = quadPoint(quad, 0.97, 0.87);
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(bumperLeft.x, bumperLeft.y);
+    ctx.lineTo(bumperRight.x, bumperRight.y);
+    ctx.strokeStyle = 'rgba(255, 130, 200, 0.35)';
+    ctx.lineWidth = Math.max(1, Math.abs(bumperRight.x - bumperLeft.x) * 0.01);
+    ctx.stroke();
+    ctx.restore();
+
+    var exhaustSides = [0.36, 0.64];
+    for (var pipe = 0; pipe < exhaustSides.length; pipe += 1) {
+      var pipeCenter = quadPoint(quad, exhaustSides[pipe], 0.93);
+      var pipeRadius = Math.max(2, Math.abs(quad[1].x - quad[0].x) * 0.022);
+      if (!isFinite(pipeCenter.x)) continue;
+      ctx.save();
+      ctx.beginPath();
+      ctx.ellipse(pipeCenter.x, pipeCenter.y, pipeRadius, pipeRadius * 0.72, 0, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.fillStyle = '#0a0410';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 168, 120, 0.6)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawCarWing(motion) {
+    var plate = [
+      projectCar(-0.98, 1.18, 0.32, motion),
+      projectCar(0.98, 1.18, 0.32, motion),
+      projectCar(0.98, 1.18, 0.95, motion),
+      projectCar(-0.98, 1.18, 0.95, motion)
+    ];
+    fillQuad(plate, '#1d0a2f', 'rgba(255, 160, 226, 0.5)', 1.2);
+    var edge = [
+      projectCar(-0.98, 1.18, 0.32, motion),
+      projectCar(0.98, 1.18, 0.32, motion),
+      projectCar(0.98, 1.11, 0.32, motion),
+      projectCar(-0.98, 1.11, 0.32, motion)
+    ];
+    fillQuad(edge, '#0c0414', 'rgba(255, 120, 200, 0.25)', 1);
+    var struts = [-0.62, 0.62];
+    for (var index = 0; index < struts.length; index += 1) {
+      var strut = [
+        projectCar(struts[index] - 0.05, 1.11, 0.55, motion),
+        projectCar(struts[index] + 0.05, 1.11, 0.55, motion),
+        projectCar(struts[index] + 0.05, 0.98, 0.55, motion),
+        projectCar(struts[index] - 0.05, 0.98, 0.55, motion)
+      ];
+      fillQuad(strut, '#0a0312', null, 0);
+    }
+  }
+
+  function drawCarLouvers(farRing, nearRing) {
+    var deck = [nearRing.topLeft, nearRing.topRight, farRing.topRight, farRing.topLeft];
+    ctx.save();
+    ctx.strokeStyle = 'rgba(4, 0, 10, 0.62)';
+    ctx.lineWidth = Math.max(1, view.h * 0.0022);
+    for (var line = 1; line <= 6; line += 1) {
+      var rowRatio = 0.16 + (line / 7) * 0.7;
+      var start = quadPoint(deck, 0.12, rowRatio);
+      var finish = quadPoint(deck, 0.88, rowRatio);
+      if (!isFinite(start.x) || !isFinite(finish.x)) continue;
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(finish.x, finish.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawCar() {
+    var motion = carMotion();
+    var rings = [];
+    var index = 0;
+    for (index = 0; index < carSections.length; index += 1) {
+      var section = carSections[index];
+      var shoulder = section.halfWidth * 0.9;
+      rings.push({
+        topLeft: projectCar(-shoulder, section.roof, section.z, motion),
+        topRight: projectCar(shoulder, section.roof, section.z, motion),
+        bottomLeft: projectCar(-section.halfWidth, section.floor, section.z, motion),
+        bottomRight: projectCar(section.halfWidth, section.floor, section.z, motion)
+      });
+    }
+    drawCarShadow(motion);
+    drawCarWheels(motion);
+    for (index = rings.length - 2; index >= 0; index -= 1) {
+      var nearRing = rings[index];
+      var farRing = rings[index + 1];
+      fillQuad(
+        [nearRing.topLeft, nearRing.topRight, farRing.topRight, farRing.topLeft],
+        index >= 3 ? '#150822' : '#1e0b30',
+        'rgba(255, 156, 224, 0.42)',
+        1
+      );
+      fillQuad(
+        [nearRing.topLeft, farRing.topLeft, farRing.bottomLeft, nearRing.bottomLeft],
+        '#07030d',
+        'rgba(255, 120, 200, 0.14)',
+        1
+      );
+      fillQuad(
+        [nearRing.topRight, farRing.topRight, farRing.bottomRight, nearRing.bottomRight],
+        '#07030d',
+        'rgba(255, 120, 200, 0.14)',
+        1
+      );
+    }
+    drawCarLouvers(rings[1], rings[2]);
+    var rearQuad = [rings[0].topLeft, rings[0].topRight, rings[0].bottomRight, rings[0].bottomLeft];
+    drawCarTaillightBloom(rearQuad);
+    fillQuad(rearQuad, '#05010a', 'rgba(255, 150, 215, 0.55)', Math.max(1, view.h * 0.0018));
+    drawCarRearDetails(rearQuad);
+    drawCarWing(motion);
+  }
+
+  function drawAtmosphere() {
+    if (scene.scanlinePattern) {
+      ctx.save();
+      ctx.fillStyle = scene.scanlinePattern;
+      ctx.fillRect(0, 0, view.w, view.h);
+      ctx.restore();
+    }
+    if (scene.vignette) {
+      ctx.save();
+      ctx.fillStyle = scene.vignette;
+      ctx.fillRect(0, 0, view.w, view.h);
+      ctx.restore();
+    }
+  }
+
+  function render(now) {
+    if (!ctx) return;
+    frames += 1;
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, view.w, view.h);
+    drawSky();
+    drawStars();
+    drawSun();
+    drawRidges();
+    drawPalms();
+    drawGround();
+    drawHorizonHaze();
+    drawGrid();
+    drawCar();
+    drawAtmosphere();
+    drawLyrics(clock);
+  }
+
+  function startLoop() {
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function frame(now) {
+    rafId = requestAnimationFrame(frame);
+    var started = performance.now();
+    try {
+      stepSimulation(now);
+      render(now);
+    } catch (frameError) {
+      reportError(frameError);
+    }
+    jsMs = performance.now() - started;
+  }
+
+  function stepSimulation(now) {
+    var stamp = (typeof now === 'number') ? now : performance.now();
+    var delta = lastFrameAt > 0 ? (stamp - lastFrameAt) / 1000 : 1 / 60;
+    lastFrameAt = stamp;
+    if (!isFinite(delta) || delta < 0) delta = 0;
+    delta = Math.min(delta, 0.09);
+    visualTime += delta * (playing ? 1 : 0.3);
+    beatAge += delta;
+    beatLevel = Math.max(0, beatLevel - beatLevel * delta * 4.2);
+    if (lastLaidIndex !== lineIndex) {
+      try {
+        layoutLyrics();
+      } catch (layoutError) {
+        reportError(layoutError);
+      }
+    }
+  }
+
+  requestAnimationFrame(function firstFrame() {
+    sendReady();
+    startLoop();
+  });
+  window.setTimeout(sendReady, 800);
+  window.addEventListener('message', onMessage);
+  window.addEventListener('resize', resize);
+  resize();
+  layoutLyrics();
+})();
+</script>
+</body>
+</html>

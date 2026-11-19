@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>新拟态面板</title>
+<style>
+  html,body{margin:0;height:100%;background:#222834;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(142,153,180,.34);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   032 · 新拟态面板 —— 歌词是一块从面板上"凸"出来的浮雕
+   ---------------------------------------------------------------------------
+   核心机制：**双向偏移浮雕 + 整体按压**。
+   参考文件的新拟态只有两件事：一凸（18px/18px 暗影 + -14px/-14px 亮影）
+   和一凹（inset 暗影）。这里把它变成字：
+     · 每个采样点画三次 —— 暗影点（右下偏移）、高光点（左上偏移）、
+       面色点（原位）。三点叠在一起，笔画就成了一道有倒角的凸起；
+     · 偏移量 = 2.9 × press。press 由弹簧驱动：踩拍时被按到 -0.9，
+       于是暗影跑到左上、高光跑到右下 —— 整块字**由凸变凹**，
+       再弹回凸起。这就是参考文件里 `.btn:active` 的 inset 效果，
+       只不过作用在字形上，而且整块一起按（相干，不是逐颗乱抖）。
+
+   精修记录（批次B）：① **逐字压印接 YRC** —— 每个采样点记录自己属于
+   第几个字；该字的 chars[k].t 没到之前点是"凹刻"（inset，只有暗影无高光，
+   极暗），到点瞬间"浮起"成全亮度凸浮雕 + 一记 0.5s 的压印脉冲；无 chars
+   按 t + dur*i/n 均分。② 长句折行 —— 单行缩到 ~14px 不可读，改为
+   2~4 行布局采样（行数按目标块宽高比决定），面内字号自适应。
+   ③ beat 时整卡光影呼吸（面板整体压暗 + 表盘/滑条一起动，相干）。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+const PI = Math.PI, TAU = PI * 2;
+const MAXP = 2600;
+
+const canFilter = (() => {
+  try { return typeof document.createElement('canvas').getContext('2d').filter === 'string'; }
+  catch (_) { return false; }
+})();
+
+/* 参考文件的暗色新拟态令牌 */
+const SF = '#242a36', BG = '#222834';
+let accent = [109, 141, 255];       // --acc  #6d8dff
+let accent2 = [167, 139, 250];      // --acc2 #a78bfa
+let colCore = '#39424f', colCoreDown = '#20252f';
+const colShadow = 'rgba(0,0,0,0.46)';
+const colHi = 'rgba(255,255,255,0.11)';
+let pressCols = [];
+
+/* 布局 */
+const PAD = 26, GAP = 16, HEADH = 20, DIAL = 64, LCDH = 64, SLH = 12, DOTSH = 22;
+let PX = 0, PY = 0, PW = 0, PH = 0;
+let GX = 0, GY = 0, GW = 0, GH = 0;
+let LX = 0, LY = 0, LW = 0, LH = 0;
+let DX = 0, DY = 0, DR = 0;
+let SXp = 0, SYp = 0, SWp = 0;
+let DOTY = 0, DOTW = 0, DOTR = 7;
+
+/* 预渲染精灵 */
+let layer = null, disc = null, discA = null, glow = null, ledSpr = null;
+
+function rr(g, x, y, w, h, r) {
+  const k = Math.min(r, w * 0.5, h * 0.5);
+  g.beginPath();
+  g.moveTo(x + k, y);
+  g.arcTo(x + w, y, x + w, y + h, k);
+  g.arcTo(x + w, y + h, x, y + h, k);
+  g.arcTo(x, y + h, x, y, k);
+  g.arcTo(x, y, x + w, y, k);
+  g.closePath();
+}
+
+/* ---- 字采样（多行布局）----
+   行数按目标块 aspect 决定：宽 ≈ (L/R)·F、高 ≈ R·1.18·F，
+   要 aspect ≤ 2.0 需要 R ≥ √(L/2)。返回 { pts, charIdx }，
+   charIdx[i] = 第 i 个采样点属于原文第几个字（逐字压印靠它）。 */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+const BREAK32 = /[\s，。！？、；：,.!?;:…—～·「」『』（）()《》【】]/;
+function splitRows32(text) {
+  const L = text.length;
+  if (L < 10) return [text];
+  const R = Math.max(2, Math.min(5, Math.ceil(Math.sqrt(L / 2))));
+  const rows = [];
+  let prev = 0;
+  for (let r = 1; r < R; r++) {
+    const ideal = prev + Math.round((L - prev) / (R - r + 1));
+    let i = ideal;
+    for (const d of [0, 1, 2, 3, -1, -2, -3]) {
+      const j = ideal + d;
+      if (j > prev && j < L && (BREAK32.test(text[j - 1]) || BREAK32.test(text[j]))) { i = j; break; }
+    }
+    i = Math.max(prev + 1, Math.min(L - (R - r), i));
+    rows.push(text.slice(prev, i));
+    prev = i;
+  }
+  rows.push(text.slice(prev));
+  return rows;
+}
+function glyphPoints(text) {
+  const rows = splitRows32(text);
+  const F = 96;
+  const maxW = Math.min(W * 0.72, 1000);
+  octx.font = '800 ' + F + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  let w = 1;
+  for (const r of rows) w = Math.max(w, Math.ceil(octx.measureText(r).width) + 8);
+  const lh = F * 1.18;
+  const fs = w > maxW ? F * (maxW / w) : F;
+  const scale = fs / F;
+  const h = Math.ceil(lh * rows.length * scale) + 8;
+  const w2 = Math.ceil(w * scale) + 8;
+  off.width = w2; off.height = h;
+  octx.clearRect(0, 0, w2, h);
+  octx.font = '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  /* 逐字绘制：每个字画在自己的包围盒里，采样后 charIdx 直接回填 */
+  const pts = [];
+  const charIdx = [];
+  const step = 2;
+  let y = h / 2 - (rows.length - 1) * lh * scale / 2;
+  let ci = 0;
+  for (const row of rows) {
+    const rw = octx.measureText(row).width;
+    let x = w2 / 2 - rw / 2;
+    for (let k = 0; k < row.length; k++, ci++) {
+      const ch = row[k];
+      if (ch === ' ') continue;
+      const cw = octx.measureText(ch).width;
+      octx.fillText(ch, x + cw / 2, y);
+      x += cw;
+      const gx0 = Math.max(0, Math.floor(x - cw - 1)), gx1 = Math.min(w2, Math.ceil(x + 1));
+      const gy0 = Math.max(0, Math.floor(y - fs * 0.72)), gy1 = Math.min(h, Math.ceil(y + fs * 0.72));
+      const img = octx.getImageData(gx0, gy0, gx1 - gx0, gy1 - gy0).data;
+      const gw = gx1 - gx0;
+      for (let yy = 0; yy < gy1 - gy0; yy += step)
+        for (let xx = 0; xx < gw; xx += step)
+          if (img[(yy * gw + xx) * 4 + 3] > 128) {
+            pts.push(gx0 + xx - w2 / 2, gy0 + yy - h / 2);
+            charIdx.push(ci);
+          }
+    }
+    y += lh * scale;
+  }
+  return { pts, charIdx };
+}
+
+/* 两个缓冲：rawCur = 正在显示的，rawNext = 正在酝酿的。
+   换句时交换指针，旧的当场释放（不能留着一句占着池子）。
+   ci = 采样点属于第几个字；ct = 逐字压印时刻表（秒）。 */
+const rawA = { x: new Float32Array(MAXP), y: new Float32Array(MAXP), ci: new Uint16Array(MAXP), ct: null, n: 0, w: 1, h: 1 };
+const rawB = { x: new Float32Array(MAXP), y: new Float32Array(MAXP), ci: new Uint16Array(MAXP), ct: null, n: 0, w: 1, h: 1 };
+let rawCur = rawA, rawNext = rawB;
+const sx = new Float32Array(MAXP), sy = new Float32Array(MAXP);
+const sci = new Uint16Array(MAXP);
+let sn = 0, bornAt = -1, curCt = null, curYrc = false;
+let gsc = 1, gcx = 0, gcy = 0;
+
+function sampleInto(dst, text, line) {
+  const g = glyphPoints(text || '');
+  const pts = g.pts;
+  const pc = pts.length / 2;
+  dst.n = 0; dst.ct = null;
+  if (!pc) return;
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < pc; i++) {
+    const x = pts[i * 2], y = pts[i * 2 + 1];
+    if (x < mnX) mnX = x; if (x > mxX) mxX = x;
+    if (y < mnY) mnY = y; if (y > mxY) mxY = y;
+  }
+  const cx = (mnX + mxX) / 2, cy = (mnY + mxY) / 2;
+  const n = Math.min(MAXP, pc);
+  /* 逐字压印时刻表：chars[k].t，无 chars 按 t + dur*i/n 均分 */
+  const L = (text || '').length;
+  const chs = line && line.chars && line.chars.length === L ? line.chars : null;
+  const t0 = line ? line.t : 0;
+  const dur = Math.max(0.8, (line && line.dur) || 2.4);
+  const ct = new Float32Array(L);
+  let prev = 0;
+  for (let i = 0; i < L; i++) {
+    let t = chs && isFinite(+chs[i].t) ? +chs[i].t : t0 + dur * 0.80 * (i / Math.max(1, L));
+    if (!(t >= t0)) t = t0;
+    if (t < prev) t = prev;
+    prev = t;
+    ct[i] = t;
+  }
+  dst.ct = ct; dst.yrc = !!chs;
+  for (let i = 0; i < n; i++) {
+    const p = (Math.floor(i * pc / n) % pc) * 2;   // 等间隔取样
+    dst.x[i] = pts[p] - cx;
+    dst.y[i] = pts[p + 1] - cy;
+    dst.ci[i] = g.charIdx[Math.floor(i * pc / n) % pc] || 0;
+  }
+  dst.n = n; dst.w = Math.max(1, mxX - mnX); dst.h = Math.max(1, mxY - mnY);
+}
+
+function fitGlyph() {
+  sn = 0;
+  if (!rawCur.n) return;
+  /* 放大倍率封顶 2.2：采样步长 2px 乘上它就是屏幕上的点距，
+     短句被放得太大时点距会超过颗粒直径，笔画就散成点阵（坑 ④）。 */
+  const sc = Math.min(GW * 0.94 / rawCur.w, GH * 0.86 / rawCur.h, 2.2);
+  gsc = sc; gcx = GX + GW / 2; gcy = GY + GH / 2;
+  for (let i = 0; i < rawCur.n; i++) {
+    sx[i] = gcx + rawCur.x[i] * sc;
+    sy[i] = gcy + rawCur.y[i] * sc;
+    sci[i] = rawCur.ci[i];
+  }
+  sn = rawCur.n;
+  curCt = rawCur.ct; curYrc = !!rawCur.yrc;
+}
+
+/* ---- 预渲染 ---- */
+function bakeDisc(n, fill) {
+  const c = document.createElement('canvas'); c.width = n; c.height = n;
+  const g = c.getContext('2d');
+  const r = n * 0.5 - n * 0.2, cx = n / 2, cy = n / 2;
+  g.save();
+  if (canFilter) g.filter = 'blur(' + (n * 0.05).toFixed(2) + 'px)';
+  g.fillStyle = 'rgba(0,0,0,0.55)';
+  g.beginPath(); g.arc(cx + n * 0.05, cy + n * 0.05, r, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.10)';
+  g.beginPath(); g.arc(cx - n * 0.045, cy - n * 0.045, r, 0, TAU); g.fill();
+  g.restore();
+  g.fillStyle = fill;
+  g.beginPath(); g.arc(cx, cy, r, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.06)';
+  g.beginPath(); g.arc(cx - r * 0.22, cy - r * 0.26, r * 0.62, 0, TAU); g.fill();
+  return c;
+}
+function bakeGlow(n, rgb, a) {
+  const c = document.createElement('canvas'); c.width = n; c.height = n;
+  const g = c.getContext('2d');
+  const gr = g.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+  gr.addColorStop(0, 'rgba(' + rgb + ',' + a + ')');
+  gr.addColorStop(0.45, 'rgba(' + rgb + ',' + (a * 0.34).toFixed(3) + ')');
+  gr.addColorStop(1, 'rgba(' + rgb + ',0)');
+  g.fillStyle = gr; g.fillRect(0, 0, n, n);
+  return c;
+}
+
+function layout() {
+  PW = Math.min(W * 0.86, 1060);
+  PH = Math.min(H * 0.76, 620);
+  PX = (W - PW) / 2; PY = (H - PH) / 2;
+  const inner = PW - PAD * 2;
+  GX = PX + PAD; GW = inner;
+  GY = PY + PAD + HEADH + GAP;
+  GH = PH - PAD * 2 - HEADH - LCDH - SLH - DOTSH - GAP * 4;
+  LX = PX + PAD + DIAL + GAP; LY = GY + GH + GAP;
+  LW = inner - DIAL - GAP; LH = LCDH;
+  DX = PX + PAD + DIAL / 2; DY = LY + LCDH / 2; DR = DIAL / 2;
+  SXp = PX + PAD; SYp = LY + LH + GAP; SWp = inner;
+  DOTY = SYp + SLH + GAP; DOTW = inner;
+}
+
+function bake() {
+  layout();
+  const acc = 'rgb(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ')';
+  disc = bakeDisc(160, SF);
+  discA = bakeDisc(160, acc);
+  glow = bakeGlow(128, accent[0] + ',' + accent[1] + ',' + accent[2], 0.55);
+  ledSpr = bakeGlow(96, '35,196,108', 0.85);
+
+  layer = document.createElement('canvas');
+  layer.width = cv.width; layer.height = cv.height;
+  const g = layer.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  /* 背景：radial-gradient(110% 90% at 50% -10%, rgba(90,110,200,.10), transparent 55%) + --sf */
+  g.fillStyle = BG; g.fillRect(0, 0, W, H);
+  let gr = g.createRadialGradient(W * 0.5, -H * 0.1, 0, W * 0.5, -H * 0.1, Math.max(W, H) * 0.95);
+  gr.addColorStop(0, 'rgba(90,110,200,0.13)');
+  gr.addColorStop(0.55, 'rgba(90,110,200,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+
+  /* 面板：先暗影（+18,+18）再亮影（-14,-14），最后面板本体 */
+  const PP = 70;
+  const mk = (col, blur) => {
+    const c = document.createElement('canvas');
+    c.width = Math.round(PW + PP * 2); c.height = Math.round(PH + PP * 2);
+    const q = c.getContext('2d');
+    if (canFilter) q.filter = 'blur(' + blur + 'px)';
+    q.fillStyle = col; rr(q, PP, PP, PW, PH, 30); q.fill();
+    return c;
+  };
+  const sh1 = mk('rgba(0,0,0,0.62)', 20);
+  const sh2 = mk('rgba(255,255,255,0.075)', 18);
+  g.drawImage(sh1, PX - PP + 18, PY - PP + 18);
+  g.drawImage(sh2, PX - PP - 14, PY - PP - 14);
+  g.fillStyle = SF; rr(g, PX, PY, PW, PH, 30); g.fill();
+
+  /* 表盘：底盘 + 刻度（repeating-conic-gradient 的等价物，合成一条路径一次描边） */
+  g.drawImage(disc, DX - DR, DY - DR, DR * 2, DR * 2);
+  g.strokeStyle = 'rgba(140,152,184,0.42)';
+  g.lineWidth = 1.6;
+  g.beginPath();
+  for (let i = 0; i < 36; i++) {
+    const a = -PI * 0.75 + (i / 35) * PI * 1.5;
+    const c1 = Math.cos(a), s1 = Math.sin(a);
+    g.moveTo(DX + c1 * (DR - 13), DY + s1 * (DR - 13));
+    g.lineTo(DX + c1 * (DR - 6), DY + s1 * (DR - 6));
+  }
+  g.stroke();
+  g.strokeStyle = 'rgba(140,152,184,0.18)';
+  g.lineWidth = 1;
+  g.beginPath(); g.arc(DX, DY, DR - 5, 0, TAU); g.stroke();
+
+  /* LCD 屏：凹槽 */
+  g.save();
+  rr(g, LX, LY, LW, LH, 16); g.clip();
+  g.fillStyle = '#0a0f17'; g.fillRect(LX, LY, LW, LH);
+  if (canFilter) g.filter = 'blur(7px)';
+  g.strokeStyle = 'rgba(0,0,0,0.9)'; g.lineWidth = 10;
+  rr(g, LX, LY, LW, LH, 16); g.stroke();
+  g.restore();
+  g.fillStyle = 'rgba(255,255,255,0.05)';
+  g.fillRect(LX + 8, LY + 1, LW - 16, 1.4);
+
+  /* 滑条凹槽 */
+  g.save();
+  rr(g, SXp, SYp, SWp, SLH, 6); g.clip();
+  g.fillStyle = '#1d222c'; g.fillRect(SXp, SYp, SWp, SLH);
+  if (canFilter) g.filter = 'blur(4px)';
+  g.strokeStyle = 'rgba(0,0,0,0.85)'; g.lineWidth = 6;
+  rr(g, SXp, SYp, SWp, SLH, 6); g.stroke();
+  g.restore();
+
+  /* 一排小圆点（相当于参考文件的 lever 开关） */
+  DOTR = Math.min(7, DOTSH * 0.32);
+  const step = DOTW / 12;
+  for (let i = 0; i < 12; i++) {
+    const x = PX + PAD + step * (i + 0.5), y = DOTY + DOTSH / 2;
+    g.drawImage(disc, x - DOTR - 4, y - DOTR - 4, DOTR * 2 + 8, DOTR * 2 + 8);
+  }
+
+  /* 静态文字 */
+  g.fillStyle = '#8e99b4';
+  g.font = '600 10px ui-monospace,"Cascadia Code",Consolas,monospace';
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.fillText('NEUMORPH OS · V2.6', PX + PW - PAD - 150, PY + PAD + HEADH / 2);
+  g.fillStyle = '#dfe6f5';
+  g.font = '700 13px ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif';
+  g.fillText('拟态控制台', PX + PAD + 20, PY + PAD + HEADH / 2);
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bake();
+  fitGlyph();
+}
+addEventListener('resize', resize);
+
+function buildColors() {
+  const a = accent;
+  colCore = 'rgb(' + Math.round(46 + a[0] * 0.04) + ',' + Math.round(52 + a[1] * 0.04) + ',' + Math.round(64 + a[2] * 0.05) + ')';
+  colCoreDown = '#20252f';
+  pressCols = [];
+  for (let i = 0; i < 7; i++) pressCols.push('rgba(0,0,0,' + (i * 0.033).toFixed(3) + ')');
+}
+buildColors();
+resize();
+
+/* ---- 节奏 ---- */
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+let press = 1, pressV = 0;          // 1 = 凸起，负 = 按下去
+let breath = 0;                     // beat 整卡光影呼吸包络
+let curLine = null;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    rawCur.n = 0; rawNext.n = 0; sn = 0; curLine = null;   // 清掉所有结构
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      /* 显示切到第 ci 句：交换缓冲，旧的当场释放 */
+      const tmp = rawCur; rawCur = rawNext; rawNext = tmp;
+      rawNext.n = 0;
+      /* 拖进度条回来时这一句没酝酿过，这里补采样一次，否则整句空白 */
+      if (!rawCur.n) sampleInto(rawCur, lines[ci].text, lines[ci]);
+      fitGlyph();
+      bornAt = T;
+      curLine = lines[ci];
+      press = -0.45; pressV = 0;      // 换页时面板被按一下
+    } else {
+      rawCur.n = 0; sn = 0; curLine = null;
+    }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      sampleInto(rawNext, lines[nx].text, lines[nx]);   // 提前把下一句的字形点算好
+    }
+  }
+}
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+const fmt = (t) => {
+  if (!(t > 0)) t = 0;
+  const m = Math.floor(t / 60), s = t - m * 60;
+  return m + ':' + (s < 10 ? '0' : '') + s.toFixed(1);
+};
+
+/* ---- 浮雕：三档各一次 fillStyle + 一整轮 fillRect。
+   逐字压印：该字的 YRC 时刻没到 → 点是"凹刻"（只有暗影、极暗）；
+   到点 → 浮起成全亮凸浮雕，0.5s 内有一记压印脉冲（亮桶） ---- */
+function drawRelief(T) {
+  if (!sn || bornAt < 0) return;
+  let rv = (T - bornAt) / 0.42;
+  if (rv < 0) rv = 0; else if (rv > 1) rv = 1;
+  const d = 2.9 * press * rv;
+  const szS = 5.6, szH = 5.0, szC = 4.0;
+  const ct = curCt;
+
+  /* 未浮起的字：凹刻（inset）—— 原位一颗暗点，没有暗影/高光分离 */
+  ctx.globalAlpha = 0.55 * rv;
+  ctx.fillStyle = colCoreDown;
+  for (let i = 0; i < sn; i++) {
+    if (ct && T < ct[sci[i] % ct.length]) ctx.fillRect(sx[i] - szC / 2, sy[i] - szC / 2, szC, szC);
+  }
+
+  /* 已浮起的字：正常凸浮雕（暗影右下 + 高光左上 + 面色原位）；
+     到点 0.5s 内额外画进亮桶（压印脉冲） */
+  ctx.globalAlpha = 0.30 + 0.70 * rv;
+  ctx.fillStyle = colShadow;
+  for (let i = 0; i < sn; i++) {
+    if (ct && T < ct[sci[i] % ct.length]) continue;
+    ctx.fillRect(sx[i] + d - szS / 2, sy[i] + d - szS / 2, szS, szS);
+  }
+  ctx.fillStyle = colHi;
+  for (let i = 0; i < sn; i++) {
+    if (ct && T < ct[sci[i] % ct.length]) continue;
+    ctx.fillRect(sx[i] - d - szH / 2, sy[i] - d - szH / 2, szH, szH);
+  }
+  ctx.fillStyle = press < 0 ? colCoreDown : colCore;
+  for (let i = 0; i < sn; i++) {
+    if (ct && T < ct[sci[i] % ct.length]) continue;
+    ctx.fillRect(sx[i] - szC / 2, sy[i] - szC / 2, szC, szC);
+  }
+  /* 压印脉冲桶：刚浮起的点又大又亮（accent 染色） */
+  if (ct) {
+    ctx.fillStyle = 'rgb(' + Math.min(255, accent[0] + 60) + ',' + Math.min(255, accent[1] + 60) +
+                    ',' + Math.min(255, accent[2] + 40) + ')';
+    for (let i = 0; i < sn; i++) {
+      const since = T - ct[sci[i] % ct.length];
+      if (since < 0 || since >= 0.5) continue;
+      const k = 1 - since / 0.5;
+      const sz = szC + 2.6 * k;
+      ctx.globalAlpha = 0.35 + 0.65 * k;
+      ctx.fillRect(sx[i] - sz / 2, sy[i] - sz / 2, sz, sz);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawDynamics(T) {
+  const acc = 'rgb(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ')';
+  const acc2 = 'rgb(' + accent2[0] + ',' + accent2[1] + ',' + accent2[2] + ')';
+
+  /* 按压时整块面板压暗 */
+  if (press < 0.985) {
+    let b = Math.round((1 - press) * 3.5); if (b > 6) b = 6; if (b < 0) b = 0;
+    ctx.fillStyle = pressCols[b];
+    rr(ctx, PX, PY, PW, PH, 30); ctx.fill();
+  }
+
+  /* beat 整卡光影呼吸：面板四缘内侧一起亮一圈（accent 染色，相干） */
+  if (breath > 0.02) {
+    ctx.strokeStyle = 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',' +
+                      (0.10 + 0.22 * breath).toFixed(3) + ')';
+    ctx.lineWidth = 1.5 + 2.5 * breath;
+    rr(ctx, PX + 2, PY + 2, PW - 4, PH - 4, 28); ctx.stroke();
+  }
+
+  /* 表盘旋钮：角度复刻参考文件的 -135deg + v*2.7 */
+  let prog = 0;
+  if (curLine) {
+    const dur = curLine.dur > 0.4 ? curLine.dur : 3.2;
+    prog = (T - curLine.t) / dur;
+    if (prog < 0) prog = 0; else if (prog > 1) prog = 1;
+  }
+  const kr = DR - 12;
+  ctx.drawImage(disc, DX - kr, DY - kr, kr * 2, kr * 2);
+  const ka = (-135 + prog * 270) * PI / 180;
+  ctx.strokeStyle = acc;
+  ctx.lineWidth = 3.5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(DX + Math.cos(ka) * (kr * 0.30), DY + Math.sin(ka) * (kr * 0.30));
+  ctx.lineTo(DX + Math.cos(ka) * (kr * 0.80), DY + Math.sin(ka) * (kr * 0.80));
+  ctx.stroke();
+  ctx.lineCap = 'butt';
+
+  /* 滑条：accent → accent2 的填充 */
+  const fw = Math.max(0, SWp * prog);
+  if (fw > 3) {
+    ctx.fillStyle = acc;
+    rr(ctx, SXp + 3, SYp + 3, fw - 6 > 2 ? fw - 6 : 2, SLH - 6, 4); ctx.fill();
+    ctx.globalAlpha = 0.5; ctx.fillStyle = acc2;
+    rr(ctx, SXp + 3, SYp + 3, fw - 6 > 2 ? fw - 6 : 2, (SLH - 6) * 0.5, 3); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  /* 点阵：当前句那一颗亮起 */
+  const step = DOTW / 12;
+  const ai = curIdx >= 0 ? curIdx % 12 : -1;
+  for (let i = 0; i < 12; i++) {
+    if (i !== ai) continue;
+    const x = PX + PAD + step * (i + 0.5), y = DOTY + DOTSH / 2;
+    ctx.globalAlpha = 0.75;
+    ctx.drawImage(glow, x - 22, y - 22, 44, 44);
+    ctx.globalAlpha = 1;
+    ctx.drawImage(discA, x - DOTR - 2, y - DOTR - 2, DOTR * 2 + 4, DOTR * 2 + 4);
+  }
+
+  /* LED */
+  const lx = PX + PAD + 7, ly = PY + PAD + HEADH / 2;
+  const pulse = 0.55 + 0.45 * Math.max(0, 1 + press) * (0.6 + 0.4 * Math.sin(T * 5.2));
+  ctx.globalAlpha = 0.35 + 0.5 * pulse;
+  ctx.drawImage(ledSpr, lx - 13, ly - 13, 26, 26);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = 'rgb(60,220,130)';
+  ctx.beginPath(); ctx.arc(lx, ly, 5, 0, TAU); ctx.fill();
+
+  /* LCD 上的绿字 */
+  ctx.save();
+  rr(ctx, LX, LY, LW, LH, 16); ctx.clip();
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#57e6a1';
+  ctx.font = '600 12px ui-monospace,"Cascadia Code",Consolas,monospace';
+  const st = (curIdx >= 0 ? String(curIdx + 1).padStart(2, '0') : '--') + '/' +
+    (lines.length ? String(lines.length).padStart(2, '0') : '--');
+  ctx.fillText('VOL 064   SPD 045   BRT 072   ' + (playing ? 'RUN' : 'STANDBY'),
+    LX + 14, LY + 17);
+  ctx.font = '700 15px ui-monospace,"Cascadia Code",Consolas,monospace';
+  const txt = curLine ? curLine.text : (lines.length ? '· · ·' : 'NO LYRIC');
+  ctx.fillText(txt, LX + 14, LY + 42);
+  ctx.textAlign = 'right';
+  ctx.font = '600 12px ui-monospace,"Cascadia Code",Consolas,monospace';
+  ctx.fillText(st + '  ' + fmt(T), LX + LW - 14, LY + 17);
+  ctx.restore();
+}
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+
+  /* beat 光影呼吸包络衰减 */
+  breath *= Math.exp(-dt * 3.6);
+
+  /* 弹簧：踩拍被按下去，然后弹回凸起（整块一起，相干） */
+  pressV += ((1 - press) * 150 - pressV * 12) * dt;
+  press += pressV * dt;
+  if (press > 1.3) press = 1.3; else if (press < -1.4) press = -1.4;
+
+  ctx.drawImage(layer, 0, 0, W, H);
+  drawRelief(T);
+  drawDynamics(T);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) {
+      accent = p.accent;
+      const h = accent[0] * 0.299 + accent[1] * 0.587 + accent[2] * 0.114;
+      accent2 = [
+        Math.min(255, Math.round(accent[0] * 0.55 + h * 0.45 + 40)),
+        Math.min(255, Math.round(accent[1] * 0.55 + h * 0.45)),
+        Math.min(255, Math.round(accent[2] * 0.60 + h * 0.40 + 30))
+      ];
+      buildColors(); bake();
+    }
+    rawCur.n = 0; rawNext.n = 0; sn = 0; bornAt = -1; curLine = null;
+    press = 1; pressV = 0;
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：整块面板一起按下去 + 整卡光影一起呼吸一次 */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    press = -0.55 - 0.45 * lv; pressV = 0;
+    breath = Math.min(1, breath + 0.4 + 0.6 * lv);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => {
+  let mnX = 1e9, mxX = -1e9, mnY = 1e9, mxY = -1e9;
+  for (let i = 0; i < sn; i++) {
+    if (sx[i] < mnX) mnX = sx[i]; if (sx[i] > mxX) mxX = sx[i];
+    if (sy[i] < mnY) mnY = sy[i]; if (sy[i] > mxY) mxY = sy[i];
+  }
+  return {
+    lines: lines.length, cur: curIdx, brew: brewIdx, t: +now().toFixed(2),
+    pts: sn, press: +press.toFixed(3), yrc: !!curYrc,
+    scrBox: sn ? { x: mnX, y: mnY, w: mxX - mnX, h: mxY - mnY } : null
+  };
+};
+</script>
+</body>
+</html>

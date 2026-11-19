@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>生长之树</title>
+<style>
+  html,body{margin:0;height:100%;background:#04080b;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(170,220,215,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   051 · 生长之树 —— L 系统从**每个字的根部**长出来，把这句话读成一片树林
+   ----------------------------------------------------------------------------
+   核心机制：**每字一棵 L 系统树**。字是这棵树的吸引域，不是粒子靶点：
+     · 每个字脚下有自己的根点，重写规则每段 2~3 个子枝、角度按黄金角错开、
+       长度按 0.68 衰减，共 4 层；
+     · 每一段新枝生成时朝**该字的字形采样点**偏转（距离越近拉得越狠），
+       于是树冠不是散开的，而是层层收束到笔画上 —— 枝梢最后停住的轮廓，
+       就是那个字；
+     · 字本身也以同一套青绿光画在枝梢之间，所以读的时候是"枝干 + 字"一起
+       把词读出来的，而不是一团点阵。
+   整句 = 一排小树。行是地面，每个字脚下长一棵，长句自动分成 1~3 行。
+
+   和已有形态的区别：这里没有"粒子被吸到采样点"的过程，也没有沿已知轮廓
+   跑的轨道；拓扑是 L 系统自己算出来的，每句、每字都不一样。
+   和 042（叶序）/049（双摆）的区别：那是数学轨迹，这里是文法生长。
+
+   分词：不用 —— 生成系统类逐字生长更自然，第 k 个字自己的树长出来就够了。
+
+   精修记录：
+   ① 逐字时刻统一走 charTimes()：chars 只有"长度与正文逐字相等 + 时间可解析"
+      才采信，并做单调钳位；缺 chars / 长度不符一律 line.t + dur*k/n 均分回退，
+      不会报错。第 k 字的树与字在 chars[k].t 开始生长（生长动画提前 0.16s 起笔，
+      笔画落在 t 上），window.__stage().yrc 暴露是否走了 YRC。
+   ② 阅读优先：整句按 1~3 行排版，取放得下的最大字号（41 字约 84px、3 行），
+      每行再居中；暗色描边 + 低透明压暗层保证枝干再亮也读得清；未唱到的字
+      保持 0.62 可见度，句尾仍完整。
+   ③ 镜头：整场缓慢漂移（双正弦，约 10px），每棵树随 gust 轻微摆动；
+       beat 相干脉冲（glow 提亮 + 枝干变粗 + 一次风）。
+   ④ 性能：所有枝段端点预先算好（每句一次），每帧只按深度合批 5 条 Path2D；
+      天空/地面/辉光/暗角烘成位图，星点整批一次 fill。
+   ========================================================================== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hint = document.getElementById('hint');
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+/* ---- 画布 ---- */
+let W = 0, H = 0, DPR = 1;
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeOut = (t) => 1 - Math.pow(1 - t, 2.2);
+function fit() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(320, innerWidth); H = Math.max(240, innerHeight);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+fit();
+
+/* ================= 排版：1~3 行，逐字绝对坐标 ================= */
+const FAMILY = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif';
+const FONT = (fs) => '800 ' + fs.toFixed(1) + 'px ' + FAMILY;
+const om = document.createElement('canvas').getContext('2d');
+
+/* 平衡折行：先按"想要几行"估字号，再按目标宽度均分，行数超了缩字号 */
+function layout(text, availW, availH, maxRows, cy) {
+  const s = text;
+  if (!/\S/.test(s)) return null;
+  const n = s.length;
+  om.font = FONT(100);
+  let best = 0, bestR = 1;
+  for (let r = 1; r <= maxRows; r++) {
+    const per = Math.ceil(n / r);
+    const wPer = om.measureText(s.slice(0, Math.min(n, per))).width / 100 || 0.01;
+    const f = Math.min(availW / wPer, availH / (r * 1.34), 96);
+    if (f > best * (r >= 3 ? 1.06 : 1)) { best = f; bestR = r; }
+  }
+  let fs = Math.max(13, best);
+  let ranges = null;
+  for (let guard = 0; guard < 30; guard++) {
+    om.font = FONT(fs);
+    const total = om.measureText(s).width;
+    const cap = Math.max(fs * 2.2, Math.min(availW, total / bestR * 1.04));
+    const rr = [];
+    let start = 0;
+    while (start < n) {
+      let lo = start + 1, hi = n;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (om.measureText(s.slice(start, mid)).width <= cap) lo = mid; else hi = mid - 1;
+      }
+      let end = Math.max(start + 1, lo);
+      const sp = s.lastIndexOf(' ', end - 1);
+      if (sp > start + Math.max(2, (end - start) * 0.5)) end = sp;
+      rr.push([start, end]);
+      start = end;
+    }
+    if (rr.length <= maxRows) { ranges = rr; break; }
+    fs *= 0.9;
+    if (fs < 13) { fs = 13; ranges = rr; break; }
+  }
+  if (!ranges) return null;
+  const lh = fs * 1.34;
+  const rows = [];
+  let maxw = 0;
+  om.font = FONT(fs);
+  for (let q = 0; q < ranges.length; q++) {
+    const a = ranges[q][0], b = ranges[q][1];
+    let x = 0;
+    const chars = [];
+    for (let i = a; i < b; i++) {
+      const ch = s[i];
+      const w = om.measureText(ch).width;
+      chars.push({ ch, x, w, k: i });
+      x += w;
+    }
+    if (x > maxw) maxw = x;
+    rows.push({ chars, w: x });
+  }
+  const blockH = rows.length * lh;
+  const y0 = cy - blockH / 2;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const rx = (W - row.w) / 2;
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      c.ax = rx + c.x + c.w / 2;
+      c.ay = y0 + r * lh + lh / 2;
+    }
+  }
+  return { rows, fs, lh, blockW: maxw, blockH, cy };
+}
+
+/* 逐字时刻：chars 与正文逐字对齐才采信（并单调钳位），否则均分回退 */
+function charTimes(line, n) {
+  const out = new Float32Array(Math.max(1, n));
+  const chs = line ? line.chars : null;
+  const base = line ? (isFinite(line.t) ? line.t : 0) : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+/* ================= 单字采样（给树的吸引域用） ================= */
+const off = document.createElement('canvas');
+off.width = 128; off.height = 128;
+const octx = off.getContext('2d', { willReadFrequently: true });
+const GLYPHF = 78;
+
+function sampleGlyph(ch, bw, bh, maxPts) {
+  const w = off.width, h = off.height;
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, w, h);
+  octx.font = '800 ' + GLYPHF + 'px ' + FAMILY;
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(ch, w / 2, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const kx = bw / GLYPHF, ky = bh / (GLYPHF * 1.02);
+  const all = [];
+  for (let y = 2; y < h; y += 5) {
+    for (let x = 2; x < w; x += 5) {
+      if (d[(y * w + x) * 4 + 3] > 120) all.push((x - w / 2) * kx, (y - h / 2) * ky);
+    }
+  }
+  const np = all.length / 2;
+  if (!np) return new Float32Array(0);
+  const cnt = Math.min(np, maxPts);
+  const out = new Float32Array(cnt * 2);
+  const step = Math.max(1, Math.floor(np / cnt));
+  let o = 0;
+  for (let i = 0; i < np && o < out.length; i += step) {
+    out[o++] = all[i * 2]; out[o++] = all[i * 2 + 1];
+  }
+  return out;
+}
+
+/* ================= L 系统树林（每句一次性算完所有端点） ================= */
+const MAXD = 5;
+function mulberry(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function buildForest(lay, ct, idx, txtBottom) {
+  const X0 = [], Y0 = [], X1 = [], Y1 = [], DD = [], TT = [], PP = [];
+  const rnd = mulberry(0x51ed2f ^ (idx * 7919 + 13));
+  const groundY = H * 0.982;
+  /* 树冠顶到字块下沿为止 —— 字是树"够"到的目标，但不许穿过字 */
+  const topLimit = clamp(txtBottom + Math.max(14, lay.lh * 0.22), H * 0.30, H * 0.80);
+  const geoSum = (1 - Math.pow(0.76, 6)) / 0.24;
+  function push(x0, y0, x1, y1, d, t0, ph) {
+    X0.push(x0); Y0.push(y0); X1.push(x1); Y1.push(y1);
+    DD.push(d); TT.push(t0); PP.push(ph);
+  }
+  function nearest(pts, np, x, y) {
+    let bi = -1, bd = 1e18;
+    for (let i = 0; i < np; i++) {
+      const dx = pts[i * 2] - x, dy = pts[i * 2 + 1] - y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bd) { bd = d2; bi = i; }
+    }
+    return bi;
+  }
+  function grow(x, y, ang, len, depth, t0, pts, np, ceil) {
+    let a = ang;
+    let x2 = x + Math.cos(a) * len, y2 = y + Math.sin(a) * len;
+    let cut = false;
+    if (y2 < ceil) {                         /* 到了自己的树冠线就收笔 */
+      const t = (y - ceil) / Math.max(1e-3, y - y2);
+      len *= clamp(t, 0, 1);
+      x2 = x + Math.cos(a) * len; y2 = y + Math.sin(a) * len;
+      cut = true;
+    }
+    push(x, y, x2, y2, depth, t0 + depth * 0.058, rnd() * TAU);
+    if (cut || depth >= MAXD || len < 3) return;
+    const n = depth === 0 ? 3 : 2;
+    for (let i = 0; i < n; i++) {
+      let na = a + (i / (n - 1 || 1) - 0.5) * (0.72 + rnd() * 0.34) + (rnd() - 0.5) * 0.14;
+      const ti = nearest(pts, np, x2, y2);
+      if (ti >= 0) {                         /* 朝这个字的笔画偏转 —— 吸引域 */
+        const ta = Math.atan2(pts[ti * 2 + 1] - y2, pts[ti * 2] - x2);
+        let da = ta - na;
+        while (da > Math.PI) da -= TAU;
+        while (da < -Math.PI) da += TAU;
+        na += da * 0.34 * Math.pow(0.82, depth);
+      }
+      grow(x2, y2, clamp(na, -Math.PI + 0.17, -0.17), len * (0.72 + rnd() * 0.08),
+           depth + 1, t0, pts, np, ceil);
+    }
+  }
+  const span = groundY - topLimit;
+  let nShort = 0;
+  for (let r = 0; r < lay.rows.length; r++) nShort += lay.rows[r].chars.length;
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      if (X0.length > 4000) break;
+      const c = row.chars[i];
+      if (!/\S/.test(c.ch)) continue;
+      const cw = Math.max(c.w, lay.fs * 0.80);
+      const rel = sampleGlyph(c.ch, cw * 0.86, lay.lh * 0.80, 16);
+      const np = rel.length / 2;
+      if (!np) continue;
+      const abs = new Float32Array(np * 2);
+      for (let q = 0; q < np; q++) {
+        abs[q * 2] = c.ax + rel[q * 2];
+        abs[q * 2 + 1] = c.ay + rel[q * 2 + 1];
+      }
+      const t0 = isFinite(ct[c.k]) ? ct[c.k] : 0;
+      const hh = span * (0.54 + rnd() * 0.44);          /* 高矮不一，才像林子 */
+      const L0 = Math.max(20, hh / geoSum);
+      const rx0 = c.ax + (rnd() - 0.5) * cw * 0.70;
+      grow(rx0, groundY + rnd() * 5,
+           -Math.PI / 2 + (rnd() - 0.5) * 0.42, L0, 0, t0, abs, np, groundY - hh);
+      /* 短句树太少会空 —— 每个字再补一棵矮的，偏半格 */
+      if (nShort < 18) {
+        const hh2 = hh * (0.55 + rnd() * 0.25);
+        const side = rnd() < 0.5 ? -1 : 1;
+        grow(c.ax + side * cw * (0.45 + rnd() * 0.35), groundY + rnd() * 5,
+             -Math.PI / 2 + (rnd() - 0.5) * 0.5, Math.max(16, hh2 / geoSum), 0, t0,
+             abs, np, groundY - hh2);
+      }
+    }
+  }
+  return {
+    n: X0.length,
+    x0: Float32Array.from(X0), y0: Float32Array.from(Y0),
+    x1: Float32Array.from(X1), y1: Float32Array.from(Y1),
+    d: Uint8Array.from(DD), t0: Float32Array.from(TT), ph: Float32Array.from(PP)
+  };
+}
+
+/* ================= 静态层 ================= */
+let accent = [130, 220, 200];
+let hueBase = 168;
+let stars = [];
+function makeStars() {
+  stars = [];
+  const n = Math.round((W * H) / 16000);
+  for (let i = 0; i < n; i++) {
+    stars.push({ x: Math.random() * W, y: Math.random() * H * 0.82,
+                 r: 0.4 + Math.random() * 1.2, p: Math.random() * TAU });
+  }
+}
+function hueOf(rgb) {
+  const r = rgb[0] / 255, g = rgb[1] / 255, b = rgb[2] / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  if (d < 1e-4) return 168;
+  let h;
+  if (mx === r) h = ((g - b) / d) % 6;
+  else if (mx === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return h;
+}
+
+const COL = [], LW = [];
+function buildPalette() {
+  hueBase = hueOf(accent);
+  COL.length = 0; LW.length = 0;
+  for (let d = 0; d <= MAXD; d++) {
+    COL.push('hsl(' + ((hueBase + 4 + d * 6) % 360).toFixed(0) + ',' +
+             (58 + d * 5).toFixed(0) + '%,' + (34 + d * 7).toFixed(0) + '%)');
+    LW.push(Math.max(0.7, 3.6 * Math.pow(0.77, d)));
+  }
+}
+buildPalette();
+
+let bgCv = null, vgCv = null, fogCv = null, bgW = 0, bgH = 0;
+function buildStatic() {
+  const pw = Math.round(W * DPR), ph = Math.round(H * DPR);
+  bgW = pw; bgH = ph;
+  bgCv = document.createElement('canvas'); bgCv.width = pw; bgCv.height = ph;
+  const g = bgCv.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const sky = g.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#04080c'); sky.addColorStop(0.55, '#061218'); sky.addColorStop(1, '#04100f');
+  g.fillStyle = sky; g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = 'lighter';
+  const glow = g.createRadialGradient(W * 0.5, H * 0.97, 0, W * 0.5, H * 0.97, Math.max(W, H) * 0.5);
+  glow.addColorStop(0, 'rgba(' + (accent[0] * 0.34 + 20 | 0) + ',' + (accent[1] * 0.5 + 30 | 0) + ',' +
+                        (accent[2] * 0.45 + 30 | 0) + ',0.17)');
+  glow.addColorStop(0.5, 'rgba(30,90,100,0.05)');
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = glow; g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = 'source-over';
+  g.fillStyle = 'rgba(5,16,18,0.95)';
+  g.beginPath();
+  g.moveTo(0, H * 0.972 + 6);
+  g.quadraticCurveTo(W * 0.22, H * 0.972 - 20, W * 0.46, H * 0.972 - 2);
+  g.quadraticCurveTo(W * 0.72, H * 0.972 - 26, W, H * 0.972 + 8);
+  g.lineTo(W, H); g.lineTo(0, H);
+  g.closePath(); g.fill();
+  const ground = g.createLinearGradient(0, H - H * 0.12, 0, H);
+  ground.addColorStop(0, 'rgba(10,30,30,0)');
+  ground.addColorStop(0.4, 'rgba(10,30,30,0.5)');
+  ground.addColorStop(1, 'rgba(3,9,11,0.95)');
+  g.fillStyle = ground; g.fillRect(0, H - H * 0.12, W, H * 0.12);
+
+  /* 地平线雾带：单独一层，画在树林之后 —— 根扎在雾里，才不会是一排整齐的桩 */
+  fogCv = document.createElement('canvas'); fogCv.width = pw; fogCv.height = ph;
+  const fg = fogCv.getContext('2d');
+  fg.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const fog = fg.createLinearGradient(0, H * 0.74, 0, H);
+  fog.addColorStop(0, 'rgba(4,20,20,0)');
+  fog.addColorStop(0.55, 'rgba(4,18,18,0.52)');
+  fog.addColorStop(1, 'rgba(3,14,15,0.90)');
+  fg.fillStyle = fog; fg.fillRect(0, H * 0.74, W, H * 0.26);
+
+  vgCv = document.createElement('canvas'); vgCv.width = pw; vgCv.height = ph;
+  const v = vgCv.getContext('2d');
+  v.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const vg = v.createRadialGradient(W * 0.5, H * 0.5, Math.min(W, H) * 0.28,
+                                    W * 0.5, H * 0.5, Math.max(W, H) * 0.80);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(2,5,7,0.46)');
+  v.fillStyle = vg; v.fillRect(0, 0, W, H);
+}
+
+/** 字块背后的低透明压暗层（字在亮枝之间才压得住） */
+function makeScrim(bw, bh) {
+  const pad = 64;
+  const w = bw + pad * 2, h = bh + pad * 2;
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(w * DPR));
+  c.height = Math.max(2, Math.round(h * DPR));
+  const g = c.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const rx = w * 0.52, ry = Math.max(h * 0.34, 1);
+  g.save();
+  g.translate(w / 2, h / 2);
+  g.scale(1, ry / rx);
+  const rg = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+  rg.addColorStop(0, 'rgba(3,9,11,0.52)');
+  rg.addColorStop(0.60, 'rgba(3,9,11,0.36)');
+  rg.addColorStop(1, 'rgba(3,9,11,0)');
+  g.fillStyle = rg;
+  g.beginPath(); g.arc(0, 0, rx, 0, TAU); g.fill();
+  g.restore();
+  return { cv: c, w, h };
+}
+
+/* ================= 节奏 ================= */
+let lines = [];
+let cur = null, pend = null;
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let curYrc = false;
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+function buildLyric(ln, idx) {
+  const text = (ln && ln.text) || '';
+  const n = text.length;
+  if (!n) return null;
+  const ct = charTimes(ln, n);
+  const availW = Math.min(W * 0.90, 1380);
+  const availH = Math.min(H * 0.28, 280);
+  const lay = layout(text, availW, availH, 3, H * 0.23);
+  if (!lay) return null;
+  return {
+    line: ln, t0: isFinite(ln.t) ? ln.t : 0, dur: ln.dur || 4, text, n,
+    ct: ct.t, yrc: ct.yrc,
+    rows: lay.rows, fs: lay.fs, lh: lay.lh, cy: lay.cy, blockH: lay.blockH,
+    scrim: makeScrim(lay.blockW, lay.blockH),
+    br: buildForest(lay, ct.t, idx, lay.cy + lay.blockH / 2)
+  };
+}
+
+function prepare(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  pend = buildLyric(ln, idx);
+}
+
+function startLine(idx) {
+  const ln = lines[idx];
+  if (!ln) return;
+  if (pend && pend.line === ln) { cur = pend; pend = null; }
+  else cur = buildLyric(ln, idx);
+  curYrc = !!(cur && cur.yrc);
+  hint.style.opacity = '0';
+}
+
+function release() {
+  cur = null; pend = null; curYrc = false;
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; release(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci);
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      prepare(nx);
+    }
+  }
+}
+
+/* ================= 绘制 ================= */
+let time = 0, gust = 0, glow = 0;
+const paths = [];
+for (let d = 0; d <= MAXD; d++) paths.push(new Path2D());
+
+function drawForest(T) {
+  const L = cur;
+  if (!L || !L.br || !L.br.n) return;
+  const br = L.br;
+  for (let d = 0; d <= MAXD; d++) paths[d] = new Path2D();
+  let tipPath = null;
+  for (let i = 0; i < br.n; i++) {
+    const e0 = (T - br.t0[i]) / 0.34;
+    if (e0 <= 0) continue;
+    const e = easeOut(e0 >= 1 ? 1 : e0);
+    const x0 = br.x0[i], y0 = br.y0[i];
+    const dx = br.x1[i] - x0, dy = br.y1[i] - y0;
+    const d = br.d[i];
+    let a = (Math.sin(time * 1.25 + br.ph[i]) * 0.024 + gust * 0.055) * (d + 1) / 6;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    const rx = (dx * ca - dy * sa) * e, ry = (dx * sa + dy * ca) * e;
+    const p = paths[d];
+    p.moveTo(x0, y0);
+    p.lineTo(x0 + rx, y0 + ry);
+    if (d >= MAXD && e > 0.55) {
+      if (!tipPath) tipPath = new Path2D();
+      const tx = x0 + rx, ty = y0 + ry;
+      tipPath.moveTo(tx + 1.4, ty);
+      tipPath.arc(tx, ty, 1.4, 0, TAU);
+    }
+  }
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for (let d = 0; d <= MAXD; d++) {
+    ctx.strokeStyle = COL[d];
+    ctx.lineWidth = LW[d] * (1 + glow * 0.16);
+    ctx.stroke(paths[d]);
+  }
+  if (tipPath) {
+    ctx.fillStyle = 'hsla(' + ((hueBase + 26) % 360).toFixed(0) + ',88%,78%,' +
+                    (0.16 + glow * 0.34).toFixed(3) + ')';
+    ctx.fill(tipPath);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+let lastFs = -1;
+function drawScrim(T) {
+  const L = cur;
+  if (!L || !L.scrim) return;
+  const app = clamp((T - L.t0) / 0.26, 0, 1);
+  const ap = 0.34 + 0.66 * (app * app * (3 - 2 * app));
+  ctx.globalAlpha = 0.9 * ap;
+  ctx.drawImage(L.scrim.cv, 0, 0, L.scrim.cv.width, L.scrim.cv.height,
+                W / 2 - L.scrim.w / 2, L.cy - L.scrim.h / 2, L.scrim.w, L.scrim.h);
+  ctx.globalAlpha = 1;
+}
+function drawText(T) {
+  const L = cur;
+  if (!L || !L.rows) return;
+  const app = clamp((T - L.t0) / 0.26, 0, 1);
+  const ap = 0.34 + 0.66 * (app * app * (3 - 2 * app));
+  let curCh = -1;
+  for (let k = 0; k < L.n; k++) if (T >= L.ct[k]) curCh = k;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  lastFs = -1;
+  for (let r = 0; r < L.rows.length; r++) {
+    const row = L.rows[r];
+    for (let i = 0; i < row.chars.length; i++) {
+      const c = row.chars[i];
+      const k = c.k;
+      const lit = T >= L.ct[k];
+      const isCur = k === curCh;
+      const fsz = L.fs * (isCur ? 1.10 : 1);
+      if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+      ctx.globalAlpha = ap;
+      ctx.lineWidth = Math.max(2, fsz * 0.11);
+      ctx.strokeStyle = 'rgba(3,9,11,0.88)';
+      ctx.strokeText(c.ch, c.ax, c.ay);
+      ctx.fillStyle = isCur ? 'rgba(255,255,255,0.99)'
+        : lit ? 'rgba(226,252,246,0.94)'
+          : 'rgba(150,184,178,0.62)';
+      ctx.fillText(c.ch, c.ax, c.ay);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw(T) {
+  ctx.globalCompositeOperation = 'source-over';
+  if (bgCv) ctx.drawImage(bgCv, 0, 0, W, H);
+  else { ctx.fillStyle = '#04080b'; ctx.fillRect(0, 0, W, H); }
+
+  ctx.globalCompositeOperation = 'lighter';
+  const starPath = new Path2D();
+  for (let i = 0; i < stars.length; i++) {
+    const st = stars[i];
+    const r = st.r * (1 + 0.35 * (0.5 + 0.5 * Math.sin(time * 0.7 + st.p)));
+    starPath.moveTo(st.x + r, st.y);
+    starPath.arc(st.x, st.y, r, 0, TAU);
+  }
+  ctx.fillStyle = 'rgba(' + (accent[0] * 0.7 + 50 | 0) + ',' + (accent[1] * 0.75 + 60 | 0) + ',' +
+                  (accent[2] * 0.75 + 65 | 0) + ',0.17)';
+  ctx.fill(starPath);
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* 镜头：整场缓慢漂移（两次正弦，约 10px） */
+  const camX = Math.sin(time * 0.21) * 8 + Math.sin(time * 0.071 + 1.3) * 5;
+  const camY = Math.cos(time * 0.17) * 4;
+  ctx.save();
+  ctx.translate(camX, camY);
+  drawScrim(T);
+  drawForest(T);
+  if (fogCv) ctx.drawImage(fogCv, 0, 0, W, H);
+  drawText(T);
+  ctx.restore();
+
+  if (vgCv) ctx.drawImage(vgCv, 0, 0, W, H);
+}
+
+/* ---- 消息 ---- */
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent && p.accent.length === 3) accent = p.accent;
+    buildPalette();
+    buildStatic();
+    makeStars();
+    release();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.5;
+    gust = Math.min(1.7, gust + 0.34 + lv * 0.52);
+    glow = Math.min(1, glow + 0.18 + lv * 0.30);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ---- 主循环 ---- */
+let last = performance.now();
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  time += dt;
+  gust *= Math.exp(-dt * 1.9);
+  glow *= Math.exp(-dt * 2.6);
+  const T = now();
+  timing(T);
+  draw(T);
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => {
+  fit(); buildStatic(); makeStars(); buildPalette();
+  if (cur && cur.line) cur = buildLyric(cur.line, curIdx >= 0 ? curIdx : 0);
+});
+buildStatic();
+makeStars();
+requestAnimationFrame(frame);
+
+window.__stage = () => {
+  let lit = 0;
+  if (cur) for (let k = 0; k < cur.n; k++) if (now() >= cur.ct[k]) lit++;
+  return {
+    lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+    yrc: !!curYrc, n: cur ? cur.n : 0, fs: cur ? +cur.fs.toFixed(1) : 0,
+    rows: cur ? cur.rows.length : 0, segs: cur ? cur.br.n : 0, lit,
+    seg0: cur && cur.br.n ? +cur.br.t0[0].toFixed(2) : 0
+  };
+};
+</script>
+</body>
+</html>

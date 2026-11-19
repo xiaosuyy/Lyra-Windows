@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>341 · 胶片孩童</title>
+<style>
+  :root{ --reb:140px; }
+  html,body{margin:0;padding:0;height:100%;background:#0c0a08;overflow:hidden}
+  #stage{position:fixed;inset:0;overflow:hidden;background:#0c0a08}
+  #plate{position:absolute;inset:0;width:100%;height:100%;display:block}
+
+  /* 手写注记：写在底片齿边/片边上，不是浮在画面上的字幕条 */
+  #note{position:absolute;left:0;right:0;bottom:0;height:var(--reb);
+        pointer-events:none;overflow:hidden}
+  #hand{position:absolute;left:5.2vw;right:5.2vw;bottom:calc(var(--reb) * 0.52);
+        height:0;transform:rotate(-0.55deg);transform-origin:0 50%;will-change:transform}
+  .ln{
+    position:absolute;left:0;right:0;bottom:0;margin:0;
+    font-family:"Segoe Script","Bradley Hand","Kaiti SC","KaiTi","STKaiti",
+      "楷体","Kaiti TC","Songti SC",serif;
+    font-size:clamp(17px,2.5vw,38px);line-height:1.34;font-weight:400;
+    color:#f0e4cd;letter-spacing:.04em;white-space:pre-wrap;word-break:break-word;
+    text-shadow:0 0 1px rgba(240,228,205,.35), 0 1px 2px rgba(0,0,0,.55);
+    transition:opacity .55s ease, filter .55s ease, transform .55s ease;
+    opacity:0;filter:blur(1.2px);
+    transform:rotate(var(--lr,0deg)) translateY(calc(50% + 4px));
+  }
+  .ln.on{opacity:1;filter:blur(0);transform:rotate(var(--lr,0deg)) translateY(50%)}
+  .ln.gone{opacity:0;filter:blur(2px);transform:rotate(var(--lr,0deg)) translateY(calc(50% - 5px))}
+  .ch{display:inline-block;opacity:.10;filter:blur(1.1px);
+      transition:opacity .36s ease, filter .36s ease, transform .36s ease;
+      transform:rotate(var(--r,0deg)) translateY(.6px)}
+  .ch.w{opacity:.97;filter:blur(0);transform:rotate(var(--r,0deg)) translateY(0)}
+  .ch.sp{width:.42em}
+  .wd{display:inline-block;white-space:nowrap}
+  #empty{
+    font-family:"Segoe Script","Kaiti SC","KaiTi","STKaiti","楷体",serif;
+    position:absolute;left:5.2vw;right:5.2vw;bottom:calc(var(--reb) * 0.52);
+    transform:translateY(50%);color:#c9bca4;font-size:clamp(14px,1.6vw,22px);
+    letter-spacing:.22em;opacity:0;transition:opacity .8s ease;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis
+  }
+  #empty.on{opacity:.62}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="plate" aria-hidden="true"></canvas>
+  <div id="note" aria-hidden="true">
+    <div id="hand"></div>
+    <div id="empty">· 本格无题注 ·</div>
+  </div>
+</div>
+<script>
+(function(){
+'use strict';
+var cv = document.getElementById('plate');
+var ctx = cv.getContext('2d', {alpha:false});
+var hand = document.getElementById('hand');
+var W = 1440, H = 900, DPR = 1;
+
+var S = { lines:[], idx:-1, t:0, playing:true, frames:0, js:0, rm:false, text:'', err:'',
+          now:0, bass:0, mid:0, treble:0, beat:0, jump:0, bassT:0, midT:0 };
+S.rm = false;
+try{ S.rm = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }catch(e){}
+
+function rnd(a,b){ return a + Math.random()*(b-a); }
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+
+var emptyEl = document.getElementById('empty');
+
+// ---------- 画幅与片边 ----------
+var REB = 140;                                  // 底部片边高度(css px)，写字的地方
+var LAY = { x:0, y:0, w:1, h:1 };               // 照片 cover 后的落位
+var srcImg = null, srcW = 0, srcH = 0, inkKind = 'none';
+var edgeC = document.createElement('canvas');
+
+function sizeUp(){
+  var w = window.innerWidth, h = window.innerHeight;
+  if(!isFinite(w) || !isFinite(h) || w<=0 || h<=0){ w=1440; h=900; }
+  W = Math.round(w); H = Math.round(h);
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  var budget = 3.4e6;                    // 像素预算：大窗口自动降采样，保住每帧 8ms
+  if(W*H*DPR*DPR > budget){
+    DPR = Math.max(1, Math.min(DPR, Math.sqrt(budget/(W*H))));
+  }
+  cv.width = Math.max(1,Math.round(W*DPR));
+  cv.height = Math.max(1,Math.round(H*DPR));
+  REB = Math.round(clamp(H*0.158, 82, 170));
+  try{ document.documentElement.style.setProperty('--reb', REB+'px'); }catch(e){}
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  choosePlate();
+  buildEdge();
+  buildGrads();
+}
+
+// cover 铺满（不吃黑边），纵向锚点偏上，保证人物的头永远不被裁掉
+function layout(){
+  var aw = W, ah = Math.max(1, H - REB);
+  if(!srcW || !srcH){ LAY = {x:0,y:0,w:aw,h:ah}; return; }
+  var s = Math.max(aw/srcW, ah/srcH);
+  var dw = srcW*s, dh = srcH*s;
+  var ax = 0.5, ay = 0.26;
+  LAY = { x:(aw-dw)*ax, y:(ah-dh)*ay, w:dw, h:dh };
+}
+
+// ---------- 素材：真实纪实照片（本地，零外链）；拿不到就程序化生成，绝不卡住 ----------
+// 两张预先按构图裁好的底片：横幅取「脸与铁丝网」，竖幅取「两个小孩的全身」。
+var plates = [], plateErr = 0;
+function registerPlate(img){
+  if(!img || !img.naturalWidth || !img.naturalHeight){ return; }
+  plates.push({ img:img, w:img.naturalWidth, h:img.naturalHeight,
+                a:img.naturalWidth/img.naturalHeight });
+  choosePlate();
+}
+function choosePlate(){
+  if(!plates.length){ layout(); return; }
+  var target = W / Math.max(1, H - REB), best = plates[0], bd = Infinity;
+  for(var i=0;i<plates.length;i++){
+    var d = Math.abs(Math.log(plates[i].a / target));
+    if(d < bd){ bd = d; best = plates[i]; }
+  }
+  srcImg = best.img; srcW = best.w; srcH = best.h; inkKind = 'photo';
+  layout();
+}
+function plateFail(){
+  plateErr++;
+  if(plateErr >= 2 && !plates.length){ makeFallback(); }
+}
+var wideImg = new Image(), tallImg = new Image();
+wideImg.onload = function(){ registerPlate(wideImg); };
+tallImg.onload = function(){ registerPlate(tallImg); };
+wideImg.onerror = plateFail;
+tallImg.onerror = plateFail;
+wideImg.src = 'assets/341-plate-wide.jpg';
+tallImg.src = 'assets/341-plate-tall.jpg';
+
+function makeFallback(){
+  // 程序化「胶片感」替代：土路 + 铁丝网 + 并肩坐着的两个小孩剪影 + 尘雾
+  var w = 1600, h = 1200, c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  var g = c.getContext('2d');
+  var sky = g.createLinearGradient(0,0,0,h*0.62);
+  sky.addColorStop(0,'#cfc3ac'); sky.addColorStop(0.55,'#e6d9c0'); sky.addColorStop(1,'#b9a88d');
+  g.fillStyle = sky; g.fillRect(0,0,w,h*0.62);
+  var gr = g.createLinearGradient(0,h*0.55,0,h);
+  gr.addColorStop(0,'#8d7a60'); gr.addColorStop(0.45,'#6b5a45'); gr.addColorStop(1,'#3a2f24');
+  g.fillStyle = gr; g.fillRect(0,h*0.55,w,h*0.45);
+  // 远处灌木带
+  g.fillStyle = 'rgba(60,52,38,.55)';
+  for(var i=0;i<70;i++){
+    var bx = rnd(-40,w+40), by = h*0.52 - rnd(0,55), br = rnd(28,96);
+    g.beginPath(); g.ellipse(bx,by,br,br*0.62,0,0,6.283); g.fill();
+  }
+  // 土路车辙
+  g.globalAlpha = 0.16; g.strokeStyle = '#2c2419'; g.lineWidth = 14;
+  for(var k=0;k<7;k++){
+    g.beginPath(); g.moveTo(-40, h*(0.66+k*0.05));
+    g.bezierCurveTo(w*0.32, h*(0.62+k*0.055), w*0.62, h*(0.72+k*0.05), w+40, h*(0.64+k*0.06));
+    g.stroke();
+  }
+  g.globalAlpha = 1;
+  // 铁丝网（立柱 + 横线）
+  g.strokeStyle = 'rgba(28,24,18,.82)'; g.lineWidth = 3;
+  var fy0 = h*0.50, fy1 = h*0.86;
+  for(var p=0;p<9;p++){
+    var px = w*0.02 + p*(w*0.12);
+    g.lineWidth = rnd(3,6);
+    g.beginPath(); g.moveTo(px, fy0 - 18); g.lineTo(px + rnd(-6,6), fy1); g.stroke();
+  }
+  g.lineWidth = 1.4;
+  for(var L=0;L<6;L++){
+    var y = fy0 + L*(fy1-fy0)/6;
+    g.globalAlpha = 0.55 + 0.35*Math.sin(L);
+    g.beginPath(); g.moveTo(-20,y); g.bezierCurveTo(w*0.4,y-6,w*0.7,y+7,w+20,y-3); g.stroke();
+  }
+  g.globalAlpha = 1;
+  // 两个小孩的剪影（反向光：只剩轮廓与一点边缘光）
+  function kid(cx, cy, sc, skin){
+    g.save(); g.translate(cx,cy); g.scale(sc,sc);
+    g.fillStyle = '#221b14';
+    g.beginPath(); g.ellipse(0,-96,44,50,0,0,6.283); g.fill();            // 头
+    g.beginPath(); g.moveTo(-52,60); g.quadraticCurveTo(-40,-56,0,-58);
+    g.quadraticCurveTo(42,-56,54,60); g.closePath(); g.fill();            // 身体
+    g.beginPath(); g.ellipse(-30,64,30,16,0.2,0,6.283); g.fill();         // 腿
+    g.beginPath(); g.ellipse(30,64,30,16,-0.2,0,6.283); g.fill();
+    g.fillStyle = skin; g.globalAlpha = 0.9;
+    g.beginPath(); g.ellipse(44,-96,9,13,0.3,0,6.283); g.fill();          // 耳朵/脸颊边缘光
+    g.beginPath(); g.ellipse(-46,10,12,26,0.15,0,6.283); g.fill();        // 手臂
+    g.globalAlpha = 1; g.restore();
+  }
+  kid(w*0.40, h*0.74, 1.5, '#c69a72');
+  kid(w*0.58, h*0.765, 1.42, '#5b3a25');
+  // 尘雾 + 晕光
+  var hz = g.createRadialGradient(w*0.72,h*0.34,10, w*0.72,h*0.34, w*0.55);
+  hz.addColorStop(0,'rgba(255,250,238,.55)'); hz.addColorStop(1,'rgba(255,250,238,0)');
+  g.fillStyle = hz; g.fillRect(0,0,w,h);
+  // 暖调 + 暗角，让它至少像一张旧照片
+  g.globalCompositeOperation = 'multiply';
+  g.fillStyle = 'rgba(236,214,180,1)'; g.fillRect(0,0,w,h);
+  g.globalCompositeOperation = 'source-over';
+  var vg = g.createRadialGradient(w/2,h*0.46,h*0.2, w/2,h*0.46,h*0.92);
+  vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(0,0,0,.62)');
+  g.fillStyle = vg; g.fillRect(0,0,w,h);
+
+  srcImg = c; srcW = w; srcH = h; inkKind = 'paint';
+  layout(); buildEdge();
+}
+
+// ---------- 片边（暗边 + 窗楣 + 手写编号） ----------
+function buildEdge(){
+  edgeC.width = Math.max(1, Math.round(W*DPR));
+  edgeC.height = Math.max(1, Math.round(H*DPR));
+  var g = edgeC.getContext('2d');
+  g.setTransform(DPR,0,0,DPR,0,0);
+  g.clearRect(0,0,W,H);
+
+  var top = H - REB;
+  // 片边底色
+  var rg = g.createLinearGradient(0, top-4, 0, H);
+  rg.addColorStop(0,'#14100b'); rg.addColorStop(0.35,'#0d0a07'); rg.addColorStop(1,'#080605');
+  g.fillStyle = rg; g.fillRect(0, top-4, W, REB+4);
+
+  // 照片下缘：裁切不齐的毛边 + 一点衬光
+  g.save();
+  g.beginPath();
+  g.moveTo(0, top);
+  var x = 0;
+  while(x < W){                               // 固定步长，不递减
+    var y = top + Math.sin(x*0.09)*1.2 + Math.sin(x*0.31)*1.3 + rnd(-0.9,0.9);
+    g.lineTo(x, y); x += 6;
+  }
+  g.lineTo(W, top); g.closePath();
+  g.fillStyle = 'rgba(10,8,6,.95)'; g.fill();
+  g.restore();
+  g.strokeStyle = 'rgba(255,242,220,.34)'; g.lineWidth = 1;
+  g.beginPath();
+  for(var xx=0; xx<=W; xx+=6){
+    var yy = top + Math.sin(xx*0.09)*1.2 + Math.sin(xx*0.31)*1.3;
+    if(xx===0) g.moveTo(xx,yy); else g.lineTo(xx,yy);
+  }
+  g.stroke();
+
+  // 左右与上：极窄的片边
+  g.fillStyle = 'rgba(9,7,6,.9)';
+  g.fillRect(0,0,5,H); g.fillRect(W-5,0,5,H); g.fillRect(0,0,W,5);
+
+  // 颗粒沉积（片边的脏）
+  g.globalAlpha = 0.5;
+  for(var i=0;i<Math.round(W*0.55);i++){
+    var nx = rnd(0,W), ny = top + rnd(0,REB);
+    g.fillStyle = rnd(0,1) > 0.5 ? 'rgba(210,190,160,.10)' : 'rgba(0,0,0,.35)';
+    g.fillRect(nx, ny, rnd(0.6,2.2), rnd(0.6,1.8));
+  }
+  g.globalAlpha = 1;
+
+  // 顺着片边走的竖直擦痕（显影不均）
+  for(var v=0; v<26; v++){
+    var vx = rnd(0,W);
+    g.globalAlpha = rnd(0.02,0.07);
+    g.fillStyle = rnd(0,1) > 0.5 ? '#c8b393' : '#000000';
+    g.fillRect(vx, top + rnd(0, REB*0.25), rnd(0.6,2.0), rnd(REB*0.4, REB*0.95));
+  }
+  g.globalAlpha = 1;
+
+  // 手写/机械的片边标记（不代表标题，只是底片信息）
+  g.save();
+  g.translate(W - 26, top + REB*0.30);
+  g.rotate(-Math.PI/2);
+  g.fillStyle = 'rgba(226,210,182,.30)';
+  g.font = '600 10px "Courier New",monospace';
+  g.textAlign = 'left';
+  g.fillText('341   12A', 0, 0);
+  g.restore();
+
+  // 几道铅笔的记号（不是字，只是有人在这里做过标记）
+  g.strokeStyle = 'rgba(226,210,182,.22)';
+  g.lineWidth = 1;
+  g.beginPath(); g.moveTo(20, top + 11); g.lineTo(46, top + 12); g.stroke();
+  g.beginPath(); g.moveTo(20, top + 16); g.lineTo(33, top + 16.6); g.stroke();
+  g.globalAlpha = 0.20; g.strokeStyle = 'rgba(226,210,182,.9)';
+  g.beginPath();
+  g.moveTo(W - 62, top + 18); g.lineTo(W - 46, top + 30);
+  g.moveTo(W - 46, top + 18); g.lineTo(W - 62, top + 30);
+  g.stroke();
+  g.globalAlpha = 1;
+}
+
+function draw(){
+  var top = H - REB;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#0b0908';
+  ctx.fillRect(0,0,W,H);
+
+  if(srcImg){
+    // 片门抖动（gate weave）+ 极慢的呼吸推镜：照片是静的，摄影机不是
+    var moving = (!S.rm && S.playing);
+    var wvx = moving ? (Math.sin(S.now*0.71)*0.85 + Math.sin(S.now*2.17)*0.28) : 0;
+    var wvy = moving ? (Math.sin(S.now*0.53+1.2)*0.95) : 0;
+    if(moving && S.jump > 0){ wvy += S.jump; }
+    var zoom = moving ? (1.018 + Math.sin(S.now*0.061)*0.009 + S.bass*0.012) : 1.014;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0,0,W,top); ctx.clip();
+    ctx.translate(W/2 + wvx, top/2 + wvy);
+    ctx.scale(zoom, zoom);
+    ctx.translate(-W/2, -top/2);
+    ctx.drawImage(srcImg, LAY.x, LAY.y, LAY.w, LAY.h);
+    ctx.restore();
+  }else{
+    var ph = ctx.createLinearGradient(0,0,0,top);
+    ph.addColorStop(0,'#2b2419'); ph.addColorStop(1,'#171310');
+    ctx.fillStyle = ph; ctx.fillRect(0,0,W,top);
+  }
+
+  // 漏光：从右上角渗下来的一点暖光，随低频起伏
+  if(leakGrad){
+    ctx.save();
+    ctx.globalCompositeOperation = 'screen';
+    ctx.globalAlpha = S.rm ? 0.10 : (0.07 + S.bass*0.16 + S.beat*0.10);
+    ctx.fillStyle = leakGrad;
+    ctx.fillRect(0,0,W,top);
+    ctx.restore();
+  }
+
+  // 暗角
+  if(vigGrad){
+    ctx.fillStyle = vigGrad;
+    ctx.fillRect(0,0,W,top);
+  }
+
+  // 照片下缘沉进片边（渐变过渡，不是一刀切）
+  if(fadeGrad){
+    var fh = Math.min(top, REB*1.05);
+    ctx.fillStyle = fadeGrad;
+    ctx.fillRect(0, top - fh, W, fh + 2);
+  }
+
+  ctx.drawImage(edgeC, 0, 0, W, H);
+
+  // 胶片颗粒：全局，同一层，不分画面内外
+  var ga = S.rm ? 0.085 : (0.10 + S.bass*0.05 + Math.sin(S.now*1.7)*0.012);
+  if(grainPat.length){
+    ctx.save();
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.globalAlpha = clamp(ga, 0.04, 0.24);
+    var gy = S.rm ? 37 : ((Math.random()*256)|0);
+    var gx = S.rm ? 91 : ((Math.random()*256)|0);
+    var pat = grainPat[(S.frames >> 1) % grainPat.length];
+    ctx.translate(-gx, -gy);
+    ctx.fillStyle = pat;
+    ctx.fillRect(gx, gy, W, H);
+    ctx.restore();
+  }
+
+  // 灰尘、毛发、划痕
+  drawSpecks();
+
+  // 曝光闪动（很轻，不要晃眼）
+  if(!S.rm && S.playing){
+    var fl = (Math.sin(S.now*9.3)*0.5 + Math.sin(S.now*3.1)*0.5) * 0.012;
+    ctx.fillStyle = 'rgba(255,246,230,' + (0.010 + Math.max(0, fl)).toFixed(3) + ')';
+    ctx.fillRect(0,0,W,H);
+  }
+}
+
+var leakGrad = null, vigGrad = null, fadeGrad = null, grainPat = [], specks = [];
+
+function buildGrads(){
+  var top = Math.max(1, H - REB);
+  try{
+    leakGrad = ctx.createRadialGradient(W*0.86, top*0.02, 0, W*0.80, top*0.10, Math.max(W,top)*0.78);
+    leakGrad.addColorStop(0, 'rgba(255,214,150,.85)');
+    leakGrad.addColorStop(0.45, 'rgba(255,186,120,.28)');
+    leakGrad.addColorStop(1, 'rgba(255,170,110,0)');
+  }catch(e){ leakGrad = null; }
+
+  try{
+    fadeGrad = ctx.createLinearGradient(0, top - REB*1.05, 0, top);
+    fadeGrad.addColorStop(0, 'rgba(9,7,5,0)');
+    fadeGrad.addColorStop(0.7, 'rgba(9,7,5,.18)');
+    fadeGrad.addColorStop(1, 'rgba(9,7,5,.62)');
+  }catch(e){ fadeGrad = null; }
+
+  vigGrad = ctx.createRadialGradient(W*0.5, top*0.44, Math.min(W,top)*0.22,
+                                     W*0.5, top*0.44, Math.max(W,top)*0.84);
+  vigGrad.addColorStop(0,'rgba(0,0,0,0)');
+  vigGrad.addColorStop(0.72,'rgba(0,0,0,.10)');
+  vigGrad.addColorStop(1,'rgba(0,0,0,.34)');
+
+  specks = [];
+  var n = Math.round(clamp(W*H/26000, 18, 70));
+  for(var i=0;i<n;i++){
+    specks.push({ x:Math.random()*W, y:Math.random()*(H), r:rnd(0.4,1.7),
+                  a:rnd(0.05,0.30), d:rnd(-0.06,0.06), light:Math.random()>0.45 });
+  }
+}
+
+function buildGrain(){
+  grainPat = [];
+  for(var k=0;k<3;k++){
+    var c = document.createElement('canvas');
+    c.width = 256; c.height = 256;
+    var g = c.getContext('2d');
+    var im = g.createImageData(256,256), d = im.data;
+    for(var i=0;i<d.length;i+=4){
+      var v = 90 + (Math.random()*150)|0;
+      d[i] = v; d[i+1] = v; d[i+2] = v; d[i+3] = 255;
+    }
+    g.putImageData(im,0,0);
+    try{ grainPat.push(ctx.createPattern(c,'repeat')); }catch(e){}
+  }
+}
+
+function drawSpecks(){
+  if(!specks.length) return;
+  ctx.save();
+  for(var i=0;i<specks.length;i++){
+    var s = specks[i];
+    s.y += s.d * (S.playing ? 0.30 : 0.10);
+    if(s.y < -4) s.y = H + 4; else if(s.y > H + 4) s.y = -4;
+    ctx.fillStyle = s.light ? 'rgba(255,244,224,' + s.a.toFixed(3) + ')'
+                            : 'rgba(20,14,10,' + (s.a*1.4).toFixed(3) + ')';
+    ctx.beginPath();
+    ctx.ellipse(s.x, s.y, s.r, s.r*1.25, 0, 0, 6.283);
+    ctx.fill();
+  }
+  // 一条细划痕
+  var scx = (W*0.19) + Math.sin(S.now*0.21)*W*0.03;
+  ctx.globalAlpha = S.rm ? 0.05 : (0.05 + Math.sin(S.now*0.9)*0.02);
+  ctx.fillStyle = 'rgba(240,232,214,.9)';
+  ctx.fillRect(scx, 0, 1, H);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function normLines(raw){
+  if(!Array.isArray(raw)) return [];
+  var out = [];
+  for(var i=0;i<raw.length;i++){
+    var L = raw[i];
+    if(!L || typeof L !== 'object') continue;
+    var t = Number(L.t); if(!isFinite(t)) t = 0;
+    var d = Number(L.dur); if(!isFinite(d) || d <= 0) d = 3.2;
+    var tx = (typeof L.text === 'string') ? L.text : (L.text==null?'':String(L.text));
+    if(tx === '') continue;
+    out.push({ t:t, dur:d, text:tx, parts: Array.from(tx),
+               chars: Array.isArray(L.chars)?L.chars:null });
+  }
+  out.sort(function(a,b){ return a.t-b.t; });
+  return out;
+}
+
+// ---------- 歌词：写在片边上的手写注记 ----------
+var curEl = null, curSpans = [], curTimes = [], written = 0;
+
+function charTimes(line){
+  var parts = line.parts || Array.from(line.text);
+  var n = parts.length, out = new Array(n), i;
+  var hasChars = !!(line.chars && line.chars.length);
+  var spread = Math.max(0.8, Math.min(line.dur * 0.78, 9));
+  for(i=0;i<n;i++){
+    var ct = null;
+    if(hasChars && i < line.chars.length && line.chars[i] && isFinite(Number(line.chars[i].t))){
+      ct = Number(line.chars[i].t);
+    }
+    if(ct === null){
+      ct = line.t + (n<=1 ? 0 : (i/(n-1)) * spread);
+    }
+    out[i] = ct;
+  }
+  return out;
+}
+
+function makeLine(line){
+  var el = document.createElement('div');
+  el.className = 'ln';
+  var spans = [], parts = line.parts || Array.from(line.text), i, word = null;
+  // 长句按字切，空格保留宽度；每个字带一点点手写的倾斜（笔不是直立的）
+  // 拉丁词包成一个整体，免得英文被拆到两行
+  for(i=0;i<parts.length;i++){
+    var ch = parts[i];
+    var isSpace = (ch === ' ' || ch === '\u3000' || ch === '\t');
+    var isLatin = /[A-Za-z0-9'’\-–—.,:;!?]/.test(ch);
+    var sp = document.createElement('span');
+    sp.className = isSpace ? 'ch sp' : 'ch';
+    if(!isSpace){
+      sp.textContent = ch;
+      sp.style.setProperty('--r', (Math.random()*1.7-0.85).toFixed(2) + 'deg');
+    }
+    if(isLatin){
+      if(!word){ word = document.createElement('span'); word.className = 'wd'; el.appendChild(word); }
+      word.appendChild(sp);
+    }else{
+      word = null;
+      el.appendChild(sp);
+    }
+    spans.push(sp);
+  }
+  return { el:el, spans:spans };
+}
+
+function fitLine(el){
+  var boxW = hand.clientWidth || (W*0.9);
+  var boxH = Math.max(40, REB*0.86);
+  var fs = clamp(W*0.025, 17, 38);
+  for(var k=0;k<30;k++){
+    el.style.fontSize = fs.toFixed(1) + 'px';
+    if(el.scrollWidth <= boxW + 1 && el.scrollHeight <= boxH + 1) break;
+    fs *= 0.94;
+    if(fs < 12) break;
+  }
+}
+
+function clearLine(animate){
+  if(!curEl) return;
+  var old = curEl;
+  if(animate){
+    old.classList.add('gone');
+    setTimeout(function(){ if(old.parentNode) old.parentNode.removeChild(old); }, 620);
+  }else if(old.parentNode){
+    old.parentNode.removeChild(old);
+  }
+  curEl = null; curSpans = []; curTimes = []; written = 0;
+}
+
+function setLine(idx){
+  var line = (idx >= 0 && idx < S.lines.length) ? S.lines[idx] : null;
+  if(!line){ clearLine(true); S.text = ''; return; }
+  clearLine(true);
+  var made = makeLine(line);
+  made.el.style.setProperty('--lr', (Math.random()*1.2-0.6).toFixed(2) + 'deg');
+  hand.appendChild(made.el);
+  fitLine(made.el);
+  curEl = made.el; curSpans = made.spans; curTimes = charTimes(line); written = 0;
+  S.text = line.text;
+  requestAnimationFrame(function(){ if(curEl === made.el) made.el.classList.add('on'); });
+}
+
+function stepChars(){
+  var n = 0, i, len = curTimes.length;
+  while(n < len && curTimes[n] <= S.t) n++;
+  if(n > written){ for(i=written;i<n;i++){ if(curSpans[i]) curSpans[i].classList.add('w'); } }
+  else if(n < written){ for(i=n;i<written;i++){ if(curSpans[i]) curSpans[i].classList.remove('w'); } }
+  written = n;
+}
+
+function onInit(p){
+  p = p || {};
+  S.lines = normLines(p.lines);
+  S.idx = -1;
+  if(typeof p.playing === 'boolean') S.playing = p.playing; else S.playing = true;
+  clearLine(false);
+  hand.innerHTML = '';
+  S.text = '';
+  if(emptyEl) emptyEl.classList.toggle('on', S.lines.length === 0);
+}
+
+function seekIndex(t){
+  var ls = S.lines, i = -1;
+  for(var k=0;k<ls.length;k++){ if(t >= ls[k].t) i = k; else break; }
+  return i;
+}
+
+function frame(now){
+  var t0 = performance.now();
+  S.frames++;
+  S.now = now / 1000;
+
+  var i = seekIndex(S.t);
+  if(i !== S.idx){
+    S.idx = i;
+    setLine(i);
+  }
+  if(curSpans.length) stepChars();
+
+  // 电平收敛：消息是 15Hz 来的，画面是 60Hz 的，得自己缓动
+  S.bass += (S.bassT - S.bass) * 0.12;
+  S.mid  += (S.midT  - S.mid ) * 0.12;
+  S.beat *= 0.90;
+  S.jump *= 0.86;
+  if(S.jump < 0.02) S.jump = 0;
+
+  draw();
+  S.js = performance.now() - t0;
+  requestAnimationFrame(frame);
+}
+
+var readySent = false;
+function fireReady(){
+  if(readySent) return; readySent = true;
+  try{ parent.postMessage({__c100:1, type:'ready'}, '*'); }catch(e){}
+}
+
+window.addEventListener('message', function(ev){
+  var m = ev.data;
+  if(!m || m.__c100 !== 1) return;
+  if(m.type === 'init'){ onInit(m.payload); }
+  else if(m.type === 'tick'){
+    var p = m.payload || {};
+    var tt = Number(p.time);
+    if(isFinite(tt)) S.t = tt;            // 无条件采纳，允许大跨度跳变
+    if(typeof p.playing === 'boolean') S.playing = p.playing;
+  }
+  else if(m.type === 'beat'){
+    var bp = m.payload || {};
+    var bl = Number(bp.level);
+    S.beat = isFinite(bl) ? clamp(bl,0,1) : 0.6;
+    if(!S.rm && Math.random() < 0.10) S.jump = rnd(0.8, 2.4);   // 偶尔一格跳片
+  }
+  else if(m.type === 'live'){
+    var lp = m.payload || {};
+    var b = Number(lp.bass), mm = Number(lp.mid);
+    S.bassT = isFinite(b) ? clamp(b,0,1) : 0;
+    S.midT  = isFinite(mm) ? clamp(mm,0,1) : 0;
+    if(typeof lp.playing === 'boolean') S.playing = lp.playing;
+  }
+});
+
+window.__stage = function(){
+  return { lines:S.lines.length, idx:S.idx, t:S.t, playing:S.playing, frames:S.frames,
+           js:S.js, err:S.err, text:S.text, gl:false, rm:S.rm };
+};
+
+sizeUp();
+buildGrain();
+window.addEventListener('resize', function(){ sizeUp(); });
+requestAnimationFrame(frame);
+requestAnimationFrame(function(){ fireReady(); });
+setTimeout(fireReady, 500);
+})();
+</script>
+</body>
+</html>

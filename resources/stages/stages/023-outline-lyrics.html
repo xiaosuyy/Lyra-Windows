@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>轮廓脉冲</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#05060a}
+  #bg{position:fixed;inset:-40px;background:radial-gradient(1100px 720px at 50% 44%,#0d0f1c 0%,#05060a 68%)}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  /* 四个同心空壳：同一个字，scale 递增、stroke 递减 —— 描边在向外扩散 */
+  .ring{position:absolute;left:50%;top:50%;margin:0;text-align:center;box-sizing:border-box;
+        font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;font-weight:900;
+        line-height:1.2;letter-spacing:.03em;color:transparent;padding:0 4vw;
+        will-change:transform,opacity;transform-origin:50% 50%}
+  .ring.core{position:relative;left:auto;top:auto;margin:0}
+  .ring .lrow{display:block;white-space:nowrap}
+  .ring.core .ch{display:inline-block;will-change:-webkit-text-stroke-color}
+  #rail{position:fixed;left:22px;top:16vh;bottom:16vh;width:2px;
+        background:linear-gradient(180deg,rgba(120,135,200,.05),rgba(120,135,200,.16),rgba(120,135,200,.05))}
+  #head{position:fixed;left:16px;width:14px;height:3px;margin-top:-1.5px;border-radius:2px;
+        background:rgba(196,208,255,.9);box-shadow:0 0 14px rgba(130,150,255,.85);transition:top .18s linear}
+  #idx{position:fixed;left:18px;bottom:11vh;font:500 10px/1.6 ui-monospace,Consolas,monospace;
+       letter-spacing:.2em;color:rgba(120,132,178,.75)}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(175,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<div id="bg"></div>
+<div id="stage">
+  <div class="ring" id="r0"></div>
+  <div class="ring" id="r1"></div>
+  <div class="ring" id="r2"></div>
+  <div class="ring core" id="rc"></div>
+</div>
+<div id="rail"></div>
+<div id="head" style="top:50%"></div>
+<div id="idx"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   023 · 轮廓脉冲 —— 字形是**空心的**，脉冲在描边上跑
+   ----------------------------------------------------------------------------
+   和已有 10 个形态的区别：字从头到尾都是**空心描边**（fill 是透明的），
+   所以"密度/亮度"这套玩法全部失效，能玩的只有**轮廓**：
+     ① 四个同心空壳（scale 1.0 → 1.45）相位错开地一呼一吸 —— 脉冲向外扩散；
+     ② 主壳的描边亮度沿字符序列**跑动**：波峰从左扫到右，字像被点着一样；
+     ③ 踩拍 = 整个壳层相位整体前推一次，四个壳一起往外涨（相干脉冲）。
+
+   精修记录（批次B）：① **逐字 YRC 点亮** —— 第 k 个字的描边亮度主峰压在
+   chars[k].t 上（到点字被"点着"，峰值后落回呼吸底噪）；无 chars 按
+   t + dur*i/n 均分。② 长句排版 —— 主壳改为自适应字号 + 最多 3 行折行，
+   三个空壳逐行复刻主壳排版盒（原来整段 textContent 塞给空壳在折行后
+   对不齐，现在空壳按行建 .lrow，换行位置与主壳一致）。③ 动效：整场慢漂移
+   镜头（bg 平移+微缩放）、句进场从 0.86 缩放升起 + 出场放大淡出。
+   分词：**未接入** —— 本形态的逐字点亮已经由 YRC 时刻表驱动，波峰扫过
+   的方向感就是节奏本身，词团分组不会更清楚。
+   ========================================================================== */
+const r0 = document.getElementById('r0'), r1 = document.getElementById('r1');
+const r2 = document.getElementById('r2'), rc = document.getElementById('rc');
+const hint = document.getElementById('hint'), idxEl = document.getElementById('idx');
+const head = document.getElementById('head');
+const bgEl = document.getElementById('bg');
+
+const RINGS = [
+  { el: r0, s0: 1.46, w: 1.0, ph: 2.35, lum: 0.30 },
+  { el: r1, s0: 1.29, w: 1.2, ph: 1.55, lum: 0.42 },
+  { el: r2, s0: 1.13, w: 1.5, ph: 0.72, lum: 0.62 }
+];
+const CORE = { el: rc, w: 2.1 };
+for (const r of RINGS) r.el.style.webkitTextStrokeWidth = r.w + 'px';
+rc.style.webkitTextStrokeWidth = CORE.w + 'px';
+
+let accent = [128, 96, 255];
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+let phase = 0;            // 壳层共用相位：踩拍时整体前推
+let beat = 0;
+let chars = [];           // 主壳的字符节点
+let charT = [];           // 每个字的 YRC 点亮时刻
+let lineT0 = 0, lineDur = 2.4, lineOn = false;
+let lastT = -1;
+let fadeIn = 0, drift = 0;
+let curIdx = -1;
+
+/* ---------- 排版规划：自适应字号 + 最多 3 行（与 021/022 同尺） ---------- */
+const meas = document.createElement('canvas').getContext('2d');
+const FONTFAM = '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+const w100 = (t) => { meas.font = '900 100px ' + FONTFAM; return meas.measureText(t).width + 3 * Math.max(0, t.length - 1); };
+const BREAK = /[\s，。！？、；：,.!?;:…—～·「」『』（）()《》【】]/;
+
+function splitRows(text, R) {
+  const L = text.length, rows = [];
+  let prev = 0;
+  for (let r = 1; r < R; r++) {
+    const ideal = prev + Math.max(1, Math.round((L - prev) / (R - r + 1)));
+    let i = ideal;
+    for (const d of [0, 1, 2, 3, -1, -2, -3]) {
+      const j = ideal + d;
+      if (j > prev && j < L && (BREAK.test(text[j - 1]) || BREAK.test(text[j]))) { i = j; break; }
+    }
+    i = Math.max(prev + 1, Math.min(L - (R - r), i));
+    rows.push(text.slice(prev, i));
+    prev = i;
+  }
+  rows.push(text.slice(prev));
+  return rows;
+}
+function best2(text) {
+  let bi = -1, bw = Infinity;
+  for (let i = 1; i < text.length; i++) {
+    const m = Math.max(w100(text.slice(0, i)), w100(text.slice(i)))
+      - ((BREAK.test(text[i - 1]) || BREAK.test(text[i])) ? 1e5 : 0);
+    if (m < bw) { bw = m; bi = i; }
+  }
+  return bi > 0 ? [text.slice(0, bi), text.slice(bi)] : [text];
+}
+function planLayout(text) {
+  const base = Math.min(148, Math.max(46, innerWidth * 0.104));
+  if (!text) return { fs: base, rows: [''] };
+  const maxW = innerWidth * 0.88;
+  const maxH = innerHeight * 0.60;
+  const fsFor = (rows) => {
+    let mw = 1;
+    for (const r of rows) mw = Math.max(mw, w100(r));
+    return Math.min(base, maxW * 100 / mw, maxH / (1.2 * rows.length));
+  };
+  const floor = base * 0.72;
+  const one = [text];
+  const f1 = fsFor(one);
+  if (f1 >= floor) return { fs: f1, rows: one };
+  const two = text.length > 3 ? best2(text) : one;
+  const f2 = fsFor(two);
+  if (f2 >= floor || text.length <= 8) return { fs: Math.max(18, f2), rows: two };
+  const three = splitRows(text, 3);
+  const f3 = fsFor(three);
+  return f2 >= f3 ? { fs: Math.max(18, f2), rows: two } : { fs: Math.max(18, f3), rows: three };
+}
+
+/* 把主壳拆成字符并折行，空壳逐行复刻排版盒 —— 四层完全重合 */
+function layout(text) {
+  rc.innerHTML = '';
+  chars.length = 0; charT.length = 0;
+  if (!text) { for (const r of RINGS) r.el.innerHTML = ''; return; }
+  const plan = planLayout(text);
+  rc.style.fontSize = plan.fs.toFixed(1) + 'px';
+  const frag = document.createDocumentFragment();
+  let ci = 0;
+  for (let r = 0; r < plan.rows.length; r++) {
+    const row = document.createElement('div');
+    row.className = 'lrow';
+    const rt = plan.rows[r];
+    for (let i = 0; i < rt.length; i++) {
+      const ch = rt[i];
+      if (ch === ' ') { row.appendChild(document.createTextNode(' ')); ci++; continue; }
+      const s = document.createElement('span');
+      s.className = 'ch';
+      s.textContent = ch;
+      row.appendChild(s);
+      chars.push(s);
+      charT.push(ci);
+      ci++;
+    }
+    frag.appendChild(row);
+  }
+  rc.appendChild(frag);
+  /* 空壳按同样的行结构复刻：宽度/行高/字号一致，折行位置才一致 */
+  const box = rc.getBoundingClientRect();
+  for (const r of RINGS) {
+    r.el.innerHTML = '';
+    r.el.style.fontSize = plan.fs.toFixed(1) + 'px';
+    for (const rt of plan.rows) {
+      const row = document.createElement('div');
+      row.className = 'lrow';
+      row.textContent = rt;
+      r.el.appendChild(row);
+    }
+    r.el.style.width = box.width.toFixed(1) + 'px';
+    r.el.style.lineHeight = getComputedStyle(rc).lineHeight;
+  }
+}
+
+function tint(c, k) {
+  return 'rgba(' + Math.round(c[0] * k) + ',' + Math.round(c[1] * k) + ',' + Math.round(c[2] * k) + ',';
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— 句切换只发生在句首，酝酿只推相位
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let brewIdx = -1;
+const LEAD = 1.3;
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; reset(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      const ln = lines[ci];
+      layout(ln.text || '');
+      /* 逐字点亮时刻：YRC 压 chars[k].t，无 chars 均分 */
+      const n = ln.text ? ln.text.length : 0;
+      const chs = ln.chars && ln.chars.length === n ? ln.chars : null;
+      const dur = Math.max(0.8, ln.dur || 2.4);
+      const end = ci + 1 < lines.length ? Math.min(lines[ci + 1].t, ln.t + dur * 1.6) : ln.t + dur * 1.5;
+      let prev = 0;
+      charT.length = chars.length;
+      const map = charT;
+      for (let k = 0; k < chars.length; k++) {
+        const src = charT.length ? map[k] : k;   // charT 存的是原文索引
+        let t = chs && isFinite(+chs[src].t) ? +chs[src].t
+              : ln.t + (end - ln.t) * (src / Math.max(1, n));
+        if (!(t >= ln.t)) t = ln.t;
+        if (t > end) t = end;
+        if (k && t < prev) t = prev;
+        prev = t;
+        map[k] = t;
+      }
+      lineT0 = ln.t;
+      lineDur = dur;
+      lineOn = true;
+      fadeIn = 0;
+      idxEl.textContent = String(ci + 1).padStart(2, '0') + ' / ' + String(lines.length).padStart(2, '0');
+      hint.style.opacity = '0';
+    } else {
+      reset();
+    }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      /* 酝酿：下一句的"壳"先鼓起来一点（只推相位、不改字）—— 开唱时才换字 */
+      phase += 0.35;
+    }
+  }
+}
+
+function reset() {
+  layout('');
+  chars.length = 0; charT.length = 0;
+  lineOn = false;
+  idxEl.textContent = '';
+}
+
+let last = performance.now();
+let lastBeat = -1;
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  const T = now();
+  timing(T);
+
+  beat *= Math.exp(-dt * 4.6);
+  phase += dt * 1.15;
+  drift += dt;
+  const b = beat;
+
+  if (lineOn) {
+    fadeIn = Math.min(1, fadeIn + dt * 3.2);
+    const [ar, ag, ab] = accent;
+    for (let i = 0; i < RINGS.length; i++) {
+      const r = RINGS[i];
+      const w = 0.5 + 0.5 * Math.sin(phase - r.ph);
+      const a = (0.10 + 0.90 * w) * (r.lum + 0.55 * b);
+      const sc = (r.s0 + 0.045 * w + 0.055 * b) * (0.86 + 0.14 * fadeIn);
+      r.el.style.transform = 'translate(-50%,-50%) scale(' + sc.toFixed(4) + ')';
+      r.el.style.opacity = (a * fadeIn).toFixed(3);
+      /* 空壳用主色偏冷的版本，主壳用主色偏亮的版本 —— 层次靠色温拉开 */
+      r.el.style.webkitTextStrokeColor =
+        'rgba(' + Math.round(ar * 0.78 + 60) + ',' + Math.round(ag * 0.78 + 70) + ',' +
+        Math.round(ab * 0.80 + 95) + ',' + Math.min(1, a * fadeIn + 0.05).toFixed(3) + ')';
+    }
+    /* 主壳：每个字的描边亮度 = 自己 YRC 时刻的主峰 + 慢呼吸底噪。
+       点亮前是极暗的轮廓，到点"被点着"，峰值 0.9s 后落回底噪 —— 节奏可读 */
+    const n = chars.length;
+    const g = 0.34 + 0.46 * b;
+    const base = tint([Math.min(255, ar + 110), Math.min(255, ag + 120), 255], 1);
+    const peak = tint([255, Math.min(255, ag + 40), 255], 1);
+    for (let i = 0; i < n; i++) {
+      const ct = charT[i];
+      const since = T - ct;                        // 点亮后经过的时间
+      const hit = since >= 0 ? Math.exp(-since * 2.1) : 0;   // 主峰：点亮瞬间最亮，指数回落
+      const pre = since >= -0.35 && since < 0 ? (1 + since / 0.35) * 0.3 : 0;  // 点亮前 0.35s 预热
+      const wave = 0.5 + 0.5 * Math.sin(phase * 2.6 - i * 0.42);             // 呼吸底噪
+      const k = Math.min(1, Math.max(wave * 0.5, hit + pre));
+      const a = (0.22 + 0.78 * k) * g * fadeIn;
+      chars[i].style.webkitTextStrokeColor = (k > 0.55 ? peak : base) + Math.min(1, a).toFixed(3) + ')';
+      chars[i].style.textShadow = k > 0.5
+        ? '0 0 ' + (10 + 30 * k * (0.5 + b)).toFixed(0) + 'px rgba(' + ar + ',' + ag + ',' + ab + ',' +
+          (0.22 * k).toFixed(3) + ')'
+        : 'none';
+    }
+    rc.style.opacity = fadeIn.toFixed(3);
+    /* 进度轨：走的是这一句自己的时间，不是整首歌 */
+    const p = Math.max(0, Math.min(1, (T - lineT0) / lineDur));
+    head.style.top = (16 + p * 68).toFixed(2) + 'vh';
+  } else {
+    for (const r of RINGS) { r.el.style.opacity = '0'; r.el.style.transform = 'translate(-50%,-50%) scale(1)'; }
+    rc.style.opacity = '0';
+    head.style.top = '50%';
+  }
+
+  /* 整场慢漂移镜头：bg 缓慢平移 + 微缩放（相干，beat 只贡献一次极小的下压） */
+  const bx = Math.sin(drift * 0.10) * 12, by = Math.cos(drift * 0.068) * 7;
+  bgEl.style.transform = 'translate(' + bx.toFixed(2) + 'px,' + (by + 2.6 * beat).toFixed(2) + 'px)' +
+                         ' scale(' + (1.03 + 0.012 * Math.sin(drift * 0.05)).toFixed(4) + ')';
+
+  requestAnimationFrame(frame);
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) accent = p.accent;
+    reset();
+    phase = 0; beat = 0; fadeIn = 0;
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：相干 —— 四个壳共用相位，整体前推一次，脉冲一起往外涨 */
+    beat = Math.min(1.5, beat + 0.4 + 0.7 * (d.payload.level || 0));
+    phase += 0.5 + 0.5 * (d.payload.level || 0);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+requestAnimationFrame(frame);
+window.__stage = () => ({ lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+  chars: chars.length, yrc: charT.length > 0 && lines[curIdx] && lines[curIdx].chars && lines[curIdx].chars.length === (lines[curIdx].text || '').length });
+</script>
+</body>
+</html>

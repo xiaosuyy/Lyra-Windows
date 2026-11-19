@@ -48,11 +48,11 @@ const config: Configuration = {
     },
     // 播放形态页（stages/*.html 与根路径分词词典）
     {
-      from: "../LIZI/resources/app/public/stages",
+      from: "resources/stages/stages",
       to: "stages/stages",
     },
     {
-      from: "../LIZI/resources/app/public/segdict.bin",
+      from: "resources/stages/segdict.bin",
       to: "stages/segdict.bin",
     },
   ],

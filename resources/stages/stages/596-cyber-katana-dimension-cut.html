@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>596 · 次元斩裂</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: #03050b; overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #stage-cv {
+    position: fixed; inset: 0; display: block;
+    width: 100vw; height: 100vh;
+    background: #03050b;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage-cv"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================
+     0) 自检口 / 状态
+     ============================================================ */
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "" };
+  var RM = false;
+  try { RM = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) {}
+
+  window.__stage = function () {
+    var i = S.idx;
+    var ln = (i >= 0 && S.lines[i]) ? S.lines[i] : null;
+    return {
+      lines: S.lines.length,
+      idx: i,
+      t: S.t,
+      playing: S.playing,
+      frames: S.frames,
+      js: Math.round(S.js * 100) / 100,
+      err: S.err,
+      text: (ln && ln.text) ? String(ln.text) : "",
+      gl: false,
+      rm: RM
+    };
+  };
+
+  /* ============================================================
+     1) ready：首个 rAF 无条件发一次，setTimeout 兜底，仅一次
+     ============================================================ */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (e) { console.error(e); }
+  }
+  requestAnimationFrame(sendReady);
+  setTimeout(sendReady, 800);
+
+  /* ============================================================
+     2) 画布 / 尺寸
+     ============================================================ */
+  var cv = document.getElementById("stage-cv");
+  var ctx = cv.getContext("2d", { alpha: false });
+  var scene = document.createElement("canvas");
+  var sc = scene.getContext("2d", { alpha: false });
+  var tintR = document.createElement("canvas");
+  var trc = tintR.getContext("2d");
+  var tintB = document.createElement("canvas");
+  var tbc = tintB.getContext("2d");
+
+  var W = 1440, H = 900, DPR = 1, TW = 720, TH = 450;
+  var FONT = '"PingFang SC","Microsoft YaHei","Noto Sans SC","Heiti SC","SimHei",sans-serif';
+  var MONO = '"Consolas","SF Mono","Cascadia Mono","Microsoft YaHei",monospace';
+
+  var accent = [150, 165, 255];
+  var songName = "";
+  var artists = "";
+  var exitAnim = null;
+  var lineFlash = 0;
+  var errLogAt = 0;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function easeOut(t) { t = clamp(t, 0, 1); return 1 - Math.pow(1 - t, 3); }
+  function num(v) { var n = Number(v); return isFinite(n) ? n : 0; }
+
+  function noteErr(e) {
+    S.err = String((e && e.message) || e);
+    var n = performance.now();
+    if (n - errLogAt > 1000) { errLogAt = n; try { console.error(e); } catch (_) {} }
+  }
+
+  function stop(g, pos, col) {
+    try { g.addColorStop(pos, col); } catch (e) {}
+  }
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function resize() {
+    var w = window.innerWidth || 1440, h = window.innerHeight || 900;
+    if (!isFinite(w) || w <= 0) w = 1440;
+    if (!isFinite(h) || h <= 0) h = 900;
+    W = w; H = h;
+    DPR = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+    cv.width = Math.max(1, Math.round(W * DPR));
+    cv.height = Math.max(1, Math.round(H * DPR));
+    cv.style.width = W + "px";
+    cv.style.height = H + "px";
+    scene.width = cv.width;
+    scene.height = cv.height;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    sc.setTransform(DPR, 0, 0, DPR, 0, 0);
+    TW = Math.max(1, Math.round(cv.width * 0.5));
+    TH = Math.max(1, Math.round(cv.height * 0.5));
+    tintR.width = TW; tintR.height = TH;
+    tintB.width = TW; tintB.height = TH;
+    buildDecor();
+  }
+
+  /* ============================================================
+     3) 背景装饰（随尺寸重建）
+     ============================================================ */
+  var facets = [], dust = [];
+  function buildDecor() {
+    var rnd = mulberry32(0x596A1);
+    facets = [];
+    var i, q, k;
+    for (i = 0; i < 12; i++) {
+      var cx = rnd() * W, cy = rnd() * H;
+      var rad = Math.min(W, H) * (0.04 + rnd() * 0.14);
+      k = 3 + ((rnd() * 3) | 0);
+      var a0 = rnd() * Math.PI * 2, pts = [];
+      for (q = 0; q < k; q++) {
+        var a = a0 + (q / k) * Math.PI * 2 + (rnd() - 0.5) * 0.55;
+        var rr = rad * (0.55 + rnd() * 0.55);
+        pts.push({ x: Math.cos(a) * rr, y: Math.sin(a) * rr });
+      }
+      facets.push({ cx: cx, cy: cy, pts: pts, ph: rnd() * 6.283, sp: 0.12 + rnd() * 0.34, red: rnd() < 0.28, z: 0.4 + rnd() * 0.6 });
+    }
+    dust = [];
+    for (i = 0; i < 150; i++) {
+      dust.push({ x: rnd(), y: rnd(), r: 0.5 + rnd() * 1.7, ph: rnd() * 6.283, sp: 0.15 + rnd() * 0.5, z: 0.3 + rnd() * 0.7 });
+    }
+  }
+
+  addEventListener("resize", resize);
+  resize();
+
+  /* ============================================================
+     4) 歌词数据 / 逐字时间
+     ============================================================ */
+  function applyInit(p) {
+    var song = p.song || {};
+    songName = (song.name && String(song.name).trim()) ? String(song.name).trim() : "UNTITLED SIGNAL";
+    var ar = song.artists;
+    if (Array.isArray(ar)) artists = ar.filter(Boolean).map(String).join(" / ");
+    else artists = ar ? String(ar) : "";
+
+    var ac = p.accent;
+    if (Array.isArray(ac) && ac.length >= 3) {
+      var r0 = Math.round(num(ac[0])), g0 = Math.round(num(ac[1])), b0 = Math.round(num(ac[2]));
+      if (r0 || g0 || b0) accent = [clamp(r0, 0, 255), clamp(g0, 0, 255), clamp(b0, 0, 255)];
+      else accent = [150, 165, 255];
+    } else {
+      accent = [150, 165, 255];
+    }
+
+    var arr = Array.isArray(p.lines) ? p.lines : [];
+    var out = [], i;
+    for (i = 0; i < arr.length; i++) {
+      var l = arr[i];
+      if (!l || typeof l !== "object") continue;
+      var tt = Number(l.t);
+      out.push({
+        t: isFinite(tt) ? tt : 0,
+        dur: isFinite(Number(l.dur)) ? Number(l.dur) : 0,
+        text: (l.text == null) ? "" : String(l.text),
+        chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null,
+        _ct: null,
+        _lay: null,
+        _layKey: ""
+      });
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+
+    S.lines = out;
+    S.idx = -1;
+    if (typeof p.playing === "boolean") S.playing = p.playing;
+    else S.playing = true;
+
+    exitAnim = null;
+    lineFlash = 0;
+    burst.shards = [];
+    burst.slashes = [];
+    burst.rays = [];
+    burst.age = 9;
+    lastAuto = -9;
+  }
+
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    while (lo <= hi) {
+      var m = (lo + hi) >> 1;
+      var mt = a[m] ? a[m].t : 0;
+      if (mt <= t + 0.02) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return best;
+  }
+
+  function charTimes(line) {
+    if (line._ct) return line._ct;
+    var chars = Array.from(line.text || "");
+    var n = chars.length, out = new Array(n), i;
+    var cs = line.chars;
+    if (cs && cs.length) {
+      var rel = false;
+      var c0 = cs[0];
+      if (c0 && isFinite(Number(c0.t))) rel = Number(c0.t) < line.t - 0.08;
+      for (i = 0; i < n; i++) {
+        var j = (cs.length === n) ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+        var rec = cs[j];
+        var ct = rec ? Number(rec.t) : NaN;
+        out[i] = isFinite(ct) ? (rel ? line.t + ct : ct) : null;
+      }
+    } else {
+      var d = line.dur > 0 ? line.dur : 3.4;
+      for (i = 0; i < n; i++) out[i] = line.t + d * 0.9 * (i / Math.max(1, n));
+    }
+    line._ct = out;
+    return out;
+  }
+
+  function makeLayout(text) {
+    var chars = Array.from(text || "");
+    if (!chars.length) return null;
+    var size = Math.min(W * 0.07, H * 0.105, 100);
+    if (H > W * 1.15) size = Math.min(W * 0.105, H * 0.075, 76);
+    var ws = [], total = 0, gap = 0, i, it;
+    for (it = 0; it < 12; it++) {
+      sc.font = "900 " + size + "px " + FONT;
+      gap = size * 0.08;
+      total = 0;
+      ws = [];
+      for (i = 0; i < chars.length; i++) {
+        var wd = sc.measureText(chars[i] === " " ? " " : chars[i]).width;
+        ws.push(wd);
+        total += wd;
+      }
+      total += gap * Math.max(0, chars.length - 1);
+      if (total <= W * 0.86 || size < 18) break;
+      size *= 0.9;
+    }
+    var out = [], x = -total / 2;
+    for (i = 0; i < chars.length; i++) {
+      out.push({ ch: chars[i] === " " ? " " : chars[i], x: x + ws[i] / 2, w: ws[i] });
+      x += ws[i] + gap;
+    }
+    return { size: size, chars: out, total: total, text: text };
+  }
+
+  function getLayout(line) {
+    if (!line || !line.text) return null;
+    var key = W + "x" + H;
+    if (line._layKey === key && line._lay) return line._lay;
+    var l = makeLayout(line.text);
+    line._lay = l;
+    line._layKey = key;
+    return l;
+  }
+
+  /* ============================================================
+     5) 运镜 / 斩裂状态
+     ============================================================ */
+  var cam = { x: 0, y: 0, vx: 0, vy: 0 };
+  var visT = 0, shake = 0, hitstop = 0, screenFlash = 0;
+  var lastAuto = -9;
+  var pointer = { x: 0, y: 0, on: false };
+  var burst = { age: 9, power: 0, shards: [], slashes: [], rays: [], cx: 0.5, cy: 0.45 };
+
+  function burstEnv() {
+    var a = burst.age;
+    if (a < 0) return 0;
+    if (a < 0.055) return a / 0.055;
+    if (a < 0.16) return 1;
+    var k = (a - 0.16) / 0.2;
+    return k >= 1 ? 0 : (1 - k) * (1 - k);
+  }
+
+  function polyArea(poly) {
+    var a = 0, i, j;
+    for (i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      a += poly[j].x * poly[i].y - poly[i].x * poly[j].y;
+    }
+    return a / 2;
+  }
+
+  function clipPoly(poly, nx, ny, c, sign) {
+    var out = [], i;
+    for (i = 0; i < poly.length; i++) {
+      var a = poly[i], b = poly[(i + 1) % poly.length];
+      var da = sign * (nx * a.x + ny * a.y + c);
+      var db = sign * (nx * b.x + ny * b.y + c);
+      if (da >= 0) out.push(a);
+      if ((da > 0 && db < 0) || (da < 0 && db > 0)) {
+        var tt = da / (da - db);
+        out.push({ x: a.x + (b.x - a.x) * tt, y: a.y + (b.y - a.y) * tt });
+      }
+    }
+    return out;
+  }
+
+  function buildShatter(n, power) {
+    var pieces = [[
+      { x: -60, y: -60 }, { x: W + 60, y: -60 },
+      { x: W + 60, y: H + 60 }, { x: -60, y: H + 60 }
+    ]];
+    var minArea = W * H * 0.004;
+    for (var i = 0; i < n; i++) {
+      var pi = (Math.random() * pieces.length) | 0;
+      var poly = pieces[pi];
+      if (!poly || poly.length < 3) continue;
+      var cx = 0, cy = 0, q;
+      for (q = 0; q < poly.length; q++) { cx += poly[q].x; cy += poly[q].y; }
+      cx /= poly.length; cy /= poly.length;
+      var ang = Math.random() * Math.PI;
+      var nx = Math.cos(ang), ny = Math.sin(ang);
+      var cc = -(nx * cx + ny * cy);
+      var A = clipPoly(poly, nx, ny, cc, 1);
+      var B = clipPoly(poly, nx, ny, cc, -1);
+      if (A.length > 2 && B.length > 2 &&
+          Math.abs(polyArea(A)) > minArea && Math.abs(polyArea(B)) > minArea) {
+        pieces.splice(pi, 1, A, B);
+      }
+    }
+    var shards = [], maxOff = RM ? 0.28 : 1;
+    for (i = 0; i < pieces.length; i++) {
+      var p2 = pieces[i];
+      if (!p2 || p2.length < 3) continue;
+      var mx = 0, my = 0;
+      for (q = 0; q < p2.length; q++) { mx += p2[q].x; my += p2[q].y; }
+      mx /= p2.length; my /= p2.length;
+      var dir = Math.random() * Math.PI * 2;
+      var mag = (26 + Math.random() * 120) * power * maxOff;
+      shards.push({
+        poly: p2, cx: mx, cy: my,
+        ox: Math.cos(dir) * mag,
+        oy: Math.sin(dir) * mag,
+        rot: (Math.random() - 0.5) * 0.05 * power * maxOff
+      });
+    }
+    burst.shards = shards;
+  }
+
+  function triggerBurst(power, count, nx, ny) {
+    power = clamp(power, 0, 1.6);
+    burst.age = 0;
+    burst.power = power;
+    burst.cx = (nx == null) ? 0.5 : clamp(nx, 0.05, 0.95);
+    burst.cy = (ny == null) ? 0.45 : clamp(ny, 0.05, 0.95);
+    var cnt = clamp(count | 0, 3, 12);
+    buildShatter(cnt, power);
+
+    burst.slashes = [];
+    var m = Math.max(4, Math.min(12, cnt));
+    for (var i = 0; i < m; i++) {
+      var ang = Math.random() * Math.PI;
+      var dx = Math.cos(ang), dy = Math.sin(ang);
+      burst.slashes.push({
+        nx: dx, ny: dy,
+        px: (burst.cx + (Math.random() - 0.5) * 0.5) * W,
+        py: (burst.cy + (Math.random() - 0.5) * 0.5) * H,
+        delay: Math.random() * 0.085,
+        life: 0.18 + Math.random() * 0.22,
+        w: 0.9 + Math.random() * 2.2
+      });
+    }
+
+    burst.rays = [];
+    var rayN = RM ? 12 : 36;
+    for (i = 0; i < rayN; i++) {
+      burst.rays.push({
+        ang: Math.random() * Math.PI * 2,
+        r0: Math.random() * Math.min(W, H) * 0.16,
+        len: Math.min(W, H) * (0.15 + Math.random() * 0.6),
+        w: 0.6 + Math.random() * 1.6,
+        k: Math.random()
+      });
+    }
+
+    hitstop = RM ? 0 : (0.04 + power * 0.05);
+    screenFlash = Math.max(screenFlash, 0.10 + power * 0.14);
+    shake = Math.max(shake, RM ? 0 : 2 + power * 5);
+  }
+
+  function changeLine(ni) {
+    var old = S.idx;
+    if (old >= 0 && S.lines[old] && S.lines[old].text) {
+      var ol = getLayout(S.lines[old]);
+      if (ol) exitAnim = { lay: ol, age: 0 };
+    } else {
+      exitAnim = null;
+    }
+    S.idx = ni;
+    if (ni >= 0) {
+      lineFlash = 0.26;
+      cam.vx += (Math.random() < 0.5 ? -1 : 1) * (RM ? 240 : 900 + Math.random() * 480);
+      cam.vy += (Math.random() - 0.5) * (RM ? 60 : 180);
+      if (!RM) triggerBurst(0.3, 3, 0.5, 0.5);
+    }
+  }
+
+  /* ============================================================
+     6) 场景绘制：深渊底 / 网格 / 光带 / 玻璃面 / 尘埃 / 准星
+     ============================================================ */
+  function radGlow(c, x, y, r, c0, c1) {
+    var g = c.createRadialGradient(x, y, 0, x, y, Math.max(1, r));
+    stop(g, 0, c0); stop(g, 0.55, c0); stop(g, 1, c1);
+    c.fillStyle = g;
+    c.fillRect(0, 0, W, H);
+  }
+
+  function drawBackdrop(c, t) {
+    var g = c.createLinearGradient(0, 0, W * 0.15, H);
+    stop(g, 0, "#04060d");
+    stop(g, 0.45, "#070c18");
+    stop(g, 0.76, "#0c0a14");
+    stop(g, 1, "#120609");
+    c.fillStyle = g;
+    c.fillRect(0, 0, W, H);
+
+    c.save();
+    c.globalCompositeOperation = "lighter";
+    var br = clamp(live.bass, 0, 1);
+    var ed = clamp(live.edge, 0, 1);
+    radGlow(c, W * 0.72 + cam.x * 0.3, H * 0.34 + Math.sin(t * 0.21) * H * 0.02,
+      Math.max(W, H) * (0.5 + br * 0.16),
+      "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + ",0.085)", "rgba(0,0,0,0)");
+    radGlow(c, W * 0.18 + cam.x * 0.2, H * 0.68,
+      Math.max(W, H) * (0.42 + ed * 0.1),
+      "rgba(255,42,72,0.055)", "rgba(0,0,0,0)");
+    radGlow(c, W * 0.5, H * 0.5, Math.max(W, H) * 0.30,
+      "rgba(90,150,255,0.05)", "rgba(0,0,0,0)");
+    c.restore();
+
+    drawGrid(c, t);
+    drawSeams(c, t);
+  }
+
+  function drawGrid(c, t) {
+    var vpx = W * 0.5 + cam.x * 0.35 + pointer.x * 34;
+    var vpy = H * 0.47 + cam.y * 0.25 + pointer.y * 20;
+    c.save();
+    c.globalCompositeOperation = "lighter";
+    c.lineWidth = 1;
+    var i, j;
+    for (i = 1; i <= 12; i++) {
+      var f = i / 12;
+      var yy = vpy + (H - vpy) * Math.pow(f, 2.1);
+      c.globalAlpha = 0.26 * (1 - f) + 0.05;
+      c.strokeStyle = "rgba(80,150,255,0.85)";
+      c.beginPath(); c.moveTo(0, yy); c.lineTo(W, yy); c.stroke();
+    }
+    c.globalAlpha = 1;
+    for (j = -12; j <= 12; j++) {
+      var xb = W * 0.5 + j * (W * 0.115) + cam.x * 0.7;
+      c.strokeStyle = j === 0 ? "rgba(190,230,255,0.15)"
+        : (j % 4 === 0 ? "rgba(90,170,255,0.09)" : "rgba(90,170,255,0.045)");
+      c.beginPath(); c.moveTo(vpx, vpy + 1); c.lineTo(xb, H + 40); c.stroke();
+    }
+    for (j = -8; j <= 8; j++) {
+      var xt = W * 0.5 + j * W * 0.16 + cam.x * 0.5;
+      c.strokeStyle = "rgba(70,120,220,0.032)";
+      c.beginPath(); c.moveTo(vpx, vpy - 1); c.lineTo(xt, -40); c.stroke();
+    }
+    c.restore();
+  }
+
+  function drawSeams(c, t) {
+    var seams = [
+      [0.12, 0.08, 0.82, 0.88],
+      [0.86, 0.02, 0.28, 1.0],
+      [0.06, 0.66, 0.94, 0.24]
+    ];
+    c.save();
+    c.globalCompositeOperation = "lighter";
+    c.lineWidth = 1;
+    for (var i = 0; i < seams.length; i++) {
+      var s = seams[i];
+      var a = 0.055 + 0.03 * (0.5 + 0.5 * Math.sin(t * 0.4 + i * 2.1));
+      c.strokeStyle = "rgba(120,190,255," + a.toFixed(3) + ")";
+      c.beginPath();
+      c.moveTo(s[0] * W + Math.sin(t * 0.2 + i) * 10, s[1] * H);
+      c.lineTo(s[2] * W + Math.sin(t * 0.2 + i) * 10, s[3] * H);
+      c.stroke();
+    }
+    c.restore();
+  }
+
+  function drawRibbons(c, t) {
+    c.save();
+    c.globalCompositeOperation = "lighter";
+    c.lineCap = "round";
+    var br = clamp(live.bass, 0, 1);
+    var lv = clamp(live.level, 0, 1);
+    for (var i = 0; i < 6; i++) {
+      var yy = H * (0.2 + i * 0.115) + Math.sin(t * (0.25 + i * 0.04) + i * 1.7) * H * 0.035 + cam.y * 0.4;
+      var amp = H * (0.10 + br * 0.10);
+      c.beginPath();
+      c.moveTo(-60, yy);
+      c.bezierCurveTo(W * 0.28, yy - amp * (0.6 + 0.4 * Math.sin(t * 0.4 + i)),
+        W * 0.62, yy + amp, W + 60, yy - amp * 0.4);
+      c.lineWidth = 0.8 + lv * 1.6;
+      c.strokeStyle = (i % 3 === 0) ? "rgba(255,60,90,0.07)" : "rgba(90,180,255,0.065)";
+      c.stroke();
+    }
+    var s = 0.5 + 0.5 * Math.sin(t * 0.33);
+    c.beginPath();
+    c.moveTo(W * 0.06, H * (0.72 + s * 0.05));
+    c.quadraticCurveTo(W * 0.5, H * (0.5 + 0.05 * Math.sin(t * 0.4)), W * 0.96, H * (0.28 + s * 0.04));
+    c.lineWidth = 1.4;
+    c.strokeStyle = "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + ",0.10)";
+    c.stroke();
+    c.restore();
+  }
+
+  function drawFacets(c, t) {
+    c.save();
+    for (var i = 0; i < facets.length; i++) {
+      var f = facets[i];
+      var dx = Math.sin(t * f.sp + f.ph) * 26 * f.z + cam.x * 0.25 * f.z + pointer.x * 18 * f.z;
+      var dy = Math.cos(t * f.sp * 0.8 + f.ph) * 18 * f.z + cam.y * 0.2 * f.z + pointer.y * 12 * f.z;
+      c.save();
+      c.translate(f.cx + dx, f.cy + dy);
+      c.rotate(Math.sin(t * 0.12 + f.ph) * 0.06);
+      c.beginPath();
+      for (var q = 0; q < f.pts.length; q++) {
+        var p = f.pts[q];
+        if (q === 0) c.moveTo(p.x, p.y); else c.lineTo(p.x, p.y);
+      }
+      c.closePath();
+      c.fillStyle = f.red ? "rgba(255,50,80,0.030)" : "rgba(80,140,255,0.032)";
+      c.fill();
+      c.strokeStyle = f.red ? "rgba(255,90,110,0.20)" : "rgba(120,190,255,0.15)";
+      c.lineWidth = 1;
+      c.stroke();
+      c.restore();
+    }
+    c.restore();
+  }
+
+  function drawDust(c, t) {
+    c.save();
+    c.globalCompositeOperation = "lighter";
+    var tr = clamp(live.treble, 0, 1);
+    for (var i = 0; i < dust.length; i++) {
+      var d = dust[i];
+      var x = (d.x * W + Math.sin(t * d.sp + d.ph) * 36 * d.z + W * 2) % W;
+      var y = (d.y * H + Math.cos(t * d.sp * 0.7 + d.ph) * 26 * d.z + H * 2) % H;
+      var al = 0.08 + 0.22 * (0.5 + 0.5 * Math.sin(t * 2.1 * d.sp + d.ph)) + tr * 0.12;
+      c.fillStyle = "rgba(185,220,255," + Math.min(0.6, al).toFixed(3) + ")";
+      c.beginPath();
+      c.arc(x, y, d.r * (0.8 + tr * 0.5), 0, Math.PI * 2);
+      c.fill();
+    }
+    c.restore();
+  }
+
+  function drawReticle(c, t) {
+    c.save();
+    c.translate(W / 2 + pointer.x * 14, H * 0.40 + pointer.y * 10);
+    c.globalCompositeOperation = "lighter";
+    c.strokeStyle = "rgba(120,190,255,0.18)";
+    c.lineWidth = 1;
+    c.beginPath(); c.arc(0, 0, 14, 0, Math.PI * 2); c.stroke();
+    c.beginPath();
+    c.moveTo(-27, 0); c.lineTo(-18, 0);
+    c.moveTo(27, 0); c.lineTo(18, 0);
+    c.moveTo(0, -27); c.lineTo(0, -18);
+    c.moveTo(0, 27); c.lineTo(0, 18);
+    c.stroke();
+    c.rotate(t * 0.35);
+    c.strokeStyle = "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + ",0.26)";
+    for (var q = 0; q < 4; q++) {
+      c.beginPath();
+      c.arc(0, 0, 34, q * Math.PI / 2 + 0.22, q * Math.PI / 2 + 0.56);
+      c.stroke();
+    }
+    c.restore();
+  }
+
+  function drawVignette(c) {
+    var g = c.createRadialGradient(W / 2, H * 0.55, Math.min(W, H) * 0.2, W / 2, H * 0.55, Math.max(W, H) * 0.78);
+    stop(g, 0, "rgba(0,0,0,0)");
+    stop(g, 0.65, "rgba(0,0,0,0.24)");
+    stop(g, 1, "rgba(0,0,0,0.72)");
+    c.fillStyle = g;
+    c.fillRect(0, 0, W, H);
+  }
+
+  var live = { bass: 0, mid: 0, treble: 0, level: 0, edge: 0, bpm: 0 };
+
+  /* ============================================================
+     7) 歌词：刀锋斜切字 / 逐字点亮 / 换句居合斩
+     ============================================================ */
+  function drawFullLine(c, lay, x, y, alpha, shear, color) {
+    if (!lay) return;
+    c.save();
+    c.globalAlpha = clamp(alpha, 0, 1);
+    c.translate(x, y);
+    c.transform(1, 0, shear, 1, 0, 0);
+    c.font = "900 " + lay.size + "px " + FONT;
+    c.textAlign = "center";
+    c.textBaseline = "alphabetic";
+    c.fillStyle = color || "#fff";
+    for (var i = 0; i < lay.chars.length; i++) {
+      c.fillText(lay.chars[i].ch, lay.chars[i].x, 0);
+    }
+    c.restore();
+  }
+
+  function drawExit(c) {
+    if (!exitAnim || !exitAnim.lay) return;
+    var lay = exitAnim.lay;
+    var e = clamp(exitAnim.age / 0.55, 0, 1);
+    var ee = e * e;
+    var baseY = H * (H > W * 1.05 ? 0.74 : 0.64);
+    var splitY = baseY - lay.size * 0.34;
+    var off = (RM ? 36 : 150) * ee;
+    var al = (1 - e) * 0.95;
+    var top = baseY - lay.size * 1.5;
+
+    c.save();
+    c.beginPath();
+    c.rect(-W * 0.2, top, W * 1.4, Math.max(1, splitY - top));
+    c.clip();
+    drawFullLine(c, lay, W / 2 - off, baseY, al, -0.14, "rgba(245,250,255,1)");
+    c.restore();
+
+    c.save();
+    c.beginPath();
+    c.rect(-W * 0.2, splitY, W * 1.4, lay.size * 1.4);
+    c.clip();
+    drawFullLine(c, lay, W / 2 + off, baseY, al, -0.14, "rgba(245,250,255,1)");
+    c.restore();
+
+    if (e < 0.4) {
+      var f = 1 - e / 0.4;
+      c.save();
+      c.globalCompositeOperation = "lighter";
+      c.strokeStyle = "rgba(235,250,255," + (0.85 * f).toFixed(3) + ")";
+      c.lineWidth = 2;
+      c.shadowColor = "rgba(120,200,255,0.9)";
+      c.shadowBlur = 26;
+      c.beginPath(); c.moveTo(-20, splitY); c.lineTo(W + 20, splitY); c.stroke();
+      c.restore();
+    }
+  }
+
+  function drawLyrics(c, t) {
+    if (exitAnim) drawExit(c);
+
+    if (!S.lines.length) { drawEmpty(c, t); return; }
+    if (S.idx < 0) { drawStandby(c, t); return; }
+
+    var line = S.lines[S.idx];
+    var lay = line ? getLayout(line) : null;
+    if (!lay) return;
+
+    var times = charTimes(line);
+    var baseY = H * (H > W * 1.05 ? 0.74 : 0.64);
+    var cx = W / 2 + cam.x * 0.35 + pointer.x * 12;
+    var cy = cam.y * 0.22 + pointer.y * 8;
+    var shear = -0.14;
+    var splitY = baseY - lay.size * 0.34;
+
+    var band = c.createLinearGradient(0, baseY - lay.size * 1.5, 0, baseY + lay.size * 0.7);
+    stop(band, 0, "rgba(2,4,10,0)");
+    stop(band, 0.42, "rgba(2,4,10,0.52)");
+    stop(band, 1, "rgba(2,4,10,0)");
+    c.fillStyle = band;
+    c.fillRect(0, baseY - lay.size * 1.5, W, lay.size * 2.2);
+
+    var dash = RM ? 0 : clamp(Math.abs(cam.vx) / 1000, 0, 1);
+    if (dash > 0.12) {
+      for (var gi = 0; gi < 3; gi++) {
+        var gx = cx - cam.vx * 0.03 * (gi + 1) + (gi - 1) * 5;
+        var gc = gi === 0 ? "#3ad0ff" : (gi === 1 ? "#7a5cff" : "#ff3e6c");
+        drawFullLine(c, lay, gx, baseY + cy, 0.15 * (1 - gi * 0.26) * dash, shear, gc);
+      }
+    }
+
+    c.save();
+    c.translate(cx, baseY + cy);
+    c.transform(1, 0, shear, 1, 0, 0);
+    c.font = "900 " + lay.size + "px " + FONT;
+    c.textAlign = "center";
+    c.textBaseline = "alphabetic";
+
+    for (var i = 0; i < lay.chars.length; i++) {
+      var ch = lay.chars[i];
+      var ct = times[i];
+      if (ct == null || !isFinite(ct)) ct = line.t;
+      var on = S.t >= ct;
+      var pp = clamp((S.t - ct) / 0.16, 0, 1);
+      var flash = on ? Math.max(0, 1 - (S.t - ct) / 0.22) : 0;
+      var scl = 0.74 + 0.26 * easeOut(pp) + flash * 0.07;
+      var al = on ? (0.32 + 0.68 * easeOut(pp)) : 0.22;
+
+      c.save();
+      c.translate(ch.x, 0);
+      c.scale(scl, scl);
+      if (on) {
+        c.fillStyle = "rgba(244,250,255," + al.toFixed(3) + ")";
+        c.shadowColor = flash > 0.02 ? "rgba(255,255,255,0.95)"
+          : "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + ",0.9)";
+        c.shadowBlur = 14 + flash * 28;
+      } else {
+        c.fillStyle = "rgba(150,180,230,0.22)";
+        c.shadowColor = "rgba(80,140,255,0.5)";
+        c.shadowBlur = 6;
+      }
+      c.fillText(ch.ch, 0, 0);
+      c.restore();
+
+      if (flash > 0.05) {
+        c.save();
+        c.strokeStyle = "rgba(220,245,255," + (flash * 0.9).toFixed(3) + ")";
+        c.lineWidth = 1.6;
+        c.shadowColor = "rgba(120,200,255,0.9)";
+        c.shadowBlur = 10;
+        var sx = ch.x, sy = -lay.size * 0.55;
+        c.beginPath();
+        c.moveTo(sx - lay.size * 0.5 * flash, sy + lay.size * 0.25);
+        c.lineTo(sx + lay.size * 0.5 * flash, sy - lay.size * 0.2);
+        c.stroke();
+        c.restore();
+      }
+    }
+    c.restore();
+
+    if (lineFlash > 0.001) {
+      var lf = clamp(lineFlash / 0.26, 0, 1);
+      c.save();
+      c.globalCompositeOperation = "lighter";
+      c.strokeStyle = "rgba(225,246,255," + (0.8 * lf).toFixed(3) + ")";
+      c.lineWidth = 2.2;
+      c.shadowColor = "rgba(120,200,255,0.9)";
+      c.shadowBlur = 24;
+      c.beginPath(); c.moveTo(-30, splitY); c.lineTo(W + 30, splitY); c.stroke();
+      c.strokeStyle = "rgba(255,70,100," + (0.38 * lf).toFixed(3) + ")";
+      c.lineWidth = 1;
+      c.beginPath(); c.moveTo(-30, splitY + 3); c.lineTo(W + 30, splitY + 3); c.stroke();
+      c.restore();
+    }
+  }
+
+  function drawStandby(c, t) {
+    var baseY = H * (H > W * 1.05 ? 0.74 : 0.64);
+    var fs = Math.min(W * 0.02, 20);
+    c.save();
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    c.font = "500 " + fs + "px " + MONO;
+    c.fillStyle = "rgba(140,180,225,0.55)";
+    c.globalAlpha = 0.6 + 0.4 * Math.sin(t * 2.2);
+    c.fillText("//  STANDBY  ·  待刀出鞘  //", W / 2, baseY);
+    c.globalAlpha = 0.34;
+    c.font = "400 " + (fs * 0.8) + "px " + MONO;
+    c.fillStyle = "rgba(120,170,255,0.55)";
+    c.fillText("DIMENSION CUT READY", W / 2, baseY + fs * 2);
+    c.restore();
+  }
+
+  function drawEmpty(c, t) {
+    var fs = Math.min(W * 0.018, 18);
+    c.save();
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    c.font = "600 " + fs + "px " + MONO;
+    c.fillStyle = "rgba(150,190,235,0.55)";
+    c.fillText("NO LYRICS  //  次元静默", W / 2, H * 0.60);
+    c.fillStyle = "rgba(120,160,210,0.30)";
+    c.font = "400 " + (fs * 0.8) + "px " + MONO;
+    c.fillText("SILENT FIELD · NO SIGNAL", W / 2, H * 0.60 + fs * 2.2);
+    c.globalCompositeOperation = "lighter";
+    c.strokeStyle = "rgba(110,180,255,0.16)";
+    c.lineWidth = 1;
+    c.beginPath();
+    c.moveTo(W * 0.3, H * 0.60 - fs * 4);
+    c.lineTo(W * 0.7, H * 0.60 - fs * 4);
+    c.stroke();
+    c.restore();
+  }
+
+  /* ============================================================
+     8) HUD：时间码 / 歌名水印 / 准星装饰 / 频谱条
+     ============================================================ */
+  function pad2(n) { n = Math.floor(n); return n < 10 ? "0" + n : "" + n; }
+  function fmtTime(tt) {
+    tt = Math.max(0, isFinite(tt) ? tt : 0);
+    return pad2(tt / 60) + ":" + pad2(tt % 60) + ":" + pad2((tt % 1) * 30);
+  }
+
+  function bracket(c, x, y, dx, dy, len) {
+    c.beginPath();
+    c.moveTo(x + dx * len, y);
+    c.lineTo(x, y);
+    c.lineTo(x, y + dy * len);
+    c.stroke();
+  }
+
+  function drawHUD(c, t) {
+    var pad = Math.max(18, Math.min(W, H) * 0.035);
+    var ms = Math.max(10, Math.min(W * 0.0105, 13));
+    c.save();
+    c.textBaseline = "middle";
+
+    c.globalAlpha = 1;
+    c.textAlign = "left";
+    c.font = "600 " + ms + "px " + MONO;
+    var rec = 0.5 + 0.5 * Math.sin(t * 4);
+    c.fillStyle = "rgba(255,60,80," + (0.32 + 0.55 * rec).toFixed(3) + ")";
+    c.beginPath(); c.arc(pad + 5, pad + 6, 3.2, 0, Math.PI * 2); c.fill();
+    c.fillStyle = "rgba(175,205,240,0.72)";
+    c.fillText("REC  //  " + fmtTime(S.t), pad + 16, pad + 6);
+
+    c.textAlign = "right";
+    c.fillStyle = "rgba(235,244,255,0.82)";
+    c.font = "700 " + (ms * 1.12) + "px " + FONT;
+    var title = songName.length > 26 ? songName.slice(0, 25) + "…" : songName;
+    c.fillText(title, W - pad, pad + 7);
+    if (artists) {
+      c.font = "500 " + ms + "px " + MONO;
+      c.fillStyle = "rgba(150,185,225,0.55)";
+      c.fillText(artists.length > 30 ? artists.slice(0, 29) + "…" : artists, W - pad, pad + 7 + ms * 1.9);
+    }
+
+    c.textAlign = "left";
+    c.font = "500 " + ms + "px " + MONO;
+    var by = H - pad - 2;
+    c.fillStyle = "rgba(140,180,225,0.50)";
+    c.fillText("DIMENSION CUT // NO.596", pad, by);
+    c.fillStyle = "rgba(" + accent[0] + "," + accent[1] + "," + accent[2] + ",0.85)";
+    c.fillRect(pad, by - ms * 1.55, 26, 1);
+    c.fillStyle = "rgba(140,180,225,0.32)";
+    c.fillText("CYBER-KATANA / SHATTER FIELD", pad, by - ms * 2.25);
+
+    c.textAlign = "right";
+    c.fillStyle = "rgba(150,190,235,0.55)";
+    c.fillText("BPM " + (live.bpm > 0 ? Math.round(live.bpm) : "---"), W - pad, by);
+    var n = 10, bw = 3.5, gapb = 3;
+    for (var i = 0; i < n; i++) {
+      var base = i < n * 0.4 ? live.bass : (i < n * 0.75 ? live.mid : live.treble);
+      var v = clamp(base * 1.35, 0.04, 1);
+      var hh = 8 + v * 16;
+      c.fillStyle = i < n * 0.4 ? "rgba(255,70,90,0.65)" : "rgba(110,190,255,0.60)";
+      c.fillRect(W - pad - (n - i) * (bw + gapb), by - ms * 2.3 - hh, bw, hh);
+    }
+
+    c.strokeStyle = "rgba(130,190,255,0.30)";
+    c.lineWidth = 1;
+    var q = 11, bl = 15;
+    bracket(c, q, q, 1, 1, bl);
+    bracket(c, W - q, q, -1, 1, bl);
+    bracket(c, q, H - q, 1, -1, bl);
+    bracket(c, W - q, H - q, -1, -1, bl);
+
+    c.restore();
+  }
+
+  /* ============================================================
+     9) 全屏刀光残留 / 电弧速度线 / 冲击环
+     ============================================================ */
+  function polyPath(c, poly) {
+    if (!poly || poly.length < 3) return;
+    c.moveTo(poly[0].x, poly[0].y);
+    for (var i = 1; i < poly.length; i++) c.lineTo(poly[i].x, poly[i].y);
+    c.closePath();
+  }
+
+  function drawBurstFX(c, env) {
+    var age = burst.age;
+    c.save();
+    c.globalCompositeOperation = "lighter";
+    c.lineCap = "round";
+
+    if (age < 0.34) {
+      var rr = 40 + age * 1700 * (RM ? 0.5 : 1);
+      var ra = Math.max(0, 1 - age / 0.34) * 0.28;
+      c.strokeStyle = "rgba(190,235,255," + ra.toFixed(3) + ")";
+      c.lineWidth = 1.4 + env * 2;
+      c.beginPath();
+      c.arc(burst.cx * W, burst.cy * H, rr, 0, Math.PI * 2);
+      c.stroke();
+    }
+
+    if (burst.rays && env > 0.01) {
+      for (var i = 0; i < burst.rays.length; i++) {
+        var r = burst.rays[i];
+        var a = env * (0.08 + 0.13 * r.k);
+        var cx0 = burst.cx * W + Math.cos(r.ang) * r.r0;
+        var cy0 = burst.cy * H + Math.sin(r.ang) * r.r0;
+        var len = r.len * (0.45 + env * 0.8);
+        c.strokeStyle = "rgba(170,225,255," + a.toFixed(3) + ")";
+        c.lineWidth = r.w;
+        c.beginPath();
+        c.moveTo(cx0, cy0);
+        c.lineTo(cx0 + Math.cos(r.ang) * len, cy0 + Math.sin(r.ang) * len);
+        c.stroke();
+      }
+    }
+
+    if (burst.slashes) {
+      var L = Math.hypot(W, H) * 1.1;
+      for (i = 0; i < burst.slashes.length; i++) {
+        var s = burst.slashes[i];
+        if (!s) continue;
+        var aa = age - s.delay;
+        if (aa < 0 || aa > s.life) continue;
+        var fade = 1 - aa / s.life;
+        var f2 = fade * fade;
+        var ddx = -s.ny, ddy = s.nx;
+        var x0 = s.px - ddx * L, y0 = s.py - ddy * L;
+        var x1 = s.px + ddx * L, y1 = s.py + ddy * L;
+        c.strokeStyle = "rgba(80,175,255," + (0.30 * f2).toFixed(3) + ")";
+        c.lineWidth = s.w * 3.4;
+        c.shadowColor = "rgba(80,170,255,0.9)";
+        c.shadowBlur = 22;
+        c.beginPath(); c.moveTo(x0, y0); c.lineTo(x1, y1); c.stroke();
+        c.shadowBlur = 0;
+        c.strokeStyle = "rgba(245,252,255," + (0.90 * f2).toFixed(3) + ")";
+        c.lineWidth = Math.max(0.6, s.w * 0.8);
+        c.beginPath(); c.moveTo(x0, y0); c.lineTo(x1, y1); c.stroke();
+        c.strokeStyle = "rgba(255,60,90," + (0.26 * f2).toFixed(3) + ")";
+        c.lineWidth = 1.1;
+        c.beginPath(); c.moveTo(x0 + 2, y0 + 2); c.lineTo(x1 + 2, y1 + 2); c.stroke();
+      }
+    }
+    c.restore();
+  }
+
+  /* ============================================================
+     10) 主循环
+     ============================================================ */
+  var lastNow = 0;
+  function frame(now) {
+    var js0 = performance.now();
+    try {
+      if (!lastNow) lastNow = now;
+      var dtRaw = (now - lastNow) / 1000;
+      lastNow = now;
+      if (!isFinite(dtRaw) || dtRaw < 0) dtRaw = 0;
+      if (dtRaw > 0.05) dtRaw = 0.05;
+
+      var dtVis = dtRaw;
+      if (hitstop > 0) { hitstop -= dtRaw; dtVis = 0; }
+      if (!isFinite(dtVis) || dtVis < 0) dtVis = 0;
+      visT += dtVis;
+
+      if (S.playing) S.t += dtRaw;
+
+      var kk = RM ? 110 : 240, dd = RM ? 18 : 15;
+      cam.vx += (-cam.x * kk - cam.vx * dd) * dtRaw;
+      cam.vy += (-cam.y * kk - cam.vy * dd) * dtRaw;
+      cam.x = clamp(cam.x + cam.vx * dtRaw, -280, 280);
+      cam.y = clamp(cam.y + cam.vy * dtRaw, -180, 180);
+
+      shake *= Math.exp(-dtRaw * 6.5);
+      if (shake < 0.02) shake = 0;
+      screenFlash *= Math.exp(-dtRaw * 17);
+      lineFlash = Math.max(0, lineFlash - dtRaw);
+      if (exitAnim) {
+        exitAnim.age += dtRaw;
+        if (exitAnim.age > 0.7) exitAnim = null;
+      }
+      if (burst.age < 9) burst.age += dtRaw;
+      if (burst.age > 0.46 && burst.shards.length) burst.shards = [];
+
+      var ni = idxAt(S.t);
+      if (ni !== S.idx) changeLine(ni);
+
+      /* ---- 场景离屏 ---- */
+      sc.setTransform(DPR, 0, 0, DPR, 0, 0);
+      sc.globalCompositeOperation = "source-over";
+      sc.globalAlpha = 1;
+      sc.fillStyle = "#04060c";
+      sc.fillRect(0, 0, W, H);
+      drawBackdrop(sc, visT);
+      drawRibbons(sc, visT);
+      drawFacets(sc, visT);
+      drawDust(sc, visT);
+      drawReticle(sc, visT);
+      drawVignette(sc);
+      drawLyrics(sc, visT);
+      drawHUD(sc, visT);
+
+      /* ---- 主合成：按碎片错位贴回 ---- */
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#03050b";
+      ctx.fillRect(0, 0, W, H);
+
+      var env = burstEnv();
+      var shx = (Math.random() - 0.5) * shake;
+      var shy = (Math.random() - 0.5) * shake;
+      ctx.save();
+      ctx.translate(shx, shy);
+
+      if (env > 0.002 && burst.shards.length) {
+        var si, sh, ang;
+        for (si = 0; si < burst.shards.length; si++) {
+          sh = burst.shards[si];
+          if (!sh || !sh.poly) continue;
+          ang = sh.rot * env;
+          ctx.save();
+          ctx.translate(sh.ox * env, sh.oy * env);
+          if (ang) { ctx.translate(sh.cx, sh.cy); ctx.rotate(ang); ctx.translate(-sh.cx, -sh.cy); }
+          ctx.beginPath();
+          polyPath(ctx, sh.poly);
+          ctx.clip();
+          try { ctx.drawImage(scene, 0, 0, W, H); } catch (e) {}
+          ctx.restore();
+        }
+
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        ctx.shadowColor = "rgba(90,190,255,0.85)";
+        ctx.shadowBlur = 10;
+        for (si = 0; si < burst.shards.length; si++) {
+          var sh2 = burst.shards[si];
+          if (!sh2 || !sh2.poly) continue;
+          var ang2 = sh2.rot * env;
+          ctx.save();
+          ctx.translate(sh2.ox * env, sh2.oy * env);
+          if (ang2) { ctx.translate(sh2.cx, sh2.cy); ctx.rotate(ang2); ctx.translate(-sh2.cx, -sh2.cy); }
+          ctx.beginPath();
+          polyPath(ctx, sh2.poly);
+          ctx.lineWidth = 1.1;
+          ctx.strokeStyle = "rgba(150,225,255," + (0.34 * env).toFixed(3) + ")";
+          ctx.stroke();
+          ctx.restore();
+        }
+        ctx.restore();
+      } else {
+        try { ctx.drawImage(scene, 0, 0, W, H); } catch (e) {}
+      }
+      ctx.restore();
+
+      /* ---- 红蓝通道分离（色差残影） ---- */
+      var chroma = Math.max(env * (RM ? 0.5 : 1), Math.min(1, Math.abs(cam.vx) / 1100));
+      if (chroma > 0.02) {
+        try {
+          trc.globalCompositeOperation = "copy";
+          trc.drawImage(scene, 0, 0, scene.width, scene.height, 0, 0, TW, TH);
+          trc.globalCompositeOperation = "multiply";
+          trc.fillStyle = "#ff0000";
+          trc.fillRect(0, 0, TW, TH);
+
+          tbc.globalCompositeOperation = "copy";
+          tbc.drawImage(scene, 0, 0, scene.width, scene.height, 0, 0, TW, TH);
+          tbc.globalCompositeOperation = "multiply";
+          tbc.fillStyle = "#0000ff";
+          tbc.fillRect(0, 0, TW, TH);
+
+          var cdd = 2 + 13 * chroma;
+          ctx.save();
+          ctx.globalCompositeOperation = "lighter";
+          ctx.globalAlpha = 0.25 * chroma;
+          ctx.drawImage(tintR, cdd, 0, W, H);
+          ctx.drawImage(tintB, -cdd, 0, W, H);
+          ctx.restore();
+        } catch (e) { noteErr(e); }
+      }
+
+      /* ---- 入刀白闪 ---- */
+      if (screenFlash > 0.003) {
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        ctx.fillStyle = "rgba(210,235,255," + Math.min(0.24, screenFlash * 0.4).toFixed(3) + ")";
+        ctx.fillRect(0, 0, W, H);
+        ctx.restore();
+      }
+
+      /* ---- 刀光 / 电弧 / 冲击环 ---- */
+      if (burst.age < 0.6) {
+        ctx.save();
+        ctx.translate(shx, shy);
+        drawBurstFX(ctx, env);
+        ctx.restore();
+      }
+
+      S.frames++;
+    } catch (e) {
+      noteErr(e);
+    }
+    S.js = performance.now() - js0;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  /* ============================================================
+     11) 消息通道
+     ============================================================ */
+  function onBeat(index, level) {
+    var lv = clamp(isFinite(level) ? level : 0.6, 0, 1);
+    var ix = isFinite(index) ? index : 1;
+    triggerBurst(0.55 + lv * 0.65, 5 + Math.round(lv * 7),
+      0.5 + (ix - 1.5) * 0.06, 0.32 + Math.random() * 0.3);
+    cam.vx += (Math.random() - 0.5) * (RM ? 50 : 240);
+    if (!RM) shake = Math.max(shake, 1.5 + lv * 4);
+  }
+
+  addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === "init") {
+        applyInit(p);
+      } else if (d.type === "tick") {
+        var tt = Number(p.time);
+        if (isFinite(tt)) S.t = tt;
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      } else if (d.type === "beat") {
+        onBeat(num(p.index), num(p.level));
+      } else if (d.type === "live") {
+        live.bass = clamp(num(p.bass), 0, 1);
+        live.mid = clamp(num(p.mid), 0, 1);
+        live.treble = clamp(num(p.treble), 0, 1);
+        live.level = clamp(num(p.level), 0, 1);
+        live.bpm = num(p.bpm);
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+        if (!RM && S.playing && live.bass > 0.86 && (visT - lastAuto) > 1.25) {
+          lastAuto = visT;
+          triggerBurst(0.55, 5, 0.3 + Math.random() * 0.4, 0.35 + Math.random() * 0.3);
+        }
+      }
+    } catch (e) {
+      noteErr(e);
+    }
+  });
+
+  /* ============================================================
+     12) 用户活动 / 空格转发 / reduced-motion 热更新
+     ============================================================ */
+  var lastPing = 0;
+  function pingActivity() {
+    var n = performance.now();
+    if (n - lastPing < 180) return;
+    lastPing = n;
+    try { parent.postMessage({ __c100: 1, type: "activity" }, "*"); } catch (e) {}
+  }
+
+  function onKey(e) {
+    var k = e && e.key;
+    if (k === " " || k === "Spacebar" || (e && e.code === "Space")) {
+      try { parent.postMessage({ __c100: 1, type: "key", payload: { key: "Space" } }, "*"); } catch (_) {}
+      if (e && e.preventDefault) e.preventDefault();
+    }
+    pingActivity();
+  }
+
+  addEventListener("keydown", onKey);
+  addEventListener("pointermove", function (e) {
+    var w = W || 1, h = H || 1;
+    pointer.x = clamp(e.clientX / w - 0.5, -0.5, 0.5);
+    pointer.y = clamp(e.clientY / h - 0.5, -0.5, 0.5);
+    pointer.on = true;
+    pingActivity();
+  }, { passive: true });
+  addEventListener("pointerdown", pingActivity, { passive: true });
+  addEventListener("wheel", pingActivity, { passive: true });
+  addEventListener("touchstart", pingActivity, { passive: true });
+
+  try {
+    var mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    if (mq.addEventListener) mq.addEventListener("change", function (e) { RM = !!e.matches; });
+    else if (mq.addListener) mq.addListener(function (e) { RM = !!e.matches; });
+  } catch (e) {}
+})();
+</script>
+</body>
+</html>

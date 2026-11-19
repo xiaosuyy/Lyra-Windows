@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>直闪夜拍</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #0a0609; overflow: hidden; }
+  #frame-canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="frame-canvas"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var view = {
+    lines: [], idx: -1, time: 0, playing: true, frames: 0, js: 0,
+    err: '', text: '', gl: false, now: 0,
+    reduced: false, ready: false, inited: false, accent: [255, 214, 0]
+  };
+
+  /* self-check port: assigned first, unconditionally, no branches above it */
+  window.__stage = function () {
+    return {
+      lines: view.lines.length, idx: view.idx, t: view.time, playing: view.playing,
+      frames: view.frames, js: view.js, err: view.err, text: view.text,
+      gl: view.gl, rm: view.reduced
+    };
+  };
+
+  var canvasEl = document.getElementById('frame-canvas');
+  var context2d = canvasEl.getContext('2d');
+  var box = { w: 1440, h: 900, dpr: 1 };
+  var stage = {
+    portrait: false, printW: 1080, printH: 810, photoW: 1000, photoH: 750, inset: 12,
+    centerX: 720, centerY: 430, tilt: -0.028, deskGradient: null,
+    photoBase: null
+  };
+
+  function reportError(where, problem) {
+    view.err = String(problem && problem.message ? problem.message : problem);
+    console.error('[364] ' + where, problem);
+  }
+
+  function clampNumber(value, low, high) {
+    if (!isFinite(value)) { return low; }
+    return value < low ? low : (value > high ? high : value);
+  }
+
+  function sendReady() {
+    if (view.ready) { return; }
+    view.ready = true;
+    try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); }
+    catch (problem) { reportError('ready', problem); }
+  }
+
+  function resize() {
+    var width = Math.round(window.innerWidth || 0);
+    var height = Math.round(window.innerHeight || 0);
+    if (!width || !isFinite(width)) { width = 1440; }
+    if (!height || !isFinite(height)) { height = 900; }
+    var ratio = clampNumber(window.devicePixelRatio || 1, 1, 2);
+    box.w = width; box.h = height; box.dpr = ratio;
+    canvasEl.width = Math.round(width * ratio);
+    canvasEl.height = Math.round(height * ratio);
+    context2d.setTransform(ratio, 0, 0, ratio, 0, 0);
+    computeLayout();
+  }
+
+  function normalizeLines(raw) {
+    if (!Array.isArray(raw)) { return []; }
+    var cleaned = [];
+    for (var index = 0; index < raw.length && index < 400; index++) {
+      var entry = raw[index];
+      if (!entry) { continue; }
+      var content = entry.text == null ? '' : String(entry.text);
+      if (!content.trim() && !entry.chars) { continue; }
+      cleaned.push({
+        t: clampNumber(Number(entry.t) || 0, 0, 86400),
+        dur: clampNumber(Number(entry.dur) || 0, 0, 300),
+        text: content,
+        chars: Array.isArray(entry.chars) ? entry.chars : null
+      });
+    }
+    cleaned.sort(function (left, right) { return left.t - right.t; });
+    return cleaned;
+  }
+
+  function hashText(text) {
+    var hash = 2166136261;
+    var content = String(text == null ? '' : text);
+    for (var index = 0; index < content.length && index < 64; index++) {
+      hash = Math.imul(hash ^ content.charCodeAt(index), 16777619);
+    }
+    return hash >>> 0;
+  }
+
+  function padTwo(value) {
+    var number = Math.abs(Math.round(value)) % 100;
+    return number < 10 ? '0' + number : String(number);
+  }
+
+  function stampFromSeed(seed) {
+    var year = 2000 + (seed % 4);
+    var month = 1 + (Math.floor(seed / 7) % 12);
+    var day = 1 + (Math.floor(seed / 13) % 28);
+    var hour = 6 + (Math.floor(seed / 17) % 6);
+    var minute = Math.floor(seed / 19) % 60;
+    paint.stamp = padTwo(year % 100) + ' ' + padTwo(month) + ' ' + padTwo(day);
+    paint.clock = (hour < 12 ? 'AM ' : 'PM ') + (hour % 12 || 12) + ':' + padTwo(minute);
+  }
+
+  function applyInit(payload) {
+    var data = payload || {};
+    view.lines = normalizeLines(data.lines);
+    view.idx = -1;
+    view.text = '';
+    var accent = data.accent;
+    if (Array.isArray(accent) && accent.length >= 3) {
+      view.accent = [
+        clampNumber(Number(accent[0]), 0, 255),
+        clampNumber(Number(accent[1]), 0, 255),
+        clampNumber(Number(accent[2]), 0, 255)
+      ];
+    }
+    var song = data.song || {};
+    var artists = Array.isArray(song.artists) ? song.artists.join(' / ') : String(song.artists || '');
+    paint.seed = hashText(String(song.id || '') + String(song.name || '') + artists) || 20011102;
+    stampFromSeed(paint.seed);
+    try {
+      buildStickerPlate();
+    } catch (problem) {
+      reportError('stickers', problem);
+    }
+    view.inited = true;
+    layoutCache = {};
+    resolveIndex(view.time);
+  }
+
+  function resolveIndex(now) {
+    var lines = view.lines;
+    var found = -1;
+    for (var index = 0; index < lines.length; index++) {
+      if (now + 0.02 >= lines[index].t) { found = index; } else { break; }
+    }
+    view.idx = found;
+    view.text = found >= 0 ? lines[found].text : '';
+  }
+
+  function computeLayout() {
+    var portrait = box.h > box.w * 1.02;
+    var marginX = clampNumber(box.w * 0.05, 8, 130);
+    var marginTop = clampNumber(box.h * 0.055, 12, 96);
+    var marginBottom = clampNumber(box.h * 0.05, 12, 80);
+    var availW = Math.max(120, box.w - marginX * 2);
+    var availH = Math.max(120, box.h - marginTop - marginBottom);
+    var printW = 0;
+    var printH = 0;
+    if (portrait) {
+      printW = Math.min(availW, box.w * 0.94);
+      printH = printW * 0.75;
+      if (printH > availH * 0.58) {
+        printH = availH * 0.58;
+        printW = printH / 0.75;
+      }
+    } else {
+      printH = Math.min(availH * 0.84, box.h * 0.8);
+      printW = printH / 0.75;
+      if (printW > availW) {
+        printW = availW;
+        printH = printW * 0.75;
+      }
+    }
+    stage.portrait = portrait;
+    stage.printW = printW;
+    stage.printH = printH;
+    var inset = clampNumber(printW * 0.038, 6, 30);
+    stage.inset = inset;
+    stage.photoW = Math.max(60, printW - inset * 2);
+    stage.photoH = Math.max(45, printH - inset * 2);
+    stage.centerX = box.w * 0.5;
+    stage.centerY = marginTop + printH * 0.5 + (portrait ? box.h * 0.035 : box.h * 0.02);
+    stage.tilt = portrait ? -0.022 : -0.03;
+
+    if (portrait) {
+      var deskTop = stage.centerY + printH * 0.5;
+      stage.lyric = {
+        originX: box.w * 0.5,
+        centerY: deskTop + (box.h - deskTop) * 0.4,
+        baseFont: clampNumber(box.w * 0.062, 16, 40),
+        maxWidth: box.w * 0.86,
+        inside: false,
+        limitTop: deskTop + box.h * 0.03,
+        limitBottom: box.h - box.h * 0.025
+      };
+    } else {
+      stage.lyric = {
+        originX: 0,
+        centerY: printH * 0.235,
+        baseFont: clampNumber(printH * 0.082, 14, 42),
+        maxWidth: stage.photoW * 0.82,
+        inside: true,
+        limitTop: -printH * 0.5 + 10,
+        limitBottom: printH * 0.5 - 10
+      };
+    }
+
+    var desk = null;
+    try {
+      desk = context2d.createRadialGradient(
+        box.w * 0.5, box.h * 0.42, Math.min(box.w, box.h) * 0.1,
+        box.w * 0.5, box.h * 0.52, Math.max(box.w, box.h) * 0.82
+      );
+      desk.addColorStop(0, '#241726');
+      desk.addColorStop(0.55, '#140d18');
+      desk.addColorStop(1, '#07040a');
+    } catch (problem) {
+      reportError('desk-gradient', problem);
+      desk = null;
+    }
+    stage.deskGradient = desk;
+
+    buildPhotoBase();
+    buildStickerPlate();
+    buildScanPattern();
+    layoutCache = {};
+  }
+
+  /* the flash-lit photo is painted at 0.3 megapixel resolution and then blown up:
+     that upscale is the whole point, so keep the plate deliberately small */
+  function buildPhotoBase() {
+    var pixelW = Math.round(clampNumber(stage.photoW * 0.55, 200, 520));
+    var pixelH = Math.round(clampNumber(pixelW * (stage.photoH / Math.max(1, stage.photoW)), 150, 420));
+    var plate = document.createElement('canvas');
+    plate.width = pixelW;
+    plate.height = pixelH;
+    var pen = plate.getContext('2d');
+    if (!pen) { stage.photoBase = null; return; }
+    stage.photoBaseW = pixelW;
+
+    try {
+    var wash = pen.createLinearGradient(0, 0, 0, pixelH);
+    wash.addColorStop(0, '#fffaf3');
+    wash.addColorStop(0.22, '#fff0ea');
+    wash.addColorStop(0.46, '#ffdfe9');
+    wash.addColorStop(0.68, '#e2c8dd');
+    wash.addColorStop(0.86, '#9d82b0');
+    wash.addColorStop(1, '#5c4767');
+    pen.fillStyle = wash;
+    pen.fillRect(0, 0, pixelW, pixelH);
+
+    var flash = pen.createRadialGradient(pixelW * 0.5, pixelH * 0.28, pixelW * 0.02, pixelW * 0.5, pixelH * 0.3, pixelW * 0.78);
+    flash.addColorStop(0, 'rgba(255,255,255,0.97)');
+    flash.addColorStop(0.42, 'rgba(255,252,248,0.62)');
+    flash.addColorStop(0.75, 'rgba(255,235,240,0.2)');
+    flash.addColorStop(1, 'rgba(255,220,235,0)');
+    pen.fillStyle = flash;
+    pen.fillRect(0, 0, pixelW, pixelH);
+
+    var shadow = pen.createLinearGradient(0, pixelH * 0.55, 0, pixelH);
+    shadow.addColorStop(0, 'rgba(64,30,52,0)');
+    shadow.addColorStop(0.62, 'rgba(58,26,48,0.42)');
+    shadow.addColorStop(1, 'rgba(34,14,32,0.82)');
+    pen.fillStyle = shadow;
+    pen.fillRect(0, 0, pixelW, pixelH);
+
+    var leak = pen.createRadialGradient(pixelW * 0.9, pixelH * 0.08, 0, pixelW * 0.9, pixelH * 0.08, pixelW * 0.5);
+    leak.addColorStop(0, 'rgba(255,64,168,0.26)');
+    leak.addColorStop(1, 'rgba(255,64,168,0)');
+    pen.fillStyle = leak;
+    pen.fillRect(0, 0, pixelW, pixelH);
+
+    var cool = pen.createRadialGradient(pixelW * 0.06, pixelH * 0.16, 0, pixelW * 0.06, pixelH * 0.16, pixelW * 0.42);
+    cool.addColorStop(0, 'rgba(120,236,255,0.22)');
+    cool.addColorStop(1, 'rgba(120,236,255,0)');
+    pen.fillStyle = cool;
+    pen.fillRect(0, 0, pixelW, pixelH);
+
+    // booth wall seams: the seam lines are what tells you this is a photo, not a gradient
+    for (var seamIndex = 0; seamIndex < 7; seamIndex++) {
+      var seamX = pixelW * (0.06 + seamIndex * 0.145);
+      pen.fillStyle = seamIndex % 2 === 0 ? 'rgba(255,255,255,0.16)' : 'rgba(120,80,130,0.14)';
+      pen.fillRect(seamX, 0, Math.max(1, pixelW * 0.004), pixelH);
+    }
+
+    var tube = pen.createLinearGradient(0, pixelH * 0.02, 0, pixelH * 0.11);
+    tube.addColorStop(0, 'rgba(255,255,255,0.95)');
+    tube.addColorStop(0.55, 'rgba(255,252,246,0.55)');
+    tube.addColorStop(1, 'rgba(255,255,255,0)');
+    pen.fillStyle = tube;
+    pen.fillRect(pixelW * 0.08, pixelH * 0.02, pixelW * 0.84, pixelH * 0.09);
+
+    // two out-of-focus figures at the frame edges, the way flash snapshots bleed people
+    var rightFigure = pen.createRadialGradient(pixelW * 0.94, pixelH * 0.66, pixelW * 0.02, pixelW * 0.94, pixelH * 0.66, pixelW * 0.34);
+    rightFigure.addColorStop(0, 'rgba(70,32,66,0.62)');
+    rightFigure.addColorStop(0.6, 'rgba(78,38,74,0.28)');
+    rightFigure.addColorStop(1, 'rgba(78,38,74,0)');
+    pen.fillStyle = rightFigure;
+    pen.fillRect(0, 0, pixelW, pixelH);
+
+    var leftFigure = pen.createRadialGradient(pixelW * 0.04, pixelH * 0.74, pixelW * 0.02, pixelW * 0.04, pixelH * 0.74, pixelW * 0.28);
+    leftFigure.addColorStop(0, 'rgba(52,26,58,0.5)');
+    leftFigure.addColorStop(1, 'rgba(52,26,58,0)');
+    pen.fillStyle = leftFigure;
+    pen.fillRect(0, 0, pixelW, pixelH);
+
+    // hard top edge blow-out, the signature of a direct flash fired into a wall
+    var topBlow = pen.createLinearGradient(0, 0, 0, pixelH * 0.2);
+    topBlow.addColorStop(0, 'rgba(255,255,255,0.75)');
+    topBlow.addColorStop(1, 'rgba(255,255,255,0)');
+    pen.fillStyle = topBlow;
+    pen.fillRect(0, 0, pixelW, pixelH * 0.2);
+    } catch (problem) {
+      reportError('photo-base paint', problem);
+    }
+
+    stage.photoBase = plate;
+  }
+
+  var noisePlate = null;
+  var scanPattern = null;
+  var paint = {
+    energy: 0, live: 0, liveTarget: 0, bass: 0, mid: 0, treble: 0, bpm: 0,
+    beatIndex: 0, now: 0, seed: 20011102, stamp: '01 11 02', clock: 'AM 6:07', version: '0.3M'
+  };
+
+  function makeRandom(seed) {
+    var stateSeed = (seed | 0) || 1;
+    return function () {
+      stateSeed = (stateSeed + 0x6D2B79F5) | 0;
+      var mixed = Math.imul(stateSeed ^ (stateSeed >>> 15), 1 | stateSeed);
+      mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+      return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function rgbString(triple, alpha) {
+    var red = Math.round(clampNumber(triple[0], 0, 255));
+    var green = Math.round(clampNumber(triple[1], 0, 255));
+    var blue = Math.round(clampNumber(triple[2], 0, 255));
+    if (typeof alpha === 'number') {
+      return 'rgba(' + red + ',' + green + ',' + blue + ',' + clampNumber(alpha, 0, 1).toFixed(3) + ')';
+    }
+    return 'rgb(' + red + ',' + green + ',' + blue + ')';
+  }
+
+  function buildNoisePlate() {
+    var size = 256;
+    var plate = document.createElement('canvas');
+    plate.width = size;
+    plate.height = size;
+    var pen = plate.getContext('2d');
+    if (!pen) { noisePlate = null; return; }
+    var image = pen.createImageData(size, size);
+    var data = image.data;
+    var random = makeRandom(paint.seed ^ 0x5f3a17);
+    for (var offset = 0; offset < data.length; offset += 4) {
+      var value = 128 + (random() - 0.5) * 156;
+      var tint = random();
+      var red = value;
+      var green = value;
+      var blue = value;
+      if (tint < 0.24) { red = value + 46; green = value - 34; blue = value + 16; }
+      else if (tint < 0.44) { red = value - 36; green = value + 24; blue = value + 44; }
+      else if (tint < 0.6) { red = value + 28; green = value + 34; blue = value - 42; }
+      data[offset] = clampNumber(Math.round(red), 0, 255);
+      data[offset + 1] = clampNumber(Math.round(green), 0, 255);
+      data[offset + 2] = clampNumber(Math.round(blue), 0, 255);
+      data[offset + 3] = 255;
+    }
+    pen.putImageData(image, 0, 0);
+    noisePlate = plate;
+  }
+
+  function buildScanPattern() {
+    try {
+      var tile = document.createElement('canvas');
+      tile.width = 4;
+      tile.height = 4;
+      var pen = tile.getContext('2d');
+      if (!pen) { scanPattern = null; return; }
+      pen.fillStyle = 'rgba(20,0,24,0.22)';
+      pen.fillRect(0, 0, 4, 1);
+      pen.fillStyle = 'rgba(255,255,255,0.10)';
+      pen.fillRect(0, 2, 4, 1);
+      scanPattern = context2d.createPattern(tile, 'repeat');
+    } catch (problem) {
+      scanPattern = null;
+      reportError('scan-pattern', problem);
+    }
+  }
+
+  /* chunky fixed-width letterforms so the OSD reads like a 2001 camera overlay */
+  function drawPixelText(pen, text, x, y, size, color, alignRight) {
+    var content = String(text == null ? '' : text);
+    var step = size * 0.66;
+    pen.save();
+    pen.font = '700 ' + size.toFixed(1) + 'px "Courier New", ui-monospace, monospace';
+    pen.textBaseline = 'middle';
+    pen.textAlign = 'left';
+    var width = step * content.length;
+    var startX = alignRight ? x - width : x;
+    for (var index = 0; index < content.length; index++) {
+      pen.fillStyle = 'rgba(255,252,244,0.92)';
+      pen.fillText(content.charAt(index), startX + index * step + (size * 0.12), y);
+      pen.fillStyle = color;
+      pen.fillText(content.charAt(index), startX + index * step, y);
+    }
+    pen.restore();
+  }
+
+  var stickerPlate = null;
+
+  function strokeHeart(pen, centerX, centerY, radius, color, lineWidth, fillAlpha) {
+    pen.save();
+    pen.beginPath();
+    pen.moveTo(centerX, centerY + radius * 0.72);
+    pen.bezierCurveTo(centerX - radius * 1.35, centerY - radius * 0.16, centerX - radius * 0.62, centerY - radius * 1.1, centerX, centerY - radius * 0.38);
+    pen.bezierCurveTo(centerX + radius * 0.62, centerY - radius * 1.1, centerX + radius * 1.35, centerY - radius * 0.16, centerX, centerY + radius * 0.72);
+    pen.closePath();
+    if (fillAlpha > 0) {
+      pen.fillStyle = color;
+      pen.globalAlpha = fillAlpha;
+      pen.fill();
+      pen.globalAlpha = 1;
+    }
+    pen.lineWidth = lineWidth;
+    pen.lineJoin = 'round';
+    pen.strokeStyle = color;
+    pen.stroke();
+    pen.restore();
+  }
+
+  function strokeSparkle(pen, centerX, centerY, radius, color, lineWidth) {
+    pen.save();
+    pen.beginPath();
+    for (var index = 0; index < 4; index++) {
+      var angle = index * Math.PI * 0.5;
+      var tipX = centerX + Math.cos(angle) * radius;
+      var tipY = centerY + Math.sin(angle) * radius;
+      pen.moveTo(centerX, centerY);
+      pen.quadraticCurveTo(centerX + Math.cos(angle + 0.5) * radius * 0.22, centerY + Math.sin(angle + 0.5) * radius * 0.22, tipX, tipY);
+      pen.moveTo(centerX, centerY);
+      pen.quadraticCurveTo(centerX + Math.cos(angle - 0.5) * radius * 0.22, centerY + Math.sin(angle - 0.5) * radius * 0.22, tipX, tipY);
+    }
+    pen.strokeStyle = color;
+    pen.lineWidth = lineWidth;
+    pen.lineCap = 'round';
+    pen.stroke();
+    pen.restore();
+  }
+
+  function strokeSquiggle(pen, startX, startY, span, amplitude, color, lineWidth, random, alpha) {
+    pen.save();
+    pen.globalAlpha = typeof alpha === 'number' ? alpha : 1;
+    pen.beginPath();
+    pen.moveTo(startX, startY);
+    for (var index = 1; index <= 4; index++) {
+      var controlX = startX + span * (index - 0.5) / 4;
+      var controlY = startY + (random() - 0.5) * amplitude * 2.2;
+      var endX = startX + span * index / 4;
+      var endY = startY + (random() - 0.5) * amplitude;
+      pen.quadraticCurveTo(controlX, controlY, endX, endY);
+    }
+    pen.strokeStyle = color;
+    pen.lineWidth = lineWidth;
+    pen.lineCap = 'round';
+    pen.lineJoin = 'round';
+    pen.stroke();
+    pen.restore();
+  }
+
+  function drawTapeLabel(pen, text, x, y, angle, fontSize, background, ink) {
+    pen.save();
+    pen.translate(x, y);
+    pen.rotate(angle);
+    var tapeWidth = fontSize * (text.length * 0.62 + 0.9);
+    var tapeHeight = fontSize * 1.5;
+    pen.fillStyle = background;
+    pen.fillRect(-tapeWidth / 2, -tapeHeight / 2, tapeWidth, tapeHeight);
+    pen.fillStyle = ink;
+    pen.font = '700 ' + fontSize.toFixed(1) + 'px "Courier New", ui-monospace, monospace';
+    pen.textAlign = 'center';
+    pen.textBaseline = 'middle';
+    pen.fillText(text, 0, fontSize * 0.06);
+    pen.restore();
+  }
+
+  function buildStickerPlate() {
+    var ratio = clampNumber(box.dpr, 1, 2);
+    var pixelW = Math.round(clampNumber(stage.photoW * ratio, 160, 1700));
+    var pixelH = Math.round(clampNumber(stage.photoH * ratio, 120, 1400));
+    var plate = document.createElement('canvas');
+    plate.width = pixelW;
+    plate.height = pixelH;
+    var pen = plate.getContext('2d');
+    if (!pen) { stickerPlate = null; return; }
+    var width = stage.photoW;
+    var height = stage.photoH;
+    pen.setTransform(pixelW / width, 0, 0, pixelH / height, 0, 0);
+    var random = makeRandom(paint.seed ^ 0x91ae3b);
+    var accent = rgbString(view.accent);
+    var colors = [accent, '#ff2f8f', '#37e6ff', '#c8ff2e', '#ff9a1f'];
+    var unit = clampNumber(height * 0.012, 1.6, 5.2);
+
+    for (var lineIndex = 0; lineIndex < 3; lineIndex++) {
+      var lineY = height * (0.05 + lineIndex * 0.035 + random() * 0.02);
+      strokeSquiggle(pen, width * (0.04 + random() * 0.1), lineY, width * (0.2 + random() * 0.28), unit * 2.4,
+        colors[Math.floor(random() * colors.length)], unit * (2.4 + random() * 1.6), random, 0.4);
+    }
+
+    /* highlighter scribble over the camera date, the way you'd circle it in a diary */
+    var stampUnit = clampNumber(height * 0.026, 8, 22);
+    var stampPad = clampNumber(width * 0.022, 6, 22);
+    pen.save();
+    pen.translate(stampPad + stampUnit * 2.7, stampPad + stampUnit * 0.6);
+    pen.rotate(-0.05);
+    pen.beginPath();
+    pen.ellipse ? pen.ellipse(0, 0, stampUnit * 2.9, stampUnit * 1.05, 0, 0, Math.PI * 2)
+      : pen.arc(0, 0, stampUnit * 1.6, 0, Math.PI * 2);
+    pen.strokeStyle = rgbString(view.accent, 0.55);
+    pen.lineWidth = Math.max(1.4, stampUnit * 0.22);
+    pen.stroke();
+    pen.restore();
+
+    var heartCount = 4 + Math.floor(random() * 4);
+    for (var heartIndex = 0; heartIndex < heartCount; heartIndex++) {
+      strokeHeart(pen, width * (0.08 + random() * 0.84), height * (0.06 + random() * 0.4),
+        clampNumber(height * (0.022 + random() * 0.034), 6, 46),
+        colors[Math.floor(random() * colors.length)], clampNumber(unit * 1.1, 1.4, 6), random() > 0.62 ? 0.2 : 0);
+    }
+
+    var sparkleCount = 5 + Math.floor(random() * 5);
+    for (var sparkIndex = 0; sparkIndex < sparkleCount; sparkIndex++) {
+      strokeSparkle(pen, width * (0.05 + random() * 0.9), height * (0.04 + random() * 0.48),
+        clampNumber(height * (0.012 + random() * 0.02), 4, 30),
+        colors[Math.floor(random() * colors.length)], clampNumber(unit * 0.85, 1.2, 4.5));
+    }
+
+    var bubbleX = width * 0.78;
+    var bubbleY = height * 0.19;
+    var bubbleRadius = clampNumber(height * 0.095, 18, 96);
+    pen.save();
+    pen.beginPath();
+    pen.arc(bubbleX, bubbleY, bubbleRadius, 0, Math.PI * 2);
+    pen.fillStyle = 'rgba(255,255,255,0.84)';
+    pen.fill();
+    pen.lineWidth = clampNumber(unit * 1.4, 2, 6);
+    pen.strokeStyle = '#ff2f8f';
+    pen.stroke();
+    pen.beginPath();
+    pen.moveTo(bubbleX - bubbleRadius * 0.5, bubbleY + bubbleRadius * 0.78);
+    pen.lineTo(bubbleX - bubbleRadius * 0.74, bubbleY + bubbleRadius * 1.3);
+    pen.lineTo(bubbleX - bubbleRadius * 0.08, bubbleY + bubbleRadius * 0.94);
+    pen.closePath();
+    pen.fillStyle = 'rgba(255,255,255,0.84)';
+    pen.fill();
+    pen.restore();
+    strokeHeart(pen, bubbleX, bubbleY, bubbleRadius * 0.44, '#ff2f8f', clampNumber(unit * 1.3, 2, 6), 0.85);
+
+    drawTapeLabel(pen, 'LOVE', width * 0.2, height * 0.13, -0.16, clampNumber(height * 0.05, 8, 26), rgbString(view.accent, 0.9), '#1b1018');
+    drawTapeLabel(pen, 'FLASH', width * 0.17, height * 0.33, 0.1, clampNumber(height * 0.036, 7, 20), 'rgba(255,255,255,0.9)', '#1b1018');
+
+    stickerPlate = plate;
+  }
+
+  function drawDesk() {
+    context2d.fillStyle = stage.deskGradient || '#0a0609';
+    context2d.fillRect(0, 0, box.w, box.h);
+    var glow = null;
+    try {
+      glow = context2d.createRadialGradient(
+        stage.centerX, stage.centerY, stage.printW * 0.1,
+        stage.centerX, stage.centerY, stage.printW * 1.05
+      );
+      glow.addColorStop(0, 'rgba(255,214,240,0.16)');
+      glow.addColorStop(1, 'rgba(255,214,240,0)');
+    } catch (problem) {
+      reportError('desk-glow', problem);
+      return;
+    }
+    context2d.fillStyle = glow;
+    context2d.fillRect(0, 0, box.w, box.h);
+  }
+
+  function drawPrintGroup() {
+    var width = stage.printW;
+    var height = stage.printH;
+    context2d.save();
+    context2d.translate(stage.centerX, stage.centerY);
+    var sway = view.reduced ? 0 : Math.sin(paint.now * 0.7) * 0.0035;
+    var breathe = view.reduced ? 1 : 1 + paint.bass * 0.007;
+    context2d.rotate(stage.tilt + sway);
+    context2d.scale(breathe, breathe);
+
+    context2d.save();
+    context2d.shadowColor = 'rgba(0,0,0,0.75)';
+    context2d.shadowBlur = Math.max(18, width * 0.05);
+    context2d.shadowOffsetY = Math.max(10, width * 0.018);
+    context2d.fillStyle = '#f7f1e6';
+    context2d.fillRect(-width / 2, -height / 2, width, height);
+    context2d.restore();
+
+    context2d.fillStyle = '#fbf6ec';
+    context2d.fillRect(-width / 2, -height / 2, width, height);
+
+    var photoLeft = -stage.photoW / 2;
+    var photoTop = -stage.photoH / 2;
+    if (stage.photoBase) {
+      context2d.drawImage(stage.photoBase, photoLeft, photoTop, stage.photoW, stage.photoH);
+    } else {
+      context2d.fillStyle = '#ffdfe9';
+      context2d.fillRect(photoLeft, photoTop, stage.photoW, stage.photoH);
+    }
+
+    drawGrain(photoLeft, photoTop);
+    drawStickers(photoLeft, photoTop);
+    drawCameraStamp(photoLeft, photoTop);
+    drawFlashBloom(photoLeft, photoTop);
+    if (stage.lyric && stage.lyric.inside) { drawLyrics(); }
+
+    /* lab code printed on the paper margin, the way minilab prints were stamped */
+    var borderUnit = clampNumber((stage.inset || 10) * 0.5, 5.5, 11);
+    drawPixelText(context2d, 'P-364  0.3M  2001', width * 0.5 - (stage.inset || 10) * 0.7,
+      height * 0.5 - (stage.inset || 10) * 0.5, borderUnit, '#4a3150', true);
+
+    context2d.restore();
+    if (stage.lyric && !stage.lyric.inside) { drawLyrics(); }
+  }
+
+  function drawGrain(photoLeft, photoTop) {
+    var width = stage.photoW;
+    var height = stage.photoH;
+    context2d.save();
+    context2d.beginPath();
+    context2d.rect(photoLeft, photoTop, width, height);
+    context2d.clip();
+
+    if (noisePlate) {
+      var jitterX = (Math.random() - 0.5) * 12;
+      var jitterY = (Math.random() - 0.5) * 12;
+      /* nearest-neighbour on purpose: fine grain would read digital, blocky grain reads CCD */
+      context2d.imageSmoothingEnabled = false;
+      context2d.globalCompositeOperation = 'overlay';
+      context2d.globalAlpha = clampNumber(0.26 + paint.energy * 0.22 + paint.live * 0.1, 0, 0.85);
+      context2d.drawImage(noisePlate, photoLeft + jitterX, photoTop + jitterY, width * 1.05, height * 1.05);
+      context2d.globalCompositeOperation = 'screen';
+      context2d.globalAlpha = clampNumber(0.05 + paint.energy * 0.06, 0, 0.4);
+      context2d.drawImage(noisePlate, photoLeft + jitterY, photoTop + jitterX, width * 1.02, height * 1.02);
+      context2d.imageSmoothingEnabled = true;
+    }
+
+    if (scanPattern) {
+      context2d.globalCompositeOperation = 'source-over';
+      context2d.globalAlpha = 0.4;
+      context2d.fillStyle = scanPattern;
+      context2d.fillRect(photoLeft, photoTop, width, height);
+    }
+    context2d.restore();
+  }
+
+  function drawStickers(photoLeft, photoTop) {
+    if (!stickerPlate) { return; }
+    var wobble = 1 + paint.energy * 0.012;
+    context2d.save();
+    context2d.translate(photoLeft + stage.photoW / 2, photoTop + stage.photoH / 2);
+    context2d.rotate((paint.energy - 0.35) * 0.006);
+    context2d.scale(wobble, wobble);
+    context2d.drawImage(stickerPlate, -stage.photoW / 2, -stage.photoH / 2, stage.photoW, stage.photoH);
+    context2d.restore();
+  }
+
+  function drawCameraStamp(photoLeft, photoTop) {
+    var unit = clampNumber(stage.photoH * 0.026, 8, 22);
+    var padding = clampNumber(stage.photoW * 0.022, 6, 22);
+    drawPixelText(context2d, paint.stamp, photoLeft + padding, photoTop + padding + unit * 0.6, unit, '#25142a', false);
+    drawPixelText(context2d, paint.clock, photoLeft + stage.photoW - padding, photoTop + padding + unit * 0.6, unit, '#25142a', true);
+  }
+
+  function drawFlashBloom(photoLeft, photoTop) {
+    if (paint.energy <= 0.01) { return; }
+    var bloom = null;
+    try {
+      bloom = context2d.createRadialGradient(
+        photoLeft + stage.photoW * 0.5, photoTop + stage.photoH * 0.3, 0,
+        photoLeft + stage.photoW * 0.5, photoTop + stage.photoH * 0.3, stage.photoW * 0.72
+      );
+      bloom.addColorStop(0, 'rgba(255,255,255,' + (paint.energy * 0.4).toFixed(3) + ')');
+      bloom.addColorStop(0.55, 'rgba(255,246,250,' + (paint.energy * 0.16).toFixed(3) + ')');
+      bloom.addColorStop(1, 'rgba(255,255,255,0)');
+    } catch (problem) {
+      reportError('flash-bloom', problem);
+      return;
+    }
+    context2d.fillStyle = bloom;
+    context2d.fillRect(photoLeft, photoTop, stage.photoW, stage.photoH);
+  }
+
+  var lyricCache = { key: '', rows: [], fontSize: 0 };
+  var INK = '#1c1019';
+  var STRIP_FILL = 'rgba(255,250,241,0.94)';
+
+  function roundRectPath(pen, x, y, width, height, radius) {
+    var limit = Math.max(0, Math.min(radius, Math.min(width, height) * 0.5));
+    pen.beginPath();
+    pen.moveTo(x + limit, y);
+    pen.lineTo(x + width - limit, y);
+    pen.quadraticCurveTo(x + width, y, x + width, y + limit);
+    pen.lineTo(x + width, y + height - limit);
+    pen.quadraticCurveTo(x + width, y + height, x + width - limit, y + height);
+    pen.lineTo(x + limit, y + height);
+    pen.quadraticCurveTo(x, y + height, x, y + height - limit);
+    pen.lineTo(x, y + limit);
+    pen.quadraticCurveTo(x, y, x + limit, y);
+    pen.closePath();
+  }
+
+  function lineChars(line) {
+    var items = [];
+    var text = line && line.text ? String(line.text) : '';
+    var source = line && Array.isArray(line.chars) ? line.chars : null;
+    if (source && source.length && text.length && source.length >= Math.ceil(text.length * 0.5)) {
+      for (var index = 0; index < source.length; index++) {
+        var entry = source[index];
+        if (!entry || entry.c == null) { continue; }
+        var stamp = Number(entry.t);
+        items.push({ c: String(entry.c), t: isFinite(stamp) ? stamp : line.t });
+      }
+    }
+    if (!items.length) {
+      var spread = clampNumber(line.dur, 1.2, 24) / Math.max(1, text.length);
+      for (var charIndex = 0; charIndex < text.length; charIndex++) {
+        items.push({ c: text.charAt(charIndex), t: line.t + charIndex * spread });
+      }
+    }
+    return items;
+  }
+
+  function wrapItems(items, maxWidth, maxRows) {
+    var rows = [];
+    var currentRow = [];
+    var currentWidth = 0;
+    for (var index = 0; index < items.length; index++) {
+      var advance = context2d.measureText(items[index].c).width;
+      if (currentRow.length && currentWidth + advance > maxWidth && rows.length + 1 < maxRows) {
+        rows.push({ items: currentRow, width: currentWidth });
+        currentRow = [];
+        currentWidth = 0;
+      }
+      currentRow.push(items[index]);
+      currentWidth += advance;
+    }
+    if (currentRow.length) { rows.push({ items: currentRow, width: currentWidth }); }
+    return rows;
+  }
+
+  function layoutLine(line, baseFont, maxWidth) {
+    var items = lineChars(line);
+    var size = baseFont;
+    var rows = [];
+    for (var attempt = 0; attempt < 24; attempt++) {
+      context2d.font = '800 ' + size.toFixed(1) + 'px ' + LYRIC_FONT;
+      rows = wrapItems(items, maxWidth, 3);
+      var widest = 0;
+      for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        widest = Math.max(widest, rows[rowIndex].width);
+      }
+      if (widest <= maxWidth || size <= 10) { break; }
+      size = Math.max(10, size * 0.9);
+    }
+    return { rows: rows, fontSize: size };
+  }
+
+  /* the lyric reads as a hand-scribbled sticker slapped onto the print */
+  function drawStrip(rows, fontSize, centerY, tilt, alpha, accentColor, maxWidth, bounce) {
+    var padX = fontSize * 0.62;
+    var padY = fontSize * 0.34;
+    var rowStep = fontSize * 1.26;
+    var stripWidth = 0;
+    for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      stripWidth = Math.max(stripWidth, rows[rowIndex].width);
+    }
+    stripWidth = Math.min(stripWidth + padX * 2, maxWidth + padX * 2);
+    var stripHeight = rows.length * rowStep + padY * 2;
+
+    context2d.save();
+    context2d.translate(stage.lyric.originX, centerY);
+    context2d.rotate(tilt);
+    context2d.globalAlpha = alpha;
+    var scale = 1 + clampNumber(bounce || 0, 0, 0.06);
+    if (scale !== 1) { context2d.scale(scale, scale); }
+
+    context2d.fillStyle = 'rgba(24,10,22,0.3)';
+    roundRectPath(context2d, -stripWidth / 2 + 3, -stripHeight / 2 + 4, stripWidth, stripHeight, fontSize * 0.22);
+    context2d.fill();
+
+    context2d.fillStyle = STRIP_FILL;
+    roundRectPath(context2d, -stripWidth / 2, -stripHeight / 2, stripWidth, stripHeight, fontSize * 0.22);
+    context2d.fill();
+    context2d.lineWidth = Math.max(1, fontSize * 0.045);
+    context2d.strokeStyle = 'rgba(36,16,38,0.5)';
+    context2d.stroke();
+
+    context2d.fillStyle = rgbString(view.accent, 0.95);
+    var tabWidth = Math.max(6, fontSize * 0.36);
+    context2d.fillRect(-stripWidth / 2 + fontSize * 0.16, -stripHeight / 2 + fontSize * 0.16, tabWidth, fontSize * 0.2);
+    context2d.fillRect(-stripWidth / 2 + fontSize * 0.16, -stripHeight / 2 + fontSize * 0.16 + fontSize * 0.42, tabWidth * 0.62, fontSize * 0.2);
+
+    context2d.font = '800 ' + fontSize.toFixed(1) + 'px ' + LYRIC_FONT;
+    context2d.textAlign = 'left';
+    context2d.textBaseline = 'middle';
+    for (var index = 0; index < rows.length; index++) {
+      var row = rows[index];
+      var cursorX = -row.width / 2;
+      var baselineY = -stripHeight / 2 + padY + rowStep * (index + 0.5);
+      for (var charIndex = 0; charIndex < row.items.length; charIndex++) {
+        var item = row.items[charIndex];
+        var advance = context2d.measureText(item.c).width;
+        if (item.sung) {
+          context2d.fillStyle = accentColor;
+          roundRectPath(context2d, cursorX - advance * 0.04, baselineY - fontSize * 0.46,
+            advance * 1.08, fontSize * 0.92, fontSize * 0.16);
+          context2d.fill();
+        }
+        context2d.fillStyle = INK;
+        context2d.fillText(item.c, cursorX, baselineY + fontSize * 0.04);
+        cursorX += advance;
+      }
+    }
+    context2d.restore();
+  }
+
+  function drawEmptyState(baseFont, maxWidth, centerY) {
+    var rows = [{ items: [{ c: '这首歌没有歌词', t: 0, sung: false }], width: 0 }];
+    context2d.font = '800 ' + (baseFont * 0.68).toFixed(1) + 'px ' + LYRIC_FONT;
+    rows[0].width = context2d.measureText('这首歌没有歌词').width;
+    drawStrip(rows, baseFont * 0.68, centerY - baseFont * 0.5, -0.014, 0.96, rgbString(view.accent, 0.72), maxWidth);
+
+    var subRows = [{ items: [{ c: '0.3M · FLASH ON', t: 0, sung: false }], width: 0 }];
+    context2d.font = '800 ' + (baseFont * 0.4).toFixed(1) + 'px ' + LYRIC_FONT;
+    subRows[0].width = context2d.measureText('0.3M · FLASH ON').width;
+    drawStrip(subRows, baseFont * 0.4, centerY + baseFont * 0.62, 0.02, 0.8, rgbString(view.accent, 0.55), maxWidth);
+  }
+
+  var LYRIC_FONT = '"Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Heiti SC", "Hiragino Sans GB", sans-serif';
+  var layoutCache = {};
+
+  function stripMetrics(layout) {
+    var step = layout.fontSize * 1.26;
+    return {
+      height: layout.rows.length * step + layout.fontSize * 0.68,
+      step: step
+    };
+  }
+
+  function getLineLayout(line, baseFont, maxWidth, cacheKey) {
+    if (!line) { return null; }
+    if (layoutCache[cacheKey]) { return layoutCache[cacheKey]; }
+    var layout = layoutLine(line, baseFont, maxWidth);
+    layoutCache[cacheKey] = layout;
+    return layout;
+  }
+
+  function drawLyricLine(layout, centerY, alpha, tilt, accentColor, maxWidth, markSung) {
+    if (!layout || !layout.rows.length) { return; }
+    for (var rowIndex = 0; rowIndex < layout.rows.length; rowIndex++) {
+      var items = layout.rows[rowIndex].items;
+      for (var itemIndex = 0; itemIndex < items.length; itemIndex++) {
+        items[itemIndex].sung = !!markSung && items[itemIndex].t <= view.time + 0.08;
+      }
+    }
+    drawStrip(layout.rows, layout.fontSize, centerY, tilt, alpha, accentColor, maxWidth,
+      markSung && !view.reduced ? paint.energy * 0.018 : 0);
+  }
+
+  /* the karaoke bar must never sink into the ink: dark accents get lifted toward light */
+  function accentHighlight(alpha) {
+    var red = clampNumber(view.accent[0], 0, 255);
+    var green = clampNumber(view.accent[1], 0, 255);
+    var blue = clampNumber(view.accent[2], 0, 255);
+    var luma = (0.299 * red + 0.587 * green + 0.114 * blue) / 255;
+    if (luma < 0.62) {
+      var lift = clampNumber((0.62 - luma) / 0.62, 0, 1) * 0.7;
+      red = red + (255 - red) * lift;
+      green = green + (255 - green) * lift;
+      blue = blue + (255 - blue) * lift;
+    }
+    return rgbString([red, green, blue], alpha);
+  }
+
+  function drawLyrics() {
+    if (!stage.lyric || !view.inited) { return; }
+    var baseFont = stage.lyric.baseFont;
+    var maxWidth = stage.lyric.maxWidth;
+    var centerY = stage.lyric.centerY;
+    var accentBar = accentHighlight(0.62);
+
+    if (!view.lines.length) {
+      drawEmptyState(baseFont, maxWidth, centerY);
+      return;
+    }
+
+    var cacheStamp = '|' + Math.round(baseFont) + '|' + Math.round(maxWidth);
+    var currentIndex = view.idx;
+    var currentLine = currentIndex >= 0 ? view.lines[currentIndex] : null;
+    var previousLine = currentIndex > 0 ? view.lines[currentIndex - 1] : null;
+    var upcomingIndex = currentIndex + 1;
+    var upcomingLine = view.lines[upcomingIndex] || null;
+    if (currentIndex < 0) { upcomingLine = view.lines[0] || null; }
+
+    var currentLayout = getLineLayout(currentLine, baseFont, maxWidth, 'c' + currentIndex + cacheStamp);
+    var previousLayout = previousLine ? getLineLayout(previousLine, baseFont * 0.5, maxWidth * 0.9, 'p' + (currentIndex - 1) + cacheStamp) : null;
+    var upcomingLayout = upcomingLine ? getLineLayout(upcomingLine, baseFont * 0.5, maxWidth * 0.9, 'u' + upcomingIndex + cacheStamp) : null;
+
+    var currentMetrics = currentLayout ? stripMetrics(currentLayout) : { height: baseFont * 1.7, step: baseFont };
+    var smallHeight = baseFont * 0.5 * 2.2;
+
+    var blockTop = centerY - currentMetrics.height * 0.5;
+    var blockBottom = centerY + currentMetrics.height * 0.5;
+    if (previousLayout) { blockTop -= smallHeight * 1.5; }
+    if (upcomingLayout) { blockBottom += smallHeight * 1.5; }
+
+    var limitTop = stage.lyric.limitTop;
+    var limitBottom = stage.lyric.limitBottom;
+    if (blockTop < limitTop) { centerY += limitTop - blockTop; }
+    if (blockBottom > limitBottom) { centerY -= blockBottom - limitBottom; }
+    var lowBound = limitTop + currentMetrics.height * 0.5;
+    var highBound = Math.max(lowBound, limitBottom - currentMetrics.height * 0.5);
+    centerY = clampNumber(centerY, lowBound, highBound);
+
+    if (previousLayout) {
+      drawLyricLine(previousLayout, centerY - currentMetrics.height * 0.5 - smallHeight * 0.85,
+        0.6, 0.014, accentBar, maxWidth, false);
+    }
+    if (upcomingLayout) {
+      drawLyricLine(upcomingLayout, centerY + currentMetrics.height * 0.5 + smallHeight * 0.85,
+        0.6, -0.012, accentBar, maxWidth, false);
+    }
+    if (currentLayout) {
+      drawLyricLine(currentLayout, centerY, 0.97, -0.008, accentBar, maxWidth, true);
+    }
+  }
+
+  function drawDeskFooter() {
+    var size = clampNumber(box.w * 0.011, 8, 13);
+    var lineY = box.h - clampNumber(box.h * 0.018, 9, 22);
+    context2d.save();
+    context2d.globalAlpha = 0.36;
+    context2d.fillStyle = accentHighlight(0.95);
+    context2d.font = '700 ' + size.toFixed(1) + 'px "Courier New", ui-monospace, monospace';
+    context2d.textAlign = 'center';
+    context2d.textBaseline = 'middle';
+    context2d.fillText('K E I T A I  ·  0.3M  ·  F L A S H   O N', box.w * 0.5, lineY);
+    context2d.restore();
+  }
+
+  function drawScene() {
+    drawDesk();
+    drawPrintGroup();
+    /* the flash bleeds past the paper and lights the whole room for a couple of frames */
+    var bleed = clampNumber(paint.energy * 0.07, 0, 0.12);
+    if (bleed > 0.004) {
+      context2d.fillStyle = 'rgba(255,255,255,' + bleed.toFixed(3) + ')';
+      context2d.fillRect(0, 0, box.w, box.h);
+    }
+    drawDeskFooter();
+  }
+
+  var previousStamp = 0;
+  function frame(now) {
+    var started = performance.now();
+    try {
+      var delta = previousStamp ? Math.min(80, now - previousStamp) : 16;
+      previousStamp = now;
+      view.now = now / 1000;
+      paint.energy = clampNumber(paint.energy * Math.exp(-delta / (view.reduced ? 300 : 175)), 0, 1.2);
+      paint.live = paint.live + (paint.liveTarget - paint.live) * clampNumber(delta / 200, 0, 1);
+      drawScene();
+      view.frames++;
+    } catch (problem) {
+      reportError('frame', problem);
+    }
+    view.js = Math.max(0, performance.now() - started);
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('message', function (event) {
+    var message = event && event.data;
+    if (!message || message.__c100 !== 1) { return; }
+    try {
+      if (message.type === 'init') { applyInit(message.payload); }
+      else if (message.type === 'tick') {
+        var payload = message.payload || {};
+        var incoming = Number(payload.time);
+        view.time = isFinite(incoming) ? incoming : view.time;
+        if (typeof payload.playing === 'boolean') { view.playing = payload.playing; }
+        resolveIndex(view.time);
+      } else if (message.type === 'beat') {
+        var beatPayload = message.payload || {};
+        var level = clampNumber(Number(beatPayload.level) || 0.5, 0, 1);
+        paint.energy = clampNumber(Math.max(paint.energy, 0.28 + level * 0.72), 0, 1.2);
+        paint.beatIndex = Number(beatPayload.index) || 0;
+      } else if (message.type === 'live') {
+        var livePayload = message.payload || {};
+        paint.bpm = clampNumber(Number(livePayload.bpm) || 0, 0, 300);
+        paint.bass = clampNumber(Number(livePayload.bass) || 0, 0, 1);
+        paint.mid = clampNumber(Number(livePayload.mid) || 0, 0, 1);
+        paint.treble = clampNumber(Number(livePayload.treble) || 0, 0, 1);
+        paint.liveTarget = clampNumber(Number(livePayload.level) || 0, 0, 1);
+        if (typeof livePayload.playing === 'boolean') { view.playing = livePayload.playing; }
+      }
+    } catch (problem) { reportError('message:' + message.type, problem); }
+  }, false);
+
+  window.addEventListener('resize', function () { try { resize(); } catch (problem) { reportError('resize', problem); } }, false);
+
+  window.addEventListener('error', function (event) {
+    reportError('window', (event && (event.error || event.message)) || 'unknown');
+  }, false);
+
+  try {
+    view.reduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  } catch (problem) { reportError('motion-query', problem); }
+
+  try { buildNoisePlate(); } catch (problem) { reportError('noise-plate', problem); }
+  try { resize(); } catch (problem) { reportError('boot-resize', problem); }
+
+  requestAnimationFrame(function () { sendReady(); frame(performance.now()); });
+  setTimeout(sendReady, 700);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,2235 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>馆藏证词</title>
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; height: 100%; background: #17130f; overflow: hidden; }
+  body { font-family: Georgia, "Times New Roman", "Songti SC", "Noto Serif SC", serif; }
+  #wall { display: block; width: 100vw; height: 100vh; }
+  #sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="wall" role="img" aria-label="民权档案展陈式歌词舞台"></canvas>
+<div id="sr" aria-live="polite"></div>
+<script>
+(function () {
+  "use strict";
+
+  /* ---- ready: scheduled before any boot, GL, or baking work ---- */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try {
+      parent.postMessage({ __c100: 1, type: "ready" }, "*");
+    } catch (err) {
+      console.error("[422] ready postMessage failed", err);
+    }
+  }
+  requestAnimationFrame(function firstReadyFrame() { sendReady(); });
+  setTimeout(sendReady, 900);
+
+  var state = {
+    lyrics: [],
+    idx: -1,
+    time: 0,
+    playing: true,
+    duration: 0,
+    song: { name: "", artists: "" },
+    accent: [153, 58, 38],
+    frames: 0,
+    js: 0,
+    err: "",
+    reduced: false,
+    beatPulse: 0,
+    beatIndex: -1,
+    liveLevel: 0,
+    liveBass: 0,
+    liveMid: 0,
+    liveTreble: 0,
+    displayProgress: 0,
+    seenIdx: -2,
+    lineChangedAt: 0,
+    slowFrames: 0,
+    lowPower: false
+  };
+
+  window.__stage = function () {
+    return {
+      lines: state.lyrics.length,
+      idx: state.idx,
+      t: state.time,
+      playing: state.playing,
+      frames: state.frames,
+      js: state.js,
+      err: state.err,
+      text: currentText(),
+      gl: false,
+      rm: state.reduced
+    };
+  };
+
+  var canvas = document.getElementById("wall");
+  var ctx = canvas.getContext("2d");
+  var sr = document.getElementById("sr");
+  var view = { w: 1440, h: 900, dpr: 1 };
+  var lastErrorAt = 0;
+
+  function reportError(where, err) {
+    var message = err && err.message ? err.message : String(err);
+    state.err = where + ": " + message;
+    var now = Date.now();
+    if (now - lastErrorAt >= 1000) {
+      lastErrorAt = now;
+      console.error("[422] " + where, err);
+    }
+  }
+
+  function finiteOr(value, fallback) {
+    return typeof value === "number" && isFinite(value) ? value : fallback;
+  }
+
+  function clamp(value, lo, hi) {
+    return value < lo ? lo : (value > hi ? hi : value);
+  }
+
+  function colorCss(rgb, alpha) {
+    var r = Math.round(clamp(finiteOr(rgb[0], 0), 0, 255));
+    var g = Math.round(clamp(finiteOr(rgb[1], 0), 0, 255));
+    var b = Math.round(clamp(finiteOr(rgb[2], 0), 0, 255));
+    if (typeof alpha === "number") {
+      return "rgba(" + r + "," + g + "," + b + "," + clamp(alpha, 0, 1) + ")";
+    }
+    return "rgb(" + r + "," + g + "," + b + ")";
+  }
+
+  function accentInk(alpha) {
+    var r = Math.round(clamp(finiteOr(state.accent[0], 153), 0, 255));
+    var g = Math.round(clamp(finiteOr(state.accent[1], 58), 0, 255));
+    var b = Math.round(clamp(finiteOr(state.accent[2], 38), 0, 255));
+    var luma = r * 0.299 + g * 0.587 + b * 0.114;
+    if (luma > 168) {
+      r = Math.round(r * 0.60);
+      g = Math.round(g * 0.60);
+      b = Math.round(b * 0.60);
+    }
+    return "rgba(" + r + "," + g + "," + b + "," + clamp(alpha, 0, 1) + ")";
+  }
+
+  function accentContrast() {
+    var luma = state.accent[0] * 0.299 + state.accent[1] * 0.587 + state.accent[2] * 0.114;
+    return luma > 150 ? "#1a1714" : "#f8f0de";
+  }
+
+  function sanitizeAccent(input) {
+    if (!Array.isArray(input) || input.length < 3) return [153, 58, 38];
+    var r = finiteOr(input[0], -1);
+    var g = finiteOr(input[1], -1);
+    var b = finiteOr(input[2], -1);
+    if (r < 0 || g < 0 || b < 0) return [153, 58, 38];
+    return [Math.round(clamp(r, 0, 255)), Math.round(clamp(g, 0, 255)), Math.round(clamp(b, 0, 255))];
+  }
+
+  function sanitizeSong(input) {
+    var song = input && typeof input === "object" ? input : {};
+    var name = typeof song.name === "string" ? song.name.replace(/\s+/g, " ").trim() : "";
+    var artists = "";
+    if (Array.isArray(song.artists)) {
+      artists = song.artists.filter(function (one) {
+        return typeof one === "string" && one.trim().length > 0;
+      }).join(" / ");
+    } else if (typeof song.artists === "string") {
+      artists = song.artists.trim();
+    }
+    return { name: name.slice(0, 90), artists: artists.slice(0, 90) };
+  }
+
+  function buildRevealTimes(text, start, dur, chars) {
+    var times = new Array(text.length);
+    var end = start + (dur > 0 ? dur : 2.8);
+    if (chars && chars.length > 0) {
+      var usable = Math.min(chars.length, text.length);
+      for (var index = 0; index < usable; index++) times[index] = chars[index].t;
+      if (usable < text.length) {
+        var lastT = usable > 0 ? chars[usable - 1].t : start;
+        var span = Math.max(0.05, end - lastT);
+        for (var rest = usable; rest < text.length; rest++) {
+          times[rest] = lastT + span * ((rest - usable + 1) / (text.length - usable + 1));
+        }
+      }
+    } else {
+      for (var plain = 0; plain < text.length; plain++) {
+        times[plain] = start + (end - start) * (plain / Math.max(1, text.length));
+      }
+    }
+    for (var monotonic = 1; monotonic < times.length; monotonic++) {
+      if (!(times[monotonic] >= times[monotonic - 1])) times[monotonic] = times[monotonic - 1];
+    }
+    return times;
+  }
+
+  function normalizeLyrics(input) {
+    if (!Array.isArray(input)) return [];
+    var out = [];
+    var limit = Math.min(input.length, 400);
+    for (var i = 0; i < limit; i++) {
+      var raw = input[i];
+      if (!raw || typeof raw !== "object") continue;
+      var text = typeof raw.text === "string" ? raw.text.replace(/\s+/g, " ").trim() : "";
+      if (!text) continue;
+      if (text.length > 320) text = text.slice(0, 319) + "…";
+      var start = finiteOr(raw.t, 0);
+      var dur = Math.max(0, finiteOr(raw.dur, 0));
+      var chars = null;
+      if (Array.isArray(raw.chars) && raw.chars.length > 0) {
+        chars = [];
+        var charLimit = Math.min(raw.chars.length, 1000);
+        for (var j = 0; j < charLimit; j++) {
+          var item = raw.chars[j];
+          if (item && typeof item.t === "number" && isFinite(item.t)) {
+            chars.push({ t: item.t, c: typeof item.c === "string" ? item.c : "" });
+          }
+        }
+        if (chars.length === 0) chars = null;
+      }
+      out.push({
+        t: start,
+        dur: dur,
+        text: text,
+        chars: chars,
+        revealTimes: buildRevealTimes(text, start, dur, chars)
+      });
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    return out;
+  }
+
+  function currentText() {
+    if (state.idx < 0 || state.idx >= state.lyrics.length) return "";
+    return state.lyrics[state.idx].text;
+  }
+
+  function findIndexAt(time) {
+    var lo = 0;
+    var hi = state.lyrics.length - 1;
+    var found = -1;
+    for (var probe = 0; probe < 32 && lo <= hi; probe++) {
+      var mid = (lo + hi) >> 1;
+      if (state.lyrics[mid].t <= time + 0.02) {
+        found = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return found;
+  }
+
+  function handleInit(payload) {
+    try {
+      var data = payload && typeof payload === "object" ? payload : {};
+      state.song = sanitizeSong(data.song);
+      state.accent = sanitizeAccent(data.accent);
+      state.duration = Math.max(0, finiteOr(data.duration, 0));
+      state.lyrics = normalizeLyrics(data.lines);
+      state.playing = typeof data.playing === "boolean" ? data.playing : true;
+      state.idx = findIndexAt(state.time);
+      state.seenIdx = -2;
+      state.displayProgress = state.duration > 0 ? clamp(state.time / state.duration, 0, 1) : 0;
+      lyricLayoutCache = Object.create(null);
+      plateCache = Object.create(null);
+      platePending = Object.create(null);
+      plateFailed = Object.create(null);
+      try {
+        sr.textContent = state.song.name ? state.song.name + " — " + state.song.artists : "";
+      } catch (labelErr) {
+        console.error("[422] aria label failed", labelErr);
+      }
+    } catch (err) {
+      reportError("init", err);
+    }
+  }
+
+  function handleTick(payload) {
+    try {
+      var data = payload && typeof payload === "object" ? payload : {};
+      if (typeof data.time === "number" && isFinite(data.time)) {
+        state.time = data.time;
+      }
+      if (typeof data.playing === "boolean") state.playing = data.playing;
+      state.idx = findIndexAt(state.time);
+    } catch (err) {
+      reportError("tick", err);
+    }
+  }
+
+  function handleBeat(payload) {
+    try {
+      var data = payload && typeof payload === "object" ? payload : {};
+      state.beatPulse = clamp(finiteOr(data.level, 0.6), 0, 1);
+      state.beatIndex = finiteOr(data.index, state.beatIndex);
+    } catch (err) {
+      reportError("beat", err);
+    }
+  }
+
+  function handleLive(payload) {
+    try {
+      var data = payload && typeof payload === "object" ? payload : {};
+      state.liveLevel = clamp(finiteOr(data.level, 0), 0, 1);
+      state.liveBass = clamp(finiteOr(data.bass, 0), 0, 1);
+      state.liveMid = clamp(finiteOr(data.mid, 0), 0, 1);
+      state.liveTreble = clamp(finiteOr(data.treble, 0), 0, 1);
+      if (typeof data.playing === "boolean") state.playing = data.playing;
+    } catch (err) {
+      reportError("live", err);
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || data.__c100 !== 1) return;
+    if (data.type === "init") handleInit(data.payload);
+    else if (data.type === "tick") handleTick(data.payload);
+    else if (data.type === "beat") handleBeat(data.payload);
+    else if (data.type === "live") handleLive(data.payload);
+  });
+
+  function resize() {
+    var w = finiteOr(window.innerWidth, 0);
+    var h = finiteOr(window.innerHeight, 0);
+    if (!isFinite(w) || w <= 0) w = 1440;
+    if (!isFinite(h) || h <= 0) h = 900;
+    var dpr = Math.min(Math.max(finiteOr(window.devicePixelRatio, 1), 1), 2);
+    view.w = Math.round(w);
+    view.h = Math.round(h);
+    view.dpr = dpr;
+    canvas.width = Math.max(1, Math.round(w * dpr));
+    canvas.height = Math.max(1, Math.round(h * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener("resize", function () {
+    try {
+      resize();
+      invalidateBuilds();
+      setTimeout(function () {
+        try { ensurePaper(); } catch (err) { reportError("paper resize", err); }
+      }, 0);
+    } catch (err) {
+      reportError("resize", err);
+    }
+  });
+
+  /* ---------------- paper, palette, layout ---------------- */
+  var SERIF = "Georgia, 'Times New Roman', 'Songti SC', 'Noto Serif CJK SC', 'Noto Serif SC', 'SimSun', serif";
+  var PAPER = "#e8e0cf";
+  var INK = "#211c17";
+  var INK_SOFT = "rgba(33,28,23,0.64)";
+  var HAIRLINE = "rgba(33,28,23,0.30)";
+  var paperCanvas = null;
+  var paperKey = "";
+  var noiseTile = null;
+  var buildQueue = [];
+  var trackingCache = Object.create(null);
+  var ellipsisCache = Object.create(null);
+
+  function makeRandom(seed) {
+    var value = seed >>> 0;
+    return function () {
+      value = (value + 0x6D2B79F5) | 0;
+      var t = Math.imul(value ^ (value >>> 15), 1 | value);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function addStopsSafely(gradient, stops) {
+    if (!gradient || typeof gradient.addColorStop !== "function") return false;
+    try {
+      for (var i = 0; i < stops.length; i++) {
+        var offset = clamp(finiteOr(stops[i][0], 0), 0, 1);
+        gradient.addColorStop(offset, stops[i][1]);
+      }
+      return true;
+    } catch (err) {
+      reportError("gradient", err);
+      return false;
+    }
+  }
+
+  function makeNoiseTile(size, seed) {
+    var tile = document.createElement("canvas");
+    tile.width = size;
+    tile.height = size;
+    var tileCtx = tile.getContext("2d");
+    var image = tileCtx.createImageData(size, size);
+    var rand = makeRandom(seed);
+    for (var i = 0; i < image.data.length; i += 4) {
+      var shade = 116 + (rand() - 0.5) * 120;
+      image.data[i] = shade;
+      image.data[i + 1] = shade;
+      image.data[i + 2] = shade;
+      image.data[i + 3] = 16 + Math.floor(rand() * 30);
+    }
+    tileCtx.putImageData(image, 0, 0);
+    return tile;
+  }
+
+  function buildPaper(w, h) {
+    var cw = Math.max(8, Math.round(w));
+    var ch = Math.max(8, Math.round(h));
+    var paper = document.createElement("canvas");
+    paper.width = cw;
+    paper.height = ch;
+    var paint = paper.getContext("2d");
+    paint.fillStyle = PAPER;
+    paint.fillRect(0, 0, cw, ch);
+
+    try {
+      var light = paint.createRadialGradient(cw * 0.48, ch * 0.34, Math.min(cw, ch) * 0.06, cw * 0.5, ch * 0.52, Math.max(cw, ch) * 0.82);
+      if (addStopsSafely(light, [
+        [0, "rgba(255,251,239,0.36)"],
+        [0.55, "rgba(255,251,239,0.05)"],
+        [1, "rgba(72,54,33,0.20)"]
+      ])) {
+        paint.fillStyle = light;
+        paint.fillRect(0, 0, cw, ch);
+      }
+    } catch (err) {
+      reportError("paper light", err);
+    }
+
+    var rand = makeRandom(4221968);
+    for (var i = 0; i < 80; i++) {
+      var stainX = rand() * cw;
+      var stainY = rand() * ch;
+      var radius = (0.015 + rand() * 0.085) * Math.min(cw, ch);
+      paint.save();
+      paint.translate(stainX, stainY);
+      paint.rotate(rand() * Math.PI);
+      paint.beginPath();
+      paint.ellipse(0, 0, radius, radius * (0.35 + rand() * 1.1), 0, 0, Math.PI * 2);
+      paint.fillStyle = rand() < 0.7
+        ? "rgba(121,95,58," + (0.018 + rand() * 0.034).toFixed(4) + ")"
+        : "rgba(255,252,242," + (0.03 + rand() * 0.05).toFixed(4) + ")";
+      paint.fill();
+      paint.restore();
+    }
+
+    paint.strokeStyle = "rgba(92,70,44,0.055)";
+    paint.lineWidth = 0.65;
+    for (var fibre = 0; fibre < 240; fibre++) {
+      var fromX = rand() * cw;
+      var fromY = rand() * ch;
+      var length = 5 + rand() * 26;
+      var angle = rand() * Math.PI * 2;
+      paint.beginPath();
+      paint.moveTo(fromX, fromY);
+      paint.quadraticCurveTo(
+        fromX + Math.cos(angle) * length * 0.5 + (rand() - 0.5) * 5,
+        fromY + Math.sin(angle) * length * 0.5,
+        fromX + Math.cos(angle) * length,
+        fromY + Math.sin(angle) * length
+      );
+      paint.stroke();
+    }
+
+    try {
+      if (!noiseTile) noiseTile = makeNoiseTile(160, 90210);
+      var grain = paint.createPattern(noiseTile, "repeat");
+      if (grain) {
+        paint.save();
+        paint.globalCompositeOperation = "multiply";
+        paint.globalAlpha = 0.5;
+        paint.fillStyle = grain;
+        paint.fillRect(0, 0, cw, ch);
+        paint.restore();
+      }
+    } catch (grainErr) {
+      reportError("paper grain", grainErr);
+    }
+
+    try {
+      var vignette = paint.createRadialGradient(cw * 0.5, ch * 0.5, Math.min(cw, ch) * 0.28, cw * 0.5, ch * 0.5, Math.max(cw, ch) * 0.74);
+      if (addStopsSafely(vignette, [
+        [0, "rgba(30,20,10,0)"],
+        [0.72, "rgba(54,38,22,0.02)"],
+        [1, "rgba(54,38,22,0.17)"]
+      ])) {
+        paint.fillStyle = vignette;
+        paint.fillRect(0, 0, cw, ch);
+      }
+    } catch (vigErr) {
+      reportError("paper vignette", vigErr);
+    }
+
+    paint.strokeStyle = "rgba(90,68,42,0.10)";
+    paint.lineWidth = 1.4;
+    paint.beginPath();
+    paint.moveTo(cw * 0.333, 0);
+    paint.lineTo(cw * 0.333, ch);
+    paint.stroke();
+    paint.strokeStyle = "rgba(255,250,235,0.18)";
+    paint.beginPath();
+    paint.moveTo(cw * 0.333 + 2, 0);
+    paint.lineTo(cw * 0.333 + 2, ch);
+    paint.stroke();
+
+    return paper;
+  }
+
+  function ensurePaper() {
+    var key = view.w + "x" + view.h + "x" + view.dpr;
+    if (paperCanvas && paperKey === key) return;
+    paperCanvas = buildPaper(view.w, view.h);
+    paperKey = key;
+  }
+
+  function invalidateBuilds() {
+    paperKey = "";
+    trackingCache = Object.create(null);
+    ellipsisCache = Object.create(null);
+    plateCache = Object.create(null);
+    platePending = Object.create(null);
+    plateFailed = Object.create(null);
+    folioPaperPending = "";
+    folioPaperFailed = "";
+    lyricLayoutCache = Object.create(null);
+    layoutCache = null;
+  }
+
+  var buildRunning = false;
+  function pumpBuilds() {
+    if (buildRunning) return;
+    buildRunning = true;
+    setTimeout(function stepBuild() {
+      var job = buildQueue.shift();
+      if (!job) {
+        buildRunning = false;
+        return;
+      }
+      try {
+        job();
+      } catch (err) {
+        reportError("build", err);
+      }
+      setTimeout(stepBuild, 16);
+    }, 0);
+  }
+
+  function enqueueBuild(job) {
+    buildQueue.push(job);
+    pumpBuilds();
+  }
+
+  var layoutCache = null;
+  function getLayout() {
+    if (layoutCache && layoutCache.w === view.w && layoutCache.h === view.h) return layoutCache;
+    layoutCache = computeLayout();
+    return layoutCache;
+  }
+
+  function computeLayout() {
+    var w = view.w;
+    var h = view.h;
+    var margin = clamp(Math.min(w, h) * 0.04, 14, 40);
+    var narrow = w < 980 || w / Math.max(1, h) < 1.08;
+    var headerH = clamp(h * 0.145, 82, 136);
+    var footerH = clamp(h * 0.09, 46, 66);
+    var contentTop = margin + headerH;
+    var contentBottom = h - margin - footerH;
+    var gap = clamp(w * 0.017, 11, 26);
+    var contentH = Math.max(120, contentBottom - contentTop);
+    var result = {
+      w: w, h: h, margin: margin, narrow: narrow,
+      headerH: headerH, footerH: footerH,
+      contentTop: contentTop, contentBottom: contentBottom,
+      contentH: contentH, gap: gap,
+      plates: [], index: null, folio: null
+    };
+
+    if (narrow) {
+      var folioH = Math.max(140, contentH * 0.60);
+      if (contentH - folioH < 110) folioH = contentH;
+      folioH = Math.min(folioH, contentH);
+      result.folio = { x: margin, y: contentTop, w: w - margin * 2, h: folioH };
+      var stripY = contentTop + folioH + gap;
+      var stripH = contentBottom - stripY;
+      if (stripH >= 70) {
+        var plateW = (w - margin * 2 - gap) / 2;
+        result.plates = [
+          { x: margin, y: stripY, w: plateW, h: stripH, kind: "crowd" },
+          { x: margin + plateW + gap, y: stripY, w: plateW, h: stripH, kind: "vinyl" }
+        ];
+      }
+    } else {
+      var leftW = clamp(w * 0.205, 190, 322);
+      var rightW = clamp(w * 0.176, 168, 282);
+      var centerW = Math.max(280, w - margin * 2 - leftW - rightW - gap * 2);
+      result.folio = { x: margin + leftW + gap, y: contentTop, w: centerW, h: contentH };
+      var firstH = Math.round((contentH - gap) * 0.54);
+      result.plates = [
+        { x: margin, y: contentTop, w: leftW, h: firstH, kind: "crowd" },
+        { x: margin, y: contentTop + firstH + gap, w: leftW, h: contentH - firstH - gap, kind: "document" },
+        { x: w - margin - rightW, y: contentTop, w: rightW, h: Math.round(contentH * 0.50), kind: "portrait" }
+      ];
+      var indexY = contentTop + Math.round(contentH * 0.50) + gap;
+      result.index = { x: w - margin - rightW, y: indexY, w: rightW, h: contentBottom - indexY };
+    }
+    return result;
+  }
+
+  function trackedWidth(text, tracking) {
+    var key = ctx.font + "|" + tracking.toFixed(2) + "|" + text;
+    var cached = trackingCache[key];
+    if (typeof cached === "number") return cached;
+    var total = 0;
+    for (var i = 0; i < text.length; i++) {
+      total += ctx.measureText(text.charAt(i)).width + tracking;
+    }
+    total = Math.max(0, total - tracking);
+    trackingCache[key] = total;
+    return total;
+  }
+
+  function drawTracked(text, x, y, tracking, align) {
+    var total = trackedWidth(text, tracking);
+    var cursor = align === "center" ? x - total / 2 : (align === "right" ? x - total : x);
+    ctx.textAlign = "left";
+    for (var i = 0; i < text.length; i++) {
+      ctx.fillText(text.charAt(i), cursor, y);
+      cursor += ctx.measureText(text.charAt(i)).width + tracking;
+    }
+    return total;
+  }
+
+  function ellipsize(text, maxWidth) {
+    var source = typeof text === "string" ? text : "";
+    if (!source) return "";
+    var key = ctx.font + "|" + Math.round(maxWidth) + "|" + source;
+    var cached = ellipsisCache[key];
+    if (typeof cached === "string") return cached;
+    if (ctx.measureText(source).width <= maxWidth) {
+      ellipsisCache[key] = source;
+      return source;
+    }
+    var cut = "…";
+    var limit = Math.min(source.length, 90);
+    for (var i = limit; i > 0; i--) {
+      cut = source.slice(0, i) + "…";
+      if (ctx.measureText(cut).width <= maxWidth) break;
+    }
+    ellipsisCache[key] = cut;
+    return cut;
+  }
+
+  function fitFontSize(text, maxWidth, size, minSize, family) {
+    var current = size;
+    ctx.font = current + "px " + family;
+    for (var i = 0; i < 40; i++) {
+      if (ctx.measureText(text).width <= maxWidth || current <= minSize) break;
+      current = Math.max(minSize, current - Math.max(1, Math.round(current * 0.045)));
+      ctx.font = current + "px " + family;
+    }
+    return current;
+  }
+
+  /* ---------------- archive plates ---------------- */
+  var plateCache = Object.create(null);
+  var platePending = Object.create(null);
+  var plateFailed = Object.create(null);
+  var folioPaperCache = { key: "", canvas: null, pad: 26 };
+  var folioPaperPending = "";
+  var folioPaperFailed = "";
+  var lyricLayoutCache = Object.create(null);
+  var halftoneTile = null;
+  var PLATE_META = {
+    crowd: { no: "PL. 03", title: "UNTITLED (CROWD)", detail: "GELATIN SILVER PRINT, 1965" },
+    document: { no: "PL. 07", title: "FIELD NOTES", detail: "INK ON RULED PAPER, N.D." },
+    portrait: { no: "PL. 11", title: "UNTITLED (STUDY)", detail: "GELATIN SILVER PRINT, 1968" },
+    vinyl: { no: "PL. 14", title: "LP SLEEVE", detail: "OFFSET LITHOGRAPH, 1966" }
+  };
+
+  function getHalftoneTile() {
+    if (halftoneTile) return halftoneTile;
+    var tile = document.createElement("canvas");
+    tile.width = 5;
+    tile.height = 5;
+    var paint = tile.getContext("2d");
+    paint.fillStyle = "rgba(26,21,15,0.92)";
+    paint.beginPath();
+    paint.arc(2.5, 2.5, 1.15, 0, Math.PI * 2);
+    paint.fill();
+    halftoneTile = tile;
+    return tile;
+  }
+
+  function plateKey(kind, width, height) {
+    return kind + "|" + Math.round(width) + "x" + Math.round(height) + "|" + state.accent.join(",") + "|" + state.song.name.slice(0, 24);
+  }
+
+  function getPlateImage(kind, width, height) {
+    var key = plateKey(kind, width, height);
+    var cached = plateCache[key];
+    if (cached instanceof HTMLCanvasElement && cached.width > 0 && cached.height > 0) return cached;
+    if (plateFailed[key]) return null;
+    if (!platePending[key]) {
+      platePending[key] = true;
+      enqueueBuild(function () {
+        try {
+          plateCache[key] = renderPlate(kind, width, height);
+        } catch (err) {
+          plateFailed[key] = true;
+          reportError("plate render " + kind, err);
+        } finally {
+          platePending[key] = false;
+        }
+      });
+    }
+    return null;
+  }
+
+  function buildFolioPaper(w, h) {
+    var pad = Math.round(clamp(w * 0.034, 16, 34));
+    var scale = 1.25;
+    var canvas = document.createElement("canvas");
+    canvas.width = Math.max(16, Math.round((w + pad * 2) * scale));
+    canvas.height = Math.max(16, Math.round((h + pad * 2) * scale));
+    var paint = canvas.getContext("2d");
+    paint.scale(scale, scale);
+
+    paint.save();
+    paint.shadowColor = "rgba(42,29,15,0.30)";
+    paint.shadowBlur = 20;
+    paint.shadowOffsetY = 8;
+    paint.fillStyle = "#f1e9d8";
+    paint.fillRect(pad, pad, w, h);
+    paint.restore();
+
+    try {
+      var inner = paint.createLinearGradient(pad, pad, pad + w, pad + h);
+      if (addStopsSafely(inner, [
+        [0, "rgba(255,251,239,0.55)"],
+        [0.55, "rgba(255,251,239,0.06)"],
+        [1, "rgba(120,95,60,0.10)"]
+      ])) {
+        paint.fillStyle = inner;
+        paint.fillRect(pad, pad, w, h);
+      }
+    } catch (innerErr) {
+      reportError("folio light", innerErr);
+    }
+
+    try {
+      if (!noiseTile) noiseTile = makeNoiseTile(160, 90210);
+      var grain = paint.createPattern(noiseTile, "repeat");
+      if (grain) {
+        paint.save();
+        paint.globalCompositeOperation = "multiply";
+        paint.globalAlpha = 0.30;
+        paint.fillStyle = grain;
+        paint.fillRect(pad, pad, w, h);
+        paint.restore();
+      }
+    } catch (grainErr) {
+      reportError("folio grain", grainErr);
+    }
+
+    paint.strokeStyle = "rgba(58,44,28,0.38)";
+    paint.lineWidth = 1;
+    paint.strokeRect(pad + 0.5, pad + 0.5, w - 1, h - 1);
+    paint.strokeStyle = "rgba(58,44,28,0.13)";
+    paint.strokeRect(pad + 3.5, pad + 3.5, w - 7, h - 7);
+    return { canvas: canvas, pad: pad };
+  }
+
+  function getFolioPaper(w, h) {
+    var key = Math.round(w) + "x" + Math.round(h);
+    if (folioPaperCache.key === key && folioPaperCache.canvas instanceof HTMLCanvasElement) return folioPaperCache;
+    if (folioPaperFailed === key) return null;
+    if (folioPaperPending !== key) {
+      folioPaperPending = key;
+      enqueueBuild(function () {
+        try {
+          var built = buildFolioPaper(w, h);
+          built.key = key;
+          folioPaperCache = built;
+        } catch (err) {
+          folioPaperFailed = key;
+          reportError("folio paper", err);
+        } finally {
+          if (folioPaperPending === key) folioPaperPending = "";
+        }
+      });
+    }
+    return null;
+  }
+
+  function applyPrintTexture(paint, x, y, w, h, seed) {
+    var rand = makeRandom(seed);
+    try {
+      var halftone = paint.createPattern(getHalftoneTile(), "repeat");
+      if (halftone) {
+        paint.save();
+        paint.globalCompositeOperation = "multiply";
+        paint.globalAlpha = 0.14;
+        paint.fillStyle = halftone;
+        paint.fillRect(x, y, w, h);
+        paint.restore();
+      }
+    } catch (toneErr) {
+      reportError("halftone", toneErr);
+    }
+
+    paint.save();
+    paint.globalAlpha = 0.055;
+    paint.strokeStyle = "#241f18";
+    paint.lineWidth = 1;
+    for (var scanline = 0; scanline < 120; scanline++) {
+      var scanY = y + (scanline / 120) * h;
+      paint.beginPath();
+      paint.moveTo(x, scanY);
+      paint.lineTo(x + w, scanY);
+      paint.stroke();
+    }
+    paint.restore();
+
+    try {
+      if (!noiseTile) noiseTile = makeNoiseTile(160, 90210);
+      var grain = paint.createPattern(noiseTile, "repeat");
+      if (grain) {
+        paint.save();
+        paint.globalCompositeOperation = "overlay";
+        paint.globalAlpha = 0.22;
+        paint.fillStyle = grain;
+        paint.fillRect(x, y, w, h);
+        paint.restore();
+      }
+    } catch (grainErr) {
+      reportError("print grain", grainErr);
+    }
+
+    for (var mark = 0; mark < 7; mark++) {
+      var markX = x + rand() * w;
+      var markY = y + rand() * h;
+      var markR = (0.02 + rand() * 0.06) * Math.min(w, h);
+      paint.save();
+      paint.globalAlpha = 0.05 + rand() * 0.05;
+      paint.fillStyle = rand() < 0.6 ? "#3a2e20" : "#f4eddc";
+      paint.beginPath();
+      paint.ellipse(markX, markY, markR, markR * (0.3 + rand()), rand() * Math.PI, 0, Math.PI * 2);
+      paint.fill();
+      paint.restore();
+    }
+
+    paint.save();
+    paint.strokeStyle = "rgba(245,238,222,0.16)";
+    paint.lineWidth = Math.max(1, h * 0.004);
+    for (var scratch = 0; scratch < 2; scratch++) {
+      var scratchY = y + h * (0.2 + rand() * 0.6);
+      paint.beginPath();
+      paint.moveTo(x + w * 0.05, scratchY);
+      paint.lineTo(x + w * 0.95, scratchY - h * 0.06);
+      paint.stroke();
+    }
+    paint.restore();
+
+    try {
+      var vignette = paint.createRadialGradient(x + w / 2, y + h * 0.45, Math.min(w, h) * 0.2, x + w / 2, y + h / 2, Math.max(w, h) * 0.72);
+      if (addStopsSafely(vignette, [
+        [0, "rgba(30,22,12,0)"],
+        [0.7, "rgba(30,22,12,0.03)"],
+        [1, "rgba(30,22,12,0.24)"]
+      ])) {
+        paint.fillStyle = vignette;
+        paint.fillRect(x, y, w, h);
+      }
+    } catch (vigErr) {
+      reportError("plate vignette", vigErr);
+    }
+
+    paint.strokeStyle = "rgba(38,29,18,0.42)";
+    paint.lineWidth = Math.max(1, h * 0.004);
+    paint.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  }
+
+  function renderPlate(kind, width, height) {
+    var scale = Math.min(2, Math.max(1, view.dpr * 1.2));
+    var cw = Math.max(24, Math.round(width * scale));
+    var ch = Math.max(24, Math.round(height * scale));
+    var plate = document.createElement("canvas");
+    plate.width = cw;
+    plate.height = ch;
+    var paint = plate.getContext("2d");
+
+    paint.fillStyle = "#ddd4c1";
+    paint.fillRect(0, 0, cw, ch);
+    var padX = Math.round(cw * 0.034);
+    var padY = Math.round(ch * 0.04);
+    var ix = padX;
+    var iy = padY;
+    var iw = cw - padX * 2;
+    var ih = ch - padY * 2;
+
+    paint.save();
+    paint.beginPath();
+    paint.rect(ix, iy, iw, ih);
+    paint.clip();
+    paint.fillStyle = "#c9c0ae";
+    paint.fillRect(ix, iy, iw, ih);
+    if (kind === "crowd") paintCrowd(paint, ix, iy, iw, ih);
+    else if (kind === "document") paintDocument(paint, ix, iy, iw, ih);
+    else if (kind === "portrait") paintPortrait(paint, ix, iy, iw, ih);
+    else if (kind === "vinyl") paintVinyl(paint, ix, iy, iw, ih);
+    applyPrintTexture(paint, ix, iy, iw, ih, kind.length * 977 + 13);
+    paint.restore();
+
+    paint.strokeStyle = "rgba(38,29,18,0.5)";
+    paint.lineWidth = Math.max(1, scale);
+    paint.strokeRect(ix + 0.5, iy + 0.5, iw - 1, ih - 1);
+    paint.strokeStyle = "rgba(255,250,236,0.5)";
+    paint.beginPath();
+    paint.moveTo(ix, iy + ih);
+    paint.lineTo(ix + iw, iy + ih);
+    paint.stroke();
+    return plate;
+  }
+
+  function paintBanner(paint, centerX, centerY, width, height) {
+    paint.save();
+    paint.translate(centerX, centerY);
+    paint.rotate(-0.013);
+    paint.fillStyle = "rgba(40,33,23,0.30)";
+    paint.fillRect(-width / 2 + width * 0.012, -height / 2 + height * 0.10, width, height);
+    paint.fillStyle = "#e9e0ca";
+    paint.fillRect(-width / 2, -height / 2, width, height);
+    try {
+      var fold = paint.createLinearGradient(-width / 2, 0, width / 2, 0);
+      if (addStopsSafely(fold, [
+        [0, "rgba(96,80,55,0.22)"],
+        [0.16, "rgba(255,250,235,0.12)"],
+        [0.5, "rgba(96,80,55,0.10)"],
+        [0.84, "rgba(255,250,235,0.10)"],
+        [1, "rgba(96,80,55,0.24)"]
+      ])) {
+        paint.fillStyle = fold;
+        paint.fillRect(-width / 2, -height / 2, width, height);
+      }
+    } catch (foldErr) {
+      reportError("banner fold", foldErr);
+    }
+    paint.fillStyle = "#28221a";
+    paint.font = "700 " + Math.max(6, height * 0.58) + "px 'Arial Narrow', Impact, 'Arial', sans-serif";
+    paint.textAlign = "center";
+    paint.textBaseline = "middle";
+    paint.fillText("FREEDOM", 0, height * 0.035);
+    paint.strokeStyle = "rgba(44,36,25,0.68)";
+    paint.lineWidth = Math.max(1, height * 0.05);
+    paint.beginPath();
+    paint.moveTo(-width * 0.48, -height * 0.4);
+    paint.lineTo(-width * 0.54, height * 2.1);
+    paint.stroke();
+    paint.beginPath();
+    paint.moveTo(width * 0.48, -height * 0.4);
+    paint.lineTo(width * 0.54, height * 2.1);
+    paint.stroke();
+    paint.restore();
+  }
+
+  function paintCrowdRow(paint, x, baseY, w, h, rand, count, headRadius, tone, withSigns) {
+    var gap = w / count;
+    paint.fillStyle = tone;
+    paint.strokeStyle = tone;
+    for (var person = 0; person < count; person++) {
+      var personX = x + gap * (person + 0.5) + (rand() - 0.5) * gap * 0.55;
+      var personScale = 0.82 + rand() * 0.42;
+      var headR = headRadius * personScale;
+      var headY = baseY + (rand() - 0.5) * h * 0.018;
+      paint.fillStyle = tone;
+      paint.beginPath();
+      paint.ellipse(personX, headY, headR * 0.8, headR, 0, 0, Math.PI * 2);
+      paint.fill();
+      paint.beginPath();
+      paint.ellipse(personX, headY + headR * 1.8, headR * 1.95, headR * 1.55, 0, 0, Math.PI * 2);
+      paint.fill();
+      if (rand() < 0.16) {
+        var armSide = rand() < 0.5 ? -1 : 1;
+        var armX = personX + armSide * headR * (1.1 + rand() * 0.7);
+        var armTop = headY - headR * (1.2 + rand() * 1.5);
+        paint.strokeStyle = tone;
+        paint.lineWidth = Math.max(1, headR * 0.52);
+        paint.lineCap = "round";
+        paint.beginPath();
+        paint.moveTo(personX + armSide * headR * 0.5, headY + headR * 1.1);
+        paint.lineTo(armX, armTop);
+        paint.stroke();
+        paint.beginPath();
+        paint.arc(armX, armTop - headR * 0.25, headR * 0.46, 0, Math.PI * 2);
+        paint.fillStyle = tone;
+        paint.fill();
+      }
+      if (withSigns && rand() < 0.11) {
+        var signW = headR * (4.5 + rand() * 2.5);
+        var signH = headR * (2.2 + rand() * 1.2);
+        var signX = personX - signW / 2 + (rand() - 0.5) * headR * 2;
+        var signY = headY - headR * (4.2 + rand() * 1.6);
+        paint.strokeStyle = "rgba(66,59,48,0.7)";
+        paint.lineWidth = Math.max(1, headR * 0.18);
+        paint.beginPath();
+        paint.moveTo(personX, headY + headR);
+        paint.lineTo(personX, signY + signH);
+        paint.stroke();
+        paint.fillStyle = "#ded5c2";
+        paint.fillRect(signX, signY, signW, signH);
+        paint.fillStyle = "rgba(38,32,25,0.66)";
+        for (var mark = 0; mark < 2; mark++) {
+          paint.fillRect(signX + signW * 0.14, signY + signH * (0.30 + mark * 0.32), signW * (0.55 + (mark === 0 ? 0.18 : 0)), signH * 0.11);
+        }
+      }
+    }
+    paint.lineCap = "butt";
+  }
+
+  function paintCrowd(paint, x, y, w, h) {
+    var rand = makeRandom(19650828);
+    try {
+      var sky = paint.createLinearGradient(x, y, x, y + h);
+      if (addStopsSafely(sky, [
+        [0, "#ded7c7"],
+        [0.52, "#c9c1af"],
+        [1, "#8d8577"]
+      ])) {
+        paint.fillStyle = sky;
+        paint.fillRect(x, y, w, h);
+      }
+    } catch (skyErr) {
+      reportError("crowd sky", skyErr);
+    }
+
+    var horizon = y + h * 0.47;
+    paint.fillStyle = "rgba(118,110,96,0.34)";
+    var buildingX = x - w * 0.02;
+    for (var building = 0; building < 8; building++) {
+      var buildingW = w * (0.055 + rand() * 0.075);
+      var buildingH = h * (0.10 + rand() * 0.20);
+      paint.fillRect(buildingX, horizon - buildingH, buildingW, buildingH);
+      paint.fillStyle = "rgba(232,225,210,0.20)";
+      for (var windowRow = 0; windowRow < 3; windowRow++) {
+        for (var windowCol = 0; windowCol < 2; windowCol++) {
+          paint.fillRect(
+            buildingX + buildingW * (0.20 + windowCol * 0.34),
+            horizon - buildingH + buildingH * (0.20 + windowRow * 0.23),
+            buildingW * 0.14,
+            buildingH * 0.075
+          );
+        }
+      }
+      paint.fillStyle = "rgba(118,110,96,0.34)";
+      buildingX += buildingW + w * 0.014;
+      if (buildingX > x + w) break;
+    }
+
+    paint.fillStyle = "rgba(73,67,57,0.28)";
+    paint.fillRect(x, horizon, w, y + h - horizon);
+    paint.fillStyle = "rgba(240,233,217,0.10)";
+    paint.fillRect(x, horizon - h * 0.008, w, h * 0.008);
+
+    paintCrowdRow(paint, x, horizon + h * 0.015, w, h, rand, 26, h * 0.020, "rgba(88,82,70,0.55)", false);
+    paintBanner(paint, x + w * 0.5, y + h * 0.285, w * 0.76, h * 0.095);
+    paintCrowdRow(paint, x, horizon + h * 0.105, w, h, rand, 18, h * 0.032, "rgba(57,52,43,0.80)", true);
+    paintCrowdRow(paint, x, horizon + h * 0.235, w, h, rand, 11, h * 0.048, "#29241d", true);
+
+    try {
+      var haze = paint.createLinearGradient(x, y + h * 0.25, x, y + h);
+      if (addStopsSafely(haze, [
+        [0, "rgba(235,228,212,0.18)"],
+        [0.6, "rgba(235,228,212,0)"],
+        [1, "rgba(30,24,16,0.10)"]
+      ])) {
+        paint.fillStyle = haze;
+        paint.fillRect(x, y, w, h);
+      }
+    } catch (hazeErr) {
+      reportError("crowd haze", hazeErr);
+    }
+  }
+
+  function scribbleLine(paint, startX, startY, length, unit, rand) {
+    paint.beginPath();
+    paint.moveTo(startX, startY);
+    var cursorX = startX;
+    var limit = Math.min(48, Math.floor(length / Math.max(1, unit * 0.55)));
+    for (var stepIndex = 0; stepIndex < limit; stepIndex++) {
+      var stepWidth = unit * (0.7 + rand() * 1.3);
+      var nextX = cursorX + stepWidth;
+      if (nextX > startX + length) break;
+      var wave = (rand() - 0.5) * unit * 1.8;
+      paint.quadraticCurveTo(
+        cursorX + stepWidth * 0.45,
+        startY - unit * (0.7 + rand() * 0.8),
+        nextX,
+        startY + wave * 0.5
+      );
+      cursorX = nextX;
+    }
+    paint.stroke();
+  }
+
+  function paintDocument(paint, x, y, w, h) {
+    var rand = makeRandom(19680821);
+    try {
+      var desk = paint.createLinearGradient(x, y, x + w, y + h);
+      if (addStopsSafely(desk, [
+        [0, "#b9af9c"],
+        [0.55, "#9c9381"],
+        [1, "#7d7464"]
+      ])) {
+        paint.fillStyle = desk;
+        paint.fillRect(x, y, w, h);
+      }
+    } catch (deskErr) {
+      reportError("document desk", deskErr);
+    }
+
+    paint.save();
+    paint.translate(x + w * 0.5, y + h * 0.5);
+    paint.rotate(-0.022);
+    var sheetW = w * 0.78;
+    var sheetH = h * 0.86;
+    paint.shadowColor = "rgba(30,22,12,0.40)";
+    paint.shadowBlur = Math.max(3, h * 0.02);
+    paint.shadowOffsetY = h * 0.012;
+    paint.fillStyle = "#efe6d1";
+    paint.fillRect(-sheetW / 2, -sheetH / 2, sheetW, sheetH);
+    paint.shadowColor = "transparent";
+    paint.fillStyle = "rgba(255,250,235,0.22)";
+    paint.fillRect(-sheetW / 2, -sheetH / 2, sheetW, sheetH * 0.45);
+
+    paint.strokeStyle = "rgba(86,108,132,0.26)";
+    paint.lineWidth = Math.max(0.6, h * 0.0016);
+    for (var rule = 1; rule < 11; rule++) {
+      var ruleY = -sheetH / 2 + sheetH * (rule / 12);
+      paint.beginPath();
+      paint.moveTo(-sheetW / 2 + sheetW * 0.08, ruleY);
+      paint.lineTo(sheetW / 2 - sheetW * 0.08, ruleY);
+      paint.stroke();
+    }
+
+    paint.fillStyle = "rgba(40,35,28,0.86)";
+    paint.font = "700 " + (sheetH * 0.036) + "px 'Courier New', monospace";
+    paint.textAlign = "left";
+    paint.textBaseline = "alphabetic";
+    paint.fillText("FIELD NOTES / 422", -sheetW * 0.40, -sheetH * 0.38);
+    paint.fillStyle = "rgba(40,35,28,0.58)";
+    paint.font = (sheetH * 0.025) + "px 'Courier New', monospace";
+    paint.fillText("21 AUG 1968  ·  REEL 03", -sheetW * 0.40, -sheetH * 0.338);
+    paint.strokeStyle = "rgba(40,35,28,0.32)";
+    paint.beginPath();
+    paint.moveTo(-sheetW * 0.40, -sheetH * 0.315);
+    paint.lineTo(sheetW * 0.40, -sheetH * 0.315);
+    paint.stroke();
+
+    paint.strokeStyle = "rgba(47,55,70,0.74)";
+    paint.lineWidth = Math.max(1, h * 0.0024);
+    paint.lineCap = "round";
+    for (var row = 0; row < 8; row++) {
+      var rowY = -sheetH * 0.255 + sheetH * (row * 0.072);
+      var scribbleLength = sheetW * (0.52 + rand() * 0.32);
+      scribbleLine(paint, -sheetW * 0.40, rowY, scribbleLength, sheetH * 0.023, rand);
+    }
+    paint.lineCap = "butt";
+
+    paint.save();
+    paint.translate(sheetW * 0.16, sheetH * 0.34);
+    paint.rotate(-0.16);
+    paint.strokeStyle = "rgba(133,57,44,0.72)";
+    paint.lineWidth = Math.max(1.5, h * 0.0032);
+    paint.strokeRect(-sheetW * 0.20, -sheetH * 0.055, sheetW * 0.40, sheetH * 0.11);
+    paint.fillStyle = "rgba(133,57,44,0.76)";
+    paint.textAlign = "center";
+    paint.textBaseline = "middle";
+    paint.font = "700 " + (sheetH * 0.029) + "px 'Courier New', monospace";
+    paint.fillText("RECEIVED", 0, -sheetH * 0.012);
+    paint.font = (sheetH * 0.019) + "px 'Courier New', monospace";
+    paint.fillText("21 AUG 1968", 0, sheetH * 0.027);
+    paint.restore();
+
+    paint.save();
+    paint.globalAlpha = 0.18;
+    paint.strokeStyle = "#6b4a2c";
+    paint.lineWidth = Math.max(1, h * 0.006);
+    paint.beginPath();
+    paint.arc(-sheetW * 0.31, sheetH * 0.30, sheetH * 0.078, 0, Math.PI * 2);
+    paint.stroke();
+    paint.fillStyle = "#6b4a2c";
+    paint.beginPath();
+    paint.arc(-sheetW * 0.31, sheetH * 0.30, sheetH * 0.078, 0, Math.PI * 2);
+    paint.fill();
+    paint.restore();
+
+    paint.strokeStyle = "rgba(60,55,45,0.30)";
+    paint.lineWidth = Math.max(1, h * 0.003);
+    paint.beginPath();
+    paint.moveTo(sheetW * 0.40, -sheetH * 0.42);
+    paint.quadraticCurveTo(sheetW * 0.47, -sheetH * 0.30, sheetW * 0.40, -sheetH * 0.16);
+    paint.stroke();
+
+    paint.restore();
+  }
+
+  function paintPortrait(paint, x, y, w, h) {
+    try {
+      var backdrop = paint.createRadialGradient(x + w * 0.5, y + h * 0.34, 0, x + w * 0.5, y + h * 0.52, Math.max(w, h) * 0.82);
+      if (addStopsSafely(backdrop, [
+        [0, "#d0c8b6"],
+        [0.5, "#9f9786"],
+        [1, "#4c473d"]
+      ])) {
+        paint.fillStyle = backdrop;
+        paint.fillRect(x, y, w, h);
+      }
+    } catch (backdropErr) {
+      reportError("portrait backdrop", backdropErr);
+    }
+
+    paint.strokeStyle = "rgba(58,53,45,0.10)";
+    paint.lineWidth = Math.max(1, w * 0.006);
+    for (var fold = 0; fold < 12; fold++) {
+      var foldX = x + w * (fold / 11);
+      paint.beginPath();
+      paint.moveTo(foldX, y);
+      paint.quadraticCurveTo(foldX + w * 0.02, y + h * 0.5, foldX - w * 0.01, y + h);
+      paint.stroke();
+    }
+
+    var centerX = x + w * 0.5;
+    var headCY = y + h * 0.35;
+    var headRX = w * 0.185;
+    var headRY = h * 0.225;
+
+    paint.fillStyle = "#2a251f";
+    paint.beginPath();
+    paint.ellipse(centerX, y + h * 0.93, w * 0.50, h * 0.34, 0, Math.PI, Math.PI * 2);
+    paint.fill();
+
+    paint.fillStyle = "#6f6759";
+    paint.fillRect(centerX - headRX * 0.55, headCY + headRY * 0.45, headRX * 1.1, h * 0.26);
+
+    paint.fillStyle = "#d4cbb7";
+    paint.beginPath();
+    paint.moveTo(centerX - headRX * 1.5, y + h * 0.77);
+    paint.lineTo(centerX - headRX * 0.18, y + h * 0.66);
+    paint.lineTo(centerX + headRX * 0.02, y + h * 0.84);
+    paint.closePath();
+    paint.fill();
+    paint.fillStyle = "#bdb49f";
+    paint.beginPath();
+    paint.moveTo(centerX + headRX * 1.5, y + h * 0.77);
+    paint.lineTo(centerX + headRX * 0.18, y + h * 0.66);
+    paint.lineTo(centerX - headRX * 0.02, y + h * 0.84);
+    paint.closePath();
+    paint.fill();
+
+    try {
+      var skin = paint.createLinearGradient(centerX - headRX, headCY, centerX + headRX, headCY);
+      if (addStopsSafely(skin, [
+        [0, "#b0a694"],
+        [0.34, "#8f8676"],
+        [0.70, "#665f52"],
+        [1, "#3b362e"]
+      ])) {
+        paint.fillStyle = skin;
+        paint.beginPath();
+        paint.ellipse(centerX, headCY, headRX, headRY, 0, 0, Math.PI * 2);
+        paint.fill();
+      }
+    } catch (skinErr) {
+      reportError("portrait skin", skinErr);
+    }
+
+    paint.fillStyle = "rgba(40,35,28,0.24)";
+    paint.beginPath();
+    paint.ellipse(centerX + headRX * 0.52, headCY + headRY * 0.08, headRX * 0.42, headRY * 0.68, 0, 0, Math.PI * 2);
+    paint.fill();
+
+    paint.fillStyle = "#2f2a23";
+    paint.beginPath();
+    paint.ellipse(centerX, headCY - headRY * 0.58, headRX * 1.04, headRY * 0.58, 0, Math.PI, Math.PI * 2);
+    paint.fill();
+    paint.strokeStyle = "rgba(20,17,14,0.5)";
+    paint.lineWidth = Math.max(1, w * 0.004);
+    for (var strand = 0; strand < 9; strand++) {
+      var strandX = centerX - headRX * 0.9 + headRX * 1.8 * (strand / 8);
+      paint.beginPath();
+      paint.moveTo(strandX, headCY - headRY * 0.95);
+      paint.quadraticCurveTo(strandX + w * 0.01, headCY - headRY * 0.45, strandX - w * 0.005, headCY - headRY * 0.18);
+      paint.stroke();
+    }
+
+    paint.fillStyle = "rgba(30,25,20,0.85)";
+    paint.beginPath();
+    paint.ellipse(centerX - headRX * 0.38, headCY - headRY * 0.03, headRX * 0.10, headRX * 0.045, -0.08, 0, Math.PI * 2);
+    paint.fill();
+    paint.beginPath();
+    paint.ellipse(centerX + headRX * 0.38, headCY - headRY * 0.02, headRX * 0.085, headRX * 0.04, 0.08, 0, Math.PI * 2);
+    paint.fill();
+
+    paint.strokeStyle = "rgba(44,38,30,0.5)";
+    paint.lineWidth = Math.max(1, w * 0.005);
+    paint.beginPath();
+    paint.moveTo(centerX + headRX * 0.02, headCY - headRY * 0.02);
+    paint.lineTo(centerX - headRX * 0.05, headCY + headRY * 0.27);
+    paint.lineTo(centerX + headRX * 0.05, headCY + headRY * 0.30);
+    paint.stroke();
+
+    paint.strokeStyle = "rgba(60,38,32,0.58)";
+    paint.lineWidth = Math.max(1, w * 0.005);
+    paint.beginPath();
+    paint.moveTo(centerX - headRX * 0.24, headCY + headRY * 0.53);
+    paint.quadraticCurveTo(centerX, headCY + headRY * 0.59, centerX + headRX * 0.19, headCY + headRY * 0.51);
+    paint.stroke();
+
+    paint.fillStyle = "rgba(28,24,19,0.55)";
+    paint.beginPath();
+    paint.ellipse(centerX - headRX * 1.0, headCY + headRY * 0.05, headRX * 0.10, headRY * 0.18, 0, 0, Math.PI * 2);
+    paint.fill();
+
+    try {
+      var pool = paint.createRadialGradient(centerX, y + h * 0.28, 0, centerX, y + h * 0.28, w * 0.55);
+      if (addStopsSafely(pool, [
+        [0, "rgba(255,249,234,0.14)"],
+        [0.6, "rgba(255,249,234,0)"],
+        [1, "rgba(20,16,12,0.16)"]
+      ])) {
+        paint.fillStyle = pool;
+        paint.fillRect(x, y, w, h);
+      }
+    } catch (poolErr) {
+      reportError("portrait pool", poolErr);
+    }
+  }
+
+  function paintVinyl(paint, x, y, w, h) {
+    var rand = makeRandom(19661120);
+    try {
+      var table = paint.createLinearGradient(x, y, x, y + h);
+      if (addStopsSafely(table, [
+        [0, "#c3baa7"],
+        [0.55, "#aba290"],
+        [1, "#767061"]
+      ])) {
+        paint.fillStyle = table;
+        paint.fillRect(x, y, w, h);
+      }
+    } catch (tableErr) {
+      reportError("vinyl table", tableErr);
+    }
+
+    var side = Math.min(w * 0.94, h * 0.90);
+    var sleeveX = x + w * 0.5 - side * 0.62;
+    var sleeveY = y + h * 0.5 - side * 0.50;
+
+    paint.save();
+    paint.shadowColor = "rgba(26,20,12,0.45)";
+    paint.shadowBlur = Math.max(4, side * 0.035);
+    paint.shadowOffsetX = side * 0.015;
+    paint.shadowOffsetY = side * 0.02;
+    paint.fillStyle = "#2c3633";
+    paint.fillRect(sleeveX, sleeveY, side, side);
+    paint.restore();
+
+    paint.fillStyle = "#c0b08b";
+    paint.beginPath();
+    paint.arc(sleeveX + side * 0.40, sleeveY + side * 0.50, side * 0.22, 0, Math.PI * 2);
+    paint.fill();
+    paint.fillStyle = "#7d3f30";
+    paint.fillRect(sleeveX + side * 0.61, sleeveY + side * 0.18, side * 0.17, side * 0.62);
+    paint.fillStyle = "rgba(24,30,28,0.65)";
+    paint.fillRect(sleeveX + side * 0.10, sleeveY + side * 0.70, side * 0.55, side * 0.10);
+
+    paint.fillStyle = "#d8c8a4";
+    paint.textAlign = "left";
+    paint.textBaseline = "alphabetic";
+    paint.font = "700 " + Math.max(6, side * 0.048) + "px 'Courier New', monospace";
+    var albumName = (state.song.name || "UNTITLED SESSIONS").toUpperCase();
+    paint.fillText(albumName.slice(0, 17), sleeveX + side * 0.08, sleeveY + side * 0.13);
+    paint.fillStyle = "rgba(216,200,164,0.66)";
+    paint.font = Math.max(5, side * 0.032) + "px 'Courier New', monospace";
+    var artistName = (state.song.artists || "ANONYMOUS").toUpperCase();
+    paint.fillText(artistName.slice(0, 22), sleeveX + side * 0.08, sleeveY + side * 0.19);
+    paint.fillStyle = "rgba(216,200,164,0.5)";
+    paint.font = Math.max(4.5, side * 0.027) + "px 'Courier New', monospace";
+    paint.fillText("422-014  /  MONO", sleeveX + side * 0.08, sleeveY + side * 0.86);
+
+    var recordCX = sleeveX + side * 1.03;
+    var recordCY = sleeveY + side * 0.54;
+    var recordR = side * 0.47;
+    paint.fillStyle = "#161412";
+    paint.beginPath();
+    paint.arc(recordCX, recordCY, recordR, 0, Math.PI * 2);
+    paint.fill();
+
+    for (var groove = 0; groove < 24; groove++) {
+      var grooveRadius = recordR * (0.36 + groove * 0.026);
+      paint.strokeStyle = groove % 3 === 0 ? "rgba(220,210,190,0.10)" : "rgba(220,210,190,0.045)";
+      paint.lineWidth = Math.max(0.6, recordR * 0.006);
+      paint.beginPath();
+      paint.arc(recordCX, recordCY, grooveRadius, 0, Math.PI * 2);
+      paint.stroke();
+    }
+
+    paint.save();
+    paint.beginPath();
+    paint.arc(recordCX, recordCY, recordR * 0.98, 0, Math.PI * 2);
+    paint.clip();
+    try {
+      var sheen = paint.createLinearGradient(recordCX - recordR, recordCY - recordR, recordCX + recordR, recordCY + recordR);
+      if (addStopsSafely(sheen, [
+        [0, "rgba(255,248,230,0)"],
+        [0.44, "rgba(255,248,230,0.14)"],
+        [0.5, "rgba(255,248,230,0.26)"],
+        [0.56, "rgba(255,248,230,0.10)"],
+        [1, "rgba(255,248,230,0)"]
+      ])) {
+        paint.fillStyle = sheen;
+        paint.fillRect(recordCX - recordR, recordCY - recordR, recordR * 2, recordR * 2);
+      }
+    } catch (sheenErr) {
+      reportError("vinyl sheen", sheenErr);
+    }
+    paint.restore();
+
+    paint.fillStyle = colorCss(state.accent);
+    paint.beginPath();
+    paint.arc(recordCX, recordCY, recordR * 0.33, 0, Math.PI * 2);
+    paint.fill();
+    paint.fillStyle = accentContrast();
+    paint.textAlign = "center";
+    paint.textBaseline = "middle";
+    paint.font = "700 " + Math.max(5, recordR * 0.14) + "px 'Courier New', monospace";
+    paint.fillText("422", recordCX, recordCY - recordR * 0.08);
+    paint.font = Math.max(4, recordR * 0.085) + "px 'Courier New', monospace";
+    paint.fillText("33 1/3", recordCX, recordCY + recordR * 0.12);
+    paint.fillStyle = "#171412";
+    paint.beginPath();
+    paint.arc(recordCX, recordCY, Math.max(1, recordR * 0.035), 0, Math.PI * 2);
+    paint.fill();
+
+    paint.strokeStyle = "rgba(245,238,222,0.10)";
+    paint.lineWidth = Math.max(1, side * 0.004);
+    paint.beginPath();
+    paint.moveTo(sleeveX + side * 0.10, sleeveY + side * 0.94);
+    paint.lineTo(sleeveX + side * 0.66, sleeveY + side * 0.90);
+    paint.stroke();
+  }
+
+  function update(now) {
+    var liveWidth = Math.round(finiteOr(window.innerWidth, view.w));
+    var liveHeight = Math.round(finiteOr(window.innerHeight, view.h));
+    if (liveWidth > 0 && liveHeight > 0 && (Math.abs(liveWidth - view.w) > 2 || Math.abs(liveHeight - view.h) > 2)) {
+      resize();
+      layoutCache = null;
+    }
+
+    state.beatPulse *= 0.9;
+    if (state.beatPulse < 0.01) state.beatPulse = 0;
+
+    if (state.idx !== state.seenIdx) {
+      state.seenIdx = state.idx;
+      state.lineChangedAt = now;
+    }
+
+    var targetProgress = state.duration > 0 ? clamp(state.time / state.duration, 0, 1) : 0;
+    if (state.reduced) {
+      state.displayProgress = targetProgress;
+    } else {
+      state.displayProgress += (targetProgress - state.displayProgress) * 0.18;
+    }
+    if (!isFinite(state.displayProgress)) state.displayProgress = targetProgress;
+  }
+
+  function drawPaper(lay) {
+    if (paperCanvas instanceof HTMLCanvasElement && paperCanvas.width > 0 && paperCanvas.height > 0) {
+      ctx.drawImage(paperCanvas, 0, 0, lay.w, lay.h);
+    } else {
+      ctx.fillStyle = PAPER;
+      ctx.fillRect(0, 0, lay.w, lay.h);
+    }
+    ctx.strokeStyle = "rgba(33,28,23,0.38)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(lay.margin, lay.margin, lay.w - lay.margin * 2, lay.h - lay.margin * 2);
+  }
+
+  function padNumber(value, width) {
+    var text = String(Math.max(0, Math.floor(finiteOr(value, 0))));
+    for (var index = text.length; index < width; index++) text = "0" + text;
+    return text;
+  }
+
+  function tokenizeLyric(text) {
+    var tokens = [];
+    var buffer = "";
+    var bufferStart = 0;
+    for (var index = 0; index < text.length; index++) {
+      var ch = text.charAt(index);
+      var isCjk = /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/.test(ch);
+      if (isCjk || ch === " ") {
+        if (buffer) {
+          tokens.push({ text: buffer, start: bufferStart, end: index, width: 0 });
+          buffer = "";
+        }
+        tokens.push({ text: ch, start: index, end: index + 1, width: 0 });
+      } else {
+        if (!buffer) bufferStart = index;
+        buffer += ch;
+      }
+    }
+    if (buffer) tokens.push({ text: buffer, start: bufferStart, end: text.length, width: 0 });
+    return tokens;
+  }
+
+  function wrapLyric(text, maxWidth) {
+    var tokens = tokenizeLyric(text);
+    var lines = [];
+    var current = { tokens: [], start: 0, end: 0, width: 0 };
+    for (var tokenIndex = 0; tokenIndex < tokens.length; tokenIndex++) {
+      var token = tokens[tokenIndex];
+      token.width = ctx.measureText(token.text).width;
+      if (current.tokens.length > 0 && current.width + token.width > maxWidth) {
+        lines.push(current);
+        current = { tokens: [], start: token.start, end: token.end, width: 0 };
+      }
+      if (current.tokens.length === 0 && token.text === " ") continue;
+      if (current.tokens.length === 0) current.start = token.start;
+      current.tokens.push(token);
+      current.width += token.width;
+      current.end = token.end;
+    }
+    if (current.tokens.length > 0) lines.push(current);
+    if (lines.length === 0) lines.push({ tokens: [], start: 0, end: 0, width: 0 });
+    return { lines: lines };
+  }
+
+  function getActiveLayout(text, maxWidth, maxHeight, baseSize) {
+    var key = text.length + "|" + text.slice(0, 24) + "|" + Math.round(maxWidth) + "|" + Math.round(maxHeight) + "|" + Math.round(baseSize);
+    var cached = lyricLayoutCache[key];
+    if (cached) return cached;
+    var size = baseSize;
+    var result = null;
+    for (var attempt = 0; attempt < 34; attempt++) {
+      ctx.font = size + "px " + SERIF;
+      var wrapped = wrapLyric(text, maxWidth);
+      var lineHeight = size * 1.36;
+      var height = wrapped.lines.length * lineHeight;
+      var widest = 0;
+      for (var lineIndex = 0; lineIndex < wrapped.lines.length; lineIndex++) {
+        widest = Math.max(widest, wrapped.lines[lineIndex].width);
+      }
+      result = {
+        lines: wrapped.lines,
+        fontSize: size,
+        lineHeight: lineHeight,
+        height: height,
+        width: widest
+      };
+      if ((height <= maxHeight && wrapped.lines.length <= 7) || size <= 11) break;
+      size = Math.max(11, size - 2);
+    }
+    if (result.lines.length > 8) {
+      result.lines = result.lines.slice(0, 8);
+      var lastLine = result.lines[7];
+      if (lastLine.tokens.length > 2) {
+        lastLine.tokens = lastLine.tokens.slice(0, lastLine.tokens.length - 1);
+        lastLine.tokens.push({ text: "…", start: lastLine.end, end: lastLine.end + 1, width: ctx.measureText("…").width });
+      }
+      result.height = result.lines.length * result.lineHeight;
+    }
+    if (Object.keys(lyricLayoutCache).length > 60) lyricLayoutCache = Object.create(null);
+    lyricLayoutCache[key] = result;
+    return result;
+  }
+
+  function countRevealed(times, time) {
+    var count = 0;
+    for (var index = 0; index < times.length; index++) {
+      if (times[index] <= time + 0.035) count = index + 1;
+      else break;
+    }
+    return count;
+  }
+
+  function drawActiveText(layout, text, revealTimes, time, left, top, accent, now) {
+    var revealed = countRevealed(revealTimes, time);
+    var cursorX = left;
+    var cursorBaseline = top + layout.lineHeight * 0.8;
+    var hasCursor = false;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+
+    for (var lineIndex = 0; lineIndex < layout.lines.length; lineIndex++) {
+      var line = layout.lines[lineIndex];
+      var baseline = top + layout.lineHeight * (lineIndex + 0.80);
+      var x = left;
+      var tokenIndex;
+
+      for (tokenIndex = 0; tokenIndex < line.tokens.length; tokenIndex++) {
+        var ghostToken = line.tokens[tokenIndex];
+        ctx.font = layout.fontSize + "px " + SERIF;
+        ctx.fillStyle = "rgba(33,28,23,0.15)";
+        ctx.fillText(ghostToken.text, x, baseline);
+        x += ghostToken.width;
+      }
+
+      x = left;
+      var lineRevealed = left;
+      for (tokenIndex = 0; tokenIndex < line.tokens.length; tokenIndex++) {
+        var token = line.tokens[tokenIndex];
+        var within = clamp(revealed - token.start, 0, token.text.length);
+        if (within > 0) {
+          ctx.font = layout.fontSize + "px " + SERIF;
+          ctx.fillStyle = INK;
+          var portion = within >= token.text.length ? token.text : token.text.slice(0, within);
+          ctx.fillText(portion, x, baseline);
+          var portionWidth = within >= token.text.length ? token.width : ctx.measureText(portion).width;
+          lineRevealed = Math.max(lineRevealed, x + portionWidth);
+          if (within < token.text.length) {
+            hasCursor = true;
+            cursorX = x + portionWidth;
+            cursorBaseline = baseline;
+          }
+        }
+        x += token.width;
+      }
+
+      ctx.strokeStyle = "rgba(33,28,23,0.10)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(left, baseline + layout.fontSize * 0.20);
+      ctx.lineTo(left + line.width, baseline + layout.fontSize * 0.20);
+      ctx.stroke();
+
+      if (lineRevealed > left + 0.5) {
+        ctx.strokeStyle = accentInk(0.62);
+        ctx.lineWidth = Math.max(2, layout.fontSize * 0.045);
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(left, baseline + layout.fontSize * 0.21);
+        ctx.lineTo(lineRevealed, baseline + layout.fontSize * 0.21);
+        ctx.stroke();
+        ctx.lineCap = "butt";
+      }
+    }
+
+    if (hasCursor) {
+      var visible = state.reduced || Math.floor(now / 520) % 2 === 0;
+      if (visible) {
+        ctx.fillStyle = accentInk(0.9);
+        ctx.fillRect(
+          cursorX + 1,
+          cursorBaseline - layout.fontSize * 0.72,
+          Math.max(2, layout.fontSize * 0.08),
+          layout.fontSize * 0.82
+        );
+      }
+    }
+  }
+
+  function drawNeighbourLine(line, x, y, maxWidth, size, lineNumber, tone) {
+    if (!line) return;
+    ctx.font = "600 " + size + "px " + SERIF;
+    var label = padNumber(lineNumber, 2);
+    var labelWidth = trackedWidth(label, size * 0.12);
+    ctx.fillStyle = tone === "strong" ? accentInk(0.85) : "rgba(33,28,23,0.34)";
+    drawTracked(label, x, y, size * 0.12, "left");
+    ctx.font = size + "px " + SERIF;
+    ctx.fillStyle = tone === "strong" ? "rgba(33,28,23,0.58)" : "rgba(33,28,23,0.26)";
+    ctx.fillText(ellipsize(line.text, maxWidth - labelWidth - size), x + labelWidth + size * 0.7, y);
+  }
+
+  function drawStamp(centerX, centerY, width, height, mainText, subText, rotation, alpha) {
+    ctx.save();
+    ctx.translate(centerX, centerY);
+    ctx.rotate(rotation);
+    ctx.globalAlpha = clamp(alpha, 0, 1);
+    ctx.strokeStyle = accentInk(0.78);
+    ctx.lineWidth = Math.max(1.4, height * 0.07);
+    ctx.strokeRect(-width / 2, -height / 2, width, height);
+    ctx.fillStyle = accentInk(0.86);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    var size = height * 0.34;
+    ctx.font = "700 " + size + "px " + SERIF;
+    ctx.fillText(mainText, 0, subText ? -height * 0.10 : 0);
+    if (subText) {
+      ctx.font = size * 0.62 + "px " + SERIF;
+      ctx.fillText(subText, 0, height * 0.24);
+    }
+    ctx.restore();
+    ctx.textAlign = "left";
+  }
+
+  function drawEmptyFolio(box, left, right, top, bottom) {
+    var centerX = box.x + box.w / 2;
+    var centerY = (top + bottom) / 2;
+    var titleSize = clamp(Math.min(box.w * 0.052, box.h * 0.10), 16, 44);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "rgba(33,28,23,0.76)";
+    ctx.font = "italic " + titleSize + "px " + SERIF;
+    ctx.fillText("No transcription in this file", centerX, centerY - titleSize * 0.55);
+    var subSize = clamp(box.w * 0.0125, 7.5, 10);
+    ctx.fillStyle = "rgba(33,28,23,0.46)";
+    ctx.font = "600 " + subSize + "px " + SERIF;
+    drawTracked("THIS REEL WAS CATALOGUED WITHOUT TEXT", centerX, centerY, subSize * 0.16, "center");
+    ctx.strokeStyle = "rgba(33,28,23,0.24)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(centerX - box.w * 0.18, centerY + subSize * 1.3);
+    ctx.lineTo(centerX + box.w * 0.18, centerY + subSize * 1.3);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(33,28,23,0.40)";
+    ctx.font = (subSize * 1.25) + "px " + SERIF;
+    ctx.fillText("本卷无歌词记录", centerX, centerY + subSize * 3.1);
+    if (box.h > 240) {
+      var stampW = clamp(box.w * 0.30, 110, 190);
+      var stampH = stampW * 0.28;
+      drawStamp(
+        centerX,
+        centerY + stampH * 1.6 + subSize * 4.6,
+        stampW,
+        stampH,
+        "UNTRANSCRIBED",
+        "422 / REEL 03",
+        -0.055,
+        0.52
+      );
+    }
+    ctx.textAlign = "left";
+  }
+
+  function drawFolio(lay, now) {
+    var box = lay.folio;
+    if (!box) return;
+    var paper = getFolioPaper(box.w, box.h);
+    if (paper && paper.canvas instanceof HTMLCanvasElement && paper.canvas.width > 0 && paper.canvas.height > 0) {
+      ctx.drawImage(paper.canvas, box.x - paper.pad, box.y - paper.pad, box.w + paper.pad * 2, box.h + paper.pad * 2);
+    } else {
+      ctx.fillStyle = "#f1e9d8";
+      ctx.fillRect(box.x, box.y, box.w, box.h);
+      ctx.strokeStyle = "rgba(58,44,28,0.38)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(box.x + 0.5, box.y + 0.5, box.w - 1, box.h - 1);
+    }
+
+    var inset = clamp(box.w * 0.065, 17, 54);
+    var left = box.x + inset;
+    var right = box.x + box.w - inset;
+    var headerSize = clamp(box.w * 0.0135, 7.5, 10.5);
+    var headerY = box.y + clamp(box.h * 0.052, 14, 32);
+    var accent = state.accent;
+
+    if (!state.reduced && !state.lowPower && state.beatPulse > 0.05) {
+      ctx.strokeStyle = colorCss(accent, state.beatPulse * 0.18);
+      ctx.lineWidth = 2;
+      ctx.strokeRect(box.x + 1, box.y + 1, box.w - 2, box.h - 2);
+    }
+
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = INK;
+    ctx.font = "600 " + headerSize + "px " + SERIF;
+    drawTracked("TESTIMONY / ORAL HISTORY", left, headerY + headerSize, headerSize * 0.17, "left");
+
+    var counter = state.lyrics.length === 0
+      ? "— / 00"
+      : ((state.idx >= 0 ? padNumber(state.idx + 1, 2) : "—") + " / " + padNumber(state.lyrics.length, 2));
+    ctx.fillStyle = accentInk(0.92);
+    ctx.font = "600 " + headerSize + "px " + SERIF;
+    drawTracked("PLATE " + counter, right, headerY + headerSize, headerSize * 0.17, "right");
+
+    var ruleY = headerY + headerSize * 2.15;
+    ctx.strokeStyle = "rgba(33,28,23,0.27)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, ruleY);
+    ctx.lineTo(right, ruleY);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(33,28,23,0.10)";
+    ctx.beginPath();
+    ctx.moveTo(left, ruleY + 2.5);
+    ctx.lineTo(right, ruleY + 2.5);
+    ctx.stroke();
+
+    var footerSize = clamp(box.w * 0.012, 7, 9.5);
+    var footerY = box.y + box.h - clamp(box.h * 0.043, 12, 24);
+    var footerRuleY = footerY - footerSize * 2.0;
+    ctx.strokeStyle = "rgba(33,28,23,0.27)";
+    ctx.beginPath();
+    ctx.moveTo(left, footerRuleY);
+    ctx.lineTo(right, footerRuleY);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(33,28,23,0.52)";
+    ctx.font = footerSize + "px " + SERIF;
+    ctx.fillText(
+      lay.narrow ? "REEL 03  /  33 1/3" : "TRANSCRIBED FROM REEL 03  /  33 1/3 RPM  /  MONO",
+      left,
+      footerY
+    );
+    ctx.textAlign = "right";
+    ctx.fillText(formatTime(state.time) + "  /  " + formatTime(state.duration), right, footerY);
+    ctx.textAlign = "left";
+
+    var contentTop = ruleY + clamp(box.h * 0.035, 10, 22);
+    var contentBottom = footerRuleY - clamp(box.h * 0.03, 9, 20);
+    var neighbourSize = clamp(box.w * 0.021, 9, 15);
+
+    if (state.lyrics.length === 0) {
+      drawEmptyFolio(box, left, right, contentTop, contentBottom);
+      return;
+    }
+
+    var activeIndex = state.idx;
+    var preview = activeIndex < 0;
+    if (preview) activeIndex = 0;
+    activeIndex = clamp(activeIndex, 0, state.lyrics.length - 1);
+    var activeLine = state.lyrics[activeIndex];
+    var previousLine = activeIndex > 0 ? state.lyrics[activeIndex - 1] : null;
+    var nextLine = activeIndex + 1 < state.lyrics.length ? state.lyrics[activeIndex + 1] : null;
+
+    var enter = 1;
+    if (!state.reduced) {
+      enter = clamp((now - state.lineChangedAt) / 420, 0, 1);
+      enter = 1 - Math.pow(1 - enter, 3);
+    }
+
+    if (preview) {
+      ctx.fillStyle = accentInk(0.72);
+      ctx.font = "600 " + neighbourSize + "px " + SERIF;
+      drawTracked("STANDBY  /  AWAITING FIRST LINE", left, contentTop + neighbourSize, neighbourSize * 0.13, "left");
+    } else if (previousLine) {
+      drawNeighbourLine(previousLine, left, contentTop + neighbourSize, box.w - inset * 2, neighbourSize, activeIndex, "strong");
+    }
+
+    var showNeighbours = box.h > 330;
+    var activeTop = contentTop + neighbourSize * (showNeighbours ? 2.7 : 1.2);
+    var activeBottom = contentBottom - neighbourSize * (showNeighbours ? 3.2 : 0.8);
+    var maxWidth = box.w - inset * 2;
+    var maxHeight = Math.max(48, activeBottom - activeTop);
+    var baseSize = clamp(Math.sqrt((maxWidth * maxHeight * 0.75) / Math.max(6, activeLine.text.length)), 17, 96);
+    var layout = getActiveLayout(activeLine.text, maxWidth, maxHeight, baseSize);
+    var blockTop = (activeTop + activeBottom) / 2 - layout.height / 2 + layout.fontSize * 0.12;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(left - 3, activeTop - 6, maxWidth + 6, maxHeight + 12);
+    ctx.clip();
+    if (!state.reduced && !state.lowPower) {
+      ctx.globalAlpha = 0.55 + 0.45 * enter;
+      ctx.translate(0, (1 - enter) * 7);
+    }
+    drawActiveText(layout, activeLine.text, activeLine.revealTimes, state.time, left, blockTop, accent, now);
+    ctx.restore();
+
+    var revealedNow = countRevealed(activeLine.revealTimes, state.time);
+    var stampVisible = false;
+    if (!preview && revealedNow >= activeLine.text.length && state.idx >= 0 && box.w > 420) {
+      stampVisible = true;
+      var stampW = clamp(box.w * 0.15, 66, 104);
+      var stampH = stampW * 0.30;
+      var stampAge = state.time - (activeLine.t + (activeLine.dur > 0 ? activeLine.dur : 0.6));
+      var stampAlpha = state.reduced ? 0.75 : clamp(stampAge / 0.35, 0, 0.78);
+      drawStamp(
+        right - stampW / 2,
+        footerRuleY - stampH * 1.55,
+        stampW,
+        stampH,
+        "FILED",
+        "422 / " + padNumber(activeIndex + 1, 2),
+        -0.06,
+        stampAlpha
+      );
+    }
+
+    if (nextLine && showNeighbours) {
+      ctx.strokeStyle = "rgba(33,28,23,0.18)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(left, contentBottom - neighbourSize * 1.8);
+      ctx.lineTo(right, contentBottom - neighbourSize * 1.8);
+      ctx.stroke();
+      drawNeighbourLine(
+        nextLine,
+        left,
+        contentBottom - neighbourSize * 0.15,
+        stampVisible ? maxWidth * 0.64 : maxWidth,
+        neighbourSize,
+        activeIndex + 2,
+        "faint"
+      );
+    }
+  }
+
+  function drawPlatePlaceholder(plate, imageH) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(plate.x, plate.y, plate.w, imageH);
+    ctx.clip();
+    ctx.fillStyle = "#cfc5b1";
+    ctx.fillRect(plate.x, plate.y, plate.w, imageH);
+    ctx.strokeStyle = "rgba(58,46,30,0.12)";
+    ctx.lineWidth = 1;
+    for (var step = 0; step < 18; step++) {
+      var lineY = plate.y + (step / 18) * imageH;
+      ctx.beginPath();
+      ctx.moveTo(plate.x, lineY);
+      ctx.lineTo(plate.x + plate.w, lineY + plate.w * 0.18);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(33,28,23,0.38)";
+    ctx.font = "600 " + clamp(plate.w * 0.032, 7, 10) + "px " + SERIF;
+    ctx.textAlign = "center";
+    drawTracked("PLATE IN PROCESS", plate.x + plate.w / 2, plate.y + imageH / 2, 1.2, "center");
+    ctx.restore();
+    ctx.textAlign = "left";
+  }
+
+  function drawPlates(lay) {
+    for (var index = 0; index < lay.plates.length; index++) {
+      var plate = lay.plates[index];
+      var captionH = clamp(plate.h * 0.22, 28, 58);
+      var imageH = plate.h - captionH;
+      if (imageH <= 8) continue;
+      var image = getPlateImage(plate.kind, plate.w, imageH);
+      var meta = PLATE_META[plate.kind] || PLATE_META.document;
+
+      ctx.fillStyle = "rgba(45,32,18,0.13)";
+      ctx.fillRect(plate.x + 3, plate.y + 4, plate.w, imageH);
+
+      if (image instanceof HTMLCanvasElement && image.width > 0 && image.height > 0) {
+        ctx.drawImage(image, plate.x, plate.y, plate.w, imageH);
+        if (!state.reduced && state.beatPulse > 0.02) {
+          ctx.fillStyle = colorCss(state.accent, state.beatPulse * 0.05);
+          ctx.fillRect(plate.x, plate.y, plate.w, imageH);
+        }
+      } else {
+        drawPlatePlaceholder(plate, imageH);
+      }
+
+      var labelSize = clamp(plate.w * 0.031, 7.5, 10.5);
+      var capTop = plate.y + imageH + 4;
+      ctx.strokeStyle = "rgba(33,28,23,0.28)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(plate.x, capTop);
+      ctx.lineTo(plate.x + plate.w, capTop);
+      ctx.stroke();
+
+      var baseline = capTop + labelSize * 1.65;
+      ctx.font = "600 " + labelSize + "px " + SERIF;
+      var numberWidth = trackedWidth(meta.no, labelSize * 0.14);
+      ctx.fillStyle = accentInk(0.95);
+      drawTracked(meta.no, plate.x, baseline, labelSize * 0.14, "left");
+
+      ctx.font = labelSize + "px " + SERIF;
+      ctx.fillStyle = "rgba(33,28,23,0.78)";
+      ctx.fillText(ellipsize(meta.title, plate.w - numberWidth - 9), plate.x + numberWidth + 8, baseline);
+
+      if (captionH > labelSize * 3.2) {
+        ctx.font = (labelSize * 0.88) + "px " + SERIF;
+        ctx.fillStyle = "rgba(33,28,23,0.44)";
+        ctx.fillText(ellipsize(meta.detail, plate.w), plate.x, baseline + labelSize * 1.45);
+      }
+    }
+  }
+
+  function drawIndex(lay) {
+    var box = lay.index;
+    if (!box) return;
+    var inset = clamp(box.w * 0.075, 11, 20);
+    var labelSize = clamp(box.w * 0.033, 7, 9.5);
+    ctx.fillStyle = "rgba(246,239,225,0.52)";
+    ctx.fillRect(box.x, box.y, box.w, box.h);
+    ctx.strokeStyle = "rgba(33,28,23,0.26)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(box.x + 0.5, box.y + 0.5, box.w - 1, box.h - 1);
+
+    var top = box.y + clamp(box.h * 0.075, 10, 18);
+    ctx.fillStyle = INK;
+    ctx.font = "600 " + labelSize + "px " + SERIF;
+    drawTracked("INDEX OF TESTIMONY", box.x + inset, top + labelSize, labelSize * 0.16, "left");
+    ctx.fillStyle = "rgba(33,28,23,0.36)";
+    ctx.font = (labelSize * 0.82) + "px " + SERIF;
+    ctx.textAlign = "right";
+    ctx.fillText(padNumber(state.lyrics.length, 2) + " ITEMS", box.x + box.w - inset, top + labelSize);
+    ctx.textAlign = "left";
+
+    var ruleY = top + labelSize * 2.1;
+    ctx.strokeStyle = "rgba(33,28,23,0.22)";
+    ctx.beginPath();
+    ctx.moveTo(box.x + inset, ruleY);
+    ctx.lineTo(box.x + box.w - inset, ruleY);
+    ctx.stroke();
+
+    if (state.lyrics.length === 0) {
+      ctx.fillStyle = "rgba(33,28,23,0.42)";
+      ctx.font = (labelSize * 1.05) + "px " + SERIF;
+      ctx.fillText("NOTHING CATALOGUED", box.x + inset, ruleY + labelSize * 2.2);
+      return;
+    }
+
+    var rows = clamp(Math.floor((box.h - labelSize * 4.2) / 24), 2, 5);
+    var rowTop = ruleY + labelSize * 1.4;
+    var footerSpace = labelSize * 2.2;
+    var rowH = Math.max(18, (box.h - (rowTop - box.y) - footerSpace) / rows);
+    var center = state.idx >= 0 ? state.idx : 0;
+    var first = clamp(center - 2, 0, Math.max(0, state.lyrics.length - rows));
+
+    for (var row = 0; row < rows; row++) {
+      var itemIndex = first + row;
+      if (itemIndex >= state.lyrics.length) break;
+      var item = state.lyrics[itemIndex];
+      var rowY = rowTop + row * rowH;
+      var isActive = itemIndex === state.idx;
+
+      if (isActive) {
+        ctx.fillStyle = colorCss(state.accent, 0.11);
+        ctx.fillRect(box.x + inset * 0.45, rowY, box.w - inset * 0.9, rowH - 2);
+        ctx.fillStyle = accentInk(0.9);
+        ctx.fillRect(box.x + inset * 0.45, rowY, 2, rowH - 2);
+      }
+
+      var numberSize = labelSize * 0.95;
+      ctx.font = "600 " + numberSize + "px " + SERIF;
+      ctx.fillStyle = isActive ? accentInk(0.95) : "rgba(33,28,23,0.40)";
+      ctx.fillText(padNumber(itemIndex + 1, 2), box.x + inset, rowY + rowH * 0.52);
+
+      var textX = box.x + inset + labelSize * 2.9;
+      var maxText = box.x + box.w - inset - textX;
+      ctx.font = (labelSize * 0.95) + "px " + SERIF;
+      ctx.fillStyle = isActive ? "rgba(33,28,23,0.86)" : "rgba(33,28,23,0.44)";
+      ctx.fillText(ellipsize(item.text, maxText), textX, rowY + rowH * 0.52);
+
+      if (row < rows - 1) {
+        ctx.strokeStyle = "rgba(33,28,23,0.10)";
+        ctx.beginPath();
+        ctx.moveTo(box.x + inset, rowY + rowH - 1);
+        ctx.lineTo(box.x + box.w - inset, rowY + rowH - 1);
+        ctx.stroke();
+      }
+    }
+
+    ctx.fillStyle = "rgba(33,28,23,0.38)";
+    ctx.font = (labelSize * 0.84) + "px " + SERIF;
+    ctx.fillText(
+      formatTime(state.time) + "  /  " + formatTime(state.duration),
+      box.x + inset,
+      box.y + box.h - labelSize * 1.1
+    );
+  }
+
+  function drawHeader(lay) {
+    var m = lay.margin;
+    var label = clamp(lay.h * 0.0125, 8.5, 12);
+    var tracking = label * 0.24;
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = INK;
+    ctx.font = "600 " + label + "px " + SERIF;
+    drawTracked("THE 422 COLLECTION", m, m + label * 2.3, tracking, "left");
+    ctx.fillStyle = "rgba(33,28,23,0.55)";
+    ctx.font = label * 0.88 + "px " + SERIF;
+    drawTracked("DEPARTMENT OF PUBLIC MEMORY", m, m + label * 3.95, tracking * 0.85, "left");
+
+    ctx.fillStyle = INK;
+    ctx.font = "600 " + label + "px " + SERIF;
+    drawTracked("CASE FILE 422", lay.w - m, m + label * 2.3, tracking, "right");
+    ctx.fillStyle = "rgba(33,28,23,0.55)";
+    ctx.font = label * 0.88 + "px " + SERIF;
+    drawTracked("ACC. 2026.422.07", lay.w - m, m + label * 3.95, tracking * 0.85, "right");
+
+    var titleSize = Math.round(clamp(lay.h * 0.031, 16, 31));
+    var titleMax = lay.narrow ? lay.w - m * 2 : lay.w * 0.52;
+    ctx.font = "italic " + titleSize + "px " + SERIF;
+    var title = ellipsize(state.song.name || "Untitled recording", titleMax);
+    var titleY = lay.contentTop - titleSize * 1.55;
+    ctx.fillStyle = INK;
+    ctx.textAlign = "left";
+    ctx.fillText(title, m, titleY);
+
+    var artistSize = Math.max(9, Math.round(titleSize * 0.48));
+    ctx.font = artistSize + "px " + SERIF;
+    var artistText = (state.song.artists || "Anonymous testimony").toUpperCase();
+    var artists = ellipsize(artistText, titleMax);
+    ctx.fillStyle = INK_SOFT;
+    drawTracked(artists, m, titleY + artistSize * 1.45, artistSize * 0.12, "left");
+
+    if (!lay.narrow) {
+      ctx.fillStyle = accentInk(0.9);
+      ctx.font = "600 " + label * 0.95 + "px " + SERIF;
+      var stampX = lay.w - m;
+      drawTracked("SHEET 01 / 12", stampX, titleY + label * 0.2, tracking, "right");
+      ctx.fillStyle = "rgba(33,28,23,0.55)";
+      ctx.font = label * 0.84 + "px " + SERIF;
+      drawTracked("GELATIN SILVER / OFFSET", stampX, titleY + label * 1.7, tracking * 0.8, "right");
+    }
+
+    ctx.strokeStyle = HAIRLINE;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(m, lay.contentTop - 9);
+    ctx.lineTo(lay.w - m, lay.contentTop - 9);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(33,28,23,0.12)";
+    ctx.beginPath();
+    ctx.moveTo(m, lay.contentTop - 7);
+    ctx.lineTo(lay.w - m, lay.contentTop - 7);
+    ctx.stroke();
+  }
+
+  function drawFooter(lay) {
+    var m = lay.margin;
+    var baseY = lay.h - m - lay.footerH;
+    var label = clamp(lay.h * 0.012, 8.5, 12);
+    ctx.strokeStyle = HAIRLINE;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(m, baseY + 4);
+    ctx.lineTo(lay.w - m, baseY + 4);
+    ctx.stroke();
+
+    var textY = baseY + 4 + label * 2.1;
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = INK;
+    ctx.font = "600 " + label + "px " + SERIF;
+    drawTracked(
+      lay.narrow ? "REEL 03  /  MONO" : "REEL 03  /  33 1/3 RPM  /  MONO",
+      m,
+      textY,
+      label * 0.16,
+      "left"
+    );
+
+    var centerLabel = state.playing ? "PLAYING" : "PAUSED";
+    ctx.fillStyle = accentInk(0.95);
+    ctx.font = "600 " + label + "px " + SERIF;
+    drawTracked(centerLabel, lay.w / 2, textY, label * 0.24, "center");
+    ctx.fillStyle = accentInk(0.9);
+    ctx.beginPath();
+    ctx.arc(lay.w / 2 - trackedWidth(centerLabel, label * 0.24) / 2 - label * 1.2, textY - label * 0.32, label * 0.27, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "rgba(33,28,23,0.7)";
+    ctx.font = label + "px " + SERIF;
+    ctx.textAlign = "right";
+    ctx.fillText(formatTime(state.time) + "  /  " + formatTime(state.duration), lay.w - m, textY);
+
+    if (!lay.narrow) {
+      var meterX = lay.w * 0.615;
+      var meterLevels = [state.liveBass, state.liveMid, state.liveTreble];
+      for (var meter = 0; meter < 3; meter++) {
+        var level = clamp(meterLevels[meter], 0, 1);
+        var meterH = 2 + level * label * 0.85;
+        ctx.fillStyle = accentInk(0.34 + level * 0.42);
+        ctx.fillRect(meterX + meter * (label * 0.38), textY - meterH, Math.max(1.5, label * 0.16), meterH);
+      }
+    }
+
+    var barY = lay.h - m - label * 0.9;
+    var barX0 = m;
+    var barX1 = lay.w - m;
+    ctx.strokeStyle = "rgba(33,28,23,0.22)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(barX0, barY);
+    ctx.lineTo(barX1, barY);
+    ctx.stroke();
+
+    for (var tick = 0; tick <= 8; tick++) {
+      var tickX = barX0 + (barX1 - barX0) * tick / 8;
+      ctx.strokeStyle = "rgba(33,28,23,0.20)";
+      ctx.beginPath();
+      ctx.moveTo(tickX, barY - (tick % 4 === 0 ? 4 : 2));
+      ctx.lineTo(tickX, barY);
+      ctx.stroke();
+    }
+
+    var progress = clamp(state.displayProgress, 0, 1);
+    ctx.strokeStyle = accentInk(0.92);
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(barX0, barY);
+    ctx.lineTo(barX0 + (barX1 - barX0) * progress, barY);
+    ctx.stroke();
+    if (progress > 0.001) {
+      ctx.fillStyle = accentInk(0.95);
+      ctx.fillRect(barX0 + (barX1 - barX0) * progress - 1, barY - 4, 2, 8);
+    }
+  }
+
+  function drawStage(now) {
+    var lay = getLayout();
+    drawPaper(lay);
+    drawFolio(lay, now);
+    drawPlates(lay);
+    drawIndex(lay);
+    drawHeader(lay);
+    drawFooter(lay);
+  }
+
+  function formatTime(seconds) {
+    var value = Math.max(0, Math.floor(finiteOr(seconds, 0)));
+    var mins = Math.floor(value / 60);
+    var secs = value % 60;
+    return (mins < 10 ? "0" : "") + mins + ":" + (secs < 10 ? "0" : "") + secs;
+  }
+
+  var lastFrameAt = 0;
+  function loop(now) {
+    requestAnimationFrame(loop);
+    var startedAt = performance.now();
+    try {
+      update(now);
+      drawStage(now);
+    } catch (err) {
+      reportError("frame", err);
+      try {
+        ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+        ctx.fillStyle = "#e8e0cf";
+        ctx.fillRect(0, 0, view.w, view.h);
+      } catch (fallbackErr) {
+        reportError("fallback", fallbackErr);
+      }
+    }
+    state.js = Math.round((performance.now() - startedAt) * 10) / 10;
+    if (state.js > 14) state.slowFrames += 1;
+    else state.slowFrames = Math.max(0, state.slowFrames - 1);
+    if (!state.lowPower && state.slowFrames > 30) state.lowPower = true;
+    state.frames += 1;
+    lastFrameAt = now;
+  }
+
+  try {
+    var motionQuery = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    state.reduced = !!(motionQuery && motionQuery.matches);
+    if (motionQuery) {
+      var onMotionChange = function (event) { state.reduced = !!event.matches; };
+      if (typeof motionQuery.addEventListener === "function") motionQuery.addEventListener("change", onMotionChange);
+      else if (typeof motionQuery.addListener === "function") motionQuery.addListener(onMotionChange);
+    }
+  } catch (mediaErr) {
+    state.reduced = false;
+    console.error("[422] reduced-motion probe failed", mediaErr);
+  }
+
+  resize();
+  setTimeout(function () {
+    try { ensurePaper(); } catch (paperBootErr) { reportError("paper boot", paperBootErr); }
+  }, 0);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

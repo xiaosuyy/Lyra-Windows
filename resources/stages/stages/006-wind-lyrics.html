@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>风之图歌词</title>
+<style>
+  html,body{margin:0;height:100%;background:#03050a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);
+        font:500 11px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;
+        color:rgba(158,212,255,.30);letter-spacing:.18em;pointer-events:none;
+        transition:opacity .7s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   006 · 风之图 —— 风从字里穿过
+
+   【这一版彻底推翻了旧逻辑，机制不同】
+
+   旧版把字形**边缘**抽成一条链，粒子挂在链上像传送带 —— 结果是一条线框，
+   没有颗粒、没有体积感，笔画密集处还会断。
+
+   新版：**字是风道，不是轨道。**
+
+   1. 排版：逐字测量 → 自动折行（长句 2~3 行）→ 定字号，
+      保证一个屏幕里字的实心面积足够大，这是"看得清"的唯一前提。
+   2. 字形场：把整行字画进半分辨率画布 → 二值墨迹掩码 → 倒角距离变换
+      → 距离场的**梯度**。梯度指向笔画中心，它的**垂线就是笔画切向**。
+      于是每一笔都成了一条风道：垂直于边缘的方向是墙，沿笔画的方向是流。
+   3. 粒子**铺满笔画内部**（按墨迹面积定量，不是只取轮廓）。
+      风道不是"自由漂流 + 缰绳"（试过：整笔墨迹被抽干、挤出亮沟，成了皱锡纸），
+      而是**沿笔画切向的强制振荡**：每颗粒子在自己 ±amp 内往返滑动，
+      波形沿笔画坐标传播（ph = 沿笔长度·0.075 - t·ω），于是整笔是被一股
+      风梳过去的，密度恒定、字永远是实的。amp 在建场时预计算（走出墨迹为止），
+      所以粒子永远不会越出笔画。
+   4. 每个字按 YRC 逐字时间被**风写入**：粒子从上风侧划着弧线射进笔画，
+      落位后汇进风道；唱完一句，整行被风整片吹散成尘（不是淡出）。
+   5. 背景是同一套风的宏观版本：长流线 + 尘埃 + 光斑，靠"离文字越远越亮"
+      的衰减把舞台让给字，避免抢戏。
+
+   教训（血泪）：
+   · 只画轮廓 = 线框；必须**填充笔画内部**，粒子密度按墨迹面积算。
+   · 逐颗 beginPath/stroke 会掉到个位数帧率 → 按"色调段 × 亮度档"合批。
+   · 沿路径跑时上一帧位置要检查跳变，否则换句时画出横跨屏幕的长线。
+   · 长句必须折行，单行硬缩会缩成蚂蚁（播放器里根本读不出来）。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 1, H = 1, DPR = 1;
+
+/* ============================================================================
+   一、常量
+   ========================================================================== */
+const MS = 0.5;                // 字形场分辨率：1 场像素 = 2 CSS 像素
+const INVMS = 2;
+const PAD = 6;                 // 场四周留白（场像素）
+const TRACK = 0.045;           // 字距（em）
+const MAXP = 12000;            // 粒子池上限
+const ZN = 4, BN = 3;          // 色调 4 段 × 亮度 3 档
+const WID = [1.5, 1.9, 2.4];  // 三档笔宽（CSS 像素）
+
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+const fontStr = (fs) => '800 ' + fs + 'px ' + FAMILY;
+
+const OPUNCT = '，。、；：！？）】》」』”’,.!?;:)]}%…';
+const LPUNCT = '（【《「『“‘({[';
+
+/* ============================================================================
+   二、状态
+   ========================================================================== */
+let ACC = [160, 226, 255];
+let STY = [];                  // STY[z][b] = 描边色
+let DOT_C = 'rgba(255,255,255,0.4)';
+let BOK = [];                  // 光斑精灵（带色）
+let iceR = 176, iceG = 238, iceB = 255;
+
+let lines = [];
+let curIdx = -1, brewIdx = -1, lastT = -1;
+let clockT = 0, clockAt = 0, playing = false;
+
+let FG = null;                 // 当前字形场
+let geoCache = null;           // 酝酿好的下一句
+let geoEpoch = 0;              // resize 后旧场作废
+let needRebuild = false;
+
+let lastMs = performance.now();
+let t0 = 0;                    // 视觉时间（暂停也走，风不歇）
+let beatPulse = 0;
+
+/* 音频时间：tick 之间外推，tick 一来回正 */
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* 粒子池 */
+const pX = new Float32Array(MAXP), pY = new Float32Array(MAXP);
+const pPX = new Float32Array(MAXP), pPY = new Float32Array(MAXP);
+const pHX = new Float32Array(MAXP), pHY = new Float32Array(MAXP);
+const pFX = new Float32Array(MAXP), pFY = new Float32Array(MAXP);
+const pT0 = new Float32Array(MAXP), pFD = new Float32Array(MAXP);
+const pSp = new Float32Array(MAXP), pPh = new Float32Array(MAXP), pSC = new Float32Array(MAXP);
+const pEV = new Float32Array(MAXP), pEVY = new Float32Array(MAXP), pEL = new Float32Array(MAXP);
+const pTX = new Float32Array(MAXP), pTY = new Float32Array(MAXP), pAmp = new Float32Array(MAXP);
+const pSt = new Uint8Array(MAXP);      // 0 待生 / 1 飞入 / 2 风道 / 3 逃逸
+const pZ = new Uint8Array(MAXP), pBd = new Uint8Array(MAXP);
+let pN = 0;
+
+/* 离场粉尘 */
+const SPRAY_N = 3200;
+const sX = new Float32Array(SPRAY_N), sY = new Float32Array(SPRAY_N);
+const sVX = new Float32Array(SPRAY_N), sVY = new Float32Array(SPRAY_N);
+const sL = new Float32Array(SPRAY_N), sM = new Float32Array(SPRAY_N);
+const sB = new Uint8Array(SPRAY_N);
+let sprayN = 0;
+
+/* 背景：风丝 / 尘埃 / 光斑 */
+let STREAKS = [];
+const DUST_N = 460;
+const dX = new Float32Array(DUST_N), dY = new Float32Array(DUST_N);
+const dVX = new Float32Array(DUST_N), dVY = new Float32Array(DUST_N);
+const dA = new Float32Array(DUST_N);
+let BOKS = [];
+
+/* ============================================================================
+   三、画布 / 颜色 / 精灵
+   ========================================================================== */
+function resize() {
+  DPR = Math.min(1.6, window.devicePixelRatio || 1);
+  W = Math.max(2, window.innerWidth);
+  H = Math.max(2, window.innerHeight);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildFade();
+  initAtmos();
+  geoEpoch++;
+  geoCache = null;
+  needRebuild = true;
+}
+
+function buildColors() {
+  const ar = ACC[0], ag = ACC[1], ab = ACC[2];
+  const k = 0.15;   // 只往冰蓝拉一点：留住封面主色的紫/蓝，别把字洗成灰白
+  iceR = Math.round(ar * (1 - k) + 176 * k);
+  iceG = Math.round(ag * (1 - k) + 238 * k);
+  iceB = Math.round(ab * (1 - k) + 255 * k);
+  const hot = [238, 251, 255];
+  STY = [];
+  for (let z = 0; z < ZN; z++) {
+    const w = z / (ZN - 1);
+    const r = Math.round(hot[0] + (iceR - hot[0]) * w);
+    const g = Math.round(hot[1] + (iceG - hot[1]) * w);
+    const b = Math.round(hot[2] + (iceB - hot[2]) * w);
+    STY.push([
+      'rgba(' + r + ',' + g + ',' + b + ',0.090)',
+      'rgba(' + r + ',' + g + ',' + b + ',0.150)',
+      'rgba(' + Math.min(255, r + 10) + ',' + Math.min(255, g + 6) + ',' + b + ',0.235)'
+    ]);
+  }
+  DOT_C = 'rgba(' + Math.min(255, iceR + 12) + ',' + Math.min(255, iceG + 8) + ',' + iceB + ',0.42)';
+}
+
+/* 淡出图：每帧把画面按这个渐变往深色拉 —— 一步同时做掉拖尾、暗角、底噪 */
+const fadeCv = document.createElement('canvas');
+const fadeCtx = fadeCv.getContext('2d');
+function buildFade() {
+  fadeCv.width = Math.max(2, Math.round(W));
+  fadeCv.height = Math.max(2, Math.round(H));
+  const cx = W * 0.5, cy = H * 0.47;
+  const g = fadeCtx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H) * 0.74);
+  g.addColorStop(0, 'rgb(8,12,20)');
+  g.addColorStop(0.45, 'rgb(6,9,16)');
+  g.addColorStop(1, 'rgb(2,3,7)');
+  fadeCtx.setTransform(1, 0, 0, 1, 0, 0);
+  fadeCtx.fillStyle = g;
+  fadeCtx.fillRect(0, 0, fadeCv.width, fadeCv.height);
+}
+
+/* ============================================================================
+   四、全局风场（尘埃 / 风丝 / 入场的宏观方向）
+   ========================================================================== */
+function windAngle(x, y, t) {
+  return -0.22
+    + 0.55 * Math.sin(y * 0.0022 + t * 0.21)
+    + 0.40 * Math.sin(x * 0.0017 - t * 0.15 + 1.3)
+    + 0.18 * Math.sin((x * 0.6 + y) * 0.0031 + t * 0.37);
+}
+
+const SHIST = 40;
+function initAtmos() {
+  STREAKS = [];
+  const sn = W > 1100 ? 15 : 10;
+  for (let i = 0; i < sn; i++) {
+    const st = {
+      x: Math.random() * W,
+      y: Math.random() * H,
+      hx: new Float32Array(SHIST),
+      hy: new Float32Array(SHIST),
+      hi: 0,
+      sp: 0.55 + Math.random() * 1.15
+    };
+    for (let k = 0; k < SHIST; k++) { st.hx[k] = st.x; st.hy[k] = st.y; }
+    STREAKS.push(st);
+  }
+  for (let i = 0; i < DUST_N; i++) {
+    dX[i] = Math.random() * W;
+    dY[i] = Math.random() * H;
+    dVX[i] = 0;
+    dVY[i] = 0;
+    dA[i] = 0.25 + Math.random() * 0.75;
+  }
+}
+
+/* ============================================================================
+   五、排版：逐字测量 + 自动折行 + 定字号
+   ========================================================================== */
+const measCv = document.createElement('canvas');
+const measCtx = measCv.getContext('2d');
+
+function measureStr(str, fs) {
+  measCtx.font = fontStr(fs);
+  let w = 0;
+  for (let i = 0; i < str.length; i++) w += measCtx.measureText(str[i]).width + fs * TRACK;
+  return Math.max(0, w - fs * TRACK);
+}
+
+function splitRows(s, L) {
+  const n = s.length;
+  const cuts = [];
+  for (let i = 1; i < L; i++) {
+    let c = Math.round(i * n / L);
+    while (c < n && OPUNCT.indexOf(s[c]) >= 0) c++;          // 行首不落标点
+    if (c > 0 && c < n && LPUNCT.indexOf(s[c - 1]) >= 0) c--; // 行尾不落开括号
+    if (c > 0 && c < n && /[A-Za-z0-9]/.test(s[c - 1]) && /[A-Za-z0-9]/.test(s[c])) {
+      const f = s.indexOf(' ', c);
+      if (f > 0 && f - c < 10) c = f + 1;                    // 拉丁词不从中间劈
+    }
+    if (c <= 0 || c >= n) continue;
+    if (cuts.length && c <= cuts[cuts.length - 1]) continue;
+    cuts.push(c);
+  }
+  const rows = [];
+  let prev = 0;
+  for (let i = 0; i < cuts.length; i++) { rows.push(s.slice(prev, cuts[i])); prev = cuts[i]; }
+  rows.push(s.slice(prev));
+  return rows.filter((r) => r.length > 0);
+}
+
+function fitFont(rows, L, maxW, maxH) {
+  let w100 = 0;
+  for (let i = 0; i < rows.length; i++) w100 = Math.max(w100, measureStr(rows[i], 100));
+  const fsW = maxW / (Math.max(1, w100) / 100);
+  const fsH = maxH / (1.22 * L);
+  return Math.min(fsW, fsH, 168);
+}
+
+function layoutText(raw) {
+  if (!raw) return null;
+  /* 折叠空白，同时记住每个字符在原始字符串里的下标（YRC 要按原始下标取时间） */
+  const cs = [], map = [];
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (/\s/.test(ch)) {
+      if (cs.length && cs[cs.length - 1] === ' ') continue;
+      cs.push(' ');
+    } else cs.push(ch);
+    map.push(i);
+  }
+  let a = 0, b = cs.length;
+  while (a < b && cs[a] === ' ') a++;
+  while (b > a && cs[b - 1] === ' ') b--;
+  const S = cs.slice(a, b);
+  const M = map.slice(a, b);
+  const n = S.length;
+  if (!n) return null;
+
+  const maxW = W * 0.84;
+  const maxH = H * 0.56;
+  const maxL = n <= 14 ? 1 : (n <= 26 ? 2 : 3);
+
+  let best = null;
+  for (let L = 1; L <= maxL; L++) {
+    if (n < L * 2) continue;
+    const rows = splitRows(S, L);
+    const fs = fitFont(rows, L, maxW, maxH);
+    if (fs < 26) continue;
+    if (best && fs < best.fs * 1.06) continue;   // 多一行至少换 6% 字号，否则不折
+    best = { rows: rows, L: L, fs: fs };
+  }
+  if (!best) {
+    const fs = Math.max(22, fitFont([S], 1, maxW, maxH));
+    best = { rows: [S], L: 1, fs: fs };
+  }
+
+  const fs = best.fs;
+  const lh = fs * 1.22;
+  measCtx.font = fontStr(fs);
+
+  const rows = [];
+  let bw = 0, src = 0;
+  for (let r = 0; r < best.rows.length; r++) {
+    const txt = best.rows[r];
+    const chars = [];
+    let x = 0;
+    for (let k = 0; k < txt.length; k++) {
+      const c = txt[k];
+      const wch = measCtx.measureText(c).width;
+      if (c !== ' ') chars.push({ c: c, x: x, w: wch, oi: M[src + k] });
+      x += wch + fs * TRACK;
+    }
+    src += txt.length;
+    const rw = Math.max(0, x - fs * TRACK);
+    rows.push({ chars: chars, w: rw, ly: (r + 0.5) * lh });
+    bw = Math.max(bw, rw);
+  }
+  const bh = lh * rows.length;
+  const bw2 = Math.max(1, bw);
+  return {
+    rows: rows,
+    fs: fs,
+    lh: lh,
+    bw: bw2,
+    bh: bh,
+    ox: (W - bw2) / 2,
+    oy: H * 0.47 - bh / 2
+  };
+}
+
+/* 逐字时间：YRC 有就用，没有就按句长均分 */
+function charTimes(line) {
+  const t = line.text || '';
+  const n = t.length;
+  const out = new Float32Array(n);
+  const ch = (line.chars && line.chars.length === n) ? line.chars : null;
+  const dur = Math.max(0.8, line.dur || 2.6);
+  const span = Math.min(dur * 0.72, 1.9);
+  for (let i = 0; i < n; i++) {
+    const ok = ch && ch[i] && typeof ch[i].t === 'number' && isFinite(ch[i].t);
+    out[i] = ok ? ch[i].t : line.t + (n > 1 ? span * i / (n - 1) : 0);
+  }
+  for (let i = 1; i < n; i++) if (out[i] < out[i - 1]) out[i] = out[i - 1];
+  return out;
+}
+
+/* ============================================================================
+   六、字形场：掩码 → 距离场 → 切向场 → 采样
+   ========================================================================== */
+const maskCv = document.createElement('canvas');
+const maskCtx = maskCv.getContext('2d', { willReadFrequently: true });
+
+function buildGeometry(line, idx) {
+  const lay = layoutText(line.text);
+  if (!lay) return null;
+
+  const mw = Math.ceil(lay.bw * MS) + PAD * 2;
+  const mh = Math.ceil(lay.bh * MS) + PAD * 2;
+  if (mw < 10 || mh < 10) return null;
+
+  maskCv.width = mw;
+  maskCv.height = mh;
+  const m2 = maskCtx;
+  m2.setTransform(1, 0, 0, 1, 0, 0);
+  m2.clearRect(0, 0, mw, mh);
+  m2.setTransform(MS, 0, 0, MS, PAD, PAD);
+  m2.font = fontStr(lay.fs);
+  m2.textAlign = 'left';
+  m2.textBaseline = 'middle';
+  m2.fillStyle = '#fff';
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let k = 0; k < row.chars.length; k++) {
+      m2.fillText(row.chars[k].c, row.chars[k].x, row.ly);
+    }
+  }
+
+  const img = m2.getImageData(0, 0, mw, mh).data;
+  const NP = mw * mh;
+  const mask = new Uint8Array(NP);
+  let ink = 0;
+  for (let i = 0, p = 3; i < NP; i++, p += 4) if (img[p] > 110) { mask[i] = 1; ink++; }
+  if (ink < 60) return null;
+
+  /* --- 倒角距离变换（3-4），得到"到边缘的距离" --- */
+  const INF = 1e6;
+  const D = new Float32Array(NP);
+  for (let i = 0; i < NP; i++) D[i] = mask[i] ? INF : 0;
+  for (let y = 1; y < mh - 1; y++) {
+    let i = y * mw + 1;
+    for (let x = 1; x < mw - 1; x++, i++) {
+      if (!mask[i]) continue;
+      let v = D[i];
+      let a = D[i - 1] + 3, b = D[i - mw] + 3, c = D[i - mw - 1] + 4, d = D[i - mw + 1] + 4;
+      if (a < v) v = a;
+      if (b < v) v = b;
+      if (c < v) v = c;
+      if (d < v) v = d;
+      D[i] = v;
+    }
+  }
+  for (let y = mh - 2; y >= 1; y--) {
+    let i = y * mw + mw - 2;
+    for (let x = mw - 2; x >= 1; x--, i--) {
+      if (!mask[i]) continue;
+      let v = D[i];
+      let a = D[i + 1] + 3, b = D[i + mw] + 3, c = D[i + mw + 1] + 4, d = D[i + mw - 1] + 4;
+      if (a < v) v = a;
+      if (b < v) v = b;
+      if (c < v) v = c;
+      if (d < v) v = d;
+      D[i] = v;
+    }
+  }
+  for (let i = 0; i < NP; i++) D[i] *= 0.3333333;
+
+  /* 平滑一遍：不平滑的话切线在中轴附近会抖，粒子会跳 */
+  const DD = new Float32Array(NP);
+  for (let y = 1; y < mh - 1; y++) {
+    let i = y * mw + 1;
+    for (let x = 1; x < mw - 1; x++, i++) {
+      DD[i] = (D[i - mw - 1] + D[i - mw] + D[i - mw + 1]
+             + D[i - 1] + D[i] + D[i + 1]
+             + D[i + mw - 1] + D[i + mw] + D[i + mw + 1]) * 0.1111111;
+    }
+  }
+  for (let i = 0; i < NP; i++) D[i] = DD[i];
+
+  /* --- 切向场：距离场梯度的垂线 = 沿笔画方向 ---
+     ⚠ 必须**统一朝向**。梯度符号在中轴线两侧相反，不统一的话同一笔里
+     一半粒子往左、一半往右，轨迹交叉成"皱锡纸"。统一到风向后整笔是一股流。 */
+  const REFX = 0.86, REFY = 0.51;
+  const TX = new Float32Array(NP), TY = new Float32Array(NP);
+  for (let y = 1; y < mh - 1; y++) {
+    let i = y * mw + 1;
+    for (let x = 1; x < mw - 1; x++, i++) {
+      if (!mask[i]) continue;
+      const gx = D[i + 1] - D[i - 1];
+      const gy = D[i + mw] - D[i - mw];
+      let tx = -gy, ty = gx;
+      const m = Math.sqrt(tx * tx + ty * ty);
+      if (m < 1e-5) { tx = REFX; ty = REFY; } else { tx /= m; ty /= m; }
+      if (tx * REFX + ty * REFY < 0) { tx = -tx; ty = -ty; }
+      TX[i] = tx; TY[i] = ty;
+    }
+  }
+
+  /* --- 采样：铺满笔画，不只在边缘 --- */
+  let elig = 0;
+  for (let i = 0; i < NP; i++) if (mask[i] && D[i] > 0.55) elig++;
+  if (elig < 50) return null;
+
+  const inkScreen = ink * 4;                                   // 场像素² → CSS 像素²
+  /* 粒子数不追"越多越实"：12000 颗时软件光栅化直接掉到 38fps，
+     而笔画反而是花的（粒子互相挤成沟）。9000 以内、把单颗画大更划算。 */
+  const target = Math.max(2400, Math.min(9000, Math.round(inkScreen * 0.16)));
+  const keep = Math.min(1, target / elig);
+  let rnd = ((idx + 7) * 2654435761) >>> 0 || 12345;
+  const rnd01 = () => ((rnd = (rnd * 1664525 + 1013904223) >>> 0) / 4294967296);
+
+  const ct = charTimes(line);
+  const samples = [];
+  for (let y = 1; y < mh - 1; y++) {
+    let i = y * mw + 1;
+    for (let x = 1; x < mw - 1; x++, i++) {
+      if (!mask[i] || D[i] <= 0.55) continue;
+      if (rnd01() > keep) continue;
+      const bx = (x - PAD) * INVMS;
+      const by = (y - PAD) * INVMS;
+      let birth = line.t;
+      for (let r = 0; r < lay.rows.length; r++) {
+        const row = lay.rows[r];
+        const y0 = row.ly - lay.lh * 0.5, y1 = row.ly + lay.lh * 0.5;
+        if (by < y0 || by > y1) continue;
+        const chs = row.chars;
+        let lo = 0, hi = chs.length - 1, found = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          const cc = chs[mid];
+          if (bx < cc.x) hi = mid - 1;
+          else if (bx > cc.x + cc.w) lo = mid + 1;
+          else { found = mid; break; }
+        }
+        if (found < 0) found = bx < chs[0].x ? 0 : chs.length - 1;
+        const oi = chs[found].oi;
+        birth = ct[Math.min(oi, ct.length - 1)];
+        break;
+      }
+      /* 预计算：这颗粒子沿笔画切向能走多远还不越出墨迹。
+         粒子只在 ±amp 内往返 → 整句期间笔画密度恒定，不会被"抽干"成空管。 */
+      const tx = TX[i], ty = TY[i];
+      let fwd = 0, bwd = 0;
+      for (let q = 2; q <= 16; q += 2) {
+        const xx = (x + tx * q) | 0, yy = (y + ty * q) | 0;
+        if (xx < 1 || yy < 1 || xx >= mw - 1 || yy >= mh - 1) break;
+        const kk = yy * mw + xx;
+        if (!mask[kk] || D[kk] < 0.45) break;
+        fwd = q;
+      }
+      for (let q = 2; q <= 16; q += 2) {
+        const xx = (x - tx * q) | 0, yy = (y - ty * q) | 0;
+        if (xx < 1 || yy < 1 || xx >= mw - 1 || yy >= mh - 1) break;
+        const kk = yy * mw + xx;
+        if (!mask[kk] || D[kk] < 0.45) break;
+        bwd = q;
+      }
+      samples.push({ x: x, y: y, t: birth, tx: tx, ty: ty, amp: Math.min(fwd, bwd) });
+    }
+  }
+  if (!samples.length) return null;
+
+  /* 每个字的落笔点：画笔画到哪儿，哪儿就亮一下（"风正在写"的笔尖） */
+  const marks = [];
+  for (let r = 0; r < lay.rows.length; r++) {
+    const row = lay.rows[r];
+    for (let k = 0; k < row.chars.length; k++) {
+      const ch = row.chars[k];
+      const oi = Math.min(ch.oi, ct.length - 1);
+      marks.push({ x: lay.ox + ch.x + ch.w * 0.5, t: ct[oi] });
+    }
+  }
+  marks.sort((a, b) => a.t - b.t);
+
+  return {
+    idx: idx, epoch: geoEpoch, lay: lay, mw: mw, mh: mh,
+    mask: mask, D: D, TX: TX, TY: TY, samples: samples, marks: marks,
+    ox: lay.ox, oy: lay.oy,
+    rect: [lay.ox - 40, lay.oy - 40, lay.ox + lay.bw + 40, lay.oy + lay.bh + 40]
+  };
+}
+
+/* ============================================================================
+   七、粒子：分配 / 风道推进 / 逃逸
+   ========================================================================== */
+function spawn(g) {
+  const S = g.samples;
+  pN = Math.min(S.length, MAXP);
+  const cx = g.ox + g.lay.bw * 0.5, cy = g.oy + g.lay.bh * 0.5;
+  const wa = windAngle(cx, cy, t0);
+  const wx = Math.cos(wa), wy = Math.sin(wa);
+  for (let i = 0; i < pN; i++) {
+    const s = S[i];
+    pHX[i] = s.x;
+    pHY[i] = s.y;
+    /* ⚠ 单位：场像素。曾经把 CSS 像素的入场距离直接除以 MS 当成了场像素，
+       结果粒子从 900px 外以 2000px/s 砸进来，整屏都是横飞的雨丝。 */
+    const dist = (70 + Math.random() * 110) * MS;
+    pFX[i] = s.x - wx * dist + (Math.random() - 0.5) * 16;
+    pFY[i] = s.y - wy * dist + (Math.random() - 0.5) * 16;
+    pX[i] = pFX[i];
+    pY[i] = pFY[i];
+    pPX[i] = pX[i];
+    pPY[i] = pY[i];
+    pT0[i] = s.t + Math.random() * 0.10;
+    pFD[i] = Math.max(0.40, Math.min(0.95, dist * INVMS / 460));
+    pSp[i] = 0.55 + Math.random() * 1.10;
+    pPh[i] = Math.random() * 6.2832;
+    pSC[i] = 0.92 + Math.random() * 0.16;
+    pSt[i] = 0;
+    pZ[i] = 0;
+    pBd[i] = 0;
+    pTX[i] = s.tx;
+    pTY[i] = s.ty;
+    pAmp[i] = s.amp > 0 ? s.amp * (0.7 + Math.random() * 0.3) : 0;
+    pEL[i] = 0;
+    pEV[i] = 0;
+    pEVY[i] = 0;
+  }
+}
+
+function clearInk() {
+  pN = 0;
+  FG = null;
+  sprayN = 0;
+}
+
+/* 上一句被风整片吹散（不是淡出） */
+function sprayFrom(g) {
+  if (!g || !pN) return;
+  const ox = g.ox, oy = g.oy;
+  sprayN = 0;
+  for (let i = 0; i < pN && sprayN < SPRAY_N; i += 3) {
+    if (pSt[i] !== 2 && pSt[i] !== 1) continue;
+    const sx = ox + (pX[i] - PAD) * INVMS;
+    const sy = oy + (pY[i] - PAD) * INVMS;
+    if (sx < -120 || sx > W + 120 || sy < -120 || sy > H + 120) continue;
+    const a = windAngle(sx, sy, t0) + (Math.random() - 0.5) * 0.7;
+    const v = 160 + Math.random() * 220;
+    const k = sprayN++;
+    sX[k] = sx; sY[k] = sy;
+    sVX[k] = Math.cos(a) * v;
+    sVY[k] = Math.sin(a) * v - 20;
+    sM[k] = sL[k] = 0.75 + Math.random() * 0.95;
+    sB[k] = 0;
+  }
+}
+
+function escapeOne(i) {
+  if (pSt[i] !== 2) return;
+  const sx = FG.ox + (pX[i] - PAD) * INVMS;
+  const sy = FG.oy + (pY[i] - PAD) * INVMS;
+  const a = windAngle(sx, sy, t0) + (Math.random() - 0.5) * 0.6;
+  const v = (150 + Math.random() * 190) * INVMS;   // → 场像素/秒
+  pSt[i] = 3;
+  pEV[i] = Math.cos(a) * v;
+  pEVY[i] = Math.sin(a) * v;
+  pEL[i] = 0.65 + Math.random() * 1.05;
+  pPX[i] = pX[i];
+  pPY[i] = pY[i];
+}
+
+/* ============================================================================
+   八、节奏：显示与酝酿分离 / 索引单调 / 提前量自适应
+   ========================================================================== */
+const LEAD = 1.5;
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {          // 拖进度条
+    curIdx = -1;
+    brewIdx = -1;
+    lastT = T;
+    clearInk();
+    return;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) setLine(ci);
+    hint.style.opacity = ci >= 0 ? '0' : '1';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.5, gap * 0.6));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; prepare(nx); }
+  }
+}
+
+function prepare(nx) {
+  const line = lines[nx];
+  if (!line) return;
+  if (geoCache && geoCache.idx === nx && geoCache.epoch === geoEpoch) return;
+  geoCache = buildGeometry(line, nx);
+}
+
+function setLine(ci) {
+  const line = lines[ci];
+  if (!line) return;
+  let g = null;
+  if (geoCache && geoCache.idx === ci && geoCache.epoch === geoEpoch) {
+    g = geoCache;
+    geoCache = null;
+  } else {
+    g = buildGeometry(line, ci);
+  }
+  if (FG) sprayFrom(FG);
+  if (!g) { clearInk(); return; }
+  FG = g;
+  spawn(g);
+}
+
+/* ============================================================================
+   九、绘制
+   ========================================================================== */
+function drawWind(dt) {
+  const t = STREAKS.length;
+  if (!t) return;
+  const r = FG ? FG.rect : null;
+  /* 两档：离文字远 = 正常，离文字近 = 淡出（把舞台让给字） */
+  const near = [], far = [];
+  for (let i = 0; i < t; i++) {
+    const s = STREAKS[i];
+    const a = windAngle(s.x, s.y, t0);
+    const v = (130 + 90 * s.sp) * (1 + beatPulse * 0.55);
+    s.x += Math.cos(a) * v * dt;
+    s.y += Math.sin(a) * v * dt;
+    if (s.x < -260 || s.x > W + 260 || s.y < -220 || s.y > H + 220) {
+      /* 从上风侧重生 */
+      const wa = windAngle(0, Math.random() * H, t0);
+      if (Math.cos(wa) >= 0) {
+        s.x = -120 - Math.random() * 160;
+        s.y = Math.random() * H;
+      } else {
+        s.x = W + 120 + Math.random() * 160;
+        s.y = Math.random() * H;
+      }
+      for (let k = 0; k < SHIST; k++) { s.hx[k] = s.x; s.hy[k] = s.y; }
+      s.hi = 0;
+    }
+    s.hi = (s.hi + 1) % SHIST;
+    s.hx[s.hi] = s.x;
+    s.hy[s.hi] = s.y;
+
+    let fade = 1;
+    if (r) {
+      const dx = Math.max(0, Math.max(r[0] - s.x, s.x - r[2]));
+      const dy = Math.max(0, Math.max(r[1] - s.y, s.y - r[3]));
+      fade = Math.min(1, Math.sqrt(dx * dx + dy * dy) / 190);
+    }
+    (fade > 0.62 ? far : near).push(s, fade);
+  }
+  ctx.lineCap = 'round';
+  for (let band = 0; band < 2; band++) {
+    const arr = band === 0 ? near : far;
+    if (!arr.length) continue;
+    ctx.strokeStyle = 'rgba(' + iceR + ',' + iceG + ',' + iceB + ',' + (band === 0 ? 0.011 : 0.017) + ')';
+    ctx.lineWidth = band === 0 ? 0.8 : 1.0;
+    ctx.beginPath();
+    for (let j = 0; j < arr.length; j += 2) {
+      const s = arr[j], fade = arr[j + 1];
+      if (fade < 0.03) continue;
+      let px = 0, py = 0;
+      let started = false;
+      for (let k = 0; k < SHIST; k++) {
+        const idx2 = (s.hi - k + SHIST * 2) % SHIST;
+        const x = s.hx[idx2], y = s.hy[idx2];
+        /* ⚠ 这个阈值必须远大于每帧位移（200px/s ≈ 3.3px/帧）。
+           曾经写成 2.5，等于每一帧都被当成"刚重生"跳过，整条线就碎了。 */
+        if (started && (Math.abs(x - px) + Math.abs(y - py)) > 80) { started = false; }
+        if (!started) { ctx.moveTo(x, y); started = true; }
+        else ctx.lineTo(x, y);
+        px = x; py = y;
+      }
+    }
+    ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
+}
+
+function drawDust(dt) {
+  const k = Math.min(1, dt * 1.4);
+  for (let i = 0; i < DUST_N; i++) {
+    const a = windAngle(dX[i], dY[i], t0);
+    const v = 14 + 34 * dA[i];
+    dVX[i] += (Math.cos(a) * v - dVX[i]) * k;
+    dVY[i] += (Math.sin(a) * v - dVY[i]) * k;
+    dX[i] += dVX[i] * dt;
+    dY[i] += dVY[i] * dt;
+    if (dX[i] < -20) dX[i] = W + 20;
+    if (dX[i] > W + 20) dX[i] = -20;
+    if (dY[i] < -20) dY[i] = H + 20;
+    if (dY[i] > H + 20) dY[i] = -20;
+  }
+  for (let band = 0; band < 2; band++) {
+    ctx.fillStyle = 'rgba(' + iceR + ',' + iceG + ',' + iceB + ',' + (band === 0 ? 0.05 : 0.11) + ')';
+    for (let i = 0; i < DUST_N; i++) {
+      if ((dA[i] > 0.62 ? 1 : 0) !== band) continue;
+      ctx.fillRect(dX[i], dY[i], 1.2, 1.2);
+    }
+  }
+}
+
+function drawInk(dt, T) {
+  if (!FG || !pN) return;
+  const ox = FG.ox, oy = FG.oy;
+  const invbh = 1 / Math.max(1, FG.lay.bh);
+  const gustK = 1 + beatPulse * 0.9;
+
+  /* 笔尖：最后一个"该唱到的字"的位置，附近提亮，让写入过程看得见 */
+  let frontX = -1e9, frontAmp = 0;
+  const marks = FG.marks;
+  if (marks && marks.length) {
+    let fi = -1;
+    for (let m = 0; m < marks.length; m++) if (T >= marks[m].t) fi = m;
+    if (fi >= 0) {
+      frontX = marks[fi].x;
+      frontAmp = Math.max(0, 1 - (T - marks[fi].t) / 0.8) * 1.15;
+    }
+  }
+
+  /* 时不时有粒子被风偷走 —— 这是"颗粒感"的来源之一 */
+  if (Math.random() < dt * 26) escapeOne((Math.random() * pN) | 0);
+
+  for (let i = 0; i < pN; i++) {
+    const st = pSt[i];
+    if (st === 0) {
+      if (T < pT0[i]) continue;
+      pSt[i] = 1;
+      pPX[i] = pX[i];
+      pPY[i] = pY[i];
+    }
+    if (pSt[i] === 1) {
+      /* 风把字写进去：从起飞点划一条弧线落下 */
+      const k = (T - pT0[i]) / pFD[i];
+      const e = k >= 1 ? 1 : 1 - (1 - k) * (1 - k) * (1 - k);
+      const fx = pFX[i], fy = pFY[i];
+      const nx = fx + (pHX[i] - fx) * e;
+      const ny = fy + (pHY[i] - fy) * e + Math.sin(Math.min(1, k) * 3.14159) * 9;
+      pPX[i] = pX[i];
+      pPY[i] = pY[i];
+      pX[i] = nx;
+      pY[i] = ny;
+      if (k >= 1) { pSt[i] = 2; pPX[i] = nx; pPY[i] = ny; }
+    } else if (pSt[i] === 3) {
+      /* 逃逸：自由飞，尾迹很长 */
+      pPX[i] = pX[i];
+      pPY[i] = pY[i];
+      pX[i] += pEV[i] * dt;
+      pY[i] += pEVY[i] * dt;
+      pEV[i] *= 1 - Math.min(0.9, dt * 0.5);
+      pEVY[i] *= 1 - Math.min(0.9, dt * 0.5);
+      pEL[i] -= dt;
+      if (pEL[i] <= 0) {
+        pSt[i] = 0;
+        pT0[i] = T + 0.05;
+        pFX[i] = pX[i];
+        pFY[i] = pY[i];
+        pFD[i] = 0.42;
+      }
+    } else {
+      /* 风道：粒子沿笔画切向**往返滑动**，波形沿笔画传播。
+         不用"自由漂流 + 缰绳"—— 那会把整笔墨迹抽干、挤出亮沟。
+         强制振荡是密度恒定的：每颗粒子永远在自家附近 ±amp 内。 */
+      const hxo = pHX[i], hyo = pHY[i];
+      pPX[i] = pX[i];
+      pPY[i] = pY[i];
+      const w = (1.15 + 1.05 * pSp[i]) * (0.7 + 0.5 * gustK);
+      /* 相位沿笔画坐标展开 → 波沿着笔画跑，整笔像被风梳过去 */
+      const ph = (hxo * pTX[i] + hyo * pTY[i]) * 0.075 - t0 * w + pPh[i];
+      const amp = pAmp[i] * (0.8 + 0.35 * gustK);
+      const offs = Math.sin(ph) * amp;
+      const lat = Math.cos(ph * 0.57 + pPh[i] * 1.7) * 1.1;
+      pX[i] = hxo + pTX[i] * offs - pTY[i] * lat;
+      pY[i] = hyo + pTY[i] * offs + pTX[i] * lat;
+    }
+
+    /* 亮度分档（拖尾按帧位移，飞入自然更亮） */
+    const sx = ox + (pX[i] - PAD) * INVMS;
+    const sy = oy + (pY[i] - PAD) * INVMS;
+    const qx = ox + (pPX[i] - PAD) * INVMS;
+    const qy = oy + (pPY[i] - PAD) * INVMS;
+    const mvx = sx - qx, mvy = sy - qy;
+    const spd2 = Math.sqrt(mvx * mvx + mvy * mvy) / Math.max(0.004, dt);
+    /* 亮度不要再由速度主导 —— 速度主导会让同一笔里明暗随机跳，
+       字看起来像被蚀刻过的铁皮。以"常亮"为底，只留一点速度增益。 */
+    let lum = pSC[i] * (0.72 + 0.34 * Math.min(1, spd2 / 110));
+    if (pSt[i] === 3) lum *= 1.45;
+    if (frontAmp > 0) {
+      const df = sx - frontX;
+      if (df > -175 && df < 175) lum *= 1 + frontAmp * (1 - (df < 0 ? -df : df) / 175);
+    }
+    pBd[i] = lum > 0.95 ? 2 : (lum > 0.62 ? 1 : 0);
+    let z = ((sy - oy) * invbh * ZN) | 0;
+    if (z < 0) z = 0; else if (z >= ZN) z = ZN - 1;
+    pZ[i] = z;
+  }
+
+  /* --- 体光：粗笔画、低透明度铺一层底 ---
+     没有这一层，9000 颗 1.5px 的颗粒在 8 万像素² 的墨迹里根本铺不满，
+     笔画会变成"网格"。宽笔画填的是覆盖率，颗粒层负责质感，两层缺一不可。 */
+  ctx.strokeStyle = 'rgba(' + iceR + ',' + iceG + ',' + iceB + ',0.042)';
+  ctx.lineWidth = 7;
+  ctx.beginPath();
+  for (let i = 0; i < pN; i += 2) {
+    if (pSt[i] === 0) continue;
+    const sx = ox + (pX[i] - PAD) * INVMS;
+    const sy = oy + (pY[i] - PAD) * INVMS;
+    if (sx < -100 || sx > W + 100 || sy < -100 || sy > H + 100) continue;
+    const qx = ox + (pPX[i] - PAD) * INVMS;
+    const qy = oy + (pPY[i] - PAD) * INVMS;
+    ctx.moveTo(qx, qy);
+    ctx.lineTo(sx, sy);
+  }
+  ctx.stroke();
+
+  /* --- 合批描边 --- */
+  for (let z = 0; z < ZN; z++) {
+    const stz = STY[z];
+    for (let b = 0; b < BN; b++) {
+      ctx.strokeStyle = stz[b];
+      ctx.lineWidth = WID[b];
+      ctx.beginPath();
+      for (let i = 0; i < pN; i++) {
+        if (pZ[i] !== z || pBd[i] !== b) continue;
+        if (pSt[i] === 0) continue;
+        const sx = ox + (pX[i] - PAD) * INVMS;
+        const sy = oy + (pY[i] - PAD) * INVMS;
+        if (sx < -100 || sx > W + 100 || sy < -100 || sy > H + 100) continue;
+        const qx = ox + (pPX[i] - PAD) * INVMS;
+        const qy = oy + (pPY[i] - PAD) * INVMS;
+        const dx = sx - qx, dy = sy - qy;
+        const l2 = dx * dx + dy * dy;
+        if (l2 > 4900) { ctx.moveTo(sx, sy); ctx.lineTo(sx + 0.7, sy); }
+        else if (l2 < 0.16) { ctx.moveTo(sx, sy); ctx.lineTo(sx + 0.75, sy); }
+        else { ctx.moveTo(qx, qy); ctx.lineTo(sx, sy); }
+      }
+      ctx.stroke();
+    }
+  }
+
+  /* --- 亮头：少数颗粒画成实心点，让"颗粒"看得见 --- */
+  ctx.strokeStyle = DOT_C;
+  ctx.lineWidth = 2.6;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (let i = 0; i < pN; i += 3) {
+    if (pSt[i] === 0 || pBd[i] !== 2) continue;
+    const sx = ox + (pX[i] - PAD) * INVMS;
+    const sy = oy + (pY[i] - PAD) * INVMS;
+    if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue;
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + 0.35, sy);
+  }
+  ctx.stroke();
+  ctx.lineCap = 'butt';
+}
+
+function drawSpray(dt) {
+  if (!sprayN) return;
+  /* 每帧算一次全场风就够了 —— 逐颗算 windAngle 是 3×3200 次 sin，
+     光这一项就能吞掉好几毫秒。 */
+  const wa = windAngle(W * 0.5, H * 0.45, t0);
+  const wvx = Math.cos(wa) * 205;
+  const wvy = Math.sin(wa) * 205;
+  const k = Math.min(1, dt * 1.1);
+  for (let i = 0; i < sprayN; i++) {
+    if (sL[i] <= 0) continue;
+    sVX[i] += (wvx - sVX[i]) * k;
+    sVY[i] += (wvy - sVY[i]) * k;
+    sX[i] += sVX[i] * dt;
+    sY[i] += sVY[i] * dt;
+    sL[i] -= dt;
+  }
+  ctx.lineCap = 'round';
+  for (let pass = 0; pass < 2; pass++) {
+    ctx.strokeStyle = 'rgba(' + Math.min(255, iceR + 18) + ',' + Math.min(255, iceG + 10) + ',' + iceB + ',' + (pass ? 0.09 : 0.20) + ')';
+    ctx.lineWidth = pass ? 1.3 : 2.0;
+    ctx.beginPath();
+    for (let i = 0; i < sprayN; i++) {
+      const q = sL[i] / sM[i];
+      if (q <= 0) continue;
+      if ((q > 0.45) !== (pass === 0)) continue;
+      ctx.moveTo(sX[i], sY[i]);
+      ctx.lineTo(sX[i] + 0.2, sY[i]);
+    }
+    ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
+}
+
+/* ============================================================================
+   十、主循环
+   ========================================================================== */
+function frame(ms) {
+  let dt = (ms - lastMs) / 1000;
+  if (!isFinite(dt) || dt <= 0) dt = 0.016;
+  if (dt > 0.05) dt = 0.05;
+  lastMs = ms;
+  t0 += dt;
+  beatPulse *= Math.exp(-dt * 2.1);
+  if (beatPulse < 0.001) beatPulse = 0;
+
+  const T = now();
+  timing(T);
+
+  if (needRebuild) {
+    needRebuild = false;
+    if (curIdx >= 0) setLine(curIdx);
+  }
+
+  /* 1) 淡出：一步做掉拖尾 + 暗角 */
+  const fa = 1 - Math.pow(0.85, dt * 60);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = fa;
+  ctx.drawImage(fadeCv, 0, 0, W, H);
+  ctx.globalAlpha = 1;
+
+  /* 2) 加色层 */
+  ctx.globalCompositeOperation = 'lighter';
+  drawWind(dt);
+  drawDust(dt);
+  drawInk(dt, T);
+  drawSpray(dt);
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+
+/* ============================================================================
+   十一、与播放器通信（协议照抄，不要改）
+   ========================================================================== */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1;
+    brewIdx = -1;
+    lastT = -1;
+    geoCache = null;
+    geoEpoch++;
+    clearInk();
+    if (p.accent && p.accent.length >= 3) {
+      ACC = [p.accent[0] | 0, p.accent[1] | 0, p.accent[2] | 0];
+      buildColors();
+    }
+    clockT = 0;
+    clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.4';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time;
+    clockAt = performance.now();
+    playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍要**相干**：整场一起加速、一起亮，不是逐颗乱踢。
+       振荡模型里就是给每颗粒子加一个沿切向的瞬时偏移（同一方向）。 */
+    const lv = d.payload.level || 0;
+    beatPulse = Math.min(1.6, beatPulse + 0.35 + lv * 0.75);
+    const kick = 5 * (0.5 + lv);
+    for (let i = 0; i < pN; i++) {
+      if (pSt[i] !== 2) continue;
+      pX[i] += pTX[i] * kick;
+      pY[i] += pTY[i] * kick;
+    }
+  }
+});
+
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ============================================================================
+   十二、启动
+   ========================================================================== */
+buildColors();
+resize();
+addEventListener('resize', resize);
+requestAnimationFrame(frame);
+
+window.__stage = () => {
+  let on = 0, flying = 0, esc = 0;
+  for (let i = 0; i < pN; i++) {
+    if (pSt[i] === 2) on++;
+    else if (pSt[i] === 1) flying++;
+    else if (pSt[i] === 3) esc++;
+  }
+  return {
+    lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+    particles: pN, onChannel: on, flying: flying, escaping: esc,
+    spray: sprayN,
+    field: FG ? (FG.mw + 'x' + FG.mh) : 'none',
+    lines_geo: FG ? FG.lay.rows.length : 0,
+    fontSize: FG ? Math.round(FG.lay.fs) : 0,
+    t: +now().toFixed(2),
+    beat: +beatPulse.toFixed(2)
+  };
+};
+</script>
+</body>
+</html>

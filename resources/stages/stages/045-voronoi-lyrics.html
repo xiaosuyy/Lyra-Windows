@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>泰森多边形</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060b;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;pointer-events:none;z-index:5;
+       background:radial-gradient(120% 100% at 50% 50%,transparent 44%,rgba(3,5,11,.44) 80%,rgba(3,5,11,.82))}
+  #scan{position:fixed;inset:0;pointer-events:none;z-index:6;opacity:.1;
+       background:repeating-linear-gradient(0deg,rgba(0,0,0,.5) 0 1px,transparent 1px 3px);
+       mix-blend-mode:multiply}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(170,205,235,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="scan"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   045 · 泰森多边形 —— 字是一片**会分裂的细胞组织**
+   ---------------------------------------------------------------------------
+   和已有 10 个的区别：001-010 的"字"都是一堆点自己摆出来的形状。
+   这里没有任何东西移动到字形上：点的位置几乎不动，
+   变的是每个点的**势力值**（幂图的权重）。字是被"细胞膨胀"顶出来的。
+
+   机制（参考页只有"点集 → 细胞"，我给它加了两件事）：
+     · 幂图（power diagram）：每个细胞点带一个权重 w，
+       半平面裁剪的常数从 (|o|²-|s|²)/2 变成 (|o|²-|s|²)/2 + (w_s-w_o)/2。
+       权重由字形距离场给 —— 笔画上的细胞"吃"掉邻居的地盘，
+       整片细胞的**边界**就被顶成了字的轮廓。所以字不在点上，在**边界**上。
+     · 有丝分裂 / 凋亡：势力够大的细胞（在笔画上）会**分裂成两个**，
+       两个子细胞沿各自的轴分开，局部分辨率翻倍 —— 所以字上那一片
+       细胞比周围细一倍，边界更贴笔画。势力掉下去就合回一个。
+       换句时整片组织凋亡、按书写顺序重新长出来（坑③：旧的一整批在这里被丢掉）。
+
+   为什么快：格子加速 —— 每个细胞只跟自己附近 13 个格子的点做裁剪（不是 O(n²)）；
+   倒角距离场一次建好、之后 O(1) 查表（坑⑯）；
+   细胞按亮度分 6 档、边分 3 档合批（每档只描一遍，不是每档描两遍）；
+   组织图按 ~2.5Hz 重算（一次 ≈ 20~40ms），其余帧直接复用烘好的图；
+   "哪个字亮了"走的是掩膜 → litCv 的**独立**合成（≈2ms），一帧就生效。
+
+   精修记录：① YRC 逐字生长 —— 每个格子记它所属字的成立时刻 slotCT
+   （chars[k].t；缺 chars / 长度不符按 t+dur*k/n 均分，__stage 增 yrc 字段），
+   权重从 0.60 的"静息态"在 0.3s 内涨到 1.0，同时该格的点**分裂成两个**、
+   细胞核点亮、边界加档 —— 第 k 字的分裂/膨胀正好压在 chars[k].t 上；
+   静息态就有 60% 的权重，所以整句从换句那一刻起完整可读（旧版 4s 时只长到
+   第 19 字，后半句是一片没有轮廓的空白组织）。② 长句自动折 2~3 行 + 字号
+   自适应（41 字 @96px 三行，旧版压成一行 28px、细胞边界糊成一条横带）。
+   ③ 动效：镜头缓慢呼吸缩放 + 平移（整片组织一起漂）、细胞分裂（原有）、
+   踩拍整片一起鼓（相干）；accent 调最亮的两档细胞与细胞核。
+   ④ 性能返工（串行实测 43~50fps → 57~59）：①把"字上那一份"从几何刷新里拆出来
+   （maskChar → litDirty → renderLit），逐字亮起不再等组织图重算 —— 旧版两者绑在
+   一起，30 帧才刷一次，YRC 最晚要等 0.5s；②边从"5 遍全量描边"降到"每档 1 遍"，
+   细胞核只给 q>0.30 的格子（背景格也点核会把包围盒铺成一片亮点，屏幕上一个硬矩形）；
+   ③组织图 0.72 倍采样 + 包围盒边缘羽化（bakeFeather），矩形边界化在背景里；
+   ④换句的"凋亡"改成整块 snapshot 淡出，不再每帧重描 3000+ 个旧胞。
+   分词：不使用。逐字时间已精确到字、静息态保证整句可读，按词团生长只会让
+   细胞在句子里"跳段"分裂。
+   ========================================================================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const TAU = Math.PI * 2;
+const FONT = (fs) => '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+let W = 0, H = 0, DPR = 1;
+let bgGrad = null;
+
+/* ---- 参数 ---- */
+const G = 11;                     // 组织网格间距：必须比笔画细，细胞才排得出字（20px 时整行糊成一条）
+const JIT = G * 0.40;             // 抖动
+const WMAX = 0.45 * G * G;        // 权重上限：位移 ≈ 0.225G，细胞鼓起来但不把笔画糊在一起
+const SIG = 2.6;                  // 影响半径：只让真正压在笔画上的细胞亮起来（宽一点整行就糊成一条）
+const CELL = 4;                   // 距离场格子（比细胞细，边界才贴得住笔画）
+const POLYMAX = 48;               // 单个细胞顶点上限
+const TBUF = 64;                  // 裁剪临时多边形顶点上限
+
+/* ---- 距离场 ---- */
+let gw = 0, gh = 0, dist = null, wgt = null;
+let hasField = false;
+const box = { x0: 0, y0: 0, x1: 0, y1: 0 };
+let lastPts = null;
+
+/* ---- 组织 ---- */
+let cols = 0, rows = 0, ox = 0, oy = 0;
+let slotX = null, slotY = null, slotS = null, slotSep = null, slotCT = null, slotN = 0;
+let slotBase = new Int32Array(4096);        // 每格第一个点在 siteX 里的下标
+let slotCnt = new Int32Array(4096);         // 这一格现在有 1 个点还是 2 个（分裂）
+let dieT = 0;
+
+/* ---- 点（细胞核）---- */
+const MAXSITES = 9000;
+let siteX = new Float32Array(MAXSITES), siteY = new Float32Array(MAXSITES);
+let siteW = new Float32Array(MAXSITES), siteQ = new Float32Array(MAXSITES);
+let siteSlot = new Int32Array(MAXSITES);
+let siteN = 0;
+let cellXY = new Float64Array(MAXSITES * POLYMAX * 2);
+let cellOff = new Int32Array(MAXSITES), cellN = new Int32Array(MAXSITES);
+
+/* 幂图裁剪的临时多边形（两块轮换） */
+const pa = new Float64Array(TBUF * 2), pb = new Float64Array(TBUF * 2);
+const candBuf = new Int32Array(32);
+const candD = new Float32Array(32);
+
+let fillPaths = [], edgePaths = [], nucPaths = [];
+/* 换句时旧组织不再每帧重描 3000+ 个胞（实测 20~60ms/帧）：整块拷成一张图淡出 */
+let oldCv = null, oldX = 0, oldY = 0, oldW = 0, oldH = 0;
+/* 逐字"亮起来"只改掩膜，不重算几何 —— 所以 litDirty 一置就立刻重合成 litCv */
+let litDirty = true, baseT = 0;
+
+const BUCK = 6;
+const FILLS = [
+  'rgb(13,23,40)', 'rgb(19,34,56)', 'rgb(27,48,76)',
+  'rgb(38,70,104)', 'rgb(56,112,150)', 'rgb(100,182,216)'
+];
+const EDGE_B = 3;
+const EDGES = ['rgba(120,212,255,0.11)', 'rgba(140,228,255,0.20)', 'rgba(186,242,255,0.40)'];
+const NUC_B = 2;
+const NUCS = ['rgba(150,220,255,0.16)', 'rgba(255,222,152,0.62)'];
+
+/* 先放一批空 path，第一帧还没算图时 fill(undefined) 会直接抛错 */
+for (let b = 0; b < BUCK; b++) fillPaths.push(new Path2D());
+for (let b = 0; b < EDGE_B; b++) edgePaths.push(new Path2D());
+for (let b = 0; b < NUC_B; b++) nucPaths.push(new Path2D());
+
+let lines = [], accent = [120, 220, 255];
+let beatPulse = 0;
+let lay = null, ctArr = null, curYrc = false, lit = 0, curT = 0;
+let curLineRef = null;
+
+function resize() {
+  DPR = Math.min(1.5, window.devicePixelRatio || 1);   // 贴图成本是逐像素的，2 倍屏不划算
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  bgGrad = ctx.createRadialGradient(W * 0.5, H * 0.45, 0, W * 0.5, H * 0.45, Math.max(W, H) * 0.72);
+  bgGrad.addColorStop(0, '#0a111d');
+  bgGrad.addColorStop(0.5, '#070b13');
+  bgGrad.addColorStop(1, '#04060b');
+  if (curLineRef) relayout();
+  buildIdle();
+}
+
+/* ---- 排版：长句折 2~3 行，字号自适应 ---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => {
+    if (i > 0 && i < n) {
+      const c = text.charCodeAt(i);
+      if (c >= 0xDC00 && c <= 0xDFFF) return i - 1;
+    }
+    return i;
+  };
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+function makeLayout(text) {
+  if (!text) return null;
+  const rows = splitRows(text);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.74, 1120);
+  const maxH = H * 0.46;
+  const LHK = 1.24;
+  octx.font = FONT(96);
+  let widest = 0;
+  for (const r of rows) widest = Math.max(widest, octx.measureText(r).width);
+  let fs = 96 * Math.min(1, maxW / Math.max(1, widest), maxH / (nr * LHK * 96));
+  fs = Math.max(28, Math.floor(fs));
+  octx.font = FONT(fs);
+  let wMax = 0;
+  for (const r of rows) wMax = Math.max(wMax, octx.measureText(r).width);
+  if (wMax > maxW) { fs = Math.max(28, Math.floor(fs * maxW / wMax)); octx.font = FONT(fs); }
+  const LH = fs * LHK;
+  const glyphs = [], rowInfo = [];
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  let gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r];
+    let wsum = 0; const ws = [];
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH;
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi++ });
+      x += w;
+    }
+    rowInfo.push({ text: row, x0: W / 2 - wsum / 2, w: wsum, y: y });
+  }
+  return { glyphs: glyphs, rowInfo: rowInfo, fs: fs, LH: LH, nr: nr };
+}
+
+function charTimes(line) {
+  const n = line.text.length;
+  const ct = new Float32Array(n);
+  const chs = line.chars;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      ct[k] = v;
+    }
+  }
+  if (!ok) {
+    const dur = line.dur > 0 ? line.dur : 3;
+    const t0 = +line.t || 0;
+    for (let k = 0; k < n; k++) ct[k] = t0 + dur * k / Math.max(1, n);
+  }
+  for (let k = 1; k < n; k++) if (ct[k] < ct[k - 1]) ct[k] = ct[k - 1];
+  return { ct: ct, yrc: ok };
+}
+
+/* ---- 单字采样（相对字心）---- */
+function sampleChar(ch, fs) {
+  octx.font = FONT(fs);
+  const w = Math.max(6, Math.ceil(octx.measureText(ch).width) + 8);
+  const h = Math.max(6, Math.ceil(fs * 1.35) + 8);
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(ch, w / 2, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const pts = [];
+  for (let y = 0; y < h; y += 2)
+    for (let x = 0; x < w; x += 2)
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - w / 2, y - h / 2);
+  return pts;
+}
+
+function layoutPoints(L) {
+  const out = [];
+  for (let i = 0; i < L.glyphs.length; i++) {
+    const g = L.glyphs[i], p = sampleChar(g.ch, L.fs);
+    for (let k = 0; k < p.length; k += 2) out.push(g.x + p[k], g.y + p[k + 1]);
+  }
+  return out;
+}
+
+function buildField(pts) {
+  gw = Math.ceil(W / CELL) + 1; gh = Math.ceil(H / CELL) + 1;
+  const n = gw * gh;
+  if (!dist || dist.length !== n) { dist = new Float32Array(n); wgt = new Float32Array(n); }
+  const INF = 1e6;
+  for (let i = 0; i < n; i++) dist[i] = INF;
+  const cx = W / 2, cy = H / 2;
+  let x0 = W, y0 = H, x1 = 0, y1 = 0;
+  for (let i = 0; i < pts.length; i += 2) {
+    const sx = pts[i], sy = pts[i + 1];            // 点云已是画布绝对坐标
+    const gx = (sx / CELL) | 0, gy = (sy / CELL) | 0;
+    if (gx >= 0 && gx < gw && gy >= 0 && gy < gh) dist[gy * gw + gx] = 0;
+    if (sx < x0) x0 = sx; if (sx > x1) x1 = sx;
+    if (sy < y0) y0 = sy; if (sy > y1) y1 = sy;
+  }
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const i = y * gw + x; let v = dist[i];
+    if (x > 0 && dist[i - 1] + 1 < v) v = dist[i - 1] + 1;
+    if (y > 0 && dist[i - gw] + 1 < v) v = dist[i - gw] + 1;
+    if (x > 0 && y > 0 && dist[i - gw - 1] + 1.414 < v) v = dist[i - gw - 1] + 1.414;
+    if (x < gw - 1 && y > 0 && dist[i - gw + 1] + 1.414 < v) v = dist[i - gw + 1] + 1.414;
+    dist[i] = v;
+  }
+  for (let y = gh - 1; y >= 0; y--) for (let x = gw - 1; x >= 0; x--) {
+    const i = y * gw + x; let v = dist[i];
+    if (x < gw - 1 && dist[i + 1] + 1 < v) v = dist[i + 1] + 1;
+    if (y < gh - 1 && dist[i + gw] + 1 < v) v = dist[i + gw] + 1;
+    if (x < gw - 1 && y < gh - 1 && dist[i + gw + 1] + 1.414 < v) v = dist[i + gw + 1] + 1.414;
+    if (x > 0 && y < gh - 1 && dist[i + gw - 1] + 1.414 < v) v = dist[i + gw - 1] + 1.414;
+    dist[i] = v;
+  }
+  for (let i = 0; i < n; i++) {
+    const t = dist[i] * CELL / SIG;
+    wgt[i] = t < 3 ? Math.exp(-t * t) : 0;
+  }
+  box.x0 = x0; box.y0 = y0; box.x1 = x1; box.y1 = y1;
+  hasField = pts.length > 0;
+  lastPts = pts;
+}
+
+function S(x, y) {
+  const gx = (x / CELL) | 0, gy = (y / CELL) | 0;
+  if (gx < 0 || gx >= gw || gy < 0 || gy >= gh) return 0;
+  return wgt[gy * gw + gx];
+}
+
+/* ---- 铺组织：字形包围盒上的抖动网格，每个格子记自己的势力、分裂状态和成立时刻 ---- */
+function buildSlots() {
+  if (!hasField) { slotN = 0; return; }
+  const M = 44;
+  const x0 = box.x0 - M, x1 = box.x1 + M, y0 = box.y0 - M, y1 = box.y1 + M;
+  cols = Math.max(2, Math.ceil((x1 - x0) / G));
+  rows = Math.max(2, Math.ceil((y1 - y0) / G));
+  ox = x0; oy = y0;
+  const n = cols * rows;
+  if (!slotBase || slotBase.length < n) {
+    slotBase = new Int32Array(n); slotCnt = new Int32Array(n);
+  }
+  if (!slotX || slotX.length < n) {
+    slotX = new Float32Array(n); slotY = new Float32Array(n);
+    slotS = new Float32Array(n); slotSep = new Float32Array(n);
+    slotCT = new Float32Array(n);
+  }
+  slotN = Math.min(n, slotX.length);
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const i = r * cols + c;
+    /* 抖动用确定性的哈希，别每帧换一个样子 */
+    const h1 = Math.sin(c * 12.9898 + r * 78.233) * 43758.5453;
+    const h2 = Math.sin(c * 39.3468 + r * 11.135) * 24634.6345;
+    const jx = ((h1 - Math.floor(h1)) - 0.5) * 2 * JIT;
+    const jy = ((h2 - Math.floor(h2)) - 0.5) * 2 * JIT;
+    const x = ox + (c + 0.5) * G + jx, y = oy + (r + 0.5) * G + jy;
+    slotX[i] = x; slotY[i] = y;
+    slotS[i] = S(x, y);
+    slotSep[i] = 0;
+    /* 这一格归哪个字：最近的字的成立时刻。字的坐标已经是画布坐标 */
+    let bt = 0, bd = 1e18;
+    if (lay && ctArr) {
+      for (let k = 0; k < lay.glyphs.length; k++) {
+        const g = lay.glyphs[k];
+        const dx = g.x - x, dy = (g.y - y) * 1.45;      // 上下相邻的行不要互相抢
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bd) { bd = d2; bt = ctArr[k]; }
+      }
+    }
+    slotCT[i] = bt;
+  }
+  siteN = 0;
+  setupTex(ox, oy, cols * G, rows * G);
+}
+/* ---- 半平面裁剪（幂图：常数多一项 (w_i - w_j)/2）---- */
+function clipPoly(src, n, dst, dx, dy, c) {
+  let on = 0;
+  let px = src[(n - 1) * 2], py = src[(n - 1) * 2 + 1];
+  let pin = px * dx + py * dy <= c;
+  for (let i = 0; i < n; i++) {
+    const qx = src[i * 2], qy = src[i * 2 + 1];
+    const qin = qx * dx + qy * dy <= c;
+    if (pin !== qin) {
+      const ex = qx - px, ey = qy - py;
+      const den = ex * dx + ey * dy;
+      if (den > 1e-9 || den < -1e-9) {
+        const u = (c - (px * dx + py * dy)) / den;
+        dst[on * 2] = px + ex * u; dst[on * 2 + 1] = py + ey * u; on++;
+      }
+    }
+    if (qin) { dst[on * 2] = qx; dst[on * 2 + 1] = qy; on++; }
+    px = qx; py = qy; pin = qin;
+  }
+  return on;
+}
+
+/* ---- 算一遍图：每格最多两个点（分裂），每个点只跟附近 13 格的最近 12 个点裁 ---- */
+function computeTissue() {
+  if (!slotN) { siteN = 0; return; }
+  const pulse = 1 + 0.24 * beatPulse;
+  /* 静息态 0.60：整句从换句起就有轮廓（可读）；唱到哪个字，那个字 0.3s 内涨满并分裂 */
+  const BASE = 0.60;
+  /* 1) 生成点：势力大的格子分裂成两个子细胞，沿各自固定的轴分开 */
+  let sn = 0;
+  for (let i = 0; i < slotN; i++) {
+    const s = slotS[i];
+    const t0 = slotCT[i];
+    let grow = curT >= t0 ? Math.min(1, (curT - t0) / 0.30) : 0;
+    const gmix = BASE + (1 - BASE) * grow;
+    const w = WMAX * s * gmix * pulse;
+    /* 亮度：没唱到的字是暗档（仍看得见笔画），唱到的那一刻跳到最亮档。
+       再乘一个包围盒边缘的淡出 —— 不然组织图会在屏幕上露出一个硬矩形
+       （背景格也有底色、边和细胞核，整块的边界一眼就能看出来）*/
+    const edg = Math.max(0, Math.min(slotX[i] - ox, ox + cols * G - slotX[i],
+                                     slotY[i] - oy, oy + rows * G - slotY[i]));
+    const fade = edg < 58 ? edg / 58 : 1;
+    const q = (s * (0.58 + 0.42 * grow) + (grow > 0 && grow < 1 ? 0.10 * s : 0)) * fade * fade;
+    const sep = slotSep[i];
+    slotBase[i] = sn;
+    if (sn >= MAXSITES - 2) { slotCnt[i] = 0; continue; }
+    if (sep > 0.03 && s > 0.35) {
+      const off = sep * G * 0.30;
+      const a = i * 2.399963;
+      const ax2 = Math.cos(a) * off, ay2 = Math.sin(a) * off;
+      siteX[sn] = slotX[i] - ax2; siteY[sn] = slotY[i] - ay2;
+      siteW[sn] = w; siteQ[sn] = q; siteSlot[sn] = i; sn++;
+      siteX[sn] = slotX[i] + ax2; siteY[sn] = slotY[i] + ay2;
+      siteW[sn] = w; siteQ[sn] = q; siteSlot[sn] = i; sn++;
+      slotCnt[i] = 2;
+    } else {
+      siteX[sn] = slotX[i]; siteY[sn] = slotY[i];
+      siteW[sn] = w; siteQ[sn] = q; siteSlot[sn] = i; sn++;
+      slotCnt[i] = 1;
+    }
+  }
+  siteN = sn;
+  const bx0 = ox, by0 = oy, bx1 = ox + cols * G, by1 = oy + rows * G;
+  /* 2) 逐点裁剪 */
+  for (let i = 0; i < siteN; i++) {
+    const si = siteSlot[i];
+    const c0 = si % cols, r0 = (si / cols) | 0;
+    /* 3×3 + 上下左右各隔一格的 4 个 = 13 格，够定出一个抖动网格的 Voronoi 胞 */
+    let cn = 0;
+    for (let k = 0; k < 13; k++) {
+      const dc = (k < 9) ? (k % 3) - 1 : ((k === 9) ? 2 : (k === 10) ? -2 : 0);
+      const dr = (k < 9) ? (((k / 3) | 0) - 1) : ((k === 11) ? 2 : (k === 12) ? -2 : 0);
+      const cc = c0 + dc, rr = r0 + dr;
+      if (cc < 0 || cc >= cols || rr < 0 || rr >= rows) continue;
+      const s2 = rr * cols + cc;
+      const n2 = slotCnt[s2], b2 = slotBase[s2];
+      for (let q = 0; q < n2; q++) {
+        const j = b2 + q;
+        if (j === i || cn >= 32) continue;
+        const dx = siteX[j] - siteX[i], dy = siteY[j] - siteY[i];
+        candBuf[cn] = j; candD[cn] = dx * dx + dy * dy; cn++;
+      }
+    }
+    /* 选最近的 12 个：远的那几个对胞的形状没有影响，裁了是白裁 */
+    let use = cn < 12 ? cn : 12;
+    if (slotS[si] < 0.25 && use > 7) use = 7;      // 背景格裁得少一点，省一半时间
+    for (let a = 0; a < use; a++) {
+      let bi = a, bd = candD[a];
+      for (let b = a + 1; b < cn; b++) if (candD[b] < bd) { bd = candD[b]; bi = b; }
+      if (bi !== a) {
+        const t = candBuf[a]; candBuf[a] = candBuf[bi]; candBuf[bi] = t;
+        const td = candD[a]; candD[a] = candD[bi]; candD[bi] = td;
+      }
+    }
+    /* 3) 半平面裁剪（幂图：常数多一项 (w_i - w_j)/2）*/
+    const R = G * 1.75;
+    const sx0 = Math.max(bx0, siteX[i] - R), sx1 = Math.min(bx1, siteX[i] + R);
+    const sy0 = Math.max(by0, siteY[i] - R), sy1 = Math.min(by1, siteY[i] + R);
+    let src = pa, dst = pb, pn = 4;
+    src[0] = sx0; src[1] = sy0; src[2] = sx1; src[3] = sy0;
+    src[4] = sx1; src[5] = sy1; src[6] = sx0; src[7] = sy1;
+    const xi = siteX[i], yi = siteY[i], wi = siteW[i];
+    for (let a = 0; a < use && pn >= 3 && pn < TBUF - 2; a++) {
+      const j = candBuf[a];
+      const jx = siteX[j], jy = siteY[j];
+      const dx = jx - xi, dy = jy - yi;
+      if (dx * dx + dy * dy < 1e-6) continue;
+      const c = (jx * jx + jy * jy - xi * xi - yi * yi) * 0.5 + (wi - siteW[j]) * 0.5;
+      const nn = clipPoly(src, pn, dst, dx, dy, c);
+      if (nn < 3) { pn = 0; break; }
+      pn = nn;
+      const t = src; src = dst; dst = t;
+    }
+    cellOff[i] = i * POLYMAX * 2;
+    if (pn > POLYMAX) pn = POLYMAX;
+    cellN[i] = pn;
+    if (pn >= 3) for (let k = 0; k < pn * 2; k++) cellXY[cellOff[i] + k] = src[k];
+  }
+  buildPaths();
+  renderTissue();
+}
+
+/* ---- 合批：按亮度 6 档填、边 3 档描、核 2 档点 ---- */
+function buildPaths() {
+  fillPaths = []; edgePaths = []; nucPaths = [];
+  for (let b = 0; b < BUCK; b++) fillPaths.push(new Path2D());
+  for (let b = 0; b < EDGE_B; b++) edgePaths.push(new Path2D());
+  for (let b = 0; b < NUC_B; b++) nucPaths.push(new Path2D());
+  for (let i = 0; i < siteN; i++) {
+    const n = cellN[i];
+    if (n < 3) continue;
+    const q = Math.max(0, Math.min(0.999, siteQ[i]));
+    const b = (q * BUCK) | 0;
+    const p = fillPaths[b];
+    const o = cellOff[i];
+    p.moveTo(cellXY[o], cellXY[o + 1]);
+    for (let k = 1; k < n; k++) p.lineTo(cellXY[o + k * 2], cellXY[o + k * 2 + 1]);
+    p.closePath();
+    const eb = q > 0.62 ? 2 : (q > 0.22 ? 1 : 0);
+    const pe = edgePaths[eb];
+    for (let k = 0; k < n; k++) {
+      const k2 = (k + 1) % n;
+      pe.moveTo(cellXY[o + k * 2], cellXY[o + k * 2 + 1]);
+      pe.lineTo(cellXY[o + k2 * 2], cellXY[o + k2 * 2 + 1]);
+    }
+    /* 细胞核只给"有势力"的格子（q>0.30）。背景格也点核的话，整块包围盒会被
+       铺成一片等距亮点 —— 屏幕上看就是一个硬邦邦的矩形，字还没出来，框先出来了 */
+    if (q > 0.30) {
+      const nb = (q > 0.72 && siteQ[i] > 0.7) ? 1 : 0;
+      const pn2 = nucPaths[nb];
+      const nx = siteX[i], ny = siteY[i];
+      pn2.moveTo(nx + 1.5, ny); pn2.arc(nx, ny, 1.5, 0, TAU);
+    }
+  }
+}
+
+/* ---- 离屏组织图 + 文字掩膜 ----
+   为什么要有这一层：每帧直接填 6 档多边形 + 3 道边（三行句子有 3000+ 个胞）是
+   26fps 的元凶。改成"每 3 帧才重画一次离屏图"，帧内只剩两次 drawImage；
+   同时顺带解决了可读性 —— 把组织图按**文字掩膜**取一份（字上的细胞被提亮），
+   字就是"由细胞拼出来的"，而不是一整条亮斑。掩膜按字累积：
+   整句先铺 42% 的潜影，第 k 字在 chars[k].t 那一刻把掩膜补到 100%。 */
+let texCv = null, texG = null, litCv = null, litG = null, maskCv = null, maskG = null;
+let texX = 0, texY = 0, texW = 0, texH = 0, texK = 1;
+let featherCv = null;                            // 组织图边缘的羽化遮罩（只在尺寸变时烘一次）
+
+/* 组织图只覆盖字的包围盒，所以它一定有个矩形边界。边界以内全是真实细胞（不能裁），
+   只把 buildSlots 留出来的那圈边距（M）用线性渐变擦掉 —— 矩形边就化在背景里了。 */
+function bakeFeather(pw, ph) {
+  if (!featherCv) featherCv = document.createElement('canvas');
+  if (featherCv.width !== pw || featherCv.height !== ph) { featherCv.width = pw; featherCv.height = ph; }
+  const g = featherCv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = 'source-over';
+  g.clearRect(0, 0, pw, ph);
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, pw, ph);
+  g.globalCompositeOperation = 'destination-out';
+  const m = Math.max(2, Math.round(44 * texK));
+  const band = (x, y, w, h, x0, y0, x1, y1) => {
+    const lg = g.createLinearGradient(x0, y0, x1, y1);
+    lg.addColorStop(0, 'rgba(0,0,0,1)');
+    lg.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = lg;
+    g.fillRect(x, y, w, h);
+  };
+  band(0, 0, m, ph, 0, 0, m, 0);
+  band(pw - m, 0, m, ph, pw, 0, pw - m, 0);
+  band(0, 0, pw, m, 0, 0, 0, m);
+  band(0, ph - m, pw, m, 0, ph, 0, ph - m);
+  g.globalCompositeOperation = 'source-over';
+}
+
+function setupTex(x0, y0, w0, h0) {
+  texX = x0; texY = y0;
+  texW = Math.max(8, Math.round(w0)); texH = Math.max(8, Math.round(h0));
+  /* 细胞边界本来就是软的，0.72 倍采样（像素量 ×0.52）肉眼看不出差别，填充便宜一半 */
+  texK = Math.min(DPR, 1) * 0.72;
+  const pw = Math.max(2, Math.round(texW * texK)), ph = Math.max(2, Math.round(texH * texK));
+  if (!texCv) texCv = document.createElement('canvas');
+  if (!litCv) litCv = document.createElement('canvas');
+  if (!maskCv) maskCv = document.createElement('canvas');
+  for (const c of [texCv, litCv, maskCv]) {
+    if (c.width !== pw || c.height !== ph) { c.width = pw; c.height = ph; }
+  }
+  texG = texCv.getContext('2d');
+  litG = litCv.getContext('2d');
+  maskG = maskCv.getContext('2d');
+  bakeFeather(pw, ph);
+  litG.setTransform(1, 0, 0, 1, 0, 0);
+  litG.clearRect(0, 0, litCv.width, litCv.height);
+  bakeMask();
+}
+
+/* 掩膜：整句先铺 42% 的潜影（任何时刻整句可读）*/
+function bakeMask() {
+  if (!maskG) return;
+  maskG.setTransform(1, 0, 0, 1, 0, 0);
+  maskG.globalCompositeOperation = 'source-over';
+  maskG.clearRect(0, 0, maskCv.width, maskCv.height);
+  maskG.setTransform(texK, 0, 0, texK, -texX * texK, -texY * texK);
+  maskG.textAlign = 'center'; maskG.textBaseline = 'middle';
+  maskG.font = FONT(lay ? lay.fs : 96);
+  maskG.fillStyle = 'rgba(255,255,255,0.52)';
+  if (lay) for (let r = 0; r < lay.rowInfo.length; r++) {
+    const row = lay.rowInfo[r];
+    maskG.fillText(row.text, row.x0 + row.w / 2, row.y);
+  }
+  lit = 0;
+  litDirty = true;
+}
+
+/* 第 k 个字：掩膜补到 100% —— 这个字的细胞当场"长实" */
+function maskChar(k) {
+  if (!maskG || !lay || !lay.glyphs[k]) return;
+  maskG.globalCompositeOperation = 'source-over';
+  maskG.font = FONT(lay.fs);
+  maskG.fillStyle = '#fff';
+  maskG.fillText(lay.glyphs[k].ch, lay.glyphs[k].x, lay.glyphs[k].y);
+  litDirty = true;                       /* 下一帧就重合成，不等几何刷新 */
+}
+
+/* 组织图本体（几何 + 细胞色）—— 只在"几何变了"的时候重画 */
+function renderBase() {
+  if (!texG) return;
+  texG.setTransform(1, 0, 0, 1, 0, 0);
+  texG.clearRect(0, 0, texCv.width, texCv.height);
+  texG.setTransform(texK, 0, 0, texK, -texX * texK, -texY * texK);
+  texG.globalCompositeOperation = 'source-over';
+  for (let b = 0; b < BUCK; b++) { texG.fillStyle = FILLS2[b]; texG.fill(fillPaths[b]); }
+  /* 边：每档只描一遍。旧版是「1 道暗缝 + 1 道晕 + 3 档」= 5 遍全量描边，
+     3000+ 胞 × 5 遍就是这一形态最大的单笔开销，纯浪费 */
+  texG.globalCompositeOperation = 'lighter';
+  for (let b = 0; b < EDGE_B; b++) {
+    texG.strokeStyle = EDGES2[b];
+    texG.lineWidth = b === 2 ? 0.95 : 0.7;
+    texG.stroke(edgePaths[b]);
+  }
+  texG.fillStyle = NUCS2[0]; texG.fill(nucPaths[0]);
+  texG.fillStyle = NUCS2[1]; texG.fill(nucPaths[1]);
+  texG.globalCompositeOperation = 'source-over';
+  /* 把矩形边化掉（只擦最外那圈没有字的边距） */
+  if (featherCv) {
+    texG.setTransform(1, 0, 0, 1, 0, 0);
+    texG.globalCompositeOperation = 'destination-in';
+    texG.drawImage(featherCv, 0, 0);
+    texG.globalCompositeOperation = 'source-over';
+  }
+}
+
+/* "字上的那一份"：texCv 按文字掩膜取一份出来。这一步只是两次小图合成（≈1.8ms），
+   所以从几何刷新里拆出来 —— 逐字亮起不必等组织图重算。
+   旧版把它绑在 30 帧一次的几何刷新上，YRC 就被拖成 0.5s 一跳（最晚晚 0.5s）。 */
+function renderLit() {
+  if (!litG || !texG) return;
+  litG.setTransform(1, 0, 0, 1, 0, 0);
+  litG.globalCompositeOperation = 'source-over';
+  litG.clearRect(0, 0, litCv.width, litCv.height);
+  litG.drawImage(texCv, 0, 0);
+  litG.globalCompositeOperation = 'destination-in';
+  litG.drawImage(maskCv, 0, 0);
+  litG.globalCompositeOperation = 'source-over';
+  litDirty = false;
+}
+
+function renderTissue() { renderBase(); renderLit(); }
+
+/* ---- 空闲态：整屏一片稀疏的泰森多边形（参考页的样子）---- */
+const IC = 12, IR = 7;
+let idleX = null, idleY = null, idlePh = null;
+function buildIdle() {
+  const n = IC * IR;
+  idleX = new Float32Array(n); idleY = new Float32Array(n); idlePh = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const c = i % IC, r = (i / IC) | 0;
+    const h1 = Math.sin(c * 12.9898 + r * 78.233) * 43758.5453;
+    const h2 = Math.sin(c * 39.3468 + r * 11.135) * 24634.6345;
+    idleX[i] = ((c + 0.5 + ((h1 - Math.floor(h1)) - 0.5) * 0.78) / IC) * W;
+    idleY[i] = ((r + 0.5 + ((h2 - Math.floor(h2)) - 0.5) * 0.78) / IR) * H;
+    idlePh[i] = (h1 - Math.floor(h1)) * TAU;
+  }
+}
+
+function computeIdle(t) {
+  if (!texCv || texW !== W || texH !== H) setupTex(0, 0, W, H);
+  const n = IC * IR;
+  for (let i = 0; i < n; i++) {
+    siteX[i] = idleX[i] + Math.sin(t * 0.11 + idlePh[i]) * 26;
+    siteY[i] = idleY[i] + Math.cos(t * 0.09 + idlePh[i] * 1.4) * 22;
+    siteW[i] = 0;
+    /* 空闲态没有字形场，深浅靠每格自己的哈希 —— 参考页里那片深浅不一的细胞 */
+    siteQ[i] = 0.15 + 0.75 * (0.5 + 0.5 * Math.sin(idlePh[i] * 3.7));
+  }
+  siteN = n;
+  for (let i = 0; i < n; i++) {
+    let src = pa, dst = pb, pn = 4;
+    src[0] = -80; src[1] = -80; src[2] = W + 80; src[3] = -80;
+    src[4] = W + 80; src[5] = H + 80; src[6] = -80; src[7] = H + 80;
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const dx = siteX[j] - siteX[i], dy = siteY[j] - siteY[i];
+      if (dx * dx + dy * dy < 1e-6) continue;
+      const c = (siteX[j] * siteX[j] + siteY[j] * siteY[j] -
+                 siteX[i] * siteX[i] - siteY[i] * siteY[i]) * 0.5;
+      const nn = clipPoly(src, pn, dst, dx, dy, c);
+      if (nn < 3) { pn = 0; break; }
+      pn = nn;
+      const tt = src; src = dst; dst = tt;
+    }
+    cellOff[i] = i * POLYMAX * 2;
+    cellN[i] = pn;
+    if (pn >= 3) for (let k = 0; k < pn * 2; k++) cellXY[cellOff[i] + k] = src[k];
+  }
+  buildPaths();
+  renderTissue();
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let pend = null, pendIdx = -1;
+
+function brewLine(i) {
+  const L = lines[i];
+  const tm = charTimes(L);
+  const ly = makeLayout(L.text);
+  pend = { lay: ly, ct: tm.ct, yrc: tm.yrc, pts: ly ? layoutPoints(ly) : [] };
+  pendIdx = i;
+}
+
+function relayout() {
+  if (!curLineRef) return;
+  const tm = charTimes(curLineRef);
+  lay = makeLayout(curLineRef.text);
+  ctArr = tm.ct; curYrc = tm.yrc;
+  buildField(lay ? layoutPoints(lay) : []);
+  buildSlots();
+  bakeMask();
+  lit = 0;
+  if (slotN) computeTissue();
+}
+
+function startLine(i) {
+  if (pendIdx !== i) brewLine(i);
+  const b = pend;
+  pend = null; pendIdx = -1;
+  curLineRef = lines[i];
+  /* 旧的一整批细胞在这里凋亡：把当前这张组织图**整块拷下来**淡出，再把点集换掉（坑③）。
+     旧版是留着旧 Path2D 每帧重描一遍（6 次 fill + 3 次 stroke × 3000 胞），
+     换句那 0.45 秒里每帧都是 20ms+ 的尖峰。 */
+  if (texCv && litCv && lay) {
+    if (!oldCv) oldCv = document.createElement('canvas');
+    if (oldCv.width !== texCv.width || oldCv.height !== texCv.height) {
+      oldCv.width = texCv.width; oldCv.height = texCv.height;
+    }
+    const og = oldCv.getContext('2d');
+    og.setTransform(1, 0, 0, 1, 0, 0);
+    og.globalCompositeOperation = 'source-over';
+    og.clearRect(0, 0, oldCv.width, oldCv.height);
+    og.drawImage(texCv, 0, 0);
+    og.globalCompositeOperation = 'lighter';
+    og.drawImage(litCv, 0, 0);
+    og.globalCompositeOperation = 'source-over';
+    oldX = texX; oldY = texY; oldW = texW; oldH = texH;
+    dieT = 0.45;
+  }
+  if (!b || !b.lay) {
+    lay = null; ctArr = null; curYrc = false;
+    buildField([]); buildSlots();
+    return;
+  }
+  lay = b.lay; ctArr = b.ct; curYrc = b.yrc;
+  buildField(b.pts || []);
+  buildSlots();
+  lit = 0;
+  for (let k = 0; k < slotN; k++) slotSep[k] = 0;
+  computeTissue();                       /* 新句当场成型，不等下一次几何刷新 */
+}
+
+function timing(T) {
+  curT = T;
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    pend = null; pendIdx = -1; hasField = false; slotN = 0; siteN = 0;
+    oldCv = null; lay = null; ctArr = null; curLineRef = null; lit = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci);
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine(nx); }
+  }
+  /* YRC：第 k 个字的细胞在 chars[k].t 分裂并涨满（槽位的 grow 直接读 slotCT）*/
+  if (ctArr) while (lit < ctArr.length && T >= ctArr[lit]) { maskChar(lit); lit++; }
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    pend = null; pendIdx = -1; hasField = false;
+    slotN = 0; siteN = 0; dieT = 0;
+    oldCv = null; litDirty = true; baseT = 0;
+    lay = null; ctArr = null; curLineRef = null; lit = 0;
+    if (p.accent) { accent = p.accent; rebuildPalette(); }
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：所有细胞的势力一起涨一下 —— 整片组织同时鼓起来（相干），
+       不是逐点乱踢；幂图里"一起涨"等于边界整体外扩，字会像呼吸一样鼓一下 */
+    beatPulse = Math.min(1, beatPulse + 0.6 * (0.35 + (d.payload.level || 0)));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* accent 影响最亮的两档细胞、边与核（在 init 之后重算一次）*/
+let FILLS2 = FILLS.slice(), EDGES2 = EDGES.slice(), NUCS2 = NUCS.slice();
+function rebuildPalette() {
+  FILLS2 = FILLS.slice(); EDGES2 = EDGES.slice(); NUCS2 = NUCS.slice();
+  FILLS2[4] = 'rgb(' + Math.min(255, accent[0] * 0.35 + 20) + ',' + Math.min(255, accent[1] * 0.35 + 70) + ',' +
+              Math.min(255, accent[2] * 0.35 + 95) + ')';
+  FILLS2[5] = 'rgb(' + Math.min(255, accent[0] * 0.45 + 70) + ',' + Math.min(255, accent[1] * 0.45 + 130) + ',' +
+              Math.min(255, accent[2] * 0.45 + 150) + ')';
+  EDGES2[2] = 'rgba(' + Math.min(255, accent[0] * 0.3 + 170) + ',' + Math.min(255, accent[1] * 0.3 + 200) + ',' +
+              Math.min(255, accent[2] * 0.3 + 220) + ',0.36)';
+}
+
+/* ---------------- 主循环 ---------------- */
+let last = performance.now();
+let t0 = 0;
+let frameNo = 0;
+let camS = 1, camX = 0, camY = 0;
+
+resize();
+requestAnimationFrame(frame);
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt; frameNo++;
+  const T = now();
+  timing(T);
+  beatPulse *= Math.exp(-dt * 3.0);
+  if (dieT > 0) dieT -= dt;
+
+  /* 有丝分裂 / 合并：已经唱到的格子在分裂，没唱到的还是单细胞 */
+  if (slotN) {
+    const k = Math.min(1, dt * 3.2);
+    for (let i = 0; i < slotN; i++) {
+      const tg = (slotS[i] > 0.35 && curT >= slotCT[i]) ? 1 : 0;
+      slotSep[i] += (tg - slotSep[i]) * k;
+    }
+  }
+
+  /* 镜头：整片组织缓慢呼吸缩放 + 平移 */
+  camS = 1 + 0.013 * Math.sin(t0 * 0.067) + 0.005 * Math.sin(t0 * 0.027);
+  camX = Math.sin(t0 * 0.055) * 12;
+  camY = Math.cos(t0 * 0.043) * 9;
+
+  /* 组织图重算很贵（3000+ 胞 × 13 邻域裁剪 + 3 档填充 + 2 档描边，实测一次 ≈ 20~40ms），
+     所以几何按 ~2.5Hz 刷；"哪个字亮了"走的是 maskChar → litDirty → renderLit()，
+     和几何解耦，逐字时机照样压在 chars[k].t 上（旧版绑在一起，最晚晚 0.5s）。 */
+  if (litDirty && texCv && lay) renderLit();
+  if (hasField && slotN) {
+    baseT += dt;
+    if (baseT >= 0.40) { baseT = 0; computeTissue(); }
+  } else if (frameNo % 3 === 0) {
+    computeIdle(t0);
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(W / 2 + camX, H / 2 + camY);
+  ctx.scale(camS, camS);
+  ctx.translate(-W / 2, -H / 2);
+
+  /* 凋亡中的旧组织：一张图淡出（这就是"上一句占用的细胞被释放"）*/
+  if (oldCv && dieT > 0) {
+    ctx.globalAlpha = Math.max(0, dieT / 0.45) * 0.8;
+    ctx.drawImage(oldCv, oldX, oldY, oldW, oldH);
+    ctx.globalAlpha = 1;
+  } else if (oldCv && dieT <= 0) oldCv = null;
+
+  /* 细胞：一张离屏图（背景膜）+ 一张按文字掩膜取出来的（字上的细胞）*/
+  if (texCv) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = lay ? 0.55 : 1;
+    ctx.drawImage(texCv, texX, texY, texW, texH);
+    ctx.globalAlpha = 1;
+    if (lay) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.82;
+      ctx.drawImage(litCv, texX, texY, texW, texH);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  if (beatPulse > 0.01) {
+    ctx.fillStyle = 'rgba(' + Math.min(255, accent[0]) + ',' + Math.min(255, accent[1]) + ',' +
+                    Math.min(255, accent[2]) + ',' + (0.035 * beatPulse).toFixed(3) + ')';
+    ctx.fillRect(-W, -H, W * 3, H * 3);
+  }
+  ctx.restore();
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx, hasField: hasField,
+  slots: slotN, sites: siteN, yrc: !!curYrc, lit: lit,
+  rows: lay ? lay.rowInfo.length : 0, fs: lay ? lay.fs : 0,
+  chars: ctArr ? ctArr.length : 0, T: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

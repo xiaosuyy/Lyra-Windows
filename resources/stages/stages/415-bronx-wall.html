@@ -1,0 +1,1415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>喷漆未干 · 415</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #100c0a; }
+  #street { position: fixed; inset: 0; display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="street" aria-hidden="true"></canvas>
+<script>
+var stageState = {
+  lines: 0, idx: -1, t: 0, playing: true, frames: 0, js: 0,
+  gl: false, rm: false, text: ''
+};
+
+window.__stage = function () {
+  return {
+    lines: stageState.lines,
+    idx: stageState.idx,
+    t: stageState.t,
+    playing: stageState.playing,
+    frames: stageState.frames,
+    js: stageState.js,
+    err: '',
+    text: stageState.text,
+    gl: stageState.gl,
+    rm: stageState.rm
+  };
+};
+
+(function () {
+  'use strict';
+
+  var READY_FALLBACK_MS = 600;
+
+  var lastErrorMs = -2000;
+  var readySent = false;
+
+  function reportError(scope, problem) {
+    var nowMs = Date.now();
+    if (nowMs - lastErrorMs < 1000) return;
+    lastErrorMs = nowMs;
+    console.error('[415 bronx-wall] ' + scope, problem);
+  }
+
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try {
+      parent.postMessage({ __c100: 1, type: 'ready' }, '*');
+    } catch (problem) {
+      reportError('ready', problem);
+    }
+  }
+
+  requestAnimationFrame(function announceOnFirstFrame() { sendReady(); });
+  setTimeout(sendReady, READY_FALLBACK_MS);
+
+  var canvasEl = document.getElementById('street');
+  var ctx = canvasEl.getContext('2d', { alpha: false });
+  var view = { w: 1440, h: 900, dpr: 1 };
+  var clock = { tickTime: 0, tickAt: 0, lastFrame: 0 };
+  var liveState = { bass: 0.42, mid: 0.3, treble: 0.22, level: 0.4 };
+  var resizeTimer = 0;
+  var track = { lines: [], index: -1, active: null, song: { name: '', artists: '' } };
+
+  var accentRgb = [226, 88, 46];
+  var palette = {};
+  var scene = { baked: null, ready: false };
+  var motion = { bass: 0, mid: 0, treble: 0, level: 0, kick: 0, beatIndex: -1, pulse: 0 };
+  var perf = { avg: 8, low: false, quality: 1 };
+  var particles = [];
+  var lyricCache = { key: '', layout: null, index: -2 };
+  var bakeState = { canvas: null, paint: null, steps: [], index: 0, running: false };
+
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return Date.now();
+  }
+
+  function clampNumber(value, low, high) {
+    if (!isFinite(value)) return low;
+    return Math.min(high, Math.max(low, value));
+  }
+
+  function hash01(seed) {
+    var value = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
+    return value - Math.floor(value);
+  }
+
+  function safeColor(red, green, blue, alpha) {
+    var redValue = Math.round(clampNumber(Number(red), 0, 255));
+    var greenValue = Math.round(clampNumber(Number(green), 0, 255));
+    var blueValue = Math.round(clampNumber(Number(blue), 0, 255));
+    var alphaValue = clampNumber(alpha === undefined ? 1 : Number(alpha), 0, 1);
+    return 'rgba(' + redValue + ',' + greenValue + ',' + blueValue + ',' + (Math.round(alphaValue * 1000) / 1000) + ')';
+  }
+
+  function mixRgb(fromColor, toColor, amount) {
+    var ratio = clampNumber(amount, 0, 1);
+    return [
+      fromColor[0] + (toColor[0] - fromColor[0]) * ratio,
+      fromColor[1] + (toColor[1] - fromColor[1]) * ratio,
+      fromColor[2] + (toColor[2] - fromColor[2]) * ratio
+    ];
+  }
+
+  function addStop(gradient, position, color) {
+    if (!gradient || typeof gradient.addColorStop !== 'function') return;
+    try {
+      gradient.addColorStop(clampNumber(position, 0, 1), color);
+    } catch (problem) {
+      reportError('gradient.stop', problem);
+    }
+  }
+
+  function canDrawPath(target) {
+    return !!target && typeof target.beginPath === 'function' && typeof target.fill === 'function';
+  }
+
+  function makeCanvas(width, height) {
+    var canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width));
+    canvas.height = Math.max(1, Math.round(height));
+    return canvas;
+  }
+
+  function buildPalette(sourceRgb) {
+    var fallback = [226, 88, 46];
+    var source = Array.isArray(sourceRgb) ? sourceRgb : [];
+    var resolved = [];
+    var channel = 0;
+    for (var index = 0; index < 3; index += 1) {
+      channel = Number(source[index]);
+      resolved.push(isFinite(channel) ? Math.round(clampNumber(channel, 0, 255)) : fallback[index]);
+    }
+    accentRgb = resolved;
+    var deep = mixRgb(resolved, [16, 11, 10], 0.62);
+    var light = mixRgb(resolved, [255, 243, 220], 0.58);
+    palette = {
+      accent: safeColor(resolved[0], resolved[1], resolved[2], 1),
+      accentGlow: safeColor(resolved[0], resolved[1], resolved[2], 0.16),
+      accentSoft: safeColor(resolved[0], resolved[1], resolved[2], 0.34),
+      accentDeep: safeColor(deep[0], deep[1], deep[2], 1),
+      accentPale: safeColor(light[0], light[1], light[2], 1),
+      mortar: '#241a17',
+      brick: [126, 61, 46],
+      brickAlt: [101, 48, 39],
+      plaster: [98, 87, 74],
+      ink: '#0d0a09',
+      chalk: '#f6ecdc',
+      steelHi: '#a8adb2',
+      steelLo: '#1d2126',
+      glass: '#141920'
+    };
+  }
+
+  buildPalette(null);
+
+  function resizeCanvas() {
+    var width = canvasEl.clientWidth || window.innerWidth;
+    var height = canvasEl.clientHeight || window.innerHeight;
+    if (!isFinite(width) || width <= 0) width = 1440;
+    if (!isFinite(height) || height <= 0) height = 900;
+    var ratio = Math.min(window.devicePixelRatio || 1, 2);
+    view.w = width;
+    view.h = height;
+    view.dpr = ratio;
+    canvasEl.width = Math.max(1, Math.round(width * ratio));
+    canvasEl.height = Math.max(1, Math.round(height * ratio));
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+
+  function wallRowBoxes(width, height) {
+    var rowCount = 22;
+    var units = [];
+    var total = 0;
+    for (var row = 0; row < rowCount; row += 1) {
+      var fraction = rowCount > 1 ? row / (rowCount - 1) : 1;
+      var unit = 0.015 + 0.036 * Math.pow(fraction, 1.7);
+      units.push(unit);
+      total += unit;
+    }
+    var wallBottom = height * 0.735;
+    var pixelScale = wallBottom / total;
+    var boxes = [];
+    var cursor = wallBottom;
+    for (var index = rowCount - 1; index >= 0; index -= 1) {
+      var rowHeight = units[index] * pixelScale;
+      boxes[index] = { top: cursor - rowHeight, height: rowHeight };
+      cursor -= rowHeight;
+    }
+    return { rows: boxes, bottom: wallBottom };
+  }
+
+  function paintWallRows(paint, width, height, fromRow, toRow) {
+    var boxes = wallRowBoxes(width, height).rows;
+    var first = Math.max(0, Math.min(boxes.length - 1, fromRow));
+    var last = Math.max(0, Math.min(boxes.length - 1, toRow));
+    for (var row = first; row <= last; row += 1) {
+      var box = boxes[row];
+      var brickWidth = Math.max(26, box.height * 2.3);
+      var columns = Math.min(48, Math.ceil(width / brickWidth) + 2);
+      var parityShift = row % 2 === 0 ? 0 : brickWidth * 0.5;
+      for (var column = 0; column < columns; column += 1) {
+        var seed = hash01(row * 43.7 + column * 11.3 + 2.7);
+        var tone = 0.72 + seed * 0.5;
+        var base = seed > 0.82 ? palette.brickAlt : palette.brick;
+        var x = column * brickWidth - brickWidth + parityShift +
+          (hash01(row * 7.1 + column * 3.3) - 0.5) * brickWidth * 0.06;
+        var inset = Math.max(0.8, box.height * 0.055);
+        paint.fillStyle = safeColor(base[0] * tone, base[1] * tone, base[2] * tone, 1);
+        paint.fillRect(x + inset, box.top + inset, brickWidth - inset * 2, box.height - inset * 2);
+        if (seed > 0.94) {
+          paint.fillStyle = 'rgba(16,11,10,0.5)';
+          paint.fillRect(x + brickWidth * 0.32, box.top + box.height * 0.2, brickWidth * 0.24, box.height * 0.46);
+        } else if (seed < 0.12) {
+          paint.fillStyle = 'rgba(255,224,188,0.07)';
+          paint.fillRect(x + inset, box.top + inset, brickWidth - inset * 2, Math.max(1, box.height * 0.13));
+        }
+      }
+    }
+  }
+
+  function paintWallGrime(paint, width, height) {
+    var wallBottom = height * 0.735;
+    var patchCount = 5;
+    for (var patch = 0; patch < patchCount; patch += 1) {
+      var patchWidth = width * (0.09 + hash01(patch * 6.2) * 0.15);
+      var patchHeight = height * (0.05 + hash01(patch * 3.4) * 0.09);
+      var patchX = width * (hash01(patch * 8.8) * 0.88);
+      var patchY = height * (0.06 + hash01(patch * 2.3) * 0.42);
+      paint.fillStyle = safeColor(palette.plaster[0], palette.plaster[1], palette.plaster[2], 0.16 + hash01(patch) * 0.14);
+      paint.fillRect(patchX, patchY, patchWidth, patchHeight);
+      paint.fillRect(patchX + patchWidth * 0.2, patchY + patchHeight * 0.7, patchWidth * 0.6, patchHeight * 0.5);
+    }
+
+    for (var streak = 0; streak < 46; streak += 1) {
+      var streakX = width * hash01(streak * 4.7 + 1.3);
+      var streakWidth = Math.max(1, width * (0.001 + hash01(streak * 9.1) * 0.006));
+      var streakTop = height * hash01(streak * 3.9) * 0.5;
+      var streakHeight = wallBottom * (0.12 + hash01(streak * 7.4) * 0.4);
+      paint.fillStyle = safeColor(12, 9, 8, 0.05 + hash01(streak * 2.2) * 0.12);
+      paint.fillRect(streakX, streakTop, streakWidth, streakHeight);
+    }
+
+    var tagColors = ['#7fd6d0', '#e8508f', '#f2c14e', '#8f9fe8', '#f6ecdc'];
+    for (var tag = 0; tag < 11; tag += 1) {
+      var colour = tagColors[tag % tagColors.length];
+      var originX = width * (0.03 + hash01(tag * 2.1) * 0.86);
+      var originY = height * (0.1 + hash01(tag * 5.6) * 0.5);
+      var spanX = width * (0.04 + hash01(tag * 9.2) * 0.1);
+      var spanY = height * (0.02 + hash01(tag * 4.4) * 0.05);
+      paint.save();
+      paint.globalAlpha = 0.05 + hash01(tag * 6.3) * 0.08;
+      paint.strokeStyle = colour;
+      paint.lineWidth = Math.max(1.4, height * 0.0045);
+      paint.lineCap = 'round';
+      paint.lineJoin = 'round';
+      if (canDrawPath(paint)) {
+        paint.beginPath();
+        paint.moveTo(originX, originY);
+        paint.bezierCurveTo(
+          originX + spanX * 0.35, originY - spanY,
+          originX + spanX * 0.72, originY + spanY,
+          originX + spanX, originY - spanY * 0.35
+        );
+        paint.stroke();
+        paint.beginPath();
+        paint.moveTo(originX + spanX * 0.18, originY + spanY * 0.9);
+        paint.quadraticCurveTo(originX + spanX * 0.48, originY + spanY * 2, originX + spanX * 0.86, originY + spanY * 0.7);
+        paint.stroke();
+      }
+      paint.restore();
+    }
+  }
+
+  function paintCarBody(paint, width, height) {
+    var top = height * 0.735;
+    var bodyHeight = height - top;
+    paint.fillStyle = '#0b0908';
+    paint.fillRect(0, top - Math.max(3, height * 0.006), width, Math.max(6, height * 0.012));
+
+    var body = paint.createLinearGradient(0, top, 0, height);
+    addStop(body, 0, '#adb3b8');
+    addStop(body, 0.05, '#7f868d');
+    addStop(body, 0.42, '#4d525a');
+    addStop(body, 1, '#171a1f');
+    paint.fillStyle = body;
+    paint.fillRect(0, top, width, bodyHeight);
+
+    var glassTop = top + bodyHeight * 0.05;
+    var glassHeight = bodyHeight * 0.26;
+    paint.fillStyle = safeColor(19, 25, 33, 0.96);
+    paint.fillRect(0, glassTop, width, glassHeight);
+
+    paint.save();
+    if (canDrawPath(paint) && typeof paint.clip === 'function') {
+      paint.beginPath();
+      paint.rect(0, glassTop, width, glassHeight);
+      paint.clip();
+      for (var slash = 0; slash < 5; slash += 1) {
+        var slashX = width * hash01(slash * 3.7 + 0.4);
+        paint.fillStyle = safeColor(190, 205, 215, 0.06 + hash01(slash * 1.9) * 0.07);
+        paint.beginPath();
+        paint.moveTo(slashX, glassTop + glassHeight);
+        paint.lineTo(slashX + width * 0.16, glassTop);
+        paint.lineTo(slashX + width * 0.22, glassTop);
+        paint.lineTo(slashX + width * 0.06, glassTop + glassHeight);
+        paint.closePath();
+        paint.fill();
+      }
+      paint.restore();
+    } else if (paint && typeof paint.restore === 'function') {
+      paint.restore();
+    }
+
+    var mullionGap = Math.max(130, width * 0.19);
+    for (var mullion = 1; mullion * mullionGap < width; mullion += 1) {
+      var mullionX = mullion * mullionGap;
+      paint.fillStyle = 'rgba(22,24,26,0.9)';
+      paint.fillRect(mullionX - width * 0.007, glassTop, width * 0.014, glassHeight);
+      paint.fillStyle = 'rgba(150,165,175,0.16)';
+      paint.fillRect(mullionX - width * 0.007, glassTop, Math.max(1, width * 0.002), glassHeight);
+    }
+    paint.fillStyle = 'rgba(210,220,228,0.12)';
+    paint.fillRect(0, glassTop, width, Math.max(1, bodyHeight * 0.008));
+
+    paint.fillStyle = 'rgba(16,16,18,0.92)';
+    paint.fillRect(0, glassTop + glassHeight, width, Math.max(2, bodyHeight * 0.022));
+
+    var fluteTop = glassTop + glassHeight + bodyHeight * 0.05;
+    var fluteGap = Math.max(3, bodyHeight * 0.024);
+    var fluteCount = Math.min(56, Math.ceil((height - fluteTop) / fluteGap));
+    for (var flute = 0; flute < fluteCount; flute += 1) {
+      var fluteY = fluteTop + flute * fluteGap;
+      paint.fillStyle = 'rgba(255,255,255,0.06)';
+      paint.fillRect(0, fluteY, width, Math.max(1, bodyHeight * 0.004));
+      paint.fillStyle = 'rgba(0,0,0,0.22)';
+      paint.fillRect(0, fluteY + Math.max(1.4, bodyHeight * 0.008), width, Math.max(1, bodyHeight * 0.004));
+    }
+
+    var rivetGap = Math.max(18, width * 0.024);
+    var rivetCount = Math.min(50, Math.ceil(width / rivetGap));
+    for (var rivet = 0; rivet < rivetCount; rivet += 1) {
+      var rivetX = rivet * rivetGap + rivetGap * 0.5;
+      paint.fillStyle = 'rgba(255,255,255,0.16)';
+      if (canDrawPath(paint)) {
+        paint.beginPath();
+        paint.arc(rivetX, glassTop + glassHeight + bodyHeight * 0.09, Math.max(1, width * 0.0012), 0, Math.PI * 2);
+        paint.fill();
+      }
+    }
+
+    var underGlow = paint.createLinearGradient(0, height * 0.86, 0, height);
+    addStop(underGlow, 0, 'rgba(6,5,5,0)');
+    addStop(underGlow, 1, 'rgba(6,5,5,0.92)');
+    paint.fillStyle = underGlow;
+    paint.fillRect(0, height * 0.86, width, height * 0.14);
+  }
+
+  function paintCarMarks(paint, width, height) {
+    var top = height * 0.735;
+    var bodyHeight = height - top;
+
+    paint.save();
+    paint.lineCap = 'round';
+    for (var band = 0; band < 3; band += 1) {
+      var bandY = top + bodyHeight * (0.6 + band * 0.09);
+      paint.strokeStyle = band === 1 ? 'rgba(246,236,220,0.30)' : safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.34);
+      paint.lineWidth = Math.max(3, bodyHeight * 0.03);
+      if (canDrawPath(paint)) {
+        paint.beginPath();
+        paint.moveTo(width * 0.04, bandY);
+        paint.bezierCurveTo(width * 0.26, bandY - bodyHeight * 0.12, width * 0.5, bandY + bodyHeight * 0.1, width * 0.78, bandY - bodyHeight * 0.04);
+        paint.stroke();
+      }
+    }
+    paint.restore();
+
+    paint.fillStyle = 'rgba(242,236,224,0.5)';
+    paint.font = '700 ' + Math.round(height * 0.026) + 'px "Arial Black", Impact, "Microsoft YaHei", sans-serif';
+    paint.textAlign = 'right';
+    paint.textBaseline = 'alphabetic';
+    paint.fillText('415', width * 0.632, top + bodyHeight * 0.5);
+  }
+
+  function paintFence(paint, width, height) {
+    var bandTop = height * 0.735;
+    var bandHeight = height - bandTop;
+    var stepGap = Math.max(15, width * 0.019);
+    var span = width + bandHeight;
+    var lineCount = Math.min(150, Math.ceil(span / stepGap) * 2);
+    paint.save();
+    paint.lineWidth = Math.max(1, width * 0.0008);
+    if (canDrawPath(paint)) {
+      for (var indexA = 0; indexA < lineCount; indexA += 1) {
+        var offsetA = indexA * stepGap;
+        if (offsetA > span) break;
+        paint.strokeStyle = 'rgba(226,232,236,0.075)';
+        paint.beginPath();
+        paint.moveTo(offsetA - bandHeight, bandTop);
+        paint.lineTo(offsetA, height);
+        paint.stroke();
+        paint.beginPath();
+        paint.moveTo(offsetA - bandHeight, height);
+        paint.lineTo(offsetA, bandTop);
+        paint.stroke();
+      }
+    }
+    paint.restore();
+
+    var postGap = Math.max(180, width * 0.24);
+    for (var post = 0; post * postGap < width; post += 1) {
+      var postX = post * postGap + postGap * 0.5;
+      paint.fillStyle = 'rgba(22,24,26,0.85)';
+      paint.fillRect(postX - width * 0.004, bandTop, width * 0.008, bandHeight);
+      paint.fillStyle = 'rgba(220,228,232,0.10)';
+      paint.fillRect(postX - width * 0.004, bandTop, Math.max(1, width * 0.0015), bandHeight);
+    }
+    paint.fillStyle = 'rgba(210,218,222,0.09)';
+    paint.fillRect(0, bandTop + bandHeight * 0.06, width, Math.max(2, height * 0.004));
+  }
+
+  function paintAtmosphere(paint, width, height) {
+    var lampGlow = paint.createRadialGradient(width * 0.16, height * 0.02, 0, width * 0.16, height * 0.02, width * 0.55);
+    addStop(lampGlow, 0, 'rgba(255,196,120,0.32)');
+    addStop(lampGlow, 0.45, 'rgba(255,168,96,0.10)');
+    addStop(lampGlow, 1, 'rgba(255,168,96,0)');
+    paint.fillStyle = lampGlow;
+    paint.fillRect(0, 0, width, height * 0.85);
+
+    var accentWash = paint.createRadialGradient(width * 0.52, height * 0.44, 0, width * 0.52, height * 0.44, width * 0.62);
+    addStop(accentWash, 0, palette.accentGlow);
+    addStop(accentWash, 0.6, safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.04));
+    addStop(accentWash, 1, 'rgba(0,0,0,0)');
+    paint.fillStyle = accentWash;
+    paint.fillRect(0, 0, width, height);
+
+    var topShade = paint.createLinearGradient(0, 0, 0, height * 0.42);
+    addStop(topShade, 0, 'rgba(8,5,4,0.62)');
+    addStop(topShade, 1, 'rgba(8,5,4,0)');
+    paint.fillStyle = topShade;
+    paint.fillRect(0, 0, width, height * 0.42);
+
+    var vignette = paint.createRadialGradient(width * 0.5, height * 0.44, width * 0.24, width * 0.5, height * 0.5, Math.max(width, height) * 0.82);
+    addStop(vignette, 0, 'rgba(6,4,3,0)');
+    addStop(vignette, 0.72, 'rgba(6,4,3,0.32)');
+    addStop(vignette, 1, 'rgba(4,3,3,0.86)');
+    paint.fillStyle = vignette;
+    paint.fillRect(0, 0, width, height);
+
+    for (var fleck = 0; fleck < 1400; fleck += 1) {
+      var fleckX = width * hash01(fleck * 1.7 + 0.9);
+      var fleckY = height * hash01(fleck * 3.3 + 4.1);
+      var fleckAlpha = 0.015 + hash01(fleck * 5.5) * 0.055;
+      paint.fillStyle = hash01(fleck * 9.9) > 0.5 ? safeColor(255, 236, 210, fleckAlpha) : safeColor(10, 7, 6, fleckAlpha);
+      paint.fillRect(fleckX, fleckY, 1.2, 1.2);
+    }
+  }
+
+  function paintBackingPanel(paint, width, height) {
+    var panelTop = height * 0.195;
+    var panelBottom = height * 0.625;
+    var panelLeft = width * 0.028;
+    var panelRight = width * 0.972;
+    var slabs = 5;
+    paint.save();
+    for (var index = 0; index < slabs; index += 1) {
+      var sliceTop = panelTop + (panelBottom - panelTop) * (index / slabs);
+      var sliceHeight = (panelBottom - panelTop) / slabs * 1.16;
+      var jitterLeft = (hash01(index * 3.3 + 0.4) - 0.5) * width * 0.045;
+      var jitterRight = (hash01(index * 7.1 + 1.7) - 0.5) * width * 0.045;
+      paint.fillStyle = safeColor(10, 8, 8, 0.58 + hash01(index * 2.9) * 0.12);
+      paint.fillRect(panelLeft + jitterLeft, sliceTop, panelRight - panelLeft + jitterRight - jitterLeft, sliceHeight);
+    }
+
+    paint.fillStyle = safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.18);
+    paint.fillRect(panelLeft + width * 0.01, panelTop - height * 0.008, panelRight - panelLeft - width * 0.01, Math.max(2, height * 0.005));
+    paint.fillStyle = 'rgba(246,236,220,0.08)';
+    paint.fillRect(panelLeft + width * 0.01, panelBottom - height * 0.004, (panelRight - panelLeft) * 0.55, Math.max(2, height * 0.004));
+
+    for (var drip = 0; drip < 9; drip += 1) {
+      var dripX = panelLeft + (panelRight - panelLeft) * hash01(drip * 4.9 + 2.2);
+      var dripLength = height * (0.01 + hash01(drip * 6.7) * 0.035);
+      paint.fillStyle = safeColor(12, 9, 9, 0.5);
+      paint.fillRect(dripX, panelBottom, Math.max(1.5, width * 0.0018), dripLength);
+    }
+
+    paint.strokeStyle = safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.22);
+    paint.lineWidth = Math.max(2, height * 0.004);
+    if (canDrawPath(paint)) {
+      paint.beginPath();
+      paint.moveTo(panelLeft + width * 0.02, panelTop - height * 0.012);
+      paint.lineTo(panelRight - width * 0.06, panelTop - height * 0.02);
+      paint.stroke();
+    }
+    paint.restore();
+  }
+
+  function startBake() {
+    var scale = Math.min(view.dpr, 1.5);
+    var canvas = makeCanvas(view.w * scale, view.h * scale);
+    var paint = canvas.getContext('2d');
+    if (!paint) {
+      reportError('bake.context', new Error('2d context unavailable'));
+      return;
+    }
+    paint.setTransform(scale, 0, 0, scale, 0, 0);
+    var width = view.w;
+    var height = view.h;
+    var steps = [];
+
+    steps.push(function bakeBase() {
+      paint.fillStyle = '#150f0d';
+      paint.fillRect(0, 0, width, height);
+      paint.fillStyle = palette.mortar;
+      paint.fillRect(0, 0, width, height * 0.735);
+      paintWallRows(paint, width, height, 0, 5);
+    });
+    steps.push(function bakeRowsTwo() { paintWallRows(paint, width, height, 6, 11); });
+    steps.push(function bakeRowsThree() { paintWallRows(paint, width, height, 12, 16); });
+    steps.push(function bakeRowsFour() { paintWallRows(paint, width, height, 17, 21); });
+    steps.push(function bakeGrime() { paintWallGrime(paint, width, height); });
+    steps.push(function bakeBackingPanel() { paintBackingPanel(paint, width, height); });
+    steps.push(function bakeCarBody() { paintCarBody(paint, width, height); });
+    steps.push(function bakeCarMarks() { paintCarMarks(paint, width, height); });
+    steps.push(function bakeFence() { paintFence(paint, width, height); });
+    steps.push(function bakeAtmosphere() { paintAtmosphere(paint, width, height); });
+
+    bakeState.canvas = canvas;
+    bakeState.paint = paint;
+    bakeState.steps = steps;
+    bakeState.index = 0;
+    bakeState.running = true;
+  }
+
+  function runBakeStep() {
+    if (!bakeState.running) return;
+    var step = bakeState.steps[bakeState.index];
+    if (!step) {
+      bakeState.running = false;
+      scene.baked = bakeState.canvas;
+      scene.ready = !!scene.baked && scene.baked.width > 0 && scene.baked.height > 0;
+      bakeState.canvas = null;
+      bakeState.paint = null;
+      bakeState.steps = [];
+      return;
+    }
+    try {
+      step();
+    } catch (problem) {
+      reportError('bake.step', problem);
+    }
+    bakeState.index += 1;
+  }
+
+  function scheduleBake(delayMs) {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      resizeTimer = 0;
+      try {
+        startBake();
+      } catch (problem) {
+        reportError('bake.start', problem);
+      }
+    }, clampNumber(delayMs, 0, 2000));
+  }
+
+  function drawBackdropFallback(paint) {
+    paint.fillStyle = '#1a1210';
+    paint.fillRect(0, 0, view.w, view.h);
+    var fallbackGradient = paint.createLinearGradient(0, 0, 0, view.h);
+    addStop(fallbackGradient, 0, '#0d0908');
+    addStop(fallbackGradient, 0.62, '#3d231a');
+    addStop(fallbackGradient, 1, '#151110');
+    paint.fillStyle = fallbackGradient;
+    paint.fillRect(0, 0, view.w, view.h);
+  }
+
+  var measureCanvas = makeCanvas(8, 8);
+  var measureCtx = measureCanvas.getContext('2d');
+  var grainCanvas = null;
+  var grainPattern = null;
+
+  function lyricFont(size) {
+    return '900 ' + Math.round(size) + 'px "Arial Black", "Helvetica Neue", Impact, "Microsoft YaHei", "PingFang SC", sans-serif';
+  }
+
+  function lyricTimes(line) {
+    var count = Math.min(line.text.length, 72);
+    if (line.timeCache && line.timeCache.length === count) return line.timeCache;
+    var times = [];
+    var chars = line.chars;
+    var duration = line.dur > 0 ? line.dur : 4;
+    for (var index = 0; index < count; index += 1) {
+      var value = null;
+      if (chars && chars.length > index) {
+        var entry = chars[index];
+        if (entry && isFinite(Number(entry.t))) value = Number(entry.t);
+      }
+      if (value === null) value = line.t + duration * (index / Math.max(1, count));
+      times.push(value);
+    }
+    line.timeCache = times;
+    return times;
+  }
+
+  function wrapLyricRows(body, size, maxWidth) {
+    if (!measureCtx) return [{ chars: [], width: 0 }];
+    measureCtx.font = lyricFont(size);
+    var tracking = size * 0.035;
+    var rows = [];
+    var current = { chars: [], width: 0 };
+    for (var index = 0; index < body.length; index += 1) {
+      var character = body[index];
+      if (character === ' ' && current.chars.length === 0) continue;
+      var advance = measureCtx.measureText(character).width + tracking;
+      if (current.width + advance > maxWidth && current.chars.length > 0) {
+        rows.push(current);
+        current = { chars: [], width: 0 };
+        if (rows.length >= 4) break;
+      }
+      current.chars.push({ character: character, advance: advance });
+      current.width += advance;
+    }
+    if (current.chars.length > 0) rows.push(current);
+    return rows;
+  }
+
+  function layoutLyric(text, width, height) {
+    var body = text.slice(0, 96);
+    var maxWidth = width * (width < 640 ? 0.86 : 0.72);
+    var size = clampNumber(Math.min(width * 0.105, height * 0.14), 20, 170);
+    var rows = [];
+    var attempt = 0;
+    for (attempt = 0; attempt < 7; attempt += 1) {
+      rows = wrapLyricRows(body, size, maxWidth);
+      if (rows.length <= 3) break;
+      size = size * 0.85;
+    }
+    if (rows.length === 0) rows = [{ chars: [], width: 0 }];
+    return { size: size, rows: rows, maxWidth: maxWidth };
+  }
+
+  function lyricLayoutFor(line) {
+    var key = Math.round(view.w) + 'x' + Math.round(view.h) + '|' + line.t.toFixed(2) + '|' + line.text.slice(0, 24) + '|' + line.text.length + '|' + (line.chars ? 'y' : 'l');
+    if (lyricCache.key === key && lyricCache.layout) return lyricCache.layout;
+    var layout = layoutLyric(line.text, view.w, view.h);
+    layout.times = lyricTimes(line);
+    lyricCache.key = key;
+    lyricCache.layout = layout;
+    return layout;
+  }
+
+  function drawEmptyState(paint) {
+    var titleSize = clampNumber(Math.min(view.w * 0.034, view.h * 0.048), 16, 48);
+    paint.save();
+    paint.textAlign = 'center';
+    paint.textBaseline = 'middle';
+    paint.font = lyricFont(titleSize);
+    paint.fillStyle = 'rgba(11,8,7,0.55)';
+    paint.fillText('这首歌没有词', view.w / 2 + 2, view.h * 0.36 + 3);
+    paint.fillStyle = 'rgba(246,236,220,0.86)';
+    paint.fillText('这首歌没有词', view.w / 2, view.h * 0.36);
+    paint.font = lyricFont(titleSize * 0.5);
+    paint.fillStyle = 'rgba(246,236,220,0.52)';
+    paint.fillText('只有墙上的喷漆还在干', view.w / 2, view.h * 0.36 + titleSize * 1.5);
+    paint.strokeStyle = palette.accentSoft;
+    paint.lineWidth = Math.max(2, titleSize * 0.09);
+    paint.lineCap = 'round';
+    if (canDrawPath(paint)) {
+      paint.beginPath();
+      paint.moveTo(view.w / 2 - titleSize * 2.1, view.h * 0.36 + titleSize * 2.05);
+      paint.lineTo(view.w / 2 + titleSize * 2.1, view.h * 0.36 + titleSize * 1.95);
+      paint.stroke();
+    }
+    paint.restore();
+  }
+
+  function drawGhostLine(paint, previous) {
+    if (!previous || !previous.text) return;
+    var ghostSize = clampNumber(Math.min(view.w * 0.03, view.h * 0.042), 12, 40);
+    paint.save();
+    paint.textAlign = 'center';
+    paint.textBaseline = 'middle';
+    paint.font = lyricFont(ghostSize);
+    paint.fillStyle = 'rgba(246,236,220,0.16)';
+    paint.fillText(previous.text.slice(0, 64), view.w / 2, view.h * 0.145, view.w * 0.7);
+    paint.restore();
+  }
+
+  function drawLyricBlock(paint, timeValue, phase) {
+    var index = resolveIndex(timeValue);
+    if (index !== track.index) {
+      track.index = index;
+      track.active = index >= 0 ? track.lines[index] : null;
+      stageState.idx = index;
+      stageState.text = track.active ? track.active.text : '';
+      lyricCache.key = '';
+    }
+
+    if (track.lines.length === 0) {
+      drawEmptyState(paint);
+      return;
+    }
+
+    var active = track.active;
+    if (!active) return;
+
+    drawGhostLine(paint, index > 0 ? track.lines[index - 1] : null);
+
+    var layout = lyricLayoutFor(active);
+    var size = layout.size;
+    var rows = layout.rows;
+    var rowHeight = size * 1.08;
+    var blockHeight = rowHeight * rows.length;
+    var minCenter = view.h * 0.21 + blockHeight * 0.5;
+    var maxCenter = view.h * 0.605 - blockHeight * 0.5;
+    var centerY = clampNumber(view.h * 0.42, Math.min(minCenter, maxCenter), Math.max(minCenter, maxCenter));
+    var blockTop = centerY - blockHeight * 0.5;
+
+    var halo = paint.createRadialGradient(view.w * 0.5, centerY, size * 0.4, view.w * 0.5, centerY, Math.max(view.w, view.h) * 0.5);
+    addStop(halo, 0, safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.10 + motion.pulse * 0.10));
+    addStop(halo, 0.55, safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.03));
+    addStop(halo, 1, 'rgba(0,0,0,0)');
+    paint.fillStyle = halo;
+    paint.fillRect(0, centerY - size * 3.2, view.w, size * 6.4);
+
+    var times = layout.times;
+    var globalIndex = 0;
+    var lineAge = Math.max(0, timeValue - active.t);
+
+    paint.save();
+    paint.textAlign = 'center';
+    paint.textBaseline = 'middle';
+    paint.font = lyricFont(size);
+    paint.lineJoin = 'round';
+    paint.miterLimit = 2;
+    if (!stageState.rm) paint.transform(1, 0, -0.05, 1, 0, 0);
+
+    for (var rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      var row = rows[rowIndex];
+      var cursorX = (view.w - row.width) / 2;
+      var baseline = blockTop + rowHeight * (rowIndex + 0.5);
+      for (var charIndex = 0; charIndex < row.chars.length; charIndex += 1) {
+        var cell = row.chars[charIndex];
+        var charTime = times[globalIndex];
+        if (charTime === undefined) charTime = active.t;
+        var local = timeValue - charTime;
+        var ramp = clampNumber(local / 0.15, 0, 1);
+        var settle = local > 0 ? Math.max(0, 1 - local / 0.8) : 0;
+        var alpha = 0.08 + ramp * 0.92;
+        var wobble = hash01(globalIndex * 4.7 + 1.3) - 0.5;
+        var rotation = wobble * 0.075;
+        var bob = (hash01(globalIndex * 8.3 + 2.1) - 0.5) * size * 0.05;
+        var scaleValue = 1 + settle * 0.2;
+
+        paint.save();
+        paint.globalAlpha = alpha;
+        paint.translate(cursorX + cell.advance * 0.5, baseline + bob);
+        if (!stageState.rm) {
+          paint.rotate(rotation);
+          paint.scale(scaleValue, scaleValue);
+        }
+        if (ramp > 0) {
+          if (perf.low) {
+            paint.fillStyle = palette.ink;
+            paint.fillText(cell.character, 0, 0);
+            paint.fillStyle = palette.chalk;
+            paint.fillText(cell.character, 0, -size * 0.012);
+          } else {
+            paint.fillStyle = palette.accentDeep;
+            paint.fillText(cell.character, size * 0.05, size * 0.055);
+            paint.strokeStyle = palette.ink;
+            paint.lineWidth = size * 0.13;
+            paint.strokeText(cell.character, 0, 0);
+            paint.fillStyle = palette.chalk;
+            paint.fillText(cell.character, -size * 0.008, -size * 0.012);
+          }
+        } else {
+          paint.strokeStyle = 'rgba(246,236,220,0.5)';
+          paint.lineWidth = Math.max(1, size * 0.022);
+          paint.strokeText(cell.character, 0, 0);
+        }
+        paint.restore();
+
+        cursorX += cell.advance;
+        globalIndex += 1;
+      }
+    }
+    paint.restore();
+
+    if (lineAge > 0.25) {
+      var dripCount = Math.min(7, Math.ceil(size / 18));
+      var dripLength = Math.min(size * 0.7, size * 0.22 + lineAge * size * 0.05);
+      paint.save();
+      paint.strokeStyle = palette.accentSoft;
+      paint.lineWidth = Math.max(1.5, size * 0.02);
+      paint.lineCap = 'round';
+      for (var drip = 0; drip < dripCount; drip += 1) {
+        var dripX = view.w * 0.5 + (hash01(drip * 6.1 + 0.7) - 0.5) * Math.min(view.w * 0.7, layout.maxWidth) * 0.9;
+        var dripTop = blockTop + blockHeight * (0.9 + hash01(drip * 2.9) * 0.1);
+        if (canDrawPath(paint)) {
+          paint.beginPath();
+          paint.moveTo(dripX, dripTop);
+          paint.lineTo(dripX + (hash01(drip * 3.7) - 0.5) * size * 0.04, dripTop + dripLength);
+          paint.stroke();
+        }
+      }
+      paint.restore();
+    }
+
+    if (globalIndex === 0) {
+      var waitingX = view.w * 0.5 + Math.sin(phase * 1.4) * view.w * 0.01;
+      paint.save();
+      paint.textAlign = 'center';
+      paint.textBaseline = 'middle';
+      paint.font = lyricFont(Math.max(14, size * 0.34));
+      paint.fillStyle = 'rgba(246,236,220,0.4)';
+      paint.fillText('· · ·', waitingX, centerY);
+      paint.restore();
+    }
+  }
+
+  function pathRoundRect(paint, x, y, width, height, radius) {
+    if (!canDrawPath(paint)) return false;
+    var limit = Math.max(0, Math.min(width, height) * 0.5);
+    var corner = clampNumber(radius, 0, limit);
+    paint.beginPath();
+    paint.moveTo(x + corner, y);
+    paint.lineTo(x + width - corner, y);
+    paint.quadraticCurveTo(x + width, y, x + width, y + corner);
+    paint.lineTo(x + width, y + height - corner);
+    paint.quadraticCurveTo(x + width, y + height, x + width - corner, y + height);
+    paint.lineTo(x + corner, y + height);
+    paint.quadraticCurveTo(x, y + height, x, y + height - corner);
+    paint.lineTo(x, y + corner);
+    paint.quadraticCurveTo(x, y, x + corner, y);
+    paint.closePath();
+    return true;
+  }
+
+  function pathCircle(paint, centerX, centerY, radius) {
+    if (!canDrawPath(paint)) return false;
+    paint.beginPath();
+    paint.arc(centerX, centerY, Math.max(0.5, radius), 0, Math.PI * 2);
+    return true;
+  }
+
+  function drawSpeaker(paint, centerX, centerY, radius, pulse) {
+    paint.save();
+    paint.fillStyle = '#0b0909';
+    if (pathCircle(paint, centerX, centerY, radius * 1.06)) paint.fill();
+    paint.fillStyle = '#2a2523';
+    if (pathCircle(paint, centerX, centerY, radius * 0.98)) paint.fill();
+    var ring = 0.86;
+    var ringIndex = 0;
+    for (ringIndex = 0; ringIndex < 4; ringIndex += 1) {
+      paint.fillStyle = ringIndex % 2 === 0 ? '#3b3532' : '#1d1918';
+      if (pathCircle(paint, centerX, centerY, radius * ring)) paint.fill();
+      ring -= 0.16;
+    }
+    paint.fillStyle = safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.9);
+    if (pathCircle(paint, centerX, centerY, radius * (0.16 + pulse * 0.5))) paint.fill();
+    paint.fillStyle = 'rgba(255,255,255,0.22)';
+    if (pathCircle(paint, centerX - radius * 0.26, centerY - radius * 0.28, radius * 0.13)) paint.fill();
+    paint.restore();
+  }
+
+  function drawBoombox(paint, phase) {
+    var phone = view.w < 640;
+    var boxWidth = phone ? view.w * 0.64 : Math.min(view.w * 0.32, view.h * 0.58);
+    var boxHeight = boxWidth * 0.56;
+    var drift = stageState.rm ? 0 : Math.sin(phase * 0.5) * view.w * 0.003;
+    var right = view.w * (phone ? 1.02 : 0.995) + drift;
+    var left = right - boxWidth;
+    var top = view.h * (phone ? 0.66 : 0.685) + (stageState.rm ? 0 : Math.cos(phase * 0.72) * view.h * 0.004);
+    var pulse = clampNumber(motion.bass * 0.9 + motion.kick * 0.6, 0, 1.2);
+
+    paint.save();
+    paint.translate(left + boxWidth * 0.5, top + boxHeight * 0.5);
+    paint.rotate(-0.05);
+
+    var glow = paint.createRadialGradient(0, 0, boxWidth * 0.08, 0, 0, boxWidth * 0.7);
+    addStop(glow, 0, safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.18 + motion.level * 0.14));
+    addStop(glow, 0.55, safeColor(accentRgb[0], accentRgb[1], accentRgb[2], 0.05));
+    addStop(glow, 1, 'rgba(0,0,0,0)');
+    paint.fillStyle = glow;
+    paint.fillRect(-boxWidth * 0.8, -boxWidth * 0.75, boxWidth * 1.6, boxWidth * 1.5);
+
+    var halfWidth = boxWidth * 0.5;
+    var halfHeight = boxHeight * 0.5;
+
+    paint.fillStyle = '#1a1718';
+    if (pathRoundRect(paint, -halfWidth, -halfHeight, boxWidth, boxHeight * 1.5, boxWidth * 0.03)) paint.fill();
+    paint.fillStyle = 'rgba(255,255,255,0.06)';
+    if (pathRoundRect(paint, -halfWidth * 0.98, -halfHeight * 0.96, boxWidth * 0.97, boxHeight * 0.24, boxWidth * 0.02)) paint.fill();
+
+    paint.fillStyle = '#8d8a84';
+    if (pathRoundRect(paint, -halfWidth * 0.92, -halfHeight - boxHeight * 0.07, boxWidth * 0.9, boxHeight * 0.1, boxHeight * 0.05)) paint.fill();
+    paint.fillStyle = 'rgba(255,255,255,0.4)';
+    paint.fillRect(-halfWidth * 0.86, -halfHeight - boxHeight * 0.05, boxWidth * 0.78, Math.max(1.5, boxHeight * 0.014));
+
+    drawSpeaker(paint, -halfWidth * 0.56, halfHeight * 0.08, boxWidth * 0.18, pulse);
+    drawSpeaker(paint, halfWidth * 0.56, halfHeight * 0.08, boxWidth * 0.18, pulse);
+
+    paint.fillStyle = '#12100f';
+    if (pathRoundRect(paint, -halfWidth * 0.26, -halfHeight * 0.34, boxWidth * 0.52, boxHeight * 0.34, boxWidth * 0.02)) paint.fill();
+    paint.fillStyle = 'rgba(120,150,160,0.14)';
+    if (pathRoundRect(paint, -halfWidth * 0.22, -halfHeight * 0.30, boxWidth * 0.44, boxHeight * 0.26, boxWidth * 0.015)) paint.fill();
+
+    var reelSpin = stageState.playing ? phase * 2.6 : phase * 0.15;
+    paint.fillStyle = '#d9d2c4';
+    if (pathCircle(paint, -halfWidth * 0.12, -halfHeight * 0.17, boxWidth * 0.055)) paint.fill();
+    if (pathCircle(paint, halfWidth * 0.12, -halfHeight * 0.17, boxWidth * 0.055)) paint.fill();
+    paint.strokeStyle = '#2a2523';
+    paint.lineWidth = Math.max(1, boxWidth * 0.006);
+    if (canDrawPath(paint)) {
+      paint.beginPath();
+      paint.moveTo(-halfWidth * 0.12, -halfHeight * 0.17);
+      paint.lineTo(-halfWidth * 0.12 + Math.cos(reelSpin) * boxWidth * 0.045, -halfHeight * 0.17 + Math.sin(reelSpin) * boxWidth * 0.045);
+      paint.moveTo(halfWidth * 0.12, -halfHeight * 0.17);
+      paint.lineTo(halfWidth * 0.12 + Math.cos(reelSpin + 1.2) * boxWidth * 0.045, -halfHeight * 0.17 + Math.sin(reelSpin + 1.2) * boxWidth * 0.045);
+      paint.stroke();
+    }
+
+    var ledCount = 5;
+    for (var led = 0; led < ledCount; led += 1) {
+      var lit = motion.level > (led + 1) / (ledCount + 1);
+      paint.fillStyle = lit ? palette.accent : 'rgba(60,40,34,0.7)';
+      if (pathCircle(paint, -halfWidth * 0.2 + led * boxWidth * 0.1, halfHeight * 0.62, boxWidth * 0.014)) paint.fill();
+    }
+
+    paint.strokeStyle = 'rgba(255,240,220,0.22)';
+    paint.lineWidth = Math.max(1, boxWidth * 0.006);
+    if (canDrawPath(paint)) {
+      paint.beginPath();
+      paint.moveTo(-halfWidth + 1, -halfHeight + boxHeight * 0.06);
+      paint.lineTo(-halfWidth + 1, halfHeight);
+      paint.stroke();
+    }
+
+    paint.strokeStyle = '#6f6a63';
+    paint.lineWidth = Math.max(1.5, boxWidth * 0.008);
+    if (canDrawPath(paint)) {
+      paint.beginPath();
+      paint.moveTo(-halfWidth * 0.82, -halfHeight);
+      paint.lineTo(-halfWidth * 1.12, -halfHeight * 2.4);
+      paint.stroke();
+    }
+    paint.restore();
+  }
+
+  function drawCrew(paint, phase) {
+    var areaScale = view.w < 640 ? 0.74 : 1;
+    var figures = [
+      { x: 0.075, headY: 0.615, scale: 0.88, hat: 0, lean: -0.02 },
+      { x: 0.185, headY: 0.642, scale: 1.02, hat: 1, lean: 0.012 },
+      { x: 0.298, headY: 0.606, scale: 0.82, hat: 2, lean: -0.012 }
+    ];
+    var bodyWidth = Math.min(view.w * 0.095, view.h * 0.105);
+    for (var index = 0; index < figures.length; index += 1) {
+      var figure = figures[index];
+      var bob = stageState.rm ? 0 : Math.sin(phase * 1.1 + index * 1.7) * view.h * 0.0022;
+      var centerX = view.w * figure.x * areaScale;
+      var headRadius = bodyWidth * 0.4 * figure.scale;
+      var headCenterY = view.h * figure.headY + bob;
+      var shoulderY = headCenterY + headRadius * 1.55;
+      var halfWidth = bodyWidth * 0.5 * figure.scale;
+      var bottomY = view.h + bodyWidth * 0.4;
+
+      var backlight = paint.createRadialGradient(centerX, headCenterY, headRadius * 0.4, centerX, headCenterY, bodyWidth * 2.1);
+      addStop(backlight, 0, 'rgba(255,198,144,0.3)');
+      addStop(backlight, 0.55, 'rgba(255,186,132,0.1)');
+      addStop(backlight, 1, 'rgba(255,186,132,0)');
+      paint.fillStyle = backlight;
+      paint.fillRect(centerX - bodyWidth * 2.2, headCenterY - bodyWidth * 2.2, bodyWidth * 4.4, bodyWidth * 4.4);
+
+      paint.save();
+      paint.translate(centerX, 0);
+      paint.rotate(figure.lean + (stageState.rm ? 0 : Math.sin(phase * 0.8 + index) * 0.006));
+      paint.translate(-centerX, 0);
+
+      paint.fillStyle = '#0d0a0b';
+      if (canDrawPath(paint)) {
+        paint.beginPath();
+        paint.moveTo(centerX - halfWidth, bottomY);
+        paint.lineTo(centerX - halfWidth * 0.98, shoulderY + bodyWidth * 0.24);
+        paint.quadraticCurveTo(centerX - halfWidth * 0.96, shoulderY - bodyWidth * 0.02, centerX - halfWidth * 0.4, shoulderY - bodyWidth * 0.06);
+        paint.lineTo(centerX + halfWidth * 0.4, shoulderY - bodyWidth * 0.06);
+        paint.quadraticCurveTo(centerX + halfWidth * 0.96, shoulderY - bodyWidth * 0.02, centerX + halfWidth * 0.98, shoulderY + bodyWidth * 0.24);
+        paint.lineTo(centerX + halfWidth, bottomY);
+        paint.closePath();
+        paint.fill();
+      }
+
+      paint.fillStyle = '#0d0a0b';
+      if (pathCircle(paint, centerX, headCenterY, headRadius)) paint.fill();
+      paint.fillStyle = '#141011';
+      if (pathCircle(paint, centerX + headRadius * 0.1, headCenterY - headRadius * 0.05, headRadius * 0.88)) paint.fill();
+
+      if (figure.hat === 0) {
+        paint.fillStyle = '#0a0808';
+        if (canDrawPath(paint)) {
+          paint.beginPath();
+          paint.arc(centerX, headCenterY - headRadius * 0.16, headRadius * 1.02, Math.PI * 1.04, Math.PI * 1.96);
+          paint.closePath();
+          paint.fill();
+          paint.beginPath();
+          paint.moveTo(centerX + headRadius * 0.55, headCenterY - headRadius * 0.2);
+          paint.lineTo(centerX + headRadius * 1.24, headCenterY - headRadius * 0.02);
+          paint.lineTo(centerX + headRadius * 1.2, headCenterY + headRadius * 0.1);
+          paint.lineTo(centerX + headRadius * 0.5, headCenterY + headRadius * 0.05);
+          paint.closePath();
+          paint.fill();
+        }
+      } else if (figure.hat === 1) {
+        paint.fillStyle = '#0a0808';
+        if (canDrawPath(paint)) {
+          paint.beginPath();
+          paint.arc(centerX, headCenterY - headRadius * 0.1, headRadius * 1.12, Math.PI * 0.96, Math.PI * 2.04);
+          paint.closePath();
+          paint.fill();
+          paint.fillRect(centerX - headRadius * 1.12, headCenterY - headRadius * 0.78, headRadius * 2.24, headRadius * 0.34);
+        }
+        paint.fillStyle = 'rgba(255,240,220,0.12)';
+        paint.fillRect(centerX - headRadius * 1.1, headCenterY - headRadius * 0.72, headRadius * 2.2, Math.max(1, headRadius * 0.06));
+      } else {
+        paint.fillStyle = '#111012';
+        if (canDrawPath(paint)) {
+          paint.beginPath();
+          paint.moveTo(centerX - headRadius * 1.25, shoulderY + headRadius * 0.3);
+          paint.quadraticCurveTo(centerX - headRadius * 1.5, headCenterY - headRadius * 1.1, centerX, headCenterY - headRadius * 1.34);
+          paint.quadraticCurveTo(centerX + headRadius * 1.5, headCenterY - headRadius * 1.1, centerX + headRadius * 1.25, shoulderY + headRadius * 0.3);
+          paint.closePath();
+          paint.fill();
+        }
+      }
+
+      paint.strokeStyle = '#0d0a0b';
+      paint.lineWidth = bodyWidth * 0.17;
+      paint.lineCap = 'round';
+      if (canDrawPath(paint)) {
+        paint.beginPath();
+        paint.moveTo(centerX - halfWidth * 1.04, shoulderY + bodyWidth * 0.44);
+        paint.lineTo(centerX + halfWidth * 0.98, shoulderY + bodyWidth * 0.34);
+        paint.moveTo(centerX + halfWidth * 1.02, shoulderY + bodyWidth * 0.62);
+        paint.lineTo(centerX - halfWidth * 0.96, shoulderY + bodyWidth * 0.56);
+        paint.stroke();
+      }
+
+      paint.strokeStyle = 'rgba(255,224,186,0.2)';
+      paint.lineWidth = Math.max(1, bodyWidth * 0.018);
+      if (canDrawPath(paint)) {
+        paint.beginPath();
+        paint.moveTo(centerX - halfWidth * 1.04, shoulderY + bodyWidth * 0.44);
+        paint.lineTo(centerX + halfWidth * 0.9, shoulderY + bodyWidth * 0.35);
+        paint.stroke();
+      }
+
+      paint.strokeStyle = 'rgba(255,224,186,0.26)';
+      paint.lineWidth = Math.max(1.2, bodyWidth * 0.024);
+      if (canDrawPath(paint)) {
+        paint.beginPath();
+        paint.moveTo(centerX - halfWidth * 0.99, shoulderY + bodyWidth * 0.3);
+        paint.lineTo(centerX - halfWidth * 0.99, bottomY);
+        paint.stroke();
+      }
+      paint.restore();
+    }
+  }
+
+  function spawnBurst(level) {
+    if (perf.low) return;
+    var count = Math.min(14, 4 + Math.round(level * 10));
+    var centerX = view.w * 0.5;
+    var centerY = view.h * 0.42;
+    if (particles.length > 42) return;
+    for (var index = 0; index < count; index += 1) {
+      particles.push({
+        x: centerX + (hash01(index * 3.7 + motion.beatIndex * 1.3) - 0.5) * view.w * 0.62,
+        y: centerY + (hash01(index * 7.1 + motion.beatIndex * 0.7) - 0.5) * view.h * 0.16,
+        velocityX: (hash01(index * 1.9 + 0.3) - 0.5) * view.w * 0.05,
+        velocityY: -view.h * (0.02 + hash01(index * 5.3) * 0.05),
+        life: 0.7 + hash01(index * 2.7) * 0.6,
+        size: Math.max(1, view.w * 0.0016 * (0.6 + hash01(index * 9.1) * 1.6))
+      });
+    }
+  }
+
+  function updateParticles(deltaSeconds) {
+    var writeIndex = 0;
+    for (var readIndex = 0; readIndex < particles.length; readIndex += 1) {
+      var particle = particles[readIndex];
+      particle.x += particle.velocityX * deltaSeconds;
+      particle.y += particle.velocityY * deltaSeconds;
+      particle.velocityY += view.h * 0.02 * deltaSeconds;
+      particle.velocityX *= 0.985;
+      particle.life -= deltaSeconds * 0.6;
+      if (particle.life > 0 && particle.x > -40 && particle.x < view.w + 40 && particle.y > -40) {
+        particles[writeIndex] = particle;
+        writeIndex += 1;
+      }
+    }
+    particles.length = writeIndex;
+  }
+
+  function drawParticles(paint) {
+    if (particles.length === 0) return;
+    paint.save();
+    for (var index = 0; index < particles.length; index += 1) {
+      var particle = particles[index];
+      paint.fillStyle = safeColor(accentRgb[0], accentRgb[1], accentRgb[2], clampNumber(particle.life * 0.4, 0, 0.5));
+      if (pathCircle(paint, particle.x, particle.y, particle.size)) paint.fill();
+    }
+    paint.restore();
+  }
+
+  function buildGrain() {
+    var size = 128;
+    grainCanvas = makeCanvas(size, size);
+    var paint = grainCanvas.getContext('2d');
+    if (!paint) return;
+    var image = paint.createImageData(size, size);
+    var data = image.data;
+    for (var index = 0; index < data.length; index += 4) {
+      var value = Math.random() * 255;
+      data[index] = value;
+      data[index + 1] = value;
+      data[index + 2] = value;
+      data[index + 3] = Math.random() * 80;
+    }
+    paint.putImageData(image, 0, 0);
+    grainPattern = ctx.createPattern(grainCanvas, 'repeat');
+  }
+
+  function drawGrain(paint) {
+    if (!grainPattern) return;
+    var jitterX = stageState.rm ? 0 : (hash01(stageState.frames * 0.77) - 0.5) * 64;
+    var jitterY = stageState.rm ? 0 : (hash01(stageState.frames * 1.31) - 0.5) * 64;
+    paint.save();
+    paint.globalAlpha = 0.05 + motion.treble * 0.05;
+    paint.translate(jitterX, jitterY);
+    paint.fillStyle = grainPattern;
+    paint.fillRect(-80, -80, view.w + 160, view.h + 160);
+    paint.restore();
+  }
+
+  function drawLightFlicker(paint, phase) {
+    var strength = 0.08 + motion.treble * 0.1 + (stageState.rm ? 0 : Math.sin(phase * 7.3) * 0.012);
+    var lightGradient = paint.createRadialGradient(view.w * 0.5, -view.h * 0.08, view.h * 0.04, view.w * 0.5, 0, view.h * 0.92);
+    addStop(lightGradient, 0, safeColor(255, 206, 156, clampNumber(strength, 0, 0.3)));
+    addStop(lightGradient, 1, 'rgba(0,0,0,0)');
+    paint.fillStyle = lightGradient;
+    paint.fillRect(0, 0, view.w, view.h * 0.8);
+  }
+
+  function normalizeSong(source) {
+    var song = source && typeof source === 'object' ? source : {};
+    var name = typeof song.name === 'string' ? song.name.trim() : '';
+    var artists = '';
+    var rawArtists = song.artists;
+    if (Array.isArray(rawArtists)) {
+      var names = [];
+      for (var index = 0; index < rawArtists.length && index < 6; index += 1) {
+        if (typeof rawArtists[index] === 'string' && rawArtists[index].trim()) names.push(rawArtists[index].trim());
+      }
+      artists = names.join(' / ');
+    } else if (typeof rawArtists === 'string') {
+      artists = rawArtists.trim();
+    }
+    return { name: name, artists: artists };
+  }
+
+  function drawCaption(paint) {
+    var label = track.song.name;
+    if (track.song.artists) label = label ? label + ' · ' + track.song.artists : track.song.artists;
+    label = label.slice(0, 52);
+    if (!label) return;
+    var size = clampNumber(view.h * 0.017, 9, 15);
+    var originX = view.w * 0.035;
+    var originY = view.h * 0.052;
+    paint.save();
+    paint.fillStyle = palette.accent;
+    paint.fillRect(originX, originY - size * 0.72, Math.max(2, size * 0.22), size * 0.82);
+    paint.font = '600 ' + Math.round(size) + 'px "Courier New", "Microsoft YaHei", monospace';
+    paint.textAlign = 'left';
+    paint.textBaseline = 'alphabetic';
+    paint.fillStyle = 'rgba(246,236,220,0.62)';
+    paint.fillText(label, originX + size * 0.7, originY, view.w * 0.8);
+    paint.restore();
+  }
+
+  function isCanvasSource(source) {
+    return !!source && typeof source.getContext === 'function' && source.width > 0 && source.height > 0;
+  }
+
+  function drawScene(paint, timeValue, phase) {
+    var swayX = 0;
+    var swayY = 0;
+    if (!stageState.rm) {
+      swayX = Math.sin(phase * 0.6) * view.w * 0.004;
+      swayY = Math.cos(phase * 0.47) * view.h * 0.003;
+    }
+    if (scene.ready && isCanvasSource(scene.baked)) {
+      paint.drawImage(scene.baked, -view.w * 0.015 + swayX, -view.h * 0.02 + swayY, view.w * 1.03, view.h * 1.04);
+    } else {
+      drawBackdropFallback(paint);
+    }
+    drawCrew(paint, phase);
+    drawBoombox(paint, phase);
+    drawLightFlicker(paint, phase);
+    drawLyricBlock(paint, timeValue, phase);
+    drawParticles(paint);
+    drawCaption(paint);
+    if (!perf.low) drawGrain(paint);
+  }
+
+  function applyInit(payload) {
+    var data = payload || {};
+
+    var nextAccent = [];
+    var accentChanged = false;
+    for (var channel = 0; channel < 3; channel += 1) {
+      var rawChannel = Array.isArray(data.accent) ? Number(data.accent[channel]) : NaN;
+      nextAccent.push(isFinite(rawChannel) ? Math.round(clampNumber(rawChannel, 0, 255)) : accentRgb[channel]);
+      if (nextAccent[channel] !== accentRgb[channel]) accentChanged = true;
+    }
+    if (accentChanged) {
+      buildPalette(nextAccent);
+      scheduleBake(120);
+    }
+
+    track.song = normalizeSong(data.song);
+    stageState.playing = typeof data.playing === 'boolean' ? data.playing : true;
+
+    var incoming = Array.isArray(data.lines) ? data.lines : [];
+    var built = [];
+    var index = 0;
+    for (index = 0; index < incoming.length; index += 1) {
+      var lineData = incoming[index];
+      if (!lineData) continue;
+      var text = typeof lineData.text === 'string' ? lineData.text : '';
+      if (!text) continue;
+      built.push({
+        t: isFinite(lineData.t) ? Number(lineData.t) : 0,
+        dur: isFinite(lineData.dur) && lineData.dur > 0 ? Number(lineData.dur) : 4,
+        text: text,
+        chars: Array.isArray(lineData.chars) ? lineData.chars : null
+      });
+    }
+    built.sort(function (left, right) { return left.t - right.t; });
+
+    track.lines = built;
+    track.index = -1;
+    track.active = null;
+    lyricCache.key = '';
+    lyricCache.layout = null;
+    stageState.lines = built.length;
+    stageState.idx = -1;
+    stageState.text = '';
+  }
+
+  function currentTime(nowValue) {
+    if (!stageState.playing) return clock.tickTime;
+    var drift = (nowValue - clock.tickAt) / 1000;
+    if (!isFinite(drift) || drift < 0) drift = 0;
+    return clock.tickTime + Math.min(drift, 0.1);
+  }
+
+  function resolveIndex(timeValue) {
+    var found = -1;
+    var bestTime = -Infinity;
+    for (var index = 0; index < track.lines.length; index += 1) {
+      var lineTime = track.lines[index].t;
+      if (lineTime <= timeValue + 0.02 && lineTime >= bestTime) {
+        bestTime = lineTime;
+        found = index;
+      }
+    }
+    return found;
+  }
+
+  function resetPaintState() {
+    try {
+      ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    } catch (problem) {
+      reportError('paint.reset', problem);
+    }
+  }
+
+  function updateMotion(deltaSeconds) {
+    var smoothing = clampNumber(0.12 + deltaSeconds * 2.2, 0.12, 0.5);
+    var activity = stageState.playing ? 1 : 0.22;
+    motion.bass += (liveState.bass * activity - motion.bass) * smoothing;
+    motion.mid += (liveState.mid * activity - motion.mid) * smoothing;
+    motion.treble += (liveState.treble * activity - motion.treble) * smoothing;
+    motion.level += (liveState.level * activity - motion.level) * smoothing;
+    motion.kick = Math.max(0, motion.kick - deltaSeconds * 2.4);
+    motion.pulse = clampNumber(motion.bass * 0.7 + motion.kick * 0.7, 0, 1.4);
+  }
+
+  function updatePerf(spent) {
+    perf.avg = perf.avg * 0.9 + spent * 0.1;
+    if (perf.avg > 14) {
+      perf.low = true;
+    } else if (perf.low && perf.avg < 8 && stageState.frames % 150 === 0) {
+      perf.low = false;
+    }
+  }
+
+  function frame(nowValue) {
+    var started = nowMs();
+    stageState.frames += 1;
+    var delta = clock.lastFrame ? clampNumber((nowValue - clock.lastFrame) / 1000, 0, 0.05) : 0.016;
+    clock.lastFrame = nowValue;
+    var timeValue = currentTime(nowValue);
+    stageState.t = clock.tickTime;
+    try {
+      if (bakeState.running && stageState.frames > 1) runBakeStep();
+      updateMotion(delta);
+      updateParticles(delta);
+      drawScene(ctx, timeValue, nowValue / 1000);
+    } catch (problem) {
+      reportError('frame', problem);
+      resetPaintState();
+      try {
+        drawBackdropFallback(ctx);
+      } catch (inner) {
+        reportError('frame.fallback', inner);
+      }
+    }
+    var spent = nowMs() - started;
+    stageState.js = spent;
+    if (stageState.frames > 26) updatePerf(spent);
+    requestAnimationFrame(frame);
+  }
+
+  function handleMessage(event) {
+    var data = event && event.data;
+    if (!data || data.__c100 !== 1) return;
+    try {
+      if (data.type === 'init') {
+        applyInit(data.payload);
+      } else if (data.type === 'tick') {
+        var payload = data.payload || {};
+        var rawTime = Number(payload.time);
+        stageState.playing = payload.playing !== false;
+        if (isFinite(rawTime)) {
+          clock.tickTime = rawTime;
+          clock.tickAt = nowMs();
+        }
+      } else if (data.type === 'beat') {
+        var beatData = data.payload || {};
+        var beatIndex = Number(beatData.index);
+        var beatLevel = Number(beatData.level);
+        if (isFinite(beatIndex) && beatIndex !== motion.beatIndex) {
+          motion.beatIndex = beatIndex;
+          motion.kick = clampNumber(isFinite(beatLevel) ? beatLevel : 0.6, 0, 1);
+          spawnBurst(motion.kick);
+        }
+      } else if (data.type === 'live') {
+        var liveData = data.payload || {};
+        var keys = ['bass', 'mid', 'treble', 'level'];
+        for (var keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+          var liveValue = Number(liveData[keys[keyIndex]]);
+          if (isFinite(liveValue)) liveState[keys[keyIndex]] = clampNumber(liveValue, 0, 1);
+        }
+        if (typeof liveData.playing === 'boolean') stageState.playing = liveData.playing;
+      }
+    } catch (problem) {
+      reportError('message.' + (data && data.type), problem);
+    }
+  }
+
+  window.addEventListener('message', handleMessage);
+  window.addEventListener('resize', function onResize() {
+    try {
+      resizeCanvas();
+      lyricCache.key = '';
+      lyricCache.layout = null;
+      scheduleBake(180);
+    } catch (problem) {
+      reportError('resize', problem);
+    }
+  });
+
+  try {
+    stageState.rm = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  } catch (problem) {
+    reportError('reducedMotion', problem);
+  }
+
+  try {
+    resizeCanvas();
+    buildGrain();
+    clock.tickAt = nowMs();
+    clock.lastFrame = nowMs();
+    scheduleBake(30);
+  } catch (problem) {
+    reportError('boot', problem);
+  }
+  requestAnimationFrame(frame);
+}());
+</script>
+</body>
+</html>

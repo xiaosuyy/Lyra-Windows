@@ -1,0 +1,1263 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>墨噪枯林</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#000; overflow:hidden; }
+  body { color:#fff; font-family:"Arial Black","Microsoft YaHei","PingFang SC",Arial,sans-serif; -webkit-font-smoothing:antialiased; }
+  canvas { display:block; }
+  #bg { position:fixed; inset:0; width:100%; height:100%; z-index:0; }
+  #plate { position:absolute; left:2.4vw; top:20vh; width:95.2vw; height:46vh; z-index:1; }
+  #mark { position:absolute; left:50%; top:1.8vh; transform:translateX(-50%); width:min(76vw,780px); height:16vh; z-index:2; }
+  #grain { position:fixed; inset:0; width:100%; height:100%; z-index:5; pointer-events:none; mix-blend-mode:screen; opacity:.14; image-rendering:pixelated; }
+  #lyrics { position:absolute; left:0; right:0; top:69vh; bottom:2vh; z-index:3; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:0 5vw; text-align:center; overflow:hidden; }
+  .row { max-width:100%; }
+  #cur { font-weight:900; font-size:clamp(20px,4.3vw,56px); line-height:1.18; letter-spacing:.02em; text-shadow:3px 0 rgba(255,255,255,.20),-2px 0 rgba(255,255,255,.13); white-space:pre-wrap; overflow-wrap:anywhere; }
+  #cur .ch { color:#8b8b8b; transition:color 100ms linear; }
+  #cur .ch.on { color:#fff; }
+  #prev, #next { font-weight:700; font-size:clamp(11px,1.5vw,19px); color:#8d8d8d; line-height:1.4; text-shadow:2px 0 rgba(255,255,255,.10); max-height:2.9em; overflow:hidden; overflow-wrap:anywhere; }
+  #prev { margin-bottom:1.4vh; }
+  #next { margin-top:1.4vh; }
+  #empty { display:none; flex-direction:column; align-items:center; justify-content:center; gap:2.2vh; }
+  #empty.wide { display:flex; }
+  #empty .stamp { font-weight:900; font-size:clamp(30px,6.4vw,78px); letter-spacing:.34em; text-indent:.34em; line-height:1; text-shadow:4px 0 rgba(255,255,255,.22),-3px 0 rgba(255,255,255,.14); }
+  #empty .sub { font-size:clamp(10px,1.35vw,15px); font-weight:400; color:#8d8d8d; letter-spacing:.22em; text-indent:.22em; }
+  #empty .rule { width:clamp(80px,22vw,260px); height:1px; background:var(--accent-soft, rgba(255,255,255,.35)); }
+  @media (max-aspect-ratio: 1/1) {
+    #plate { left:3vw; width:94vw; top:17vh; height:40vh; }
+    #mark { top:1vh; height:14vh; width:96vw; }
+    #lyrics { top:60vh; bottom:3vh; padding:0 6vw; }
+    #prev, #next { margin-top:1.1vh; margin-bottom:0; }
+  }
+  @media (max-height: 520px) {
+    #plate { top:16vh; height:40vh; }
+    #mark { top:0.5vh; height:14vh; }
+    #lyrics { top:59vh; bottom:2vh; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #cur .ch { transition:none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<canvas id="plate"></canvas>
+<canvas id="mark"></canvas>
+<canvas id="grain"></canvas>
+<div id="lyrics">
+  <div class="row" id="prev"></div>
+  <div class="row" id="cur"></div>
+  <div class="row" id="next"></div>
+  <div id="empty">
+    <div class="stamp">無 詞</div>
+    <div class="rule"></div>
+    <div class="sub" id="emptySub">只剩复印机的噪声</div>
+  </div>
+</div>
+<script>
+window.__stage = function () {
+  return {
+    lines: STATE.lines.length, idx: STATE.idx, t: STATE.t, playing: STATE.playing,
+    frames: STATE.frames, js: STATE.js, err: STATE.err, text: STATE.text, gl: false, rm: STATE.rm
+  };
+};
+var STATE = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: '', text: '', rm: false, duration: 0, song: {}, accent: [255, 255, 255], live: {} };
+var readySent = false;
+var lastErrAt = 0;
+function sendReady() {
+  if (readySent) { return; }
+  readySent = true;
+  try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (error) { logError('ready', error); }
+}
+function logError(where, error) {
+  var now = Date.now();
+  if (now - lastErrAt < 1000) { return; }
+  lastErrAt = now;
+  try { console.error('[369] ' + where + ':', error && error.message ? error.message : error); } catch (ignored) {}
+}
+function toNumber(value, fallback) {
+  var num = Number(value);
+  return isFinite(num) ? num : fallback;
+}
+requestAnimationFrame(function () { sendReady(); });
+setTimeout(sendReady, 1000);
+var FONT_STACK = '"Arial Black","Helvetica Neue",Arial,"Microsoft YaHei","PingFang SC","Noto Sans SC",sans-serif';
+var DOM = {
+  prev: document.getElementById('prev'),
+  cur: document.getElementById('cur'),
+  next: document.getElementById('next'),
+  empty: document.getElementById('empty'),
+  emptySub: document.getElementById('emptySub')
+};
+var view = { idx: -2, spans: [], times: [], sung: -1, text: '', emptyOn: null };
+var measureContext = null;
+
+function measureTextWidth(text, size) {
+  if (!measureContext) {
+    var probe = makeCanvas(8, 8);
+    measureContext = probe.getContext('2d');
+  }
+  if (!measureContext) { return 0; }
+  measureContext.font = '900 ' + size + 'px ' + FONT_STACK;
+  return measureContext.measureText(text).width;
+}
+
+function normalizeLines(rawLines) {
+  var list = [];
+  var source = Array.isArray(rawLines) ? rawLines : [];
+  for (var i = 0; i < source.length; i++) {
+    var raw = source[i] || {};
+    var text = typeof raw.text === 'string' ? raw.text : '';
+    if (!text.trim()) { continue; }
+    list.push({
+      t: toNumber(raw.t, 0),
+      dur: toNumber(raw.dur, 0),
+      text: text,
+      chars: Array.isArray(raw.chars) ? raw.chars : null
+    });
+  }
+  list.sort(function (a, b) { return a.t - b.t; });
+  var merged = [];
+  for (var j = 0; j < list.length; j++) {
+    if (merged.length && Math.abs(merged[merged.length - 1].t - list[j].t) < 0.001) {
+      merged[merged.length - 1] = list[j];
+    } else {
+      merged.push(list[j]);
+    }
+  }
+  return merged;
+}
+
+function buildCharTimes(line) {
+  var text = line.text;
+  var length = text.length;
+  var times = new Array(length);
+  var i;
+  var start = line.t;
+  var span = line.dur > 0.05 ? line.dur : Math.max(1.2, length * 0.22);
+  var evenStep = span / Math.max(1, length);
+  var chars = line.chars;
+  var joined = '';
+  if (chars && chars.length) {
+    for (i = 0; i < chars.length; i++) {
+      joined += chars[i] && typeof chars[i].c === 'string' ? chars[i].c : '';
+    }
+  }
+  var exact = !!chars && joined === text;
+  var prefix = !exact && !!chars && joined.length > 0 && text.indexOf(joined) === 0;
+  var lastKnown = start;
+  for (i = 0; i < length; i++) {
+    var value;
+    if ((exact || prefix) && i < chars.length) {
+      value = toNumber(chars[i] && chars[i].t, lastKnown + evenStep);
+    } else if (exact || prefix) {
+      value = lastKnown + evenStep;
+    } else {
+      value = start + evenStep * i;
+    }
+    if (!isFinite(value)) { value = lastKnown; }
+    times[i] = value;
+    lastKnown = value;
+  }
+  return times;
+}
+
+function fitCurrentLine(text) {
+  var portrait = window.innerHeight > window.innerWidth;
+  var availableWidth = Math.max(160, window.innerWidth * (portrait ? 0.84 : 0.88));
+  var maxByHeight = Math.min(86, Math.max(19, window.innerHeight * (portrait ? 0.052 : 0.064)));
+  var referenceWidth = measureTextWidth(text, 100);
+  if (!referenceWidth || !isFinite(referenceWidth) || referenceWidth <= 0) {
+    return { size: Math.min(maxByHeight, 44), allowWrap: false };
+  }
+  var singleFit = (100 * availableWidth) / referenceWidth;
+  if (singleFit >= 26) {
+    return { size: Math.min(maxByHeight, singleFit), allowWrap: false };
+  }
+  var wrappedFit = (100 * availableWidth * 1.85) / referenceWidth;
+  return { size: Math.max(13, Math.min(maxByHeight, wrappedFit)), allowWrap: true };
+}
+
+function clearRow(element) {
+  while (element && element.firstChild) { element.removeChild(element.firstChild); }
+}
+
+function buildLineElement(line) {
+  var cur = DOM.cur;
+  if (!cur) { return; }
+  clearRow(cur);
+  view.spans = [];
+  var text = line.text;
+  var charTimes = buildCharTimes(line);
+  view.times = [];
+  var fragment = document.createDocumentFragment();
+  for (var i = 0; i < text.length; i++) {
+    var symbol = text.charAt(i);
+    if (symbol === ' ' || symbol === '\t' || symbol === '\u3000') {
+      fragment.appendChild(document.createTextNode(symbol === '\t' ? ' ' : symbol));
+      continue;
+    }
+    var span = document.createElement('span');
+    span.className = 'ch';
+    span.textContent = symbol;
+    fragment.appendChild(span);
+    view.spans.push(span);
+    view.times.push(charTimes[i]);
+  }
+  cur.appendChild(fragment);
+  var metrics = fitCurrentLine(text);
+  cur.style.fontSize = metrics.size.toFixed(1) + 'px';
+  cur.style.letterSpacing = metrics.allowWrap ? '0.005em' : '0.02em';
+  cur.style.maxWidth = metrics.allowWrap ? '100%' : Math.max(240, window.innerWidth * 0.92) + 'px';
+  view.sung = -1;
+}
+
+function setRowText(element, value) {
+  if (!element) { return; }
+  if (element.textContent !== value) { element.textContent = value; }
+}
+
+function showEmptyState(isEmpty) {
+  if (!DOM.empty) { return; }
+  if (view.emptyOn === isEmpty) { return; }
+  view.emptyOn = isEmpty;
+  DOM.empty.classList.toggle('wide', !!isEmpty);
+  if (DOM.prev) { DOM.prev.style.display = isEmpty ? 'none' : ''; }
+  if (DOM.cur) { DOM.cur.style.display = isEmpty ? 'none' : ''; }
+  if (DOM.next) { DOM.next.style.display = isEmpty ? 'none' : ''; }
+  if (isEmpty && DOM.emptySub) {
+    var name = songTitle();
+    DOM.emptySub.textContent = name ? name : '只剩复印机的噪声';
+  }
+}
+
+function songTitle() {
+  var song = STATE.song || {};
+  var primary = typeof song.name === 'string' && song.name.trim() ? song.name.trim() : '';
+  var artists = song.artists;
+  var artistText = '';
+  if (Array.isArray(artists)) {
+    var parts = [];
+    for (var i = 0; i < Math.min(4, artists.length); i++) {
+      if (artists[i] != null) { parts.push(String(artists[i])); }
+    }
+    artistText = parts.join(' / ');
+  } else if (typeof artists === 'string') {
+    artistText = artists;
+  }
+  artistText = artistText.trim();
+  if (primary && artistText) { return primary + ' — ' + artistText; }
+  return primary || artistText;
+}
+
+function findLineIndex(time) {
+  var lines = STATE.lines;
+  if (!lines.length) { return -1; }
+  var idx = view.idx;
+  if (idx >= 0 && idx < lines.length) {
+    var current = lines[idx];
+    var following = lines[idx + 1];
+    if (time >= current.t && (!following || time < following.t)) { return idx; }
+    if (idx > 0 && time >= lines[idx - 1].t && time < current.t) { return idx - 1; }
+  }
+  var low = 0;
+  var high = lines.length - 1;
+  var found = -1;
+  for (var guard = 0; guard < 24 && low <= high; guard++) {
+    var mid = (low + high) >> 1;
+    if (lines[mid].t <= time) { found = mid; low = mid + 1; } else { high = mid - 1; }
+  }
+  return found;
+}
+
+function paintLyrics() {
+  if (!DOM.cur) { return; }
+  if (!STATE.lines.length) {
+    if (view.idx !== -1) {
+      view.idx = -1;
+      STATE.idx = -1;
+      STATE.text = '';
+      clearRow(DOM.prev);
+      clearRow(DOM.cur);
+      clearRow(DOM.next);
+      view.spans = [];
+      view.times = [];
+    }
+    showEmptyState(true);
+    return;
+  }
+  showEmptyState(false);
+  var idx = findLineIndex(STATE.t);
+  if (idx !== view.idx) {
+    view.idx = idx;
+    STATE.idx = idx;
+    if (idx < 0) {
+      clearRow(DOM.cur);
+      clearRow(DOM.prev);
+      setRowText(DOM.next, STATE.lines[0].text);
+      view.spans = [];
+      view.times = [];
+      view.sung = -1;
+      STATE.text = '';
+    } else {
+      var line = STATE.lines[idx];
+      STATE.text = line.text;
+      setRowText(DOM.prev, idx > 0 ? STATE.lines[idx - 1].text : '');
+      setRowText(DOM.next, idx + 1 < STATE.lines.length ? STATE.lines[idx + 1].text : '');
+      buildLineElement(line);
+      applyCharStates(true);
+      return;
+    }
+  }
+  if (idx >= 0) { applyCharStates(false); }
+}
+
+function applyCharStates(force) {
+  var times = view.times;
+  var total = times.length;
+  var count = 0;
+  for (var i = 0; i < total; i++) {
+    if (STATE.t >= times[i]) { count++; } else { break; }
+  }
+  if (!force && count === view.sung) { return; }
+  view.sung = count;
+  var spans = view.spans;
+  for (var j = 0; j < spans.length; j++) {
+    var on = j < count;
+    var span = spans[j];
+    if (on) {
+      if (!span.classList.contains('on')) { span.classList.add('on'); }
+    } else if (span.classList.contains('on')) {
+      span.classList.remove('on');
+    }
+  }
+}
+
+function onInit(payload) {
+  var data = payload || {};
+  try {
+    STATE.duration = toNumber(data.duration, 0);
+    STATE.song = data.song || {};
+    STATE.accent = Array.isArray(data.accent) ? data.accent : [255, 255, 255];
+    STATE.playing = data.playing !== false;
+    STATE.lines = normalizeLines(data.lines);
+    STATE.idx = -1;
+    STATE.text = '';
+    view.idx = -2;
+    view.sung = -1;
+    view.emptyOn = null;
+    view.spans = [];
+    view.times = [];
+    clearRow(DOM.prev);
+    clearRow(DOM.cur);
+    clearRow(DOM.next);
+    paintLyrics();
+  } catch (error) { logError('init', error); }
+  try {
+    applyAccent();
+  } catch (error) { logError('accent', error); }
+}
+/* ---------- 静电复印管线 ---------- */
+function clampChannel(value) {
+  var number = Math.round(Number(value));
+  if (!isFinite(number)) { return 255; }
+  return number < 0 ? 0 : (number > 255 ? 255 : number);
+}
+
+function applyAccent() {
+  var accent = Array.isArray(STATE.accent) ? STATE.accent : [255, 255, 255];
+  var red = clampChannel(accent[0]);
+  var green = clampChannel(accent[1]);
+  var blue = clampChannel(accent[2]);
+  var luminance = (red * 0.299 + green * 0.587 + blue * 0.114) / 255;
+  var lifted = Math.min(1, 0.45 + luminance * 0.55);
+  var paperRed = clampChannel(230 + (red - 128) * 0.06 * lifted);
+  var paperGreen = clampChannel(230 + (green - 128) * 0.06 * lifted);
+  var paperBlue = clampChannel(228 + (blue - 128) * 0.06 * lifted);
+  var root = document.documentElement;
+  if (!root || !root.style) { return; }
+  root.style.setProperty('--accent-soft', 'rgba(' + red + ',' + green + ',' + blue + ',0.45)');
+  root.style.setProperty('--paper', 'rgb(' + paperRed + ',' + paperGreen + ',' + paperBlue + ')');
+}
+
+var plateEl = document.getElementById('plate');
+var plateCtx = null;
+var plateGens = [];
+var plateIndex = 0;
+var plateToken = 0;
+var DITHER = null;
+
+function makeRandom(seed) {
+  var state = (seed >>> 0) || 1;
+  return function () {
+    state ^= state << 13; state >>>= 0;
+    state ^= state >> 17;
+    state ^= state << 5; state >>>= 0;
+    return state / 4294967296;
+  };
+}
+
+function buildDither() {
+  if (DITHER) { return DITHER; }
+  var size = 64;
+  var table = new Float32Array(size * size);
+  var rand = makeRandom(90210);
+  for (var y = 0; y < size; y++) {
+    for (var x = 0; x < size; x++) {
+      var bayer = ((x * 5 + y * 11) & 15) / 15;
+      var n = rand();
+      table[y * size + x] = 0.13 + 0.74 * (bayer * 0.45 + n * 0.55);
+    }
+  }
+  DITHER = { size: size, table: table };
+  return DITHER;
+}
+
+function measureBox(element) {
+  var rect = element.getBoundingClientRect();
+  var width = Math.round(rect.width);
+  var height = Math.round(rect.height);
+  if (!isFinite(width) || !isFinite(height) || width < 8 || height < 8) {
+    return { width: 1440, height: 560 };
+  }
+  return { width: width, height: height };
+}
+
+function makeCanvas(width, height) {
+  var canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(width));
+  canvas.height = Math.max(1, Math.round(height));
+  return canvas;
+}
+
+function drawDeadTree(context, x, baseY, treeHeight, thickness, rand) {
+  var lean = (rand() - 0.5) * 0.16;
+  var tipX = x + lean * treeHeight;
+  var tipY = baseY - treeHeight;
+  context.beginPath();
+  context.moveTo(x - thickness * 0.5, baseY);
+  context.quadraticCurveTo(x - thickness * 0.2, baseY - treeHeight * 0.55, tipX - thickness * 0.05, tipY);
+  context.lineTo(tipX + thickness * 0.05, tipY);
+  context.quadraticCurveTo(x + thickness * 0.22, baseY - treeHeight * 0.55, x + thickness * 0.5, baseY);
+  context.closePath();
+  context.fill();
+
+  var branchCount = 4 + Math.floor(rand() * 4);
+  for (var branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+    var at = 0.22 + (branchIndex / branchCount) * 0.66 + rand() * 0.04;
+    var branchY = baseY - treeHeight * at;
+    var branchX = x + lean * treeHeight * at;
+    var direction = branchIndex % 2 === 0 ? 1 : -1;
+    var length = treeHeight * (0.14 + rand() * 0.26);
+    var angle = direction * (0.42 + rand() * 0.55);
+    var endX = branchX + Math.sin(angle) * length;
+    var endY = branchY - Math.cos(angle) * length * (0.65 + rand() * 0.5);
+    context.lineWidth = Math.max(0.9, thickness * (0.34 - at * 0.26));
+    context.beginPath();
+    context.moveTo(branchX, branchY);
+    context.quadraticCurveTo(branchX + Math.sin(angle) * length * 0.45, branchY - length * 0.3, endX, endY);
+    context.stroke();
+    var twigAngle = angle + direction * (0.5 + rand() * 0.6);
+    context.lineWidth = Math.max(0.7, context.lineWidth * 0.55);
+    context.beginPath();
+    context.moveTo(endX, endY);
+    context.lineTo(endX + Math.sin(twigAngle) * length * 0.42, endY - Math.cos(twigAngle) * length * 0.28);
+    context.stroke();
+  }
+}
+
+function addSafeStop(gradient, offset, color) {
+  try {
+    if (!gradient) { return; }
+    var position = Number(offset);
+    if (!isFinite(position)) { position = 0; }
+    if (position < 0) { position = 0; }
+    if (position > 1) { position = 1; }
+    gradient.addColorStop(position, color);
+  } catch (error) { logError('addColorStop', error); }
+}
+
+function drawForest(context, width, height, rand) {
+  var i, k;
+  context.fillStyle = '#f7f7f3';
+  context.fillRect(0, 0, width, height);
+
+  var wash = context.createLinearGradient(0, 0, 0, height * 0.5);
+  addSafeStop(wash, 0, 'rgba(0,0,0,0.30)');
+  addSafeStop(wash, 0.6, 'rgba(0,0,0,0.07)');
+  addSafeStop(wash, 1, 'rgba(0,0,0,0)');
+  context.fillStyle = wash;
+  context.fillRect(0, 0, width, height * 0.5);
+
+  var moonX = width * 0.16;
+  var moonY = height * 0.30;
+  var moonR = Math.min(width, height) * 0.060;
+  var halo = context.createRadialGradient(moonX, moonY, moonR * 0.85, moonX, moonY, moonR * 3.2);
+  addSafeStop(halo, 0, 'rgba(0,0,0,0.58)');
+  addSafeStop(halo, 0.42, 'rgba(0,0,0,0.15)');
+  addSafeStop(halo, 1, 'rgba(0,0,0,0)');
+  context.fillStyle = halo;
+  context.beginPath();
+  context.arc(moonX, moonY, moonR * 3.2, 0, Math.PI * 2);
+  context.fill();
+  context.fillStyle = '#000';
+  context.beginPath();
+  context.arc(moonX, moonY, moonR, 0, Math.PI * 2);
+  context.fill();
+  context.fillStyle = '#f7f7f3';
+  context.beginPath();
+  context.arc(moonX + moonR * 0.55, moonY - moonR * 0.42, moonR * 0.78, 0, Math.PI * 2);
+  context.fill();
+
+  context.strokeStyle = 'rgba(0,0,0,0.55)';
+  for (i = 0; i < 3; i++) {
+    var birdX = width * (0.30 + i * 0.055) + rand() * 20;
+    var birdY = height * (0.24 + rand() * 0.06);
+    var birdSize = 4 + rand() * 4;
+    context.lineWidth = 1.2;
+    context.beginPath();
+    context.moveTo(birdX - birdSize, birdY);
+    context.quadraticCurveTo(birdX - birdSize * 0.4, birdY - birdSize * 0.7, birdX, birdY);
+    context.quadraticCurveTo(birdX + birdSize * 0.4, birdY - birdSize * 0.7, birdX + birdSize, birdY);
+    context.stroke();
+  }
+
+  var farCount = 86;
+  for (i = 0; i < farCount; i++) {
+    var farX = ((i + rand() * 0.7) / farCount) * width;
+    var farH = height * (0.16 + rand() * 0.20);
+    context.strokeStyle = 'rgba(0,0,0,' + (0.35 + rand() * 0.3).toFixed(2) + ')';
+    context.lineWidth = 1 + rand() * 1.4;
+    context.beginPath();
+    context.moveTo(farX, height * 0.80);
+    context.lineTo(farX + (rand() - 0.5) * 8, height * 0.80 - farH);
+    context.stroke();
+  }
+
+  context.fillStyle = '#000';
+  context.strokeStyle = '#000';
+  var castleX = width * 0.655;
+  var castleBase = height * 0.845;
+  var castleW = width * 0.085;
+  var castleH = height * 0.30;
+  context.fillRect(castleX - castleW * 0.52, castleBase - castleH * 0.55, castleW, castleH * 0.56);
+  for (i = 0; i < 5; i++) {
+    var towerX = castleX - castleW * 0.62 + i * castleW * 0.31;
+    var towerH = castleH * (0.42 + ((i * 7) % 5) * 0.10);
+    context.fillRect(towerX, castleBase - towerH, castleW * 0.16, towerH);
+    context.beginPath();
+    context.moveTo(towerX - castleW * 0.03, castleBase - towerH);
+    context.lineTo(towerX + castleW * 0.08, castleBase - towerH - castleH * 0.16);
+    context.lineTo(towerX + castleW * 0.19, castleBase - towerH);
+    context.closePath();
+    context.fill();
+  }
+  context.fillRect(castleX - castleW * 0.30, castleBase - castleH * 0.78, castleW * 0.14, castleH * 0.78);
+  context.beginPath();
+  context.moveTo(castleX - castleW * 0.34, castleBase - castleH * 0.78);
+  context.lineTo(castleX - castleW * 0.23, castleBase - castleH * 0.98);
+  context.lineTo(castleX - castleW * 0.12, castleBase - castleH * 0.78);
+  context.closePath();
+  context.fill();
+
+  var midCount = 20;
+  for (i = 0; i < midCount; i++) {
+    var midX = (0.02 + (i + rand() * 0.6) / midCount * 0.96) * width;
+    drawDeadTree(context, midX, height * 0.86, height * (0.42 + rand() * 0.30), 3 + rand() * 5, rand);
+  }
+
+  var nearCount = 3;
+  for (i = 0; i < nearCount; i++) {
+    var nearX = i === 0 ? width * 0.035 : (i === 1 ? width * 0.945 : width * 0.80);
+    drawDeadTree(context, nearX, height * 0.95, height * (0.70 + rand() * 0.28), 16 + rand() * 14, rand);
+  }
+
+  context.strokeStyle = '#000';
+  for (i = 0; i < 5; i++) {
+    var twigStartX = width * (0.10 + i * 0.19);
+    var twigY = height * (0.12 + rand() * 0.16);
+    context.lineWidth = 1 + rand() * 2.2;
+    context.beginPath();
+    context.moveTo(twigStartX, twigY);
+    context.bezierCurveTo(
+      twigStartX + width * 0.07, twigY + height * 0.10,
+      twigStartX + width * 0.12, twigY + height * 0.05,
+      twigStartX + width * (0.16 + rand() * 0.10), twigY + height * 0.16
+    );
+    context.stroke();
+  }
+
+  context.fillStyle = '#000';
+  context.beginPath();
+  context.moveTo(0, height);
+  context.lineTo(0, height * 0.865);
+  var stepX = Math.max(5, width / 130);
+  for (k = 0; k <= width + stepX; k += stepX) {
+    context.lineTo(k, height * (0.845 + rand() * 0.030));
+  }
+  context.lineTo(width, height);
+  context.closePath();
+  context.fill();
+
+  context.strokeStyle = '#000';
+  var grassCount = 120;
+  for (i = 0; i < grassCount; i++) {
+    var grassX = (i + rand()) / grassCount * width;
+    var grassH = height * (0.012 + rand() * 0.032);
+    context.lineWidth = 0.9;
+    context.beginPath();
+    context.moveTo(grassX, height * 0.855);
+    context.quadraticCurveTo(grassX + (rand() - 0.5) * 10, height * 0.855 - grassH * 0.6, grassX + (rand() - 0.5) * 18, height * 0.855 - grassH);
+    context.stroke();
+  }
+}
+
+function crushPass(source, crush, edgeSeed) {
+  var width = source.width;
+  var height = source.height;
+  if (!width || !height) { return null; }
+  var context = source.getContext('2d');
+  var image = context.getImageData(0, 0, width, height);
+  var data = image.data;
+  var dither = buildDither();
+  var table = dither.table;
+  var tileSize = dither.size;
+  var shift = (crush - 0.5) * 0.34;
+  var edgeRand = makeRandom(edgeSeed);
+
+  var walk = new Float32Array(height);
+  var sideWalk = new Float32Array(width);
+  var level = 10 + edgeRand() * 10;
+  var sideLevel = 10 + edgeRand() * 10;
+  var columnIndex;
+  for (var y = 0; y < height; y++) {
+    level += (edgeRand() - 0.5) * 2.6;
+    if (level < 4) { level = 4; }
+    if (level > 34) { level = 34; }
+    walk[y] = level;
+  }
+  for (columnIndex = 0; columnIndex < width; columnIndex++) {
+    sideLevel += (edgeRand() - 0.5) * 3.2;
+    if (sideLevel < 3) { sideLevel = 3; }
+    if (sideLevel > 40) { sideLevel = 40; }
+    sideWalk[columnIndex] = sideLevel;
+  }
+
+  var offset = 0;
+  for (var row = 0; row < height; row++) {
+    var inset = walk[row];
+    var tileRow = (row % tileSize) * tileSize;
+    var topInset = 0;
+    for (var column = 0; column < width; column++) {
+      topInset = sideWalk[column];
+      if (column < inset || column >= width - inset || row < topInset || row >= height - topInset) {
+        data[offset + 3] = 0;
+        offset += 4;
+        continue;
+      }
+      var lum = (data[offset] * 0.299 + data[offset + 1] * 0.587 + data[offset + 2] * 0.114) / 255;
+      var threshold = table[tileRow + (column % tileSize)] + shift;
+      if (lum < threshold) {
+        data[offset] = 0;
+        data[offset + 1] = 0;
+        data[offset + 2] = 0;
+      } else {
+        data[offset] = 255;
+        data[offset + 1] = 255;
+        data[offset + 2] = 255;
+      }
+      data[offset + 3] = 255;
+      offset += 4;
+    }
+  }
+  context.putImageData(image, 0, 0);
+  return source;
+}
+
+function decoratePlate(canvas, rand) {
+  var context = canvas.getContext('2d');
+  var width = canvas.width;
+  var height = canvas.height;
+  var i;
+
+  context.globalAlpha = 0.22;
+  context.drawImage(canvas, 2.5, 0.6);
+  context.globalAlpha = 1;
+
+  for (i = 0; i < 260; i++) {
+    var speckX = rand() * width;
+    var speckY = rand() * height;
+    context.fillStyle = rand() > 0.5 ? 'rgba(0,0,0,0.75)' : 'rgba(255,255,255,0.85)';
+    context.fillRect(speckX, speckY, 1 + Math.round(rand()), 1 + Math.round(rand()));
+  }
+
+  for (i = 0; i < 9; i++) {
+    var bandY = rand() * height;
+    var bandH = 1 + rand() * 2.5;
+    context.fillStyle = rand() > 0.5 ? 'rgba(0,0,0,0.22)' : 'rgba(255,255,255,0.5)';
+    context.fillRect(0, bandY, width, bandH);
+  }
+
+  context.globalAlpha = 0.14;
+  context.strokeStyle = '#000';
+  for (i = 0; i < 14; i++) {
+    var lineX = rand() * width;
+    context.lineWidth = 0.6 + rand() * 0.9;
+    context.beginPath();
+    context.moveTo(lineX, 0);
+    context.lineTo(lineX + (rand() - 0.5) * 6, height);
+    context.stroke();
+  }
+  context.globalAlpha = 1;
+}
+
+function fitArtSize(size) {
+  var scale = Math.min(1, 1200 / Math.max(1, size.width), 640 / Math.max(1, size.height));
+  return {
+    width: Math.max(16, Math.round(size.width * scale)),
+    height: Math.max(16, Math.round(size.height * scale))
+  };
+}
+
+function buildOnePlate(size, crush, seed) {
+  var art = fitArtSize(size);
+  var canvas = makeCanvas(art.width, art.height);
+  var context = canvas.getContext('2d');
+  if (!context) { return null; }
+  try {
+    drawForest(context, art.width, art.height, makeRandom(seed));
+    crushPass(canvas, crush, seed + 7);
+    decoratePlate(canvas, makeRandom(seed + 31));
+    return canvas;
+  } catch (error) {
+    logError('plate', error);
+    return null;
+  }
+}
+
+function drawPlate() {
+  if (!plateEl) { return; }
+  try {
+    var size = measureBox(plateEl);
+    var dpr = Math.min(2, window.devicePixelRatio || 1, 2400 / Math.max(1, size.width), 1400 / Math.max(1, size.height));
+    if (!isFinite(dpr) || dpr < 1) { dpr = 1; }
+    var pixelW = Math.round(size.width * dpr);
+    var pixelH = Math.round(size.height * dpr);
+    if (pixelW < 8 || pixelH < 8) { return; }
+    if (plateEl.width !== pixelW || plateEl.height !== pixelH) {
+      plateEl.width = pixelW;
+      plateEl.height = pixelH;
+      plateCtx = null;
+    }
+    if (!plateCtx) { plateCtx = plateEl.getContext('2d'); }
+    if (!plateCtx) { return; }
+    var generation = plateGens[plateIndex] || plateGens[0];
+    plateCtx.clearRect(0, 0, pixelW, pixelH);
+    if (generation && generation.width > 0 && generation.height > 0) {
+      plateCtx.drawImage(generation, 0, 0, pixelW, pixelH);
+    }
+  } catch (error) { logError('drawPlate', error); }
+}
+
+function queuePlateBuild() {
+  plateToken++;
+  var token = plateToken;
+  var size = measureBox(plateEl);
+  plateGens = [];
+  plateIndex = 0;
+  var crushes = [0.50, 0.62, 0.40];
+  var step = 0;
+  function buildNext() {
+    if (token !== plateToken) { return; }
+    try {
+      var built = buildOnePlate(size, crushes[step], 3690 + step * 977);
+      if (built) { plateGens[step] = built; }
+    } catch (error) { logError('plateStep', error); }
+    step++;
+    if (step < crushes.length) {
+      setTimeout(buildNext, 24);
+    } else {
+      drawPlate();
+    }
+  }
+  setTimeout(buildNext, 40);
+}
+
+/* ---------- 枯枝字标 ---------- */
+var markEl = document.getElementById('mark');
+var markCtx = null;
+var markToken = 0;
+
+function briarStem(context, cx, side, baseX, baseY, angle, length, thickness, depth, rand) {
+  var dx = Math.sin(angle) * length;
+  var dy = Math.cos(angle) * length;
+  var endX = cx + side * (baseX + dx);
+  var endY = baseY - dy;
+  var startX = cx + side * baseX;
+  var controlX = cx + side * (baseX + dx * 0.42 + (rand() - 0.5) * thickness * 1.8);
+  var controlY = baseY - dy * 0.45;
+
+  context.lineWidth = Math.max(0.8, thickness);
+  context.beginPath();
+  context.moveTo(startX, baseY);
+  context.quadraticCurveTo(controlX, controlY, endX, endY);
+  context.stroke();
+
+  var thornAngle = Math.atan2(endY - baseY, endX - startX);
+  var thornSize = Math.max(2, thickness * 1.6);
+  var thornX = startX + (endX - startX) * 0.55;
+  var thornY = lerpY(baseY, endY, 0.55);
+  context.beginPath();
+  context.moveTo(thornX, thornY);
+  context.lineTo(thornX + Math.cos(thornAngle + 1.15) * thornSize, thornY + Math.sin(thornAngle + 1.15) * thornSize);
+  context.lineTo(thornX + Math.cos(thornAngle + 1.75) * thornSize * 0.6, thornY + Math.sin(thornAngle + 1.75) * thornSize * 0.6);
+  context.closePath();
+  context.fill();
+
+  if (depth <= 0) { return; }
+  var forkCount = 2;
+  for (var fork = 0; fork < forkCount; fork++) {
+    var spread = (fork === 0 ? 1 : -1) * (0.34 + rand() * 0.42);
+    briarStem(
+      context, cx, side,
+      baseX + dx * 0.98, endY,
+      angle + spread, length * (0.56 + rand() * 0.16), thickness * 0.62, depth - 1, rand
+    );
+  }
+}
+
+function lerpY(baseY, endY, ratio) {
+  return baseY + (endY - baseY) * ratio;
+}
+
+function drawBriarHalf(context, cx, width, height, side, rand) {
+  var spineY = height * 0.56;
+  var teeth = 11;
+  var i;
+  var glyph = 0.035 * width;
+
+  context.fillStyle = '#fff';
+  context.strokeStyle = '#fff';
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+
+  for (i = 0; i < teeth; i++) {
+    var toothX = (0.03 + (i / teeth) * 0.44) * width;
+    var toothH = height * (0.10 + ((i * 5) % 7) * 0.035);
+    var lean = (rand() - 0.5) * 0.02 * width;
+    context.beginPath();
+    context.moveTo(cx + side * (toothX - glyph * 0.42), spineY + height * 0.11);
+    context.lineTo(cx + side * (toothX + lean), spineY - toothH);
+    context.lineTo(cx + side * (toothX + glyph * 0.42), spineY + height * 0.11);
+    context.closePath();
+    context.fill();
+  }
+
+  var stems = [
+    { x: 0.055, angle: -0.30, length: 0.52, thickness: 0.085 },
+    { x: 0.16, angle: -0.05, length: 0.62, thickness: 0.075 },
+    { x: 0.255, angle: 0.22, length: 0.50, thickness: 0.060 },
+    { x: 0.345, angle: 0.46, length: 0.38, thickness: 0.048 },
+    { x: 0.41, angle: -0.52, length: 0.30, thickness: 0.040 }
+  ];
+  for (i = 0; i < stems.length; i++) {
+    var stem = stems[i];
+    briarStem(
+      context, cx, side,
+      stem.x * width, spineY + height * 0.10,
+      stem.angle, stem.length * height, Math.max(1.2, stem.thickness * height * 0.55),
+      3, rand
+    );
+    briarStem(
+      context, cx, side,
+      stem.x * width + width * 0.01, spineY + height * 0.10,
+      stem.angle + Math.PI, stem.length * height * 0.42, Math.max(1, stem.thickness * height * 0.34),
+      2, rand
+    );
+  }
+
+  for (i = 0; i < 6; i++) {
+    var spikeX = (0.06 + i * 0.062) * width;
+    var spikeDir = i % 2 === 0 ? 1 : -1;
+    context.lineWidth = Math.max(1, height * 0.010);
+    context.beginPath();
+    context.moveTo(cx + side * spikeX, spineY + height * 0.02);
+    context.quadraticCurveTo(
+      cx + side * (spikeX + spikeDir * height * 0.10), spineY - height * 0.18,
+      cx + side * (spikeX + spikeDir * height * 0.22), spineY - height * 0.22
+    );
+    context.stroke();
+  }
+
+  var webX = cx + side * width * 0.30;
+  var webY = height * 0.19;
+  var webR = height * 0.15;
+  context.lineWidth = Math.max(0.7, height * 0.006);
+  for (i = 0; i < 7; i++) {
+    var threadAngle = (i / 7) * Math.PI * 2;
+    context.beginPath();
+    context.moveTo(webX, webY);
+    context.lineTo(webX + Math.cos(threadAngle) * webR, webY + Math.sin(threadAngle) * webR);
+    context.stroke();
+  }
+  for (i = 1; i <= 3; i++) {
+    context.beginPath();
+    context.arc(webX, webY, webR * (i / 3.4), 0, Math.PI * 2);
+    context.stroke();
+  }
+}
+
+function drawMarkBase(context, width, height) {
+  var rand = makeRandom(4711);
+  var cx = width * 0.5;
+  context.clearRect(0, 0, width, height);
+  context.strokeStyle = '#fff';
+  context.fillStyle = '#fff';
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+
+  drawBriarHalf(context, cx, width, height, 1, rand);
+  drawBriarHalf(context, cx, width, height, -1, rand);
+
+  var stemWidth = Math.max(3, height * 0.052);
+  context.fillRect(cx - stemWidth * 0.5, height * 0.06, stemWidth, height * 0.88);
+  context.fillRect(cx - width * 0.085, height * 0.245, width * 0.17, Math.max(2.5, height * 0.038));
+
+  for (var i = 0; i < 3; i++) {
+    var spikeX = cx - width * 0.085 + i * width * 0.085;
+    context.beginPath();
+    context.moveTo(spikeX - height * 0.022, height * 0.245);
+    context.lineTo(spikeX, height * 0.115);
+    context.lineTo(spikeX + height * 0.022, height * 0.245);
+    context.closePath();
+    context.fill();
+  }
+  context.beginPath();
+  context.moveTo(cx - height * 0.030, height * 0.06);
+  context.lineTo(cx, -height * 0.02);
+  context.lineTo(cx + height * 0.030, height * 0.06);
+  context.closePath();
+  context.fill();
+}
+
+function erodeMark(canvas, rand) {
+  var context = canvas.getContext('2d');
+  var width = canvas.width;
+  var height = canvas.height;
+  if (!width || !height) { return; }
+  var image;
+  try { image = context.getImageData(0, 0, width, height); } catch (error) { logError('markData', error); return; }
+  var data = image.data;
+  var cell = 14;
+  var gridW = Math.ceil(width / cell);
+  var gridH = Math.ceil(height / cell);
+  var grid = new Float32Array(gridW * gridH);
+  var i;
+  for (i = 0; i < grid.length; i++) { grid[i] = rand(); }
+
+  var offset = 0;
+  for (var y = 0; y < height; y++) {
+    var gridRow = Math.floor(y / cell) * gridW;
+    for (var x = 0; x < width; x++) {
+      if (data[offset + 3] > 0) {
+        var bite = grid[gridRow + Math.floor(x / cell)];
+        var dropout = rand();
+        if (bite < 0.10 || dropout < 0.055) {
+          data[offset + 3] = 0;
+        } else if (dropout < 0.12) {
+          data[offset] = 46;
+          data[offset + 1] = 46;
+          data[offset + 2] = 46;
+        }
+      }
+      offset += 4;
+    }
+  }
+  context.putImageData(image, 0, 0);
+
+  context.globalCompositeOperation = 'destination-out';
+  context.fillStyle = 'rgba(0,0,0,0.55)';
+  for (i = 0; i < 5; i++) {
+    context.fillRect(0, rand() * height, width, 0.8 + rand() * 1.4);
+  }
+  context.globalCompositeOperation = 'source-over';
+}
+
+function queueMarkBuild() {
+  markToken++;
+  var token = markToken;
+  setTimeout(function () {
+    if (token !== markToken) { return; }
+    try {
+      if (!markEl) { return; }
+      var size = measureBox(markEl);
+      var dpr = Math.min(2, window.devicePixelRatio || 1);
+      var pixelW = Math.max(8, Math.round(size.width * dpr));
+      var pixelH = Math.max(8, Math.round(size.height * dpr));
+      var canvas = makeCanvas(pixelW, pixelH);
+      var context = canvas.getContext('2d');
+      if (!context) { return; }
+      context.scale(dpr, dpr);
+      drawMarkBase(context, size.width, size.height);
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      erodeMark(canvas, makeRandom(8081));
+      if (markEl.width !== pixelW || markEl.height !== pixelH) {
+        markEl.width = pixelW;
+        markEl.height = pixelH;
+        markCtx = null;
+      }
+      if (!markCtx) { markCtx = markEl.getContext('2d'); }
+      if (!markCtx) { return; }
+      markCtx.clearRect(0, 0, pixelW, pixelH);
+      markCtx.globalAlpha = 0.35;
+      markCtx.drawImage(canvas, 3 * dpr, 1 * dpr);
+      markCtx.globalAlpha = 1;
+      markCtx.drawImage(canvas, 0, 0);
+    } catch (error) { logError('mark', error); }
+  }, 150);
+}
+
+var resizeTimer = 0;
+
+/* ---------- 噪点与走带 ---------- */
+var grainEl = document.getElementById('grain');
+var grainCtx = null;
+var lastGrainAt = 0;
+var bgEl = document.getElementById('bg');
+var bgCtx = null;
+var pulse = 0;
+var jitterUntil = 0;
+var lastFrameTime = 0;
+var lastGenerationSwap = 0;
+var cachedTransform = null;
+
+function readReducedMotion() {
+  try {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  } catch (error) {
+    logError('reducedMotion', error);
+    return false;
+  }
+}
+STATE.rm = readReducedMotion();
+try {
+  if (window.matchMedia) {
+    var motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    var onMotionChange = function (event) { STATE.rm = !!(event && event.matches); };
+    if (motionQuery.addEventListener) { motionQuery.addEventListener('change', onMotionChange); }
+    else if (motionQuery.addListener) { motionQuery.addListener(onMotionChange); }
+  }
+} catch (error) { logError('motionQuery', error); }
+
+function drawBackground() {
+  try {
+    if (!bgEl) { return; }
+    var width = window.innerWidth || 1440;
+    var height = window.innerHeight || 900;
+    if (!isFinite(width) || width < 8) { width = 1440; }
+    if (!isFinite(height) || height < 8) { height = 900; }
+    var ratio = Math.min(1.5, window.devicePixelRatio || 1, 2600 / Math.max(1, width));
+    if (!isFinite(ratio) || ratio < 1) { ratio = 1; }
+    var pixelW = Math.round(width * ratio);
+    var pixelH = Math.round(height * ratio);
+    if (bgEl.width !== pixelW || bgEl.height !== pixelH) {
+      bgEl.width = pixelW;
+      bgEl.height = pixelH;
+      bgCtx = null;
+    }
+    if (!bgCtx) { bgCtx = bgEl.getContext('2d'); }
+    if (!bgCtx) { return; }
+    bgCtx.setTransform(1, 0, 0, 1, 0, 0);
+    bgCtx.fillStyle = '#000';
+    bgCtx.fillRect(0, 0, pixelW, pixelH);
+    var rand = makeRandom(1234);
+    var speckCount = Math.min(900, Math.round(pixelW * pixelH / 2600));
+    for (var i = 0; i < speckCount; i++) {
+      var alpha = 0.03 + rand() * 0.07;
+      bgCtx.fillStyle = 'rgba(210,210,205,' + alpha.toFixed(3) + ')';
+      var size = rand() > 0.9 ? 2 : 1;
+      bgCtx.fillRect(rand() * pixelW, rand() * pixelH, size, size);
+    }
+    bgCtx.fillStyle = 'rgba(255,255,255,0.035)';
+    for (var s = 0; s < 3; s++) {
+      bgCtx.fillRect(rand() * pixelW, 0, 1, pixelH);
+    }
+  } catch (error) { logError('background', error); }
+}
+
+function queueGrainSurface() {
+  try {
+    if (!grainEl) { return; }
+    var width = window.innerWidth || 1440;
+    var height = window.innerHeight || 900;
+    if (!isFinite(width) || width < 8) { width = 1440; }
+    if (!isFinite(height) || height < 8) { height = 900; }
+    var targetW = Math.max(180, Math.min(520, Math.round(width / 3.4)));
+    var targetH = Math.max(120, Math.round((targetW * height) / width));
+    grainEl.width = targetW;
+    grainEl.height = targetH;
+    grainCtx = null;
+    lastGrainAt = 0;
+  } catch (error) { logError('grainSize', error); }
+}
+
+function drawGrain(now) {
+  try {
+    if (!grainEl) { return; }
+    if (!grainCtx) { grainCtx = grainEl.getContext('2d'); }
+    if (!grainCtx) { return; }
+    var width = grainEl.width;
+    var height = grainEl.height;
+    if (!width || !height) { return; }
+    var context = grainCtx;
+    context.clearRect(0, 0, width, height);
+    var live = STATE.live || {};
+    var liveLevel = Math.min(1, Math.max(0, toNumber(live.level, 0)));
+    var bass = Math.min(1, Math.max(0, toNumber(live.bass, 0)));
+    var energy = 0.5 + liveLevel * 0.3 + pulse * 0.4;
+
+    var speckCount = Math.round(Math.min(1200, 320 + energy * 420));
+    for (var i = 0; i < speckCount; i++) {
+      var alpha = (0.10 + Math.random() * 0.55) * (0.5 + energy * 0.5);
+      context.fillStyle = 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
+      var dot = Math.random() > 0.93 ? 2 : 1;
+      context.fillRect(Math.random() * width, Math.random() * height, dot, dot);
+    }
+
+    var bands = 4;
+    for (var band = 0; band < bands; band++) {
+      var drift = (now * 0.018 + band * 53) % height;
+      var bandHeight = 1 + Math.random() * 1.6;
+      context.fillStyle = 'rgba(255,255,255,' + (0.06 + Math.random() * 0.12).toFixed(3) + ')';
+      context.fillRect(0, drift, width, bandHeight);
+    }
+
+    var drumX = (now * 0.03 + width * 0.3) % width;
+    context.fillStyle = 'rgba(255,255,255,0.10)';
+    context.fillRect(drumX, 0, 1 + Math.random() * 2, height);
+
+    if (pulse > 0.22) {
+      var flashY = Math.random() * height;
+      context.fillStyle = 'rgba(255,255,255,' + (pulse * (0.25 + bass * 0.3)).toFixed(3) + ')';
+      context.fillRect(0, flashY, width, 1 + Math.random() * 3);
+    }
+  } catch (error) { logError('grain', error); }
+}
+
+function animate(now) {
+  var delta = lastFrameTime ? Math.min(120, now - lastFrameTime) : 16;
+  lastFrameTime = now;
+  pulse *= Math.pow(0.9, delta / 16.7);
+  if (pulse < 0.004) { pulse = 0; }
+
+  var jittering = now < jitterUntil && !STATE.rm;
+  if (plateEl) {
+    var transform = jittering
+      ? 'translate(' + (Math.random() * 4 - 2).toFixed(2) + 'px,' + (Math.random() * 3 - 1.5).toFixed(2) + 'px)'
+      : 'none';
+    if (transform !== cachedTransform) {
+      cachedTransform = transform;
+      plateEl.style.transform = transform;
+    }
+  }
+  var grainDelay = STATE.rm ? 900 : 110;
+  if (now - lastGrainAt >= grainDelay) {
+    lastGrainAt = now;
+    drawGrain(now);
+  }
+}
+
+function onBeat(payload) {
+  var level = Math.min(1, Math.max(0, toNumber(payload && payload.level, 0)));
+  pulse = Math.max(pulse, 0.32 + level * 0.68);
+  if (STATE.rm) { return; }
+  jitterUntil = performance.now() + 80;
+  var now = performance.now();
+  if (level > 0.42 && plateGens.length > 1 && now - lastGenerationSwap > 360) {
+    lastGenerationSwap = now;
+    plateIndex = (plateIndex + 1) % plateGens.length;
+    drawPlate();
+  }
+}
+
+function onLive(payload) {
+  var data = payload || {};
+  STATE.live = {
+    bpm: toNumber(data.bpm, 0),
+    level: toNumber(data.level, 0),
+    bass: toNumber(data.bass, 0),
+    mid: toNumber(data.mid, 0),
+    treble: toNumber(data.treble, 0)
+  };
+  if (typeof data.playing === 'boolean') { STATE.playing = data.playing; }
+}
+
+function frame(now) {
+  var start = performance.now();
+  STATE.frames++;
+  try { paintLyrics(); } catch (error) { logError('frame', error); }
+  try { animate(toNumber(now, performance.now())); } catch (error) { logError('animate', error); }
+  STATE.js = performance.now() - start;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function relayout() {
+  try { drawBackground(); } catch (error) { logError('relayoutBg', error); }
+  try { queueGrainSurface(); } catch (error) { logError('relayoutGrain', error); }
+  try { drawGrain(performance.now()); } catch (error) { logError('relayoutGrainDraw', error); }
+  view.idx = -2;
+  view.sung = -1;
+  try { paintLyrics(); } catch (error) { logError('relayoutLyrics', error); }
+}
+
+window.addEventListener('resize', function () {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(function () {
+    try {
+      queuePlateBuild();
+      queueMarkBuild();
+      relayout();
+    } catch (error) { logError('resize', error); }
+  }, 240);
+});
+
+window.addEventListener('orientationchange', function () {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(function () {
+    try {
+      queuePlateBuild();
+      queueMarkBuild();
+      relayout();
+    } catch (error) { logError('orientation', error); }
+  }, 320);
+});
+
+setTimeout(function () {
+  try { queueGrainSurface(); } catch (error) { logError('bootGrain', error); }
+  try { drawGrain(performance.now()); } catch (error) { logError('bootGrainDraw', error); }
+  try { drawBackground(); } catch (error) { logError('bootBackground', error); }
+}, 40);
+
+setTimeout(function () {
+  try { queuePlateBuild(); } catch (error) { logError('bootPlate', error); }
+  try { queueMarkBuild(); } catch (error) { logError('bootMark', error); }
+}, 120);
+window.addEventListener('message', function (event) {
+  var msg = event.data;
+  if (!msg || msg.__c100 !== 1) { return; }
+  try {
+    if (msg.type === 'init') { onInit(msg.payload); }
+    else if (msg.type === 'tick') {
+      STATE.t = toNumber(msg.payload && msg.payload.time, STATE.t);
+      if (msg.payload && typeof msg.payload.playing === 'boolean') { STATE.playing = msg.payload.playing; }
+    }
+    else if (msg.type === 'beat') { onBeat(msg.payload); }
+    else if (msg.type === 'live') { onLive(msg.payload); }
+  } catch (error) { logError(msg.type, error); }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,883 @@
+<!-- 655 / S12A —— 自动钢琴纸卷：歌词被凿成纸带上的孔，时间以走纸距离显形。 -->
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>655 · 自动钢琴纸卷</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #080604; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+/* 655 / S12A —— 自动钢琴纸卷：歌词被凿成纸带上的孔，时间以走纸距离显形。 */
+(function () {
+  "use strict";
+
+  /* ================= 0. 状态 ================= */
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "" };
+  var DURATION = 0;
+  var RM = false;
+  try { RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) {}
+  var W = 1440, H = 900, DPR = 1;
+
+  window.__stage = function () {
+    var i = S.idx, L = S.lines, tx = "";
+    if (i >= 0 && L[i] && L[i].text != null) tx = String(L[i].text);
+    return {
+      lines: L.length, idx: i, t: S.t, playing: !!S.playing,
+      frames: S.frames, js: Math.round(S.js * 100) / 100, err: S.err,
+      text: tx, gl: false, rm: RM
+    };
+  };
+
+  var lastErrAt = 0;
+  function logErr(e) {
+    try { S.err = String((e && e.message) || e); } catch (_) { S.err = "error"; }
+    var now = (window.performance && performance.now()) || Date.now();
+    if (now - lastErrAt > 1000) {
+      lastErrAt = now;
+      try { console.error(e); } catch (_) {}
+    }
+  }
+
+  /* ================= 1. ready：首帧无条件 + 800ms 兜底 ================= */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (e) { logErr(e); }
+  }
+  var booted = false;
+  function start() {
+    if (booted) return;
+    booted = true;
+    setTimeout(boot, 0);
+  }
+  requestAnimationFrame(function () { sendReady(); start(); });
+  setTimeout(function () { sendReady(); start(); }, 800);
+
+  /* ================= 2. 工具 ================= */
+  var FONT = '"PingFang SC","Microsoft YaHei","Noto Sans SC","Source Han Sans SC","Hiragino Sans GB",sans-serif';
+  var MONO = 'ui-monospace,"SFMono-Regular",Consolas,"Liberation Mono",monospace';
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function safeSize() {
+    var w = window.innerWidth, h = window.innerHeight;
+    if (!isFinite(w) || w <= 0) w = 1440;
+    if (!isFinite(h) || h <= 0) h = 900;
+    return { w: Math.round(w), h: Math.round(h) };
+  }
+  function normAccent(a) {
+    if (!Array.isArray(a) || a.length < 3) return [226, 178, 104];
+    var r = Number(a[0]), g = Number(a[1]), b = Number(a[2]);
+    if (!isFinite(r) || !isFinite(g) || !isFinite(b)) return [226, 178, 104];
+    r = clamp(Math.round(r), 0, 255); g = clamp(Math.round(g), 0, 255); b = clamp(Math.round(b), 0, 255);
+    if (r + g + b < 45) return [226, 178, 104];
+    return [r, g, b];
+  }
+  function rgba(c, a) { return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")"; }
+  function mixc(a, b, k) {
+    return [
+      Math.round(a[0] + (b[0] - a[0]) * k),
+      Math.round(a[1] + (b[1] - a[1]) * k),
+      Math.round(a[2] + (b[2] - a[2]) * k)
+    ];
+  }
+  function hash(n) {
+    var x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  /* ================= 3. 歌词解析 ================= */
+  function charTimes(line) {
+    var chars = Array.from(line.text || ""), n = chars.length, out = new Array(n);
+    var cs = line.chars, i, j, rec, ct;
+    if (cs && cs.length) {
+      var rel = cs[0] && isFinite(cs[0].t) && cs[0].t < line.t - 0.08;
+      for (i = 0; i < n; i++) {
+        j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+        rec = cs[j];
+        ct = rec && rec.t;
+        out[i] = isFinite(ct) ? (rel ? line.t + ct : ct) : null;
+      }
+      return out;
+    }
+    var d = line.dur > 0 ? line.dur : 3.4;
+    for (i = 0; i < n; i++) out[i] = line.t + d * 0.88 * i / Math.max(1, n);
+    return out;
+  }
+
+  function buildLines(raw) {
+    var out = [];
+    if (!Array.isArray(raw)) return out;
+    for (var i = 0; i < raw.length; i++) {
+      var l = raw[i];
+      if (!l || typeof l !== "object") continue;
+      var text = (l.text == null) ? "" : String(l.text);
+      if (!text.trim()) continue;
+      var t = Number(l.t); if (!isFinite(t) || t < 0) t = 0;
+      var dur = Number(l.dur); if (!isFinite(dur) || dur < 0) dur = 0;
+      var line = { t: t, dur: dur, text: text, chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null };
+      line.times = charTimes(line);
+      line.mask = null; line.mw = 0; line.mh = 0;
+      out.push(line);
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    return out;
+  }
+
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    while (lo <= hi) {
+      var m = (lo + hi) >> 1;
+      if (a[m].t <= t + 0.02) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return best;
+  }
+
+  /* ================= 4. 画布 / 版面 ================= */
+  var cvs = document.getElementById("cv");
+  var ctx = cvs.getContext("2d");
+  var paperCv = null, paperCtx = null;
+  var bgCv = null, bgCtx = null;
+  var fiberCv = null, fiberPat = null;
+  var measureCv = document.createElement("canvas");
+  var measureCtx = measureCv.getContext("2d");
+  var maskTimer = 0;
+
+  var paperW = 600, paperX = 420, barY = 500, punchY = 310, pps = 90;
+  var baseFS = 70, maxTextW = 500, barH = 11;
+
+  function layout() {
+    if (W < 700) paperW = W * 0.86;
+    else paperW = Math.min(W * 0.60, H * 0.70);
+    paperW = Math.max(220, paperW);
+    paperX = (W - paperW) / 2;
+    barY = H * 0.555;
+    punchY = barY - clamp(H * 0.205, 118, 196);
+    pps = clamp(H * 0.1, 52, 118);
+    barH = clamp(H * 0.009, 7, 11);
+    baseFS = clamp(paperW * 0.118, 20, 82);
+    maxTextW = paperW * 0.84;
+  }
+
+  function makeCanvas(w, h) {
+    var c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(w * DPR));
+    c.height = Math.max(1, Math.round(h * DPR));
+    return c;
+  }
+
+  function buildFiber() {
+    fiberCv = makeCanvas(160, 160);
+    var g = fiberCv.getContext("2d");
+    g.scale(DPR, DPR);
+    for (var i = 0; i < 620; i++) {
+      var x = Math.random() * 160, y = Math.random() * 160;
+      g.fillStyle = "rgba(70,52,26," + (0.03 + Math.random() * 0.05) + ")";
+      g.fillRect(x, y, 0.7 + Math.random() * 1.6, 0.7 + Math.random() * 1.1);
+    }
+    for (var j = 0; j < 26; j++) {
+      var yy = Math.random() * 160;
+      g.strokeStyle = "rgba(80,60,30,0.035)";
+      g.lineWidth = 0.7;
+      g.beginPath();
+      g.moveTo(0, yy);
+      g.bezierCurveTo(50, yy + (Math.random() - 0.5) * 8, 110, yy + (Math.random() - 0.5) * 8, 160, yy);
+      g.stroke();
+    }
+    fiberPat = paperCtx.createPattern(fiberCv, "repeat");
+  }
+
+  function buildBg() {
+    bgCv = makeCanvas(W, H);
+    bgCtx = bgCv.getContext("2d");
+    bgCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    bgCtx.fillStyle = "#080604";
+    bgCtx.fillRect(0, 0, W, H);
+    var rg = bgCtx.createRadialGradient(W * 0.5, H * 0.5, 10, W * 0.5, H * 0.5, Math.max(W, H) * 0.72);
+    rg.addColorStop(0, "rgba(66,43,22,0.42)");
+    rg.addColorStop(0.55, "rgba(26,17,9,0.28)");
+    rg.addColorStop(1, "rgba(0,0,0,0)");
+    bgCtx.fillStyle = rg;
+    bgCtx.fillRect(0, 0, W, H);
+    for (var i = 0; i < 74; i++) {
+      var x = hash(i * 3.1) * W;
+      var drift = (hash(i * 7.7) - 0.5) * 90;
+      bgCtx.strokeStyle = "rgba(126,86,44," + (0.015 + hash(i * 5.3) * 0.05) + ")";
+      bgCtx.lineWidth = 0.6 + hash(i * 9.1) * 2.4;
+      bgCtx.beginPath();
+      bgCtx.moveTo(x, -20);
+      bgCtx.bezierCurveTo(x + drift * 0.4, H * 0.3, x - drift * 0.5, H * 0.7, x + drift, H + 20);
+      bgCtx.stroke();
+    }
+    var vg = bgCtx.createRadialGradient(W * 0.5, H * 0.5, Math.min(W, H) * 0.18, W * 0.5, H * 0.5, Math.max(W, H) * 0.78);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(1, "rgba(0,0,0,0.66)");
+    bgCtx.fillStyle = vg;
+    bgCtx.fillRect(0, 0, W, H);
+  }
+
+  /* ================= 5. 打孔歌词掩膜 ================= */
+  function wrapText(text, fs, maxW) {
+    measureCtx.font = "600 " + fs + "px " + FONT;
+    var arr = Array.from(text), rows = [], row = "";
+    for (var i = 0; i < arr.length; i++) {
+      var ch = arr[i];
+      if (ch === "\n") { rows.push(row); row = ""; continue; }
+      var next = row + ch;
+      if (row && measureCtx.measureText(next).width > maxW) {
+        rows.push(row);
+        row = (ch === " ") ? "" : ch;
+      } else row = next;
+    }
+    if (row) rows.push(row);
+    return rows.length ? rows : [text];
+  }
+
+  function mkMask(text) {
+    var fs = baseFS, rows = null, k;
+    for (k = 0; k < 22; k++) {
+      rows = wrapText(text, fs, maxTextW);
+      if (rows.length <= 2 || fs <= 15) break;
+      fs *= 0.9;
+    }
+    fs = Math.max(13, fs);
+    measureCtx.font = "600 " + fs + "px " + FONT;
+    var wid = 0;
+    for (k = 0; k < rows.length; k++) wid = Math.max(wid, measureCtx.measureText(rows[k]).width);
+    var pad = fs * 0.22;
+    var lh = fs * 1.28;
+    var cssW = Math.min(maxTextW + pad * 2, wid + pad * 2);
+    var cssH = rows.length * lh + pad * 2;
+    var mc = makeCanvas(cssW, cssH);
+    var g = mc.getContext("2d");
+    g.scale(DPR, DPR);
+    g.fillStyle = "#ffffff";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.font = "600 " + fs + "px " + FONT;
+    for (k = 0; k < rows.length; k++) {
+      g.fillText(rows[k], cssW / 2, pad + lh * (k + 0.5));
+    }
+    /* 孔洞质感：在字形内冲出规则小孔，留下纸纤维点 */
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = "destination-out";
+    var step = Math.max(3.0, fs * 0.078) * DPR;
+    var rad = Math.max(0.9, fs * 0.023) * DPR;
+    g.fillStyle = "#000";
+    g.beginPath();
+    for (var y = step * 0.5; y < mc.height; y += step) {
+      for (var x = (Math.round(y / step) % 2) * step * 0.5; x < mc.width; x += step) {
+        g.moveTo(x + rad, y);
+        g.arc(x, y, rad, 0, Math.PI * 2);
+      }
+    }
+    g.fill();
+    g.globalCompositeOperation = "source-over";
+    return { cv: mc, w: cssW, h: cssH };
+  }
+
+  function buildMasks() {
+    if (!paperCtx) return;
+    for (var i = 0; i < S.lines.length; i++) {
+      var line = S.lines[i];
+      if (!line.text.trim()) continue;
+      try {
+        var m = mkMask(line.text);
+        line.mask = m.cv; line.mw = m.w; line.mh = m.h;
+      } catch (e) { logErr(e); }
+    }
+  }
+
+  /* ================= 6. resize ================= */
+  function resize() {
+    var sz = safeSize();
+    W = sz.w; H = sz.h;
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    cvs.width = Math.round(W * DPR);
+    cvs.height = Math.round(H * DPR);
+    cvs.style.width = W + "px";
+    cvs.style.height = H + "px";
+    layout();
+    paperCv = makeCanvas(W, H);
+    paperCtx = paperCv.getContext("2d");
+    buildFiber();
+    buildBg();
+    buildMasks();
+    if (maskTimer) clearTimeout(maskTimer);
+    maskTimer = setTimeout(function () { buildMasks(); }, 160);
+  }
+
+  /* ================= 7. 动效瞬态 ================= */
+  var ACCENT = [226, 178, 104];
+  var LIGHT = [255, 244, 216];
+  var liveGlow = 0, liveLevel = 0, liveBass = 0, liveMid = 0, liveTreble = 0;
+  var beatAmp = 0, beatAge = 9, beatSeed = 0;
+  var sparks = [];
+  var joltPx = 0;
+
+  function resetTransients() {
+    beatAmp = 0; beatAge = 9; sparks.length = 0; joltPx = 0;
+  }
+
+  function setAccent(a) {
+    ACCENT = normAccent(a);
+    LIGHT = mixc(ACCENT, [255, 250, 236], 0.62);
+    buildBg();
+  }
+
+  function applyInit(p) {
+    S.lines = buildLines(p.lines);
+    DURATION = Number(p.duration) || 0;
+    if (Array.isArray(p.accent)) setAccent(p.accent);
+    if (typeof p.playing === "boolean") S.playing = p.playing;
+    S.idx = -1;
+    resetTransients();
+    buildMasks();
+  }
+
+  function onBeat(p) {
+    var lv = Number(p.level);
+    if (!isFinite(lv)) lv = 0.55;
+    lv = clamp(lv, 0, 1);
+    beatAmp = Math.max(beatAmp, 0.38 + lv * 0.62);
+    beatAge = 0;
+    beatSeed = (Number(p.index) || 0) + 1;
+    if (!RM) {
+      var n = 7 + Math.round(lv * 8);
+      for (var i = 0; i < n; i++) {
+        var sx = paperX + paperW * (0.1 + hash(beatSeed * 13.7 + i * 3.9) * 0.8);
+        sparks.push({
+          x: sx,
+          y: punchY + 8 + hash(beatSeed * 3.1 + i) * 22,
+          vx: (hash(i * 7.7 + beatSeed) - 0.5) * 90,
+          vy: (hash(i * 5.3 + beatSeed * 2) - 0.2) * 65,
+          life: 0.28 + hash(i * 9.1 + beatSeed) * 0.34,
+          age: 0
+        });
+      }
+      if (sparks.length > 90) sparks.splice(0, sparks.length - 90);
+    }
+  }
+
+  function tickTime(t) {
+    var nt = Number(t);
+    if (!isFinite(nt)) return;
+    if (Math.abs(nt - S.t) > 0.5) {
+      resetTransients();
+      S.t = nt;
+      S.idx = idxAt(S.t);
+    } else {
+      S.t = nt;
+    }
+  }
+
+  /* ================= 8. 消息 ================= */
+  addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === "init") applyInit(p);
+      else if (d.type === "tick") {
+        tickTime(p.time);
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      } else if (d.type === "beat") onBeat(p);
+      else if (d.type === "live") {
+        var lv = Number(p.level);
+        if (isFinite(lv)) liveLevel = clamp(lv, 0, 1);
+        var bs = Number(p.bass), md = Number(p.mid), tr = Number(p.treble);
+        if (isFinite(bs)) liveBass = clamp(bs, 0, 1);
+        if (isFinite(md)) liveMid = clamp(md, 0, 1);
+        if (isFinite(tr)) liveTreble = clamp(tr, 0, 1);
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      }
+    } catch (e) { logErr(e); }
+  });
+
+  /* ================= 9. 绘制辅助 ================= */
+  function roundRect(g, x, y, w, h, r) {
+    r = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.lineTo(x + w - r, y);
+    g.quadraticCurveTo(x + w, y, x + w, y + r);
+    g.lineTo(x + w, y + h - r);
+    g.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    g.lineTo(x + r, y + h);
+    g.quadraticCurveTo(x, y + h, x, y + h - r);
+    g.lineTo(x, y + r);
+    g.quadraticCurveTo(x, y, x + r, y);
+    g.closePath();
+  }
+
+  function drawRoller(y, h, top) {
+    var x = paperX - 42, w = paperW + 84;
+    var g = ctx.createLinearGradient(0, y, 0, y + h);
+    g.addColorStop(0, "#070503");
+    g.addColorStop(0.22, "#2b1d10");
+    g.addColorStop(0.46, "#6b4d29");
+    g.addColorStop(0.55, "#8a6636");
+    g.addColorStop(0.68, "#392616");
+    g.addColorStop(1, "#090604");
+    ctx.fillStyle = g;
+    roundRect(ctx, x, y, w, h, h * 0.42);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,219,160,0.18)";
+    ctx.lineWidth = 1;
+    roundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, h * 0.42);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,226,176,0.10)";
+    ctx.fillRect(x + 16, y + h * 0.34, w - 32, Math.max(1, h * 0.05));
+    /* 轴端 */
+    for (var s = 0; s < 2; s++) {
+      var cx2 = s ? x + w - 14 : x + 14;
+      var cy2 = y + h * 0.5;
+      var cg = ctx.createRadialGradient(cx2 - 3, cy2 - 3, 1, cx2, cy2, 12);
+      cg.addColorStop(0, "#b08b51");
+      cg.addColorStop(0.55, "#3d2a16");
+      cg.addColorStop(1, "#0b0704");
+      ctx.fillStyle = cg;
+      ctx.beginPath();
+      ctx.arc(cx2, cy2, Math.min(12, h * 0.34), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (top) {
+      ctx.fillStyle = "rgba(238,216,176,0.34)";
+      ctx.font = "600 8px " + MONO;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText("AUTOMATIC LYRIC ROLL  /  655  /  S12A", x + 34, y + h * 0.5 + 0.5);
+    }
+  }
+
+  function drawSides() {
+    var railW = Math.min(26, paperW * 0.07);
+    for (var s = 0; s < 2; s++) {
+      var x = s ? paperX + paperW + 4 : paperX - 4 - railW;
+      var g = ctx.createLinearGradient(x, 0, x + railW, 0);
+      g.addColorStop(0, "#0a0704");
+      g.addColorStop(0.35, "#24180c");
+      g.addColorStop(0.62, "#46301a");
+      g.addColorStop(1, "#0b0704");
+      ctx.fillStyle = g;
+      ctx.fillRect(x, 0, railW, H);
+      ctx.fillStyle = "rgba(236,199,138,0.16)";
+      ctx.fillRect(s ? x : x + railW - 1, 0, 1, H);
+      for (var y = 60; y < H; y += 132) {
+        var cg = ctx.createRadialGradient(x + railW / 2 - 1, y - 1, 0.5, x + railW / 2, y, 5);
+        cg.addColorStop(0, "#d7b478");
+        cg.addColorStop(0.5, "#6a4c28");
+        cg.addColorStop(1, "#1b1108");
+        ctx.fillStyle = cg;
+        ctx.beginPath();
+        ctx.arc(x + railW / 2, y, 3.4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "rgba(0,0,0,0.55)";
+        ctx.beginPath();
+        ctx.moveTo(x + railW / 2 - 2, y - 0.5);
+        ctx.lineTo(x + railW / 2 + 2, y - 0.5);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function charPips(t) {
+    var line = S.lines[S.idx];
+    if (!line || !line.mw) return;
+    var glyphs = Array.from(line.text), n = glyphs.length;
+    if (!n) return;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < n; i++) {
+      var ct = line.times[i];
+      if (!isFinite(ct)) continue;
+      var d = t - ct;
+      if (d < -0.10 || d > 0.42) continue;
+      var k = d < 0 ? 1 + d / 0.10 : 1 - d / 0.42;
+      if (k <= 0) continue;
+      var x = paperX + paperW / 2 + ((i + 0.5) / n - 0.5) * line.mw * 0.92;
+      var rr = (7 + 10 * k) * (0.75 + liveTreble * 0.5);
+      var g = ctx.createRadialGradient(x, barY, 0.4, x, barY, rr);
+      g.addColorStop(0, "rgba(255,252,236," + (0.85 * k) + ")");
+      g.addColorStop(0.35, rgba(LIGHT, 0.42 * k));
+      g.addColorStop(1, rgba(ACCENT, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, barY, rr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawTracker(t) {
+    var y = barY - barH / 2;
+    var g = ctx.createLinearGradient(0, y, 0, y + barH);
+    g.addColorStop(0, "#2a1a0b");
+    g.addColorStop(0.25, "#6f5026");
+    g.addColorStop(0.46, "#d6b06a");
+    g.addColorStop(0.55, "#8d6733");
+    g.addColorStop(1, "#201308");
+    ctx.fillStyle = g;
+    roundRect(ctx, paperX - 12, y, paperW + 24, barH, barH * 0.38);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,235,190,0.22)";
+    ctx.lineWidth = 1;
+    roundRect(ctx, paperX - 11.5, y + 0.5, paperW + 23, barH - 1, barH * 0.36);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(23,13,5,0.82)";
+    var gap = Math.max(10, paperW / 46);
+    for (var x = paperX + 14; x < paperX + paperW - 12; x += gap) {
+      ctx.beginPath();
+      ctx.arc(x, barY, Math.max(1, barH * 0.14), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    for (var s = 0; s < 2; s++) {
+      var sx = s ? paperX + paperW + 2 : paperX - 2;
+      var sg = ctx.createRadialGradient(sx - 1, barY - 1, 0.5, sx, barY, 6);
+      sg.addColorStop(0, "#f0d49a");
+      sg.addColorStop(0.5, "#735128");
+      sg.addColorStop(1, "#180e06");
+      ctx.fillStyle = sg;
+      ctx.beginPath();
+      ctx.arc(sx, barY, 4.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = "rgba(255,240,208,0.10)";
+    ctx.fillRect(paperX - 12, y + 1, paperW + 24, 1);
+    charPips(t);
+  }
+
+  function drawPunch() {
+    var ph = clamp(H * 0.022, 16, 26);
+    var y = punchY;
+    var punch = RM ? 0 : Math.sin(Math.min(1, beatAge / 0.2) * Math.PI) * 7 * beatAmp;
+    var x = paperX - 18, w = paperW + 36;
+
+    var g = ctx.createLinearGradient(0, y - ph * 0.8, 0, y + ph * 0.7);
+    g.addColorStop(0, "#120c06");
+    g.addColorStop(0.34, "#2b1d10");
+    g.addColorStop(0.62, "#5d4424");
+    g.addColorStop(1, "#080503");
+    ctx.fillStyle = g;
+    roundRect(ctx, x, y - ph * 0.7, w, ph, 4);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(240,207,150,0.20)";
+    ctx.lineWidth = 1;
+    roundRect(ctx, x + 0.5, y - ph * 0.7 + 0.5, w - 1, ph - 1, 4);
+    ctx.stroke();
+
+    /* 打孔针排 */
+    var pins = 9;
+    var gap = paperW / pins;
+    for (var i = 0; i < pins; i++) {
+      var px = paperX + gap * (i + 0.5);
+      var lit = clamp(1 - Math.abs(px - (paperX + paperW / 2)) / (paperW * 0.7), 0, 1);
+      ctx.fillStyle = "#2a1b0d";
+      roundRect(ctx, px - 3, y - ph * 0.7 - 12 + punch, 6, 14, 2);
+      ctx.fill();
+      ctx.fillStyle = "#b18b53";
+      roundRect(ctx, px - 1.6, y - ph * 0.7 - 10 + punch, 3.2, 9, 1.4);
+      ctx.fill();
+      ctx.fillStyle = "rgba(255,244,214," + (0.22 + lit * 0.45 * (0.4 + beatAmp * 0.6)) + ")";
+      ctx.fillRect(px - 1.2, y - ph * 0.7 + punch + 1, 2.4, 1.4);
+    }
+    /* 刀口余光 */
+    ctx.fillStyle = rgba(LIGHT, 0.22 + beatAmp * 0.25);
+    ctx.fillRect(paperX + 6, y + ph * 0.26, paperW - 12, 1);
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(paperX - 6, y + ph * 0.7, paperW + 12, 2);
+
+    /* 打孔碎屑光点 */
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (var s = 0; s < sparks.length; s++) {
+      var sp = sparks[s];
+      var a = Math.max(0, 1 - sp.age / sp.life);
+      if (a <= 0) continue;
+      ctx.strokeStyle = rgba(LIGHT, 0.42 * a);
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      ctx.moveTo(sp.x, sp.y);
+      ctx.lineTo(sp.x - sp.vx * 0.016, sp.y - sp.vy * 0.016);
+      ctx.stroke();
+      ctx.fillStyle = "rgba(255,250,232," + (0.75 * a) + ")";
+      ctx.beginPath();
+      ctx.arc(sp.x, sp.y, 1.25, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawDust(t) {
+    var n = RM ? 16 : 46;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < n; i++) {
+      var bx = hash(i * 4.7) * W;
+      var by = (hash(i * 8.3) * H + t * (3 + hash(i) * 7)) % H;
+      var x = bx + Math.sin(t * 0.4 + i * 2.1) * (RM ? 4 : 14);
+      var a = 0.045 + hash(i * 2.9) * 0.11;
+      ctx.fillStyle = rgba(LIGHT, a * (0.6 + liveGlow * 0.7));
+      var r = 0.5 + hash(i * 6.1) * 1.4;
+      ctx.beginPath();
+      ctx.arc(x, by, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /* ================= 10. 纸带合成 ================= */
+  function renderPaper(jo, t) {
+    paperCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    paperCtx.clearRect(0, 0, W, H);
+    var x = paperX, w = paperW;
+
+    var pg = paperCtx.createLinearGradient(x, 0, x + w, 0);
+    pg.addColorStop(0, "#655845");
+    pg.addColorStop(0.05, "#968a72");
+    pg.addColorStop(0.24, "#b5a787");
+    pg.addColorStop(0.5, "#c2b391");
+    pg.addColorStop(0.76, "#ad9e80");
+    pg.addColorStop(0.95, "#887b64");
+    pg.addColorStop(1, "#5c5140");
+    paperCtx.fillStyle = pg;
+    paperCtx.fillRect(x, 0, w, H);
+
+    var vg = paperCtx.createLinearGradient(0, 0, 0, H);
+    vg.addColorStop(0, "rgba(32,22,10,0.46)");
+    vg.addColorStop(0.22, "rgba(32,22,10,0.10)");
+    vg.addColorStop(0.5, "rgba(255,246,220,0.05)");
+    vg.addColorStop(0.82, "rgba(26,18,8,0.10)");
+    vg.addColorStop(1, "rgba(26,18,8,0.48)");
+    paperCtx.fillStyle = vg;
+    paperCtx.fillRect(x, 0, w, H);
+
+    if (fiberPat) {
+      paperCtx.save();
+      paperCtx.globalAlpha = 0.55;
+      paperCtx.fillStyle = fiberPat;
+      paperCtx.fillRect(x, 0, w, H);
+      paperCtx.restore();
+    }
+
+    /* 印刷辅助线（随纸走） */
+    paperCtx.strokeStyle = "rgba(58,42,20,0.10)";
+    paperCtx.lineWidth = 1;
+    var lsp = 26;
+    var loff = ((t * pps + jo) % lsp + lsp) % lsp;
+    for (var yy = -lsp + loff; yy < H + lsp; yy += lsp) {
+      paperCtx.beginPath();
+      paperCtx.moveTo(x + 18, yy);
+      paperCtx.lineTo(x + w - 18, yy);
+      paperCtx.stroke();
+    }
+
+    /* 印刷行号（纸面墨色） */
+    paperCtx.font = "600 9px " + MONO;
+    paperCtx.fillStyle = "rgba(56,40,20,0.34)";
+    paperCtx.textAlign = "left";
+    paperCtx.textBaseline = "middle";
+    for (var i = 0; i < S.lines.length; i++) {
+      var ln = S.lines[i];
+      if (!ln.mask) continue;
+      var lyy = barY - 6 - ln.mh * 0.5 - (ln.t - t) * pps + jo;
+      if (lyy < punchY - 40 || lyy > H + 60) continue;
+      var tag = (i + 1 < 10 ? "0" : "") + (i + 1);
+      paperCtx.fillText(tag, x + 24, lyy);
+    }
+
+    /* 打孔：齿孔 + 歌词孔 */
+    paperCtx.globalCompositeOperation = "destination-out";
+    paperCtx.fillStyle = "#000";
+
+    var spacing = Math.max(17, H * 0.022);
+    var off = ((t * pps + jo) % spacing + spacing) % spacing;
+    paperCtx.beginPath();
+    for (var sy = -spacing + off; sy < H + spacing; sy += spacing) {
+      paperCtx.moveTo(x + 11 + 2.7, sy);
+      paperCtx.arc(x + 11, sy, 2.7, 0, Math.PI * 2);
+      paperCtx.moveTo(x + w - 11 + 2.7, sy);
+      paperCtx.arc(x + w - 11, sy, 2.7, 0, Math.PI * 2);
+    }
+    paperCtx.fill();
+
+    paperCtx.save();
+    paperCtx.beginPath();
+    paperCtx.rect(x + 3, punchY + 3, w - 6, H - punchY);
+    paperCtx.clip();
+    for (var j = 0; j < S.lines.length; j++) {
+      var line = S.lines[j];
+      if (!line.mask) continue;
+      var y = barY - 6 - line.mh * 0.5 - (line.t - t) * pps + jo;
+      if (y + line.mh < punchY || y - line.mh > H + 20) continue;
+      paperCtx.drawImage(line.mask, x + (w - line.mw) / 2, y - line.mh / 2, line.mw, line.mh);
+    }
+    paperCtx.restore();
+    paperCtx.globalCompositeOperation = "source-over";
+  }
+
+  /* ================= 11. 主绘制（全部由时间推导） ================= */
+  function draw(t) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(bgCv, 0, 0, W, H);
+
+    var cx = paperX + paperW / 2;
+    var amb = ctx.createRadialGradient(cx, barY, 12, cx, barY, Math.max(W, H) * 0.64);
+    amb.addColorStop(0, rgba(ACCENT, 0.11 + liveGlow * 0.10));
+    amb.addColorStop(0.55, rgba(ACCENT, 0.035));
+    amb.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = amb;
+    ctx.fillRect(0, 0, W, H);
+
+    /* 背光箱：孔洞亮度的来源 */
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(paperX - 1, 0, paperW + 2, H);
+    ctx.clip();
+    var lg = ctx.createLinearGradient(0, 0, 0, H);
+    lg.addColorStop(0, rgba(LIGHT, 0.14));
+    lg.addColorStop(0.30, rgba(LIGHT, 0.30));
+    lg.addColorStop(0.46, rgba(LIGHT, 0.66));
+    lg.addColorStop(0.555, rgba([255, 252, 242], 0.99));
+    lg.addColorStop(0.64, rgba(LIGHT, 0.68));
+    lg.addColorStop(0.82, rgba(LIGHT, 0.28));
+    lg.addColorStop(1, rgba(LIGHT, 0.14));
+    ctx.fillStyle = lg;
+    ctx.fillRect(paperX - 1, 0, paperW + 2, H);
+    var hot = ctx.createRadialGradient(cx, barY, 6, cx, barY, Math.max(paperW * 0.72, H * 0.34));
+    hot.addColorStop(0, rgba([255, 252, 240], 0.62));
+    hot.addColorStop(0.42, rgba(LIGHT, 0.25));
+    hot.addColorStop(1, rgba(LIGHT, 0));
+    ctx.globalCompositeOperation = "lighter";
+    ctx.fillStyle = hot;
+    ctx.fillRect(paperX - 1, 0, paperW + 2, H);
+    ctx.restore();
+
+    /* 走纸位移（节拍冲击；reduced-motion 下为零） */
+    joltPx = RM ? 0 : Math.sin(Math.min(1, beatAge / 0.24) * Math.PI) * 3.6 * beatAmp;
+
+    renderPaper(joltPx, t);
+    ctx.drawImage(paperCv, 0, 0, W, H);
+
+    /* 纸边压暗 */
+    var ed = Math.min(36, paperW * 0.09);
+    var lgx = ctx.createLinearGradient(paperX, 0, paperX + ed, 0);
+    lgx.addColorStop(0, "rgba(10,7,4,0.52)");
+    lgx.addColorStop(1, "rgba(10,7,4,0)");
+    ctx.fillStyle = lgx;
+    ctx.fillRect(paperX, 0, ed, H);
+    var rgx = ctx.createLinearGradient(paperX + paperW, 0, paperX + paperW - ed, 0);
+    rgx.addColorStop(0, "rgba(10,7,4,0.52)");
+    rgx.addColorStop(1, "rgba(10,7,4,0)");
+    ctx.fillStyle = rgx;
+    ctx.fillRect(paperX + paperW - ed, 0, ed, H);
+
+    /* 读孔条区域的暖光晕 */
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(paperX, barY - 120, paperW, 240);
+    ctx.clip();
+    ctx.globalCompositeOperation = "lighter";
+    var bg2 = ctx.createRadialGradient(cx, barY, 4, cx, barY, paperW * 0.66);
+    bg2.addColorStop(0, rgba(LIGHT, 0.13));
+    bg2.addColorStop(1, rgba(LIGHT, 0));
+    ctx.fillStyle = bg2;
+    ctx.fillRect(paperX, barY - 120, paperW, 240);
+    ctx.restore();
+
+    drawSides();
+    drawTracker(t);
+    drawPunch();
+
+    drawRoller(-13, Math.max(34, H * 0.048), true);
+    drawRoller(H - Math.max(30, H * 0.043), Math.max(34, H * 0.05), false);
+
+    drawDust(t);
+
+    /* 暗角 */
+    var vg = ctx.createRadialGradient(cx, H * 0.5, Math.min(W, H) * 0.2, cx, H * 0.5, Math.max(W, H) * 0.74);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(0.72, "rgba(0,0,0,0.10)");
+    vg.addColorStop(1, "rgba(0,0,0,0.62)");
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+
+    /* 底部铭牌 */
+    ctx.fillStyle = "rgba(232,204,158,0.26)";
+    ctx.font = "600 8px " + MONO;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("655 · S12A  /  PUNCHED LYRIC ROLL  /  " + (RM ? "REDUCED MOTION" : "1:1 TIME AXIS"), W / 2, H - 7);
+  }
+
+  /* ================= 12. 帧循环 ================= */
+  var rafOn = true, rafId = 0, lastNow = 0;
+
+  function update(dt) {
+    S.idx = idxAt(S.t);
+    if (!RM) {
+      beatAge += dt;
+      beatAmp *= Math.exp(-dt * 4.2);
+      if (beatAmp < 0.002) beatAmp = 0;
+    } else {
+      beatAge = 9; beatAmp = 0;
+    }
+    var target = Math.max(liveLevel, liveBass * 0.75, liveMid * 0.45);
+    liveGlow += (target - liveGlow) * (1 - Math.exp(-dt * 3.4));
+    for (var i = sparks.length - 1; i >= 0; i--) {
+      var sp = sparks[i];
+      sp.age += dt;
+      if (sp.age >= sp.life) { sparks.splice(i, 1); continue; }
+      sp.vy += 160 * dt;
+      sp.x += sp.vx * dt;
+      sp.y += sp.vy * dt;
+    }
+  }
+
+  function frame(now) {
+    if (!rafOn) return;
+    rafId = requestAnimationFrame(frame);
+    var dt = lastNow ? Math.min(0.06, Math.max(0, (now - lastNow) / 1000)) : 0.016;
+    lastNow = now;
+    var js0 = performance.now();
+    try {
+      update(dt);
+      if (W > 1 && H > 1 && paperCtx) draw(S.t);
+      S.frames++;
+    } catch (e) { logErr(e); }
+    S.js = performance.now() - js0;
+  }
+
+  function boot() {
+    try { resize(); } catch (e) { logErr(e); }
+    rafId = requestAnimationFrame(frame);
+  }
+
+  addEventListener("resize", function () {
+    try { resize(); } catch (e) { logErr(e); }
+  });
+  addEventListener("orientationchange", function () {
+    setTimeout(function () { try { resize(); } catch (e) { logErr(e); } }, 120);
+  });
+  addEventListener("pagehide", function () {
+    rafOn = false;
+    if (rafId) cancelAnimationFrame(rafId);
+  });
+
+  try {
+    if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+      document.fonts.ready.then(function () { buildMasks(); }).catch(function () {});
+    }
+  } catch (e) {}
+})();
+</script>
+</body>
+</html>

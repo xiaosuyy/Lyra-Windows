@@ -1,0 +1,984 @@
+<!-- 638 / S03B —— 把专辑封面测绘成等高线地形图，每句歌词都是一条正在爬升的测线。 -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>638 / S03B — CONTOUR SURVEY</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#060b0a;}
+  #cv{display:block;width:100%;height:100%;}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  /* ================= 0. 舞台状态 / 合同接口 ================= */
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "", dur: 0 };
+  var RM = false;
+  try { RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) {}
+  var GL_OK = false;
+
+  window.__stage = function () {
+    var i = S.idx, L = S.lines, tx = "";
+    if (i >= 0 && L[i] && L[i].text != null) tx = String(L[i].text);
+    return {
+      lines: L.length, idx: i, t: S.t, playing: !!S.playing,
+      frames: S.frames, js: Math.round(S.js * 100) / 100, err: S.err,
+      text: tx, gl: GL_OK, rm: RM
+    };
+  };
+
+  var lastErrAt = 0;
+  function logErr(e) {
+    try { S.err = String((e && e.message) || e); } catch (_) { S.err = "error"; }
+    var now = (window.performance && performance.now()) || Date.now();
+    if (now - lastErrAt > 1000) {
+      lastErrAt = now;
+      try { console.error(e); } catch (_) {}
+    }
+  }
+
+  /* ================= 1. ready：第一个 rAF 无条件、只一次 ================= */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (e) { logErr(e); }
+  }
+  var booted = false;
+  function boot() {
+    if (booted) return;
+    booted = true;
+    setupCanvas();
+    makeProcedural();
+    makeGrain();
+    buildContours(0);
+    loopStarted = true;
+    lastFrame = performance.now();
+    rafId = requestAnimationFrame(frame);
+  }
+  var loopStarted = false, rafId = 0, stopped = false, lastFrame = 0;
+
+  requestAnimationFrame(function () { sendReady(); boot(); });
+  setTimeout(function () { sendReady(); boot(); }, 800);
+
+  /* ================= 2. 工具 / 字体 / 配色 ================= */
+  var LYRIC_FONT = 'Georgia,"Times New Roman","PingFang SC","Microsoft YaHei","Noto Sans SC",serif';
+  var MONO = '"SFMono-Regular",Consolas,"Liberation Mono",Menlo,"Courier New",monospace';
+
+  var cv = document.getElementById("cv");
+  var ctx = cv.getContext("2d", { alpha: false });
+  var W = 1440, H = 900, DPR = 1;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smoothstep(e0, e1, x) {
+    var t = clamp((x - e0) / ((e1 - e0) || 1e-6), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+  function damp(cur, target, lambda, dt) {
+    return cur + (target - cur) * (1 - Math.exp(-lambda * dt));
+  }
+  function pad3(n) { n = Math.round(n); return (n < 100 ? (n < 10 ? "00" : "0") : "") + n; }
+  function mmss(t) {
+    if (!isFinite(t) || t < 0) t = 0;
+    var m = Math.floor(t / 60), s = Math.floor(t % 60);
+    return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  var AC = [214, 164, 86];
+  var INK_DEEP = [24, 62, 58];
+  var INK_MID = [132, 172, 154];
+  var INK_HI = [208, 222, 206];
+  var INK_LINE = "166,188,176";
+
+  function normAccent(a) {
+    if (!Array.isArray(a) || a.length < 3) return [214, 164, 86];
+    var r = Number(a[0]), g = Number(a[1]), b = Number(a[2]);
+    if (!isFinite(r) || !isFinite(g) || !isFinite(b)) return [214, 164, 86];
+    r = clamp(Math.round(r), 0, 255); g = clamp(Math.round(g), 0, 255); b = clamp(Math.round(b), 0, 255);
+    if (r + g + b < 60) return [214, 164, 86];
+    return [r, g, b];
+  }
+  function lin(c) { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+  function srgb(c) { c = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055; return Math.round(clamp(c, 0, 1) * 255); }
+  function mixRgb(a, b, t) {
+    var r = srgb(lin(a[0]) * (1 - t) + lin(b[0]) * t);
+    var g = srgb(lin(a[1]) * (1 - t) + lin(b[1]) * t);
+    var bl = srgb(lin(a[2]) * (1 - t) + lin(b[2]) * t);
+    return r + "," + g + "," + bl;
+  }
+  function contourRgb(t) {
+    if (t < 0.55) return mixRgb(INK_DEEP, INK_MID, t / 0.55);
+    return mixRgb(INK_MID, INK_HI, (t - 0.55) / 0.45);
+  }
+  var AC_SOFT = mixRgb(normAccent(AC), [232, 228, 214], 0.28);
+
+  /* ================= 3. 歌词数据 ================= */
+  function charTimes(line) {
+    var chars = Array.from(line.text || ""), n = chars.length, out = new Array(n);
+    var cs = line.chars, i, j, rec, ct;
+    if (cs && cs.length) {
+      var rel = cs[0] && isFinite(cs[0].t) && cs[0].t < line.t - 0.08;
+      for (i = 0; i < n; i++) {
+        j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+        rec = cs[j];
+        ct = rec && rec.t;
+        out[i] = isFinite(ct) ? (rel ? line.t + ct : ct) : null;
+      }
+      return out;
+    }
+    var d = line.dur > 0 ? line.dur : 3.4;
+    for (i = 0; i < n; i++) out[i] = line.t + d * 0.88 * i / Math.max(1, n);
+    return out;
+  }
+
+  function buildLines(raw) {
+    var out = [];
+    if (!Array.isArray(raw)) return out;
+    for (var i = 0; i < raw.length; i++) {
+      var l = raw[i];
+      if (!l || typeof l !== "object") continue;
+      var text = (l.text == null) ? "" : String(l.text);
+      if (!text.trim()) continue;
+      var t = Number(l.t); if (!isFinite(t) || t < 0) t = 0;
+      var dur = Number(l.dur); if (!isFinite(dur) || dur < 0) dur = 0;
+      var line = { t: t, dur: dur, text: text, chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null };
+      line.times = charTimes(line);
+      out.push(line);
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    return out;
+  }
+
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    while (lo <= hi) {
+      var m = (lo + hi) >> 1;
+      if (a[m].t <= t + 0.02) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return best;
+  }
+
+  var measureCv = document.createElement("canvas");
+  var measureCtx = measureCv.getContext("2d");
+  var widthCache = {};
+  function widthsAt100(text) {
+    if (widthCache[text]) return widthCache[text];
+    measureCtx.font = "400 100px " + LYRIC_FONT;
+    var chars = Array.from(text), out = [], i;
+    for (i = 0; i < chars.length; i++) out.push(measureCtx.measureText(chars[i]).width);
+    widthCache[text] = out;
+    return out;
+  }
+
+  /* ================= 4. 画布 / 纸纹 / 底色 ================= */
+  var vignette = null, grainPat = null;
+
+  function setupCanvas() {
+    resize();
+    addEventListener("resize", resize);
+  }
+
+  function makeVignette() {
+    try {
+      var g = ctx.createRadialGradient(W * 0.5, H * 0.46, Math.min(W, H) * 0.10, W * 0.5, H * 0.5, Math.max(W, H) * 0.78);
+      g.addColorStop(0, "rgba(22,40,35,0.22)");
+      g.addColorStop(0.55, "rgba(10,18,16,0.06)");
+      g.addColorStop(1, "rgba(3,7,6,0.62)");
+      vignette = g;
+    } catch (e) { vignette = null; }
+  }
+
+  function makeGrain() {
+    try {
+      var c = document.createElement("canvas");
+      c.width = 180; c.height = 180;
+      var g = c.getContext("2d");
+      for (var i = 0; i < 1500; i++) {
+        var x = Math.random() * 180, y = Math.random() * 180;
+        var a = 0.020 + Math.random() * 0.055;
+        g.fillStyle = Math.random() < 0.5 ? "rgba(255,255,255," + a + ")" : "rgba(0,0,0," + a + ")";
+        g.fillRect(x, y, 1, 1);
+      }
+      grainPat = ctx.createPattern(c, "repeat");
+    } catch (e) { grainPat = null; }
+  }
+
+  function resize() {
+    var w = window.innerWidth, h = window.innerHeight;
+    if (!isFinite(w) || w <= 0) w = 1440;
+    if (!isFinite(h) || h <= 0) h = 900;
+    W = w; H = h;
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = Math.round(W * DPR);
+    cv.height = Math.round(H * DPR);
+    cv.style.width = W + "px";
+    cv.style.height = H + "px";
+    makeVignette();
+    terrainDirty = true;
+  }
+
+  /* ================= 5. 地形：封面像素 → 高程场 ================= */
+  var GW = 40, GH = 30;
+  var HGT = new Float32Array(GW * GH);
+  var PEAKS = [];
+  var coverImg = null, coverTried = "", coverPixels = false;
+  var EXT_X = 1.95, EXT_Y = 1.28;
+  var LEVELS = 15;
+  var contours = [];
+  var terrainDirty = true, lastBuild = -999, levelOffset = 0;
+
+  function smoothGrid(a, w, h) {
+    var b = new Float32Array(w * h), i, j;
+    for (j = 0; j < h; j++) {
+      for (i = 0; i < w; i++) {
+        var s = 0, n = 0;
+        for (var dj = -1; dj <= 1; dj++) {
+          for (var di = -1; di <= 1; di++) {
+            var x = i + di, y = j + dj;
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            s += a[y * w + x]; n++;
+          }
+        }
+        b[j * w + i] = s / n;
+      }
+    }
+    return b;
+  }
+
+  function normalizeGrid(a) {
+    var mn = Infinity, mx = -Infinity, i;
+    for (i = 0; i < a.length; i++) { if (a[i] < mn) mn = a[i]; if (a[i] > mx) mx = a[i]; }
+    var r = (mx - mn) || 1;
+    for (i = 0; i < a.length; i++) a[i] = (a[i] - mn) / r * 0.84 + 0.08;
+    return a;
+  }
+
+  function makeProcedural() {
+    var a = new Float32Array(GW * GH), i, j;
+    for (j = 0; j < GH; j++) {
+      for (i = 0; i < GW; i++) {
+        var u = i / (GW - 1), v = j / (GH - 1);
+        var d1 = (u - 0.70) * (u - 0.70) + (v - 0.32) * (v - 0.32);
+        var d2 = (u - 0.30) * (u - 0.30) + (v - 0.70) * (v - 0.70);
+        a[j * GW + i] = 0.50
+          + 0.28 * Math.sin(u * 5.6 + 0.8) * Math.cos(v * 4.9 - 0.3)
+          + 0.18 * Math.sin((u + v) * 8.3 + 2.4)
+          + 0.13 * Math.cos((u - v) * 11.7 + 0.9)
+          + 0.34 * Math.exp(-d1 / 0.028)
+          + 0.26 * Math.exp(-d2 / 0.050);
+      }
+    }
+    a = smoothGrid(a, GW, GH);
+    HGT = normalizeGrid(a);
+    findPeaks();
+  }
+
+  function coverToGrid(img) {
+    var c = document.createElement("canvas");
+    c.width = GW; c.height = GH;
+    var g = c.getContext("2d", { willReadFrequently: true });
+    g.drawImage(img, 0, 0, GW, GH);
+    var d = g.getImageData(0, 0, GW, GH).data;
+    var a = new Float32Array(GW * GH), vals = [], i;
+    for (i = 0; i < GW * GH; i++) {
+      var l = (0.2126 * d[i * 4] + 0.7152 * d[i * 4 + 1] + 0.0722 * d[i * 4 + 2]) / 255;
+      a[i] = l; vals.push(l);
+    }
+    vals.sort(function (x, y) { return x - y; });
+    var lo = vals[Math.floor(vals.length * 0.05)];
+    var hi = vals[Math.floor(vals.length * 0.95)];
+    var r = (hi - lo) || 0.25;
+    for (i = 0; i < a.length; i++) a[i] = clamp((a[i] - lo) / r, 0, 1);
+    for (var p = 0; p < 2; p++) a = smoothGrid(a, GW, GH);
+    for (var j = 0; j < GH; j++) {
+      for (i = 0; i < GW; i++) {
+        var u = i / (GW - 1), v = j / (GH - 1);
+        var grain = 0.5 + 0.5 * Math.sin(u * 7.3 + v * 5.1 + Math.sin(v * 3.7) * 1.4);
+        a[j * GW + i] = clamp(a[j * GW + i] * 0.86 + 0.06 + 0.06 * grain, 0, 1);
+      }
+    }
+    return a;
+  }
+
+  function findPeaks() {
+    var cand = [], i, j;
+    for (j = 1; j < GH - 1; j++) {
+      for (i = 1; i < GW - 1; i++) {
+        var h = HGT[j * GW + i];
+        if (h < 0.62) continue;
+        var ok = true;
+        for (var dj = -1; dj <= 1 && ok; dj++) {
+          for (var di = -1; di <= 1; di++) {
+            if ((di || dj) && HGT[(j + dj) * GW + (i + di)] > h) { ok = false; break; }
+          }
+        }
+        if (ok) cand.push({ x: i, y: j, h: h });
+      }
+    }
+    cand.sort(function (a, b) { return b.h - a.h; });
+    PEAKS = [];
+    for (i = 0; i < cand.length && PEAKS.length < 7; i++) {
+      var c = cand[i], far = true;
+      for (j = 0; j < PEAKS.length; j++) {
+        var dx = c.x - PEAKS[j].x, dy = c.y - PEAKS[j].y;
+        if (dx * dx + dy * dy < 42) { far = false; break; }
+      }
+      if (far) PEAKS.push(c);
+    }
+  }
+
+  function sampleH(u, v) {
+    var x = u * (GW - 1), y = v * (GH - 1);
+    var i = Math.min(GW - 2, Math.floor(x)), j = Math.min(GH - 2, Math.floor(y));
+    var fx = x - i, fy = y - j;
+    var a = HGT[j * GW + i], b = HGT[j * GW + i + 1];
+    var c = HGT[(j + 1) * GW + i], d = HGT[(j + 1) * GW + i + 1];
+    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
+  }
+
+  function loadCover(url) {
+    if (!url || typeof url !== "string" || url === coverTried) return;
+    coverTried = url;
+    var img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = function () {
+      coverImg = img;
+      try {
+        HGT = coverToGrid(img);
+        coverPixels = true;
+        findPeaks();
+      } catch (e) {
+        coverPixels = false;
+        makeProcedural();
+      }
+      terrainDirty = true;
+    };
+    img.onerror = function () { coverImg = null; };
+    img.src = url;
+  }
+
+  /* ================= 6. 等高线（marching squares） ================= */
+  function buildContours(offset) {
+    var NX = 84, NY = 58;
+    var g = new Float32Array(NX * NY), i, j;
+    for (j = 0; j < NY; j++) {
+      for (i = 0; i < NX; i++) {
+        var u = i / (NX - 1), v = j / (NY - 1);
+        var wu = clamp(u + 0.010 * Math.sin(v * 6.3 + 0.4), 0, 1);
+        var wv = clamp(v + 0.010 * Math.cos(u * 7.1 - 0.2), 0, 1);
+        g[j * NX + i] = sampleH(wu, wv);
+      }
+    }
+    var out = [], k;
+    for (k = 0; k < LEVELS; k++) {
+      var lvBase = 0.085 + k * (0.845 / (LEVELS - 1));
+      var lv = clamp(lvBase + offset, 0.015, 0.985);
+      var p = new Path2D();
+      var index = (k % 5 === 0);
+      var seg = function (A, B) {
+        if (!A || !B) return;
+        p.moveTo((A[0] / (NX - 1) * 2 - 1) * EXT_X, (A[1] / (NY - 1) * 2 - 1) * EXT_Y);
+        p.lineTo((B[0] / (NX - 1) * 2 - 1) * EXT_X, (B[1] / (NY - 1) * 2 - 1) * EXT_Y);
+      };
+      for (j = 0; j < NY - 1; j++) {
+        for (i = 0; i < NX - 1; i++) {
+          var v00 = g[j * NX + i], v10 = g[j * NX + i + 1];
+          var v11 = g[(j + 1) * NX + i + 1], v01 = g[(j + 1) * NX + i];
+          var mn = Math.min(v00, v10, v11, v01), mx = Math.max(v00, v10, v11, v01);
+          if (mn > lv || mx < lv) continue;
+          var b = 0;
+          if (v00 >= lv) b |= 1;
+          if (v10 >= lv) b |= 2;
+          if (v11 >= lv) b |= 4;
+          if (v01 >= lv) b |= 8;
+          if (b === 0 || b === 15) continue;
+          var Tp = null, Rp = null, Bp = null, Lp = null, tt;
+          if ((b & 1) !== (b & 2)) { tt = (lv - v00) / ((v10 - v00) || 1e-9); Tp = [i + tt, j]; }
+          if ((b & 2) !== (b & 4)) { tt = (lv - v10) / ((v11 - v10) || 1e-9); Rp = [i + 1, j + tt]; }
+          if ((b & 8) !== (b & 4)) { tt = (lv - v01) / ((v11 - v01) || 1e-9); Bp = [i + tt, j + 1]; }
+          if ((b & 1) !== (b & 8)) { tt = (lv - v00) / ((v01 - v00) || 1e-9); Lp = [i, j + tt]; }
+          if (b === 1) { seg(Lp, Tp); }
+          else if (b === 2) { seg(Tp, Rp); }
+          else if (b === 3) { seg(Lp, Rp); }
+          else if (b === 4) { seg(Rp, Bp); }
+          else if (b === 5) { seg(Lp, Tp); seg(Rp, Bp); }
+          else if (b === 6) { seg(Tp, Bp); }
+          else if (b === 7) { seg(Lp, Bp); }
+          else if (b === 8) { seg(Bp, Lp); }
+          else if (b === 9) { seg(Tp, Bp); }
+          else if (b === 10) { seg(Tp, Rp); seg(Bp, Lp); }
+          else if (b === 11) { seg(Rp, Bp); }
+          else if (b === 12) { seg(Lp, Rp); }
+          else if (b === 13) { seg(Tp, Rp); }
+          else if (b === 14) { seg(Lp, Tp); }
+        }
+      }
+      out.push({
+        p: p,
+        rgb: contourRgb(lvBase),
+        alpha: 0.12 + 0.26 * lvBase + (index ? 0.10 : 0),
+        index: index
+      });
+    }
+    contours = out;
+    lastBuild = performance.now();
+    terrainDirty = false;
+  }
+
+  /* ================= 7. 相机 / 指针 / 音频平滑 ================= */
+  var cam = { x: 0, y: 0, z: 1 };
+  var lastCam = { x: 0, y: 0, scale: 1 };
+  var pointer = { x: 0, y: 0, sx: 0, sy: 0 };
+  var mk = { x: 0, y: 0 };
+  var mkReady = false;
+  var beatPulse = 0;
+  var lineAlpha = 0;
+  var bassS = 0, levelS = 0;
+  var live = { bpm: 0, level: 0, bass: 0, mid: 0, treble: 0 };
+
+  addEventListener("mousemove", function (e) {
+    var w = window.innerWidth || 1, h = window.innerHeight || 1;
+    pointer.x = clamp((e.clientX / w) * 2 - 1, -1, 1);
+    pointer.y = clamp((e.clientY / h) * 2 - 1, -1, 1);
+  }, { passive: true });
+
+  function w2s(x, y) {
+    var s = lastCam.scale * cam.z;
+    return { x: W / 2 + (x - lastCam.x) * s, y: H / 2 + (y - lastCam.y) * s };
+  }
+
+  function spaced(txt, x, y, size, rgb, alpha, sp, align) {
+    var chars = Array.from(txt), i, ws = [], tw = 0;
+    ctx.save();
+    ctx.font = "400 " + size + "px " + MONO;
+    for (i = 0; i < chars.length; i++) {
+      ws.push(ctx.measureText(chars[i]).width);
+      tw += ws[i] + (i < chars.length - 1 ? sp : 0);
+    }
+    if (align === "right") x -= tw;
+    else if (align === "center") x -= tw / 2;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(" + rgb + "," + alpha + ")";
+    var cx = x;
+    for (i = 0; i < chars.length; i++) {
+      ctx.fillText(chars[i], cx, y);
+      cx += ws[i] + sp;
+    }
+    ctx.restore();
+    return tw;
+  }
+
+  /* ================= 8. 歌词：沿等高线排字 ================= */
+  function drawLyric(line, idx, T, yBase, active, baseFs, maxFrac) {
+    var chars = Array.from(line.text);
+    if (!chars.length) return null;
+    var w100 = widthsAt100(line.text), i;
+    var sum100 = 0;
+    for (i = 0; i < w100.length; i++) sum100 += w100[i];
+    var track100 = 7;
+    var total100 = sum100 + track100 * (chars.length - 1);
+    var maxW = Math.min(W * maxFrac, 1180);
+    var fs = Math.min(baseFs, 100 * maxW / Math.max(1, total100));
+    fs = Math.max(fs, active ? 13 : 10);
+
+    var k = fs / 100, widths = [], total = 0;
+    for (i = 0; i < chars.length; i++) { widths[i] = w100[i] * k; total += widths[i]; }
+    var track = track100 * k;
+    total += track * (chars.length - 1);
+
+    var cx = W / 2;
+    var amp = clamp(H * 0.012, 3, 13) * (active ? 1 : 0.55) * (RM ? 0.35 : 1);
+    var ph = 0.8 + idx * 0.73;
+    var y0 = yBase + pointer.sx * 2.4 + pointer.sy * 4.2;
+
+    function yAt(q) {
+      return y0 + amp * (0.72 * Math.sin(q * Math.PI * 1.65 + ph) + 0.28 * Math.sin(q * Math.PI * 3.15 + ph * 1.6));
+    }
+
+    if (active) {
+      /* 测线：比文字更长的一条等高线，文字用底色挖空压在上面 */
+      ctx.save();
+      ctx.strokeStyle = "rgba(" + AC_SOFT + ",0.42)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      var spanE = total * 1.22;
+      for (var q = -0.60; q <= 0.60; q += 0.004) {
+        var x = cx + q * spanE, y = yAt(q);
+        if (q === -0.60) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      /* 测线上的等距刻度 */
+      ctx.strokeStyle = "rgba(" + AC_SOFT + ",0.30)";
+      ctx.beginPath();
+      for (var tx = -0.56; tx <= 0.56; tx += 0.055) {
+        var xx = cx + tx * spanE, yy = yAt(tx);
+        ctx.moveTo(xx, yy - 3.2);
+        ctx.lineTo(xx, yy + 3.2);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    var xCursor = cx - total / 2;
+    ctx.save();
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    for (i = 0; i < chars.length; i++) {
+      var ch = chars[i];
+      if (ch === " ") { xCursor += widths[i] + track; continue; }
+      var centerX = xCursor + widths[i] / 2;
+      var qc = (centerX - cx) / total;
+      var y1 = yAt(qc), y2 = yAt(qc + 0.02);
+      var ang = Math.atan2(y2 - y1, total * 0.02);
+      ang = clamp(ang, -0.16, 0.16);
+
+      var a = 1;
+      if (active) {
+        var ct = line.times[i];
+        if (ct == null) ct = line.t;
+        a = smoothstep(ct, ct + 0.38, T);
+      }
+      var alpha = active ? (a * lineAlpha) : 0.5;
+      if (alpha <= 0.004) { xCursor += widths[i] + track; continue; }
+
+      ctx.save();
+      ctx.translate(centerX, yAt(qc));
+      ctx.rotate(ang);
+      ctx.font = "400 " + fs + "px " + LYRIC_FONT;
+      if (active) {
+        ctx.lineJoin = "round";
+        ctx.lineWidth = Math.max(2.6, fs * 0.30);
+        ctx.strokeStyle = "rgba(6,11,10," + (0.94 * alpha) + ")";
+        ctx.strokeText(ch, 0, 0);
+        ctx.fillStyle = "rgba(235,231,217," + alpha + ")";
+      } else {
+        ctx.fillStyle = "rgba(128,158,144," + (0.30 * alpha) + ")";
+      }
+      ctx.fillText(ch, 0, 0);
+      ctx.restore();
+
+      xCursor += widths[i] + track;
+    }
+    ctx.restore();
+
+    /* 测线端点：小的测绘钉 */
+    if (active) {
+      var ex = cx + 0.575 * total * 1.22, ey = yAt(0.575);
+      ctx.fillStyle = "rgba(" + AC_SOFT + ",0.55)";
+      ctx.fillRect(ex - 1.2, ey - 1.2, 2.4, 2.4);
+    }
+
+    return { x: cx - total / 2 - 26, y: yAt(-0.5), fs: fs, total: total };
+  }
+
+  /* ================= 9. 测站标记 ================= */
+  function drawMarker(x, y, T, alt) {
+    var r = clamp(Math.min(W, H) * 0.013, 6, 12);
+    var a = 0.82;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.strokeStyle = "rgba(" + AC_SOFT + "," + a + ")";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-r - 7, 0); ctx.lineTo(-r - 2, 0);
+    ctx.moveTo(r + 2, 0); ctx.lineTo(r + 7, 0);
+    ctx.moveTo(0, -r - 7); ctx.lineTo(0, -r - 2);
+    ctx.moveTo(0, r + 2); ctx.lineTo(0, r + 7);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(" + AC_SOFT + ",0.95)";
+    ctx.beginPath();
+    ctx.arc(0, 0, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (beatPulse > 0.02) {
+      var bp = RM ? beatPulse * 0.35 : beatPulse;
+      ctx.strokeStyle = "rgba(" + AC_SOFT + "," + (0.42 * bp) + ")";
+      ctx.beginPath();
+      ctx.arc(0, 0, r + 4 + bp * 26, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    if (alt != null) {
+      var tx = x - r - 12;
+      ctx.save();
+      ctx.fillStyle = "rgba(" + AC_SOFT + ",0.62)";
+      ctx.beginPath();
+      ctx.moveTo(tx - 7, y + 13);
+      ctx.lineTo(tx - 1, y + 13);
+      ctx.lineTo(tx - 4, y + 7);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      spaced("ALT " + pad3(alt) + " M", tx, y + 22, 8.5, AC_SOFT, 0.55, 1.4, "right");
+    }
+  }
+
+  /* ================= 10. 图廓 / 图例 / 读板 ================= */
+  function drawPeaks(T) {
+    for (var i = 0; i < PEAKS.length; i++) {
+      var p = PEAKS[i];
+      var wx = (p.x / (GW - 1) * 2 - 1) * EXT_X;
+      var wy = (p.y / (GH - 1) * 2 - 1) * EXT_Y;
+      var s = w2s(wx, wy);
+      if (s.x < 40 || s.x > W - 40 || s.y < 40 || s.y > H - 40) continue;
+      ctx.strokeStyle = "rgba(" + INK_LINE + ",0.22)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(s.x - 4, s.y); ctx.lineTo(s.x + 4, s.y);
+      ctx.moveTo(s.x, s.y - 4); ctx.lineTo(s.x, s.y + 4);
+      ctx.stroke();
+      spaced(Math.round(60 + p.h * 540) + "", s.x + 7, s.y - 5, 7.5, INK_LINE, 0.26, 0.6, "left");
+    }
+  }
+
+  function drawCompass(x, y, r) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(" + INK_LINE + ",0.26)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - r - 4, y); ctx.lineTo(x - r + 2, y);
+    ctx.moveTo(x + r - 2, y); ctx.lineTo(x + r + 4, y);
+    ctx.moveTo(x, y - r - 4); ctx.lineTo(x, y - r + 2);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(" + AC_SOFT + ",0.78)";
+    ctx.beginPath();
+    ctx.moveTo(x, y - r + 2);
+    ctx.lineTo(x - 3, y + 3);
+    ctx.lineTo(x + 3, y + 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    spaced("N", x, y - r - 11, 8, INK_LINE, 0.5, 1, "center");
+  }
+
+  function drawCoverInset(x, y, sz) {
+    if (!coverImg) return;
+    ctx.save();
+    ctx.globalAlpha = 0.52;
+    try { ctx.drawImage(coverImg, x, y, sz, sz); } catch (e) {}
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "rgba(6,11,10,0.28)";
+    ctx.fillRect(x, y, sz, sz);
+    ctx.strokeStyle = "rgba(" + INK_LINE + ",0.36)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, sz - 1, sz - 1);
+    ctx.strokeStyle = "rgba(" + AC_SOFT + ",0.6)";
+    var c = 5;
+    ctx.beginPath();
+    ctx.moveTo(x, y); ctx.lineTo(x + c, y);
+    ctx.moveTo(x, y); ctx.lineTo(x, y + c);
+    ctx.moveTo(x + sz, y + sz); ctx.lineTo(x + sz - c, y + sz);
+    ctx.moveTo(x + sz, y + sz); ctx.lineTo(x + sz, y + sz - c);
+    ctx.stroke();
+    ctx.restore();
+    spaced("SOURCE PLATE", x + sz, y - 8, 7.5, INK_LINE, 0.4, 1.2, "right");
+  }
+
+  function drawSection(T, m) {
+    if (W < 560 || H < 560) return;
+    var w = clamp(W * 0.15, 130, 210), h = 27;
+    var x = W * 0.5 - w / 2, y = H - m - 34 - h;
+    var n = 46, i, pts = [];
+    for (i = 0; i < n; i++) {
+      var u = i / (n - 1);
+      var hv = sampleH(u, 0.52 + 0.05 * Math.sin(u * 4.1 + 0.6));
+      pts.push([x + u * w, y + h - 3 - hv * (h - 5)]);
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(x, y + h);
+    for (i = 0; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.lineTo(x + w, y + h);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(" + INK_LINE + ",0.045)";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.strokeStyle = "rgba(" + INK_LINE + ",0.30)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(" + INK_LINE + ",0.16)";
+    ctx.beginPath();
+    ctx.moveTo(x, y + h + 0.5); ctx.lineTo(x + w, y + h + 0.5);
+    ctx.stroke();
+
+    var prog = 0, cur = S.idx;
+    if (cur >= 0 && S.lines[cur]) {
+      var ln = S.lines[cur];
+      prog = ln.dur > 0 ? clamp((T - ln.t) / ln.dur, 0, 1) : 0;
+    }
+    var px = x + prog * w;
+    ctx.strokeStyle = "rgba(" + AC_SOFT + ",0.55)";
+    ctx.beginPath();
+    ctx.moveTo(px + 0.5, y - 3); ctx.lineTo(px + 0.5, y + h + 3);
+    ctx.stroke();
+    ctx.restore();
+    spaced("SECTION A—A′", x, y - 8, 7, INK_LINE, 0.28, 1.2, "left");
+    spaced("0", x, y + h + 9, 6.5, INK_LINE, 0.20, 0.5, "left");
+    spaced("N", x + w, y + h + 9, 6.5, INK_LINE, 0.20, 0.5, "right");
+  }
+
+  function drawSheet(T) {
+    var m = clamp(Math.min(W, H) * 0.042, 12, 34);
+    var step = Math.max(74, Math.min(W, H) * 0.115);
+
+    /* 经纬网 */
+    ctx.save();
+    ctx.strokeStyle = "rgba(" + INK_LINE + ",0.050)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    var ox = (W / 2) % step, oy = (H / 2) % step;
+    for (var x = ox; x < W; x += step) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, H); }
+    for (var y = oy; y < H; y += step) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+    ctx.stroke();
+
+    /* 上边缘坐标数字 */
+    ctx.fillStyle = "rgba(" + INK_LINE + ",0.20)";
+    ctx.font = "400 7.5px " + MONO;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    var n = 0;
+    for (x = ox; x < W - m; x += step) {
+      if (n % 2 === 0) ctx.fillText(pad3(n * 7) + "E", x + 4, m * 0.55);
+      n++;
+    }
+    ctx.restore();
+
+    /* 角标 */
+    var b = 18;
+    ctx.save();
+    ctx.strokeStyle = "rgba(" + INK_LINE + ",0.22)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(m, m + b); ctx.lineTo(m, m); ctx.lineTo(m + b, m);
+    ctx.moveTo(W - m - b, m); ctx.lineTo(W - m, m); ctx.lineTo(W - m, m + b);
+    ctx.moveTo(W - m, H - m - b); ctx.lineTo(W - m, H - m); ctx.lineTo(W - m - b, H - m);
+    ctx.moveTo(m + b, H - m); ctx.lineTo(m, H - m); ctx.lineTo(m, H - m - b);
+    ctx.stroke();
+    ctx.restore();
+
+    /* 左上：图纸抬头 */
+    var lx = m + 16, ly = m + 18;
+    spaced("638 / S03B", lx, ly, 10, INK_LINE, 0.66, 2.2, "left");
+    spaced("TOPOGRAPHIC SURVEY OF A SONG", lx, ly + 17, 8, INK_LINE, 0.34, 1.7, "left");
+    ctx.strokeStyle = "rgba(" + INK_LINE + ",0.20)";
+    ctx.beginPath();
+    ctx.moveTo(lx, ly + 28); ctx.lineTo(lx + 52, ly + 28);
+    ctx.stroke();
+    spaced("SCALE 1 : 25 000", lx, ly + 39, 7.5, INK_LINE, 0.30, 1.5, "left");
+
+    /* 右上：罗盘 + 节拍 */
+    if (W > 560) {
+      var cx0 = W - m - 18, cy0 = m + 22;
+      drawCompass(cx0, cy0, 11);
+      var bpm = live.bpm > 0 ? Math.round(live.bpm) : 0;
+      spaced("BPM " + (bpm ? bpm : "--"), cx0 + 24, cy0 + 22, 8, INK_LINE, 0.42, 1.3, "right");
+      var lv = clamp(levelS, 0, 1), bx = cx0 + 24, by = cy0 + 38;
+      ctx.save();
+      for (var i = 0; i < 12; i++) {
+        var lit = i / 12 < lv;
+        ctx.fillStyle = lit ? "rgba(" + AC_SOFT + ",0.68)" : "rgba(" + INK_LINE + ",0.16)";
+        ctx.fillRect(bx - 12 * 3 + i * 3 + 0.5, by - (lit ? 6 : 3), 1.2, lit ? 6 : 3);
+      }
+      ctx.restore();
+    }
+
+    /* 左下：时间码 */
+    spaced("T+ " + mmss(T), m + 16, H - m - 22, 8.5, INK_LINE, 0.44, 1.5, "left");
+    if (S.dur > 0) spaced(mmss(S.dur), m + 16, H - m - 10, 7.5, INK_LINE, 0.26, 1.4, "left");
+
+    /* 右下：封面插页 + 图例 */
+    if (W > 640 && H > 600) {
+      var sz = 58, px = W - m - 16 - sz, py = H - m - 16 - sz;
+      drawCoverInset(px, py, sz);
+      spaced("CONTOUR INTERVAL 20 M", px - 16, py + sz - 22, 7.5, INK_LINE, 0.34, 1.3, "right");
+      spaced("DATUM / SONG", px - 16, py + sz - 10, 7.5, INK_LINE, 0.26, 1.3, "right");
+      ctx.strokeStyle = "rgba(" + INK_LINE + ",0.28)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(px - 92, py + sz - 29); ctx.lineTo(px - 60, py + sz - 29);
+      ctx.stroke();
+    } else if (W > 420) {
+      spaced("20 M INTERVAL", W - m - 16, H - m - 14, 7.5, INK_LINE, 0.28, 1.3, "right");
+    }
+
+    drawSection(T, m);
+  }
+
+  /* ================= 11. 主渲染 ================= */
+  var lastTickAt = 0, prevTickT = null, lastOffsetUsed = 0;
+
+  function render(now, dt) {
+    var visT = S.t + (S.playing ? clamp((now - lastTickAt) / 1000, 0, 0.085) : 0);
+
+    pointer.sx = damp(pointer.sx, RM ? 0 : pointer.x, 2.4, dt);
+    pointer.sy = damp(pointer.sy, RM ? 0 : pointer.y, 2.4, dt);
+    bassS = damp(bassS, live.bass, 3.0, dt);
+    levelS = damp(levelS, live.level, 3.6, dt);
+    beatPulse *= Math.exp(-dt * 3.1);
+    if (RM) beatPulse *= 0.4;
+
+    var idx = idxAt(visT);
+    if (idx !== S.idx) { S.idx = idx; lineAlpha = 0; }
+    if (S.idx >= 0) lineAlpha = damp(lineAlpha, 1, 7, dt);
+
+    var drift = RM ? 0.25 : 1;
+    cam.x = 0.045 * drift * Math.sin(visT * 0.055) + pointer.sx * 0.018;
+    cam.y = 0.030 * drift * Math.cos(visT * 0.043) + pointer.sy * 0.018;
+    cam.z = 1 + 0.015 * drift * Math.sin(visT * 0.035) + (RM ? 0 : levelS * 0.006);
+
+    var scale = Math.max(W / (2 * EXT_X), H / (2 * EXT_Y));
+    lastCam.x = cam.x; lastCam.y = cam.y; lastCam.scale = scale;
+
+    levelOffset = 0.011 * Math.sin(visT * 0.35) + bassS * 0.022 + beatPulse * 0.010;
+    if (terrainDirty || Math.abs(levelOffset - lastOffsetUsed) > 0.0016) {
+      if (now - lastBuild > 140) { buildContours(levelOffset); lastOffsetUsed = levelOffset; }
+    }
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = "#060b0a";
+    ctx.fillRect(0, 0, W, H);
+
+    /* 地形 */
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.scale(scale * cam.z, scale * cam.z);
+    ctx.translate(-cam.x, -cam.y);
+    ctx.lineCap = "butt";
+    for (var i = 0; i < contours.length; i++) {
+      var c = contours[i];
+      var al = c.alpha * (0.86 + 0.30 * bassS);
+      ctx.strokeStyle = "rgba(" + c.rgb + "," + al + ")";
+      ctx.lineWidth = (c.index ? 1.45 : 0.75) / scale;
+      ctx.stroke(c.p);
+    }
+    ctx.restore();
+
+    if (vignette) { ctx.fillStyle = vignette; ctx.fillRect(0, 0, W, H); }
+    drawPeaks(visT);
+
+    /* 歌词：上下文两句是低对比地名，当前句是唯一亮处 */
+    var baseFs = clamp(W * 0.050, 18, 54);
+    var L = S.lines, cur = S.idx, res = null;
+    if (cur > 0) drawLyric(L[cur - 1], cur - 1, visT, H * 0.285, false, baseFs * 0.46, 0.62);
+    if (cur >= 0 && cur < L.length - 1) drawLyric(L[cur + 1], cur + 1, visT, H * 0.775, false, baseFs * 0.46, 0.62);
+    if (cur >= 0) res = drawLyric(L[cur], cur, visT, H * 0.525, true, baseFs, 0.80);
+
+    /* 测站标记：缓动到当前测线起点 */
+    var tgtX = res ? clamp(res.x, 64, W - 28) : W / 2;
+    var tgtY = res ? res.y : H * 0.525;
+    if (!mkReady) { mk.x = tgtX; mk.y = tgtY; mkReady = true; }
+    mk.x = damp(mk.x, tgtX, 5.5, dt);
+    mk.y = damp(mk.y, tgtY, 5.5, dt);
+    var alt = cur >= 0 ? 120 + cur * 37 : null;
+    drawMarker(mk.x, mk.y, visT, alt);
+
+    drawSheet(visT);
+
+    if (grainPat) {
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = grainPat;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+  }
+
+  function frame(now) {
+    if (stopped) return;
+    rafId = requestAnimationFrame(frame);
+    var dt = Math.min(0.1, Math.max(0.001, (now - lastFrame) / 1000));
+    lastFrame = now;
+    var t0 = performance.now();
+    try { render(now, dt); } catch (e) { logErr(e); }
+    S.frames++;
+    var ms = performance.now() - t0;
+    S.js = S.js ? S.js * 0.92 + ms * 0.08 : ms;
+  }
+
+  /* ================= 12. 消息 ================= */
+  function linesSig(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].text !== b[i].text || a[i].t !== b[i].t || a[i].dur !== b[i].dur) return false;
+    }
+    return true;
+  }
+
+  function applyInit(p) {
+    var lines = buildLines(p.lines);
+    var same = linesSig(lines, S.lines);
+    S.lines = lines;
+    if (typeof p.playing === "boolean") S.playing = p.playing;
+    var d = Number(p.duration);
+    if (isFinite(d) && d > 0) S.dur = d;
+    if (Array.isArray(p.accent)) {
+      AC = normAccent(p.accent);
+      AC_SOFT = mixRgb(AC, [232, 228, 214], 0.28);
+    }
+    if (p.song && typeof p.song === "object" && p.song.cover) loadCover(String(p.song.cover));
+    if (!same) {
+      S.idx = -1; lineAlpha = 0; mkReady = false;
+      prevTickT = null;
+    }
+    terrainDirty = true;
+  }
+
+  addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === "init") {
+        applyInit(p);
+      } else if (d.type === "tick") {
+        var t = Number(p.time);
+        if (isFinite(t)) {
+          if (prevTickT !== null && Math.abs(t - prevTickT) > 0.5) {
+            /* seek：清掉当前句的所有瞬时状态 */
+            S.idx = -1; lineAlpha = 0; beatPulse = 0; mkReady = false;
+          }
+          S.t = t;
+          prevTickT = t;
+          lastTickAt = performance.now();
+        }
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      } else if (d.type === "beat") {
+        var lv = Number(p.level);
+        lv = isFinite(lv) ? clamp(lv, 0, 1) : 0.5;
+        beatPulse = Math.max(beatPulse, 0.30 + lv * 0.70);
+      } else if (d.type === "live") {
+        var b = Number(p.bpm); if (isFinite(b) && b > 0) live.bpm = b;
+        var l = Number(p.level); if (isFinite(l)) live.level = clamp(l, 0, 1);
+        var ba = Number(p.bass); if (isFinite(ba)) live.bass = clamp(ba, 0, 1);
+        var mi = Number(p.mid); if (isFinite(mi)) live.mid = clamp(mi, 0, 1);
+        var tr = Number(p.treble); if (isFinite(tr)) live.treble = clamp(tr, 0, 1);
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      }
+    } catch (e) { logErr(e); }
+  });
+
+  addEventListener("pagehide", function () {
+    stopped = true;
+    try { cancelAnimationFrame(rafId); } catch (e) {}
+  });
+
+})();
+</script>
+</body>
+</html>

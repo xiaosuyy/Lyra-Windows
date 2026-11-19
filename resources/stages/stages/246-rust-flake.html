@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>锈斑</title>
+<!--
+  机制：一块斜放着、四角都还在画面里的钢板，锈从板的四条边往里啃，啃到哪儿哪儿就从亮钢变成暗红氧化皮；
+        字是锈啃到这里停住的那块抛光面 —— 字不是画上去的，是锈的停战线自己绕出来的。
+  用了：WebGL2 实例化（drawArraysInstanced，10 万片锈片 = 10 万个实例；每帧 CPU 只发 12 个 uniform，
+        不遍历任何粒子）；锈蚀边界 = 到板边的距离 + 值噪声 − uT 的推进，法线 / 高光 / 刮擦全在顶点着色器里算；
+        无 getImageData、无字形采样，字是真 DOM 文字，只被"锈的停战线"保护。
+  最像的三个：200-rust-steel / 197-foil-crumple / 107-ablation
+  差在哪：那三个是"贴图/褶皱 + fillText"或"字形驱动微粒"；这里的粒子场自己有一套锈蚀推进的场，
+        反倒是字在保护钢板（字挡住锈），因果是"材质决定字"，不是"字决定材质"。
+-->
+<style>
+  html,body{margin:0;height:100%;background:#08070a;overflow:hidden}
+  body{font-family:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;
+       color:#eef3fb}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #type{position:fixed;inset:0;pointer-events:none;overflow:hidden;--lit:.25}
+  .slot{position:absolute;left:50%;top:48%;width:min(92vw,1300px);transform:translate(-50%,-50%);
+        text-align:center;opacity:0;filter:blur(6px);z-index:2;isolation:isolate}
+  .slot::before{content:'';position:absolute;inset:-64% -4%;z-index:-1;pointer-events:none;
+        background:radial-gradient(58% 44% at 50% 50%,rgba(3,4,7,.66) 0%,rgba(3,4,7,.30) 58%,rgba(3,4,7,0) 82%)}
+  .slot .in{display:block;font-weight:900;font-size:clamp(36px,7.0vh,96px);line-height:1.30;
+        letter-spacing:.035em;color:#f8fbff;text-wrap:balance;white-space:pre-wrap;
+        text-shadow:0 0 5px rgba(0,0,0,.98),0 0 20px rgba(0,0,0,.92),0 2px 26px rgba(0,0,0,.96),
+                    0 10px 46px rgba(0,0,0,.88),0 0 3px rgba(255,255,255,.30),
+                    0 0 90px rgba(150,180,235,calc(var(--lit) * .22))}
+  .slot .in span{display:inline-block;will-change:transform,opacity,color}
+  .slot.gst .in{color:rgba(188,98,40,.40);text-shadow:none}
+  .slot.gst::before{background:none}
+  #vig{position:fixed;inset:0;pointer-events:none;
+       background:radial-gradient(116% 92% at 50% 48%,rgba(0,0,0,0) 40%,rgba(0,0,0,.66) 100%)}
+  #hint{position:fixed;left:50%;bottom:15px;transform:translateX(-50%);pointer-events:none;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(214,150,96,.34);transition:opacity .8s;white-space:nowrap}
+  html.fb #c{display:none}
+  html.fb body{background:radial-gradient(120% 96% at 46% 54%,#2a1a12 0%,#0c0a0b 58%,#060506 100%)}
+  html.fb #type{z-index:1}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="type"></div>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ══════════════════════════════════════════════════════════════════════
+   A 车道内核（单文件内联，每个形态自带一份）
+   协议 / 时钟 / 两句槽位（前奏·进场·余韵）/ 暂停冻结 / resize / RM / 降级
+   形态只提供：片元与顶点着色器、配色、以及 stage 钩子
+   ══════════════════════════════════════════════════════════════════════ */
+const cv = document.getElementById('c');
+const typeBox = document.getElementById('type');
+const hint = document.getElementById('hint');
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+
+const N = 100000;                 /* 10 万颗粒子，全部住在 GPU 上 */
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, beatN = 0, bass = 0, treb = 0, beatAt = -9;
+let frames = 0, jsMs = 0, errMsg = '';
+let readySent = false, hintOn = true;
+let inAmt = 0, preAmt = 0, act = 0, pol = 0, sweep = 1, sbt = 1;
+let cur = null, ghost = null, ghostAt = 0, slotFlip = 0, ghostStartV = 0;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+const ease3 = (x) => 1 - Math.pow(1 - x, 3);
+
+/* prefers-reduced-motion：随时切换都要跟得上 */
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const onMQ = (e) => { RM = !!e.matches; skipToEnd(); };
+    if (mq.addEventListener) mq.addEventListener('change', onMQ);
+    else if (mq.addListener) mq.addListener(onMQ);
+  }
+} catch (_) {}
+function skipToEnd() { if (cur && cur.chars) for (const c of cur.chars) { c.style.opacity = '1'; c.style.transform = 'none'; } }
+
+/* ---------------- 文字槽位：两句交替，旧句留残影 ---------------- */
+function mkSlot() {
+  const el = document.createElement('div'); el.className = 'slot';
+  const inner = document.createElement('div'); inner.className = 'in';
+  el.appendChild(inner); typeBox.appendChild(el);
+  return { el, inner, chars: [], cx: [], t0: 0, voice: 0, dir: 1, noanim: false, text: '' };
+}
+const slots = [mkSlot(), mkSlot()];
+
+function fillSlot(slot, text) {
+  slot.inner.textContent = '';
+  slot.chars = [];
+  slot.cx = [];
+  const arr = Array.from(text);
+  for (let i = 0; i < arr.length; i++) {
+    const sp = document.createElement('span');
+    sp.textContent = arr[i];
+    sp.style.opacity = '0';
+    slot.inner.appendChild(sp);
+    slot.chars.push(sp);
+  }
+  slot.text = text;
+  for (const sp of slot.chars) {
+    const r = sp.getBoundingClientRect();
+    slot.cx.push((r.left + r.width / 2) / W * 2 - 1);
+  }
+}
+
+function showLine(ci, instant) {
+  const s = slots[slotFlip]; slotFlip ^= 1;
+  if (cur && cur !== s) { ghost = cur; ghostAt = now(); ghostStartV = vT; }
+  cur = s; ghost === s && (ghost = null);
+  s.el.style.transform = 'translate(-50%,-50%)';
+  fillSlot(s, (lines[ci] || {}).text || '');
+  s.noanim = true;
+  s.t0 = instant ? now() - 2 : lines[ci].t;
+  s.voice = ci % 3;
+  s.dir = (ci % 2) ? 1 : -1;
+  s.amb = ci % 2;
+  s.el.style.zIndex = '3';
+  s.el.classList.remove('gst');
+  if (ghost) { ghost.el.style.zIndex = '2'; ghost.el.classList.add('gst'); }
+  s.el.style.opacity = '1';
+  s.el.style.filter = 'none';
+  for (const c of s.chars) { c.style.opacity = instant ? '1' : '0'; c.style.transform = instant ? 'none' : ''; }
+  hintOn = false; hint.style.opacity = '0';
+}
+
+function hideAll() {
+  cur = null; ghost = null;
+  for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; s.el.classList.remove('gst'); }
+  hintOn = true; hint.style.opacity = '0.9';
+}
+
+/* ---------------- 时钟：空歌词 / seek / 句首 ---------------- */
+function timing(T) {
+  if (!lines.length) { if (idx !== -1) { idx = -1; hideAll(); } lastT = T; return; }
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) {
+    const jump = (lastT > -1e8 && (Math.abs(T - lastT) > 0.9 || ci > idx + 1 || ci < idx));
+    idx = ci;
+    if (ci < 0) { hideAll(); }
+    else showLine(ci, jump);
+  }
+  lastT = T;
+}
+
+/* ---------------- 每帧：uniform 状态 ---------------- */
+function state(T) {
+  if (idx >= 0 && lines[idx]) {
+    const lt = lines[idx].t;
+    inAmt = clamp01((T - lt) / 1.10);
+    const nx = lines[idx + 1];
+    preAmt = nx ? clamp01(1 - (nx.t - T) / 0.30) : 0;
+  } else { inAmt = 0; preAmt = 0; }
+  act = (vT > 8.6 && vT < 12.4) ? 1 : 0;
+  pol = beatN % 2;
+  /* 读头：这一句从左往右抛光过去；前奏 280ms 里抛光轮先到位 */
+  sweep = idx >= 0 ? clamp01((inAmt * 1.10 - 0.02) / 0.95) : 0;
+  sweep = clamp01(sweep + preAmt * 0.02);
+  /* 拍点：刮擦在 0.55s 内扫过板面 */
+  sbt = clamp01((T - beatAt) / 0.55);
+  typeBox.style.setProperty('--lit', (0.22 + 0.78 * Math.max(beatPulse, inAmt * 0.7)).toFixed(3));
+}
+
+/* ---------------- 文字：逐字进场 / 残影 ---------------- */
+function updDom(T) {
+  if (cur) {
+    const stg = 0.030, dur = 0.50;
+    for (let i = 0; i < cur.chars.length; i++) {
+      const p = cur.noanim ? 1 : clamp01((T - (cur.t0 + i * stg)) / dur);
+      const e = ease3(p);
+      const c = cur.chars[i];
+      /* 抛光轮扫到之前，字不出现：字是被"擦"出来的，不是淡入的 */
+      const vis = RM ? 1 : clamp01((sweep * 1.92 - 0.96 - (cur.cx[i] || 0)) / 0.055);
+      if (cur.voice === 0) c.style.transform = 'translateY(' + ((1 - e) * 12).toFixed(2) + 'px) skewX(' + ((1 - e) * -5).toFixed(2) + 'deg)';
+      else if (cur.voice === 1) c.style.transform = 'translateX(' + ((1 - e) * 26 * cur.dir).toFixed(2) + 'px) skewX(' + ((1 - e) * 6 * cur.dir).toFixed(2) + 'deg)';
+      else c.style.transform = 'translateY(' + ((1 - e) * -10).toFixed(2) + 'px) scale(' + (0.93 + 0.07 * e).toFixed(3) + ')';
+      c.style.opacity = (p * vis).toFixed(3);
+      /* 字面冷白，没擦到的字带一点钢的青灰 */
+      const k = RM ? 1 : clamp01((sweep * 1.92 - 0.96 - (cur.cx[i] || 0)) / 0.28);
+      c.style.color = 'rgb(' + Math.round(196 + 59 * k) + ',' + Math.round(208 + 47 * k) + ',' + Math.round(226 + 29 * k) + ')';
+    }
+    cur.el.style.filter = 'blur(' + ((1 - clamp01((T - cur.t0) / 0.40)) * 4.0).toFixed(2) + 'px)';
+    /* 前景层 2.5×：跟着抛光轮横移，拍上被刮擦顶一下 */
+    const px = (sweep * 2 - 1) * 5, py = -beatPulse * 5;
+    cur.el.style.transform = 'translate(-50%,-50%) translate(' + px.toFixed(2) + 'px,' + py.toFixed(2) + 'px)';
+  }
+  if (ghost) {
+    const q = clamp01((T - ghostAt) / 0.80);
+    if (q >= 1) { ghost.el.style.opacity = '0'; ghost.el.classList.remove('gst'); ghost = null; }
+    else {
+      ghost.el.style.opacity = (0.34 * (1 - q) * (1 - q)).toFixed(3);
+      ghost.el.style.filter = 'blur(' + (q * 11).toFixed(2) + 'px)';
+      ghost.el.style.transform = 'translate(-50%,-50%) translateY(' + (-q * 14).toFixed(2) + 'px) scale(' + (1 + q * 0.035).toFixed(3) + ')';
+    }
+  }
+}
+
+/* ══════════════════════════════ GPU ══════════════════════════════ */
+const GL_OPT = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false };
+let gl = null, P = null, U = {}, bgP = null, bgU = {}, pVao = null, bgVao = null, glOk = false;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'shader');
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link');
+  return p;
+}
+function locs(p, names) { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; }
+
+/* —— 背景：车间墙面的暗场（0.3× 速度的第一层） —— */
+const BG_VS = `#version 300 es
+in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+/* —— 背景片元：形态改这里 —— */
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform float uT; uniform vec2 uRes;
+float h21(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+void main(){
+  vec2 p = vUV;
+  /* 底：近黑，只有极低的天光；板子铺满画面，背景只负责不留死黑 */
+  vec3 c = mix(vec3(0.0085,0.0090,0.0115), vec3(0.020,0.017,0.017), smoothstep(0.02,0.96,p.y));
+  /* 锈从画框右下透出来的一层暗红余温（很慢，0.3×） */
+  float dt = length((p - vec2(1.04, -0.04)) * vec2(0.80, 0.98));
+  c += vec3(0.060,0.020,0.005) * exp(-dt*1.85) * (0.75 + 0.25*sin(p.x*2.3 + p.y*1.3 + uT*0.05));
+  /* 左上未锈区的冷反光（钢的青） */
+  float steel = exp(-length((p - vec2(0.06, 1.02)) * vec2(0.62, 0.80)) * 1.9);
+  c += vec3(0.012,0.016,0.026) * steel;
+  /* 空气里的铁锈尘：极慢横移 */
+  float dust = h21(floor(p*vec2(420.0,240.0)) + floor(uT*0.6));
+  c += vec3(0.026,0.014,0.008) * smoothstep(0.986,1.0,dust) * (0.35 + 0.65*p.y);
+  c *= 1.0 - 0.30*smoothstep(0.42,1.05,length(p-vec2(0.5,0.48)));
+  o = vec4(c,1.0);
+}`;
+
+/* —— 粒子（形态改这里）—— */
+const P_VS = `#version 300 es
+precision highp float;
+in vec2 aQ; in vec4 aSeed;
+uniform float uT, uBass, uTre, uBeat, uPre, uIn, uPol, uAct, uBT;
+uniform vec2 uRes;
+uniform vec4 uText;
+out vec2 vQ; out vec3 vCol; out float vA;
+
+float h21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+float flutter(vec2 p, float t){ return vn(p*5.0 + vec2(t*0.35, t*0.21)); }
+
+void main(){
+  float asp = uRes.x / uRes.y;
+  float act1 = step(0.5, uAct);
+  vec2 wp, lq; vec3 col; float a;
+
+  /* ── 前景层：被刮下来的锈屑粉末，2.5× 速度 ── */
+  if (aSeed.z > 0.978) {
+    float dx = fract(aSeed.x + uT*0.0128) * 2.0 - 1.0;
+    float dy = (fract(aSeed.y + uT*0.0094 + 0.37) * 2.0 - 1.0) * 0.88;
+    dy += uBeat * 0.02 * sin(aSeed.x*24.0 + uT*2.0);
+    float r = 0.0020 + aSeed.w*0.0038;
+    wp = vec2(dx, dy);
+    lq = (aQ - 0.5) * r * 2.0; lq.x /= asp;
+    a = (0.008 + 0.020*aSeed.w) * (0.7 + 0.8*uTre);
+    col = mix(vec3(1.0,0.50,0.18), vec3(0.70,0.76,0.90), step(0.74, aSeed.w));
+    gl_Position = vec4(wp + lq, 0.0, 1.0); vQ = aQ; vA = a; vCol = col; return;
+  }
+
+  /* ── 中景层：一块斜放的钢板，右/下出血铺满画面；锈从右下往左上啃 ── */
+  vec2 g = vec2(aSeed.x, aSeed.y) * vec2(400.0, 212.0);
+  vec2 cell = floor(g);
+  vec2 jt = vec2(h21(cell + 1.7), h21(cell + 9.3));
+  vec2 uv = (cell + 0.10 + 0.80*jt) / vec2(400.0, 212.0);
+
+  float hx = 1.20, hy = 1.02;
+  vec2 pl = vec2((uv.x-0.5)*2.0*hx, (uv.y-0.5)*2.0*hy);
+
+  /* 板子姿态：常驻极轻的呼吸；act 窗口里再掰一点 */
+  float tilt = -0.055 + 0.008*sin(uT*0.05) + act1*0.048;
+  float ct = cos(tilt), st = sin(tilt);
+  vec2 rp = vec2(pl.x*ct - pl.y*st, pl.x*st + pl.y*ct);
+  float pz = 1.0 - 0.16*(rp.y/hy);
+  vec2 sx = rp / pz;
+  vec2 cam = vec2(0.050*sin(uT*0.115 + 1.1), 0.036*sin(uT*0.155));
+  wp = sx + cam;
+  float near = 1.0/pz;
+
+  /* ── 锈蚀前沿：一条从右下往左上推进的斜线（m 越大越靠左上） ── */
+  /* act 里整块板面翻转：带子的倾角从 +45° 翻到 -23°，亮侧暗侧对调 */\n  float kk = mix(1.0, -0.42, act1);\n  float m = (wp.y - kk*wp.x) * 0.7071;
+  float ptn = 0.62*vn(uv*vec2(7.0,4.6) + vec2(uT*0.055, uT*0.026))
+            + 0.38*vn(uv*vec2(27.0,16.0) - vec2(uT*0.085, 0.0));
+  float jag = (vn(uv*vec2(58.0,34.0) + vec2(uT*0.021, 0.0)) - 0.5) * 0.22;
+  /* 前沿：在画面中线附近缓慢来回推（看得见边界在走），act 里猛推一大段 */
+  float front = 0.115*sin(uT*0.62) + 0.070*sin(uT*0.17 + 0.7) - 0.02
+              + 0.10*uBass + 0.12*(1.0 - uBT) + 0.30*act1;
+  float mm = m + jag + 0.045*(ptn - 0.5);
+  float rust = smoothstep(front + 0.026, front - 0.026, mm);   /* mm < front = 已锈 */
+
+  /* 未锈的一窄条：贴着前沿的亮冷灰金属；离前沿远了就不再是"新磨的面" */
+  float dFront = mm - front;
+  float strip = exp(-pow((dFront - 0.10)*3.3, 2.0));
+  /* 字区：锈在这圈里退回来一点（字是锈停下来的地方） */
+  vec2 td = vec2((wp.x - uText.x)/(uText.z*0.52 + 0.30), (wp.y - uText.y)/(uText.w*0.90 + 0.13));
+  float pocket = smoothstep(1.20, 0.46, length(td));
+  rust *= 1.0 - pocket*0.22;
+
+  /* ── 没想到：一块锈皮脱落，露出亮金属，碎屑掉下来 ── */
+  float flake = act1 * smoothstep(0.50, 0.88, vn(uv*vec2(8.0,5.4) + 21.0));
+  rust *= 1.0 - flake*0.92;
+  float lift = flake * (0.05 + 0.05*flutter(uv, uT));
+  wp += vec2(-0.5, 0.9) * lift;
+
+  /* ── 光：主光方向随拍点换边（离散两态） ── */
+  float lx = mix(-0.66, 0.66, uPol) + 0.55*sin(uT*0.31);
+  vec3 Ld = normalize(vec3(lx, 0.62, 0.50));
+  float ang = h21(cell + 3.1) * 6.2831;
+  vec3 nn = normalize(vec3(cos(ang)*0.62, sin(ang)*0.62, 0.86 + 0.40*h21(cell + 5.9)));
+  float spec = pow(max(dot(nn, Ld), 0.0), 16.0);
+  float streak = 0.5 + 0.5*sin((uv.x*2.4 + uv.y*8.0)*7.0 + uT*0.20);
+  /* 前奏：抛光轮的光先扫过板面 */
+  float preSweep = exp(-pow((uv.x - (1.06 - uPre*1.28))*4.4, 2.0)) * uPre;
+
+  /* 亮冷灰金属：亮条 + 细高光；远离前沿的未锈区压成暗钢 */
+  float bMetal = strip*(0.62 + 0.60*spec + 0.26*streak + 0.30*uIn)
+               + 0.32 + 0.10*streak + 0.34*spec*(0.30 + 0.70*strip)
+               + preSweep*(0.50 + 0.40*streak) + pocket*0.10;
+  /* 氧化皮：暗红棕壳 + 坑 + 鼓包（哑光，比钢暗一档） */
+  float pit = smoothstep(0.38, 0.90, vn(uv*vec2(88.0, 48.0) + 5.0));
+  float crust = smoothstep(0.60, 0.94, vn(uv*vec2(33.0,18.0) + 11.0));
+  float bRust = 0.62 + 0.30*ptn*(0.35 + 0.95*pit) + 0.20*crust + 0.06*act1;
+  bRust *= 0.78 + 0.34*uPre;
+  /* 锈蚀边界：锈这一侧的橙色晕开 + 钢这一侧的刚磨亮线 */
+  float halo = exp(-pow((dFront + 0.035)*5.5, 2.0));
+  float edgeL = exp(-pow(dFront*22.0, 2.0));
+
+  /* 颗粒粗细：锈区更粗更碎（哑光），金属条更细（亮） */
+  float psz = mix(1.0, 0.80, max(strip, pocket)) * mix(1.0, 1.30, rust);
+  float grit = 0.55 + 1.45*pow(h21(cell + 2.3), 3.0);
+  float len = (0.0132 + aSeed.w*0.0100) * grit * near * psz;
+  float wid = (0.0078 + aSeed.w*0.0066) * grit * near * psz;
+  float a2 = h21(cell + 12.7) * 6.2831;
+  vec2 q = vec2((aQ.x-0.5)*len, (aQ.y-0.5)*wid);
+  float c2 = cos(a2), s2 = sin(a2);
+  lq = vec2(q.x*c2 - q.y*s2, q.x*s2 + q.y*c2); lq.x /= asp;
+
+  /* act：明暗反转 —— 余烬带亮侧压下去、暗侧提起来，整幅像底片翻了一次 */
+  bMetal = mix(bMetal, bMetal*0.15 + 0.015, act1);
+  bRust  = mix(bRust,  0.86 + 0.24*ptn,     act1);
+  float b = mix(bMetal, bRust, rust);
+  b *= 0.30 + 1.55*h21(cell + 3.7) + 0.18*vn(uv*vec2(9.5, 6.2) + vec2(uT*0.045, 0.0));
+  b += edgeL*0.50;
+  a = b * mix(0.165, 0.205, rust);
+  vec3 cSteel = mix(vec3(0.34, 0.37, 0.42), vec3(0.86, 0.89, 0.94), strip);
+  vec3 cRust  = mix(vec3(0.30, 0.105, 0.078), vec3(0.52, 0.20, 0.09), ptn);
+  col = mix(cSteel * b, cRust * (0.55 + b*1.25), rust);
+  col += vec3(0.95, 0.42, 0.10) * halo * 0.20 * rust;      /* 边界橙晕 */
+  col += vec3(0.90, 0.94, 1.0) * edgeL * 0.30;             /* 刚磨出来的钢线 */
+
+  gl_Position = vec4(wp + lq, 0.0, 1.0);
+  vQ = aQ; vA = a; vCol = col;
+}`;
+
+const P_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec3 vCol; in float vA; out vec4 o;
+void main(){
+  vec2 d = vQ - 0.5;
+  float f = 1.0 - smoothstep(0.22, 0.52, length(d*vec2(1.0, 1.10)));
+  o = vec4(vCol * vA * f, 1.0);
+}`;
+
+function initGL() {
+  try { gl = cv.getContext('webgl2', GL_OPT); } catch (_) { gl = null; }
+  if (!gl) { document.documentElement.classList.add('fb'); return false; }
+  P = program(P_VS, P_FS);
+  U = locs(P, ['uT','uBass','uTre','uBeat','uPre','uIn','uPol','uAct','uBT','uRes','uText']);
+  bgP = program(BG_VS, BG_FS);
+  bgU = locs(bgP, ['uT','uRes']);
+
+  const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  /* 分层抽样（Halton）保证 10 万颗铺得均匀，不结块 */
+  const hal = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+  let sd = 20260246;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  const seeds = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    seeds[i*4] = hal(i + 1, 2); seeds[i*4+1] = hal(i + 1, 3);
+    seeds[i*4+2] = rnd(); seeds[i*4+3] = rnd();
+  }
+  const sb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+
+  pVao = gl.createVertexArray(); gl.bindVertexArray(pVao);
+  const aQ = gl.getAttribLocation(P, 'aQ'), aS = gl.getAttribLocation(P, 'aSeed');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(aQ); gl.vertexAttribPointer(aQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(aS, 1);
+
+  bgVao = gl.createVertexArray(); gl.bindVertexArray(bgVao);
+  const bQ = gl.getAttribLocation(bgP, 'aQ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(bQ); gl.vertexAttribPointer(bQ, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(null);
+  gl.clearColor(0.02, 0.018, 0.02, 1);
+  gl.disable(gl.DEPTH_TEST);
+  glOk = true;
+  return true;
+}
+
+let uTextV = [0, 0, 0.3, 0.1];
+function draw() {
+  if (!glOk) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.BLEND);
+  gl.useProgram(bgP); gl.bindVertexArray(bgVao);
+  gl.uniform1f(bgU.uT, vT); gl.uniform2f(bgU.uRes, W, H);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.useProgram(P); gl.bindVertexArray(pVao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniform1f(U.uT, vT); gl.uniform1f(U.uBass, bass); gl.uniform1f(U.uTre, treb);
+  gl.uniform1f(U.uBeat, beatPulse); gl.uniform1f(U.uPre, preAmt); gl.uniform1f(U.uIn, inAmt);
+  gl.uniform1f(U.uPol, pol); gl.uniform1f(U.uAct, act); gl.uniform1f(U.uBT, sbt);
+  gl.uniform2f(U.uRes, W, H); gl.uniform4f(U.uText, uTextV[0], uTextV[1], uTextV[2], uTextV[3]);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+  gl.bindVertexArray(null);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  if (glOk) { gl.viewport(0, 0, cv.width, cv.height); }
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+function textRect() {
+  if (!cur || !cur.chars.length) return [0, 0, 0.34, 0.09];
+  const r = cur.el.getBoundingClientRect();
+  return [ (r.left + r.width/2) / W * 2 - 1, 1 - (r.top + r.height/2) / H * 2,
+           Math.max(0.02, r.width / W), Math.max(0.02, r.height / H) ];
+}
+
+/* ══════════════════════════════ 主循环 ══════════════════════════════ */
+let last = performance.now(), raf = 0, dirty = true;
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  vT = RM ? T * 0.24 : T;
+  if (playing) {
+    beatPulse *= Math.exp(-dt * 3.6);
+    bass *= Math.exp(-dt * 0.08);
+    treb *= Math.exp(-dt * 0.10);
+  }
+  try { timing(T); } catch (e) { errMsg = 'timing: ' + (e && e.message ? e.message : e); }
+  state(T);
+  if (!RM && cur) uTextV = textRect();
+  try {
+    if (playing || dirty) { draw(); updDom(T); dirty = false; }
+  } catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------- 协议 ---------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9;
+    cur = null; ghost = null;
+    for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; s.el.style.transform = 'translate(-50%,-50%)'; s.el.classList.remove('gst'); }
+    vT = 0; beatPulse = 0; bass = 0; treb = 0; beatN = 0; beatAt = -9;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    inAmt = 0; preAmt = 0; sbt = 1;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now();
+    playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5);
+    beatN++; beatAt = now(); dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, clamp01(l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, clamp01(l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+/* ---------------- 自查 ---------------- */
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx]) ? lines[idx].text : '',
+  gl: glOk, rm: RM, vT: +vT.toFixed(2)
+});
+
+/* ---------------- 启动 ---------------- */
+resize();
+try { initGL(); } catch (e) { errMsg = 'gl: ' + (e && e.message ? e.message : e); document.documentElement.classList.add('fb'); }
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

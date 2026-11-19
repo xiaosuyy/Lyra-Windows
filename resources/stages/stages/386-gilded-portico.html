@@ -1,0 +1,1491 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鎏金门廊</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #08060c; }
+  #stage { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+'use strict';
+
+window.__stage = function () {
+  return {
+    lines: renderState.lines.length,
+    idx: renderState.lineIndex,
+    t: renderState.time,
+    playing: renderState.playing,
+    frames: renderState.frames,
+    js: renderState.jsMs,
+    err: '',
+    text: currentLineText(),
+    gl: false,
+    rm: renderState.reducedMotion
+  };
+};
+
+var stageCanvas = document.getElementById('stage');
+var stageContext = stageCanvas.getContext('2d');
+var stagePixelRatio = 1;
+var stageWidth = 1440;
+var stageHeight = 900;
+var readyReported = false;
+var reportClockMs = 0;
+
+var renderState = {
+  songName: '',
+  artists: '',
+  coverUrl: '',
+  accent: [206, 132, 74],
+  lines: [],
+  lineIndex: -1,
+  time: 0,
+  playing: true,
+  frames: 0,
+  jsMs: 0,
+  duration: 0,
+  reducedMotion: false,
+  beatIndex: -1,
+  beatLevel: 0,
+  beatPulse: 0,
+  beatAge: 99,
+  bassLevel: 0,
+  trebleLevel: 0,
+  cameraX: 0,
+  cameraY: 0,
+  cameraFade: 0,
+  lastFrameMs: 0,
+  emptyHint: '',
+  hasInit: false
+};
+
+function nowMilliseconds() {
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function reportFailure(where, error) {
+  var nowMs = nowMilliseconds();
+  if (nowMs - reportClockMs < 1000) { return; }
+  reportClockMs = nowMs;
+  try { console.error('[386 gilded-portico] ' + where, error); } catch (innerError) { /* console unavailable */ }
+}
+
+var paletteSource = {
+  skyTop: [7, 6, 14],
+  skyUpper: [23, 13, 35],
+  skyMid: [62, 20, 48],
+  skyLow: [130, 42, 44],
+  ember: [198, 92, 50],
+  sun: [252, 214, 154],
+  night: [9, 7, 13],
+  haze: [92, 46, 64],
+  window: [255, 198, 122],
+  gold: [236, 188, 116],
+  ivory: [246, 232, 208]
+};
+
+var palette = {
+  accent: [206, 132, 74],
+  skyTop: [7, 6, 14],
+  skyUpper: [23, 13, 35],
+  skyMid: [62, 20, 48],
+  skyLow: [130, 42, 44],
+  ember: [198, 92, 50],
+  night: [9, 7, 13],
+  haze: [92, 46, 64],
+  window: [255, 198, 122],
+  gold: [236, 188, 116],
+  ivory: [246, 232, 208],
+  sequinWarm: [255, 220, 170],
+  sequinCool: [150, 208, 230]
+};
+
+var stageLayout = {
+  horizonY: 700,
+  parapetY: 720,
+  figureTop: 240,
+  figureShoulder: 144,
+  narrow: false,
+  lyricCenterY: 810,
+  lyricBaseSize: 40,
+  wordmarkBandHeight: 160
+};
+
+var layerCache = {
+  sky: null,
+  glow: null,
+  far: null,
+  near: null,
+  finish: null,
+  bulbGlow: null,
+  faceGlow: null,
+  wordmark: null,
+  gownPath: null,
+  suitPath: null,
+  gownSequins: null,
+  suitSequins: null
+};
+
+var bakeStageIndex = 0;
+var bakeStagesPending = true;
+var wordmarkDirty = true;
+
+function clampNumber(value, low, high) {
+  if (!isFinite(value)) { return low; }
+  if (value < low) { return low; }
+  if (value > high) { return high; }
+  return value;
+}
+
+function mixChannel(fromValue, toValue, amount) {
+  return Math.round(clampNumber(fromValue + (toValue - fromValue) * amount, 0, 255));
+}
+
+function mixColor(fromColor, toColor, amount) {
+  return [
+    mixChannel(fromColor[0], toColor[0], amount),
+    mixChannel(fromColor[1], toColor[1], amount),
+    mixChannel(fromColor[2], toColor[2], amount)
+  ];
+}
+
+function rgbaOf(color, alpha) {
+  var safeAlpha = clampNumber(alpha, 0, 1);
+  /* accent 还没到位时（首帧烘焙）不许崩：回落到暖金 */
+  var c = (color && color.length >= 3) ? color : [255, 196, 120];
+  return 'rgba(' + Math.round(clampNumber(c[0], 0, 255)) + ',' +
+    Math.round(clampNumber(c[1], 0, 255)) + ',' +
+    Math.round(clampNumber(c[2], 0, 255)) + ',' + safeAlpha.toFixed(3) + ')';
+}
+
+function refreshPalette() {
+  var accent = [0, 0, 0];
+  if (Array.isArray(renderState.accent) && renderState.accent.length >= 3) {
+    accent = [
+      clampNumber(Number(renderState.accent[0]), 0, 255),
+      clampNumber(Number(renderState.accent[1]), 0, 255),
+      clampNumber(Number(renderState.accent[2]), 0, 255)
+    ];
+  }
+  palette.accent = accent;
+  palette.skyTop = mixColor(paletteSource.skyTop, accent, 0.06);
+  palette.skyUpper = mixColor(paletteSource.skyUpper, accent, 0.14);
+  palette.skyMid = mixColor(paletteSource.skyMid, accent, 0.26);
+  palette.skyLow = mixColor(paletteSource.skyLow, accent, 0.34);
+  palette.ember = mixColor(paletteSource.ember, accent, 0.38);
+  palette.night = mixColor(paletteSource.night, accent, 0.08);
+  palette.haze = mixColor(paletteSource.haze, accent, 0.30);
+  palette.window = mixColor(paletteSource.window, accent, 0.16);
+  palette.gold = mixColor(paletteSource.gold, accent, 0.22);
+  palette.ivory = mixColor(paletteSource.ivory, accent, 0.08);
+  palette.sequinWarm = mixColor(paletteSource.sun, accent, 0.20);
+  palette.sequinCool = mixColor([150, 208, 230], accent, 0.18);
+}
+
+function createLayer(cssWidth, cssHeight, qualityScale) {
+  var layerScale = clampNumber(qualityScale || stagePixelRatio, 0.5, 3);
+  var safeWidth = Math.max(1, Math.round(cssWidth * layerScale));
+  var safeHeight = Math.max(1, Math.round(cssHeight * layerScale));
+  var canvas = document.createElement('canvas');
+  canvas.width = safeWidth;
+  canvas.height = safeHeight;
+  var context = canvas.getContext('2d');
+  if (!context) {
+    return null;
+  }
+  context.setTransform(layerScale, 0, 0, layerScale, 0, 0);
+  return { canvas: canvas, context: context, width: cssWidth, height: cssHeight, scale: layerScale };
+}
+
+function paintStops(gradient, stops) {
+  if (!gradient || typeof gradient.addColorStop !== 'function') { return gradient; }
+  for (var stopIndex = 0; stopIndex < stops.length; stopIndex += 1) {
+    var stopPair = stops[stopIndex];
+    try {
+      gradient.addColorStop(clampNumber(stopPair[0], 0, 1), stopPair[1]);
+    } catch (error) {
+      reportFailure('addColorStop', error);
+    }
+  }
+  return gradient;
+}
+
+function safeDrawImage(targetContext, source, destX, destY, destWidth, destHeight) {
+  if (!targetContext || !source) { return false; }
+  if (typeof source.getContext !== 'function') { return false; }
+  if (!(source.width > 0) || !(source.height > 0)) { return false; }
+  if (!isFinite(destX) || !isFinite(destY) || !isFinite(destWidth) || !isFinite(destHeight)) { return false; }
+  if (destWidth <= 0 || destHeight <= 0) { return false; }
+  if (!targetContext || typeof targetContext.drawImage !== 'function') { return false; }
+  try {
+    targetContext.drawImage(source, destX, destY, destWidth, destHeight);
+    return true;
+  } catch (error) {
+    reportFailure('drawImage', error);
+    return false;
+  }
+}
+
+function hasPathApi(targetContext) {
+  return !!(targetContext && typeof targetContext.beginPath === 'function');
+}
+
+function createRandom(seed) {
+  var stateValue = seed >>> 0;
+  return function nextRandom() {
+    stateValue = (stateValue + 0x6D2B79F5) >>> 0;
+    var tempered = stateValue;
+    tempered = Math.imul(tempered ^ (tempered >>> 15), 1 | tempered);
+    tempered ^= tempered + Math.imul(tempered ^ (tempered >>> 7), 61 | tempered);
+    return ((tempered ^ (tempered >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function updateLayout() {
+  var narrow = stageWidth < 780 || stageWidth / Math.max(1, stageHeight) < 0.95;
+  var topFraction = narrow ? 0.30 : 0.268;
+  var figureTop = stageHeight * topFraction;
+  var widthBudget = stageWidth * 0.94;
+  var shoulderFromWidth = widthBudget / 5.38;
+  var ceilingY = stageHeight * 0.802;
+  var shoulderFromHeight = (ceilingY - figureTop) / 3.35;
+  var shoulder = Math.max(20, Math.min(shoulderFromWidth, shoulderFromHeight));
+  var figureRun = shoulder * 3.35;
+  var parapetY = Math.min(ceilingY, figureTop + figureRun + shoulder * 0.10);
+  var bandHeightActual = Math.max(1, stageHeight - parapetY);
+  var bandHeightSized = Math.max(96, bandHeightActual);
+  stageLayout.narrow = narrow;
+  stageLayout.figureTop = figureTop;
+  stageLayout.figureShoulder = shoulder;
+  stageLayout.horizonY = parapetY - shoulder * 0.05;
+  stageLayout.parapetY = parapetY;
+  stageLayout.lyricCenterY = parapetY + bandHeightActual * 0.52;
+  stageLayout.lyricBaseSize = clampNumber(Math.max(bandHeightSized * 0.21, stageHeight * 0.032), 17, 50);
+  stageLayout.wordmarkBandHeight = Math.max(80, figureTop);
+}
+
+function sendReady() {
+  if (readyReported) { return; }
+  readyReported = true;
+  try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (error) { reportFailure('ready', error); }
+}
+
+function normalizeArtists(rawArtists) {
+  var pieces = [];
+  if (Array.isArray(rawArtists)) {
+    for (var artistIndex = 0; artistIndex < rawArtists.length && pieces.length < 8; artistIndex += 1) {
+      var single = rawArtists[artistIndex];
+      if (typeof single === 'string' && single.trim()) { pieces.push(single.trim()); }
+    }
+  } else if (typeof rawArtists === 'string' && rawArtists.trim()) {
+    pieces.push(rawArtists.trim());
+  }
+  var joined = pieces.join(' · ');
+  return joined.length > 90 ? joined.slice(0, 90) + '…' : joined;
+}
+
+function normalizeLines(rawLines) {
+  var sourceLines = Array.isArray(rawLines) ? rawLines : [];
+  var prepared = [];
+  var lineLimit = Math.min(sourceLines.length, 400);
+  for (var lineIndex = 0; lineIndex < lineLimit; lineIndex += 1) {
+    var rawLine = sourceLines[lineIndex];
+    if (!rawLine || typeof rawLine !== 'object') { continue; }
+    var textValue = typeof rawLine.text === 'string' ? rawLine.text : '';
+    var startValue = Number(rawLine.t);
+    if (!isFinite(startValue) || startValue < 0) { startValue = prepared.length ? prepared[prepared.length - 1].t + 4 : 0; }
+    var durationValue = Number(rawLine.dur);
+    if (!isFinite(durationValue) || durationValue <= 0) { durationValue = 0; }
+    var charList = null;
+    if (Array.isArray(rawLine.chars) && rawLine.chars.length) {
+      charList = [];
+      var charLimit = Math.min(rawLine.chars.length, 300);
+      for (var charIndex = 0; charIndex < charLimit; charIndex += 1) {
+        var rawChar = rawLine.chars[charIndex];
+        if (!rawChar || typeof rawChar !== 'object') { continue; }
+        var charText = typeof rawChar.c === 'string' ? rawChar.c : '';
+        var charTime = Number(rawChar.t);
+        if (!isFinite(charTime)) { charTime = startValue; }
+        charList.push({ c: charText, t: charTime });
+      }
+      if (!charList.length) { charList = null; }
+    }
+    prepared.push({ t: startValue, dur: durationValue, text: textValue, chars: charList });
+  }
+  prepared.sort(function (leftLine, rightLine) { return leftLine.t - rightLine.t; });
+  for (var passIndex = 0; passIndex < prepared.length; passIndex += 1) {
+    var currentLine = prepared[passIndex];
+    if (currentLine.dur <= 0) {
+      var following = prepared[passIndex + 1];
+      currentLine.dur = following ? Math.max(0.4, following.t - currentLine.t) : 4;
+    }
+    if (currentLine.dur > 30) { currentLine.dur = 30; }
+  }
+  return prepared;
+}
+
+function findLineIndexAt(timeSeconds) {
+  var lines = renderState.lines;
+  if (!lines.length) { return -1; }
+  var safeTime = isFinite(timeSeconds) ? timeSeconds : 0;
+  if (safeTime < lines[0].t) { return -1; }
+  var lowIndex = 0;
+  var highIndex = lines.length - 1;
+  var foundIndex = -1;
+  while (lowIndex <= highIndex) {
+    var middleIndex = (lowIndex + highIndex) >> 1;
+    if (lines[middleIndex].t <= safeTime + 0.02) {
+      foundIndex = middleIndex;
+      lowIndex = middleIndex + 1;
+    } else {
+      highIndex = middleIndex - 1;
+    }
+  }
+  return foundIndex;
+}
+
+function applyInitPayload(payload) {
+  var song = (payload.song && typeof payload.song === 'object') ? payload.song : {};
+  var previousName = renderState.songName;
+  renderState.songName = typeof song.name === 'string' ? song.name.trim().slice(0, 120) : '';
+  renderState.artists = normalizeArtists(song.artists);
+  renderState.coverUrl = typeof song.cover === 'string' ? song.cover : '';
+  if (renderState.songName !== previousName) { wordmarkDirty = true; }
+
+  var durationValue = Number(payload.duration);
+  renderState.duration = (isFinite(durationValue) && durationValue > 0) ? durationValue : 0;
+
+  if (Array.isArray(payload.accent) && payload.accent.length >= 3) {
+    var accentCandidate = [Number(payload.accent[0]), Number(payload.accent[1]), Number(payload.accent[2])];
+    if (isFinite(accentCandidate[0]) && isFinite(accentCandidate[1]) && isFinite(accentCandidate[2])) {
+      renderState.accent = accentCandidate;
+      refreshPalette();
+      restartBake();
+      wordmarkDirty = true;
+    }
+  }
+
+  renderState.lines = normalizeLines(payload.lines);
+  renderState.lineIndex = findLineIndexAt(renderState.time);
+  renderState.playing = payload.playing !== false;
+  renderState.hasInit = true;
+  renderState.emptyHint = renderState.lines.length ? '' : '此曲暂无歌词';
+}
+
+function applyTickPayload(payload) {
+  var timeValue = Number(payload.time);
+  if (isFinite(timeValue)) {
+    renderState.time = Math.max(0, timeValue);
+  }
+  renderState.playing = payload.playing !== false;
+  renderState.lineIndex = findLineIndexAt(renderState.time);
+}
+
+function applyBeatPayload(payload) {
+  var beatLevel = Number(payload.level);
+  renderState.beatLevel = isFinite(beatLevel) ? clampNumber(beatLevel, 0, 1) : 0.6;
+  renderState.beatPulse = 1;
+  renderState.beatAge = 0;
+  var beatIndex = Number(payload.index);
+  renderState.beatIndex = isFinite(beatIndex) ? beatIndex : renderState.beatIndex + 1;
+  renderState.bassLevel = Math.min(1, renderState.bassLevel * 0.5 + renderState.beatLevel * 0.7);
+}
+
+function applyLivePayload(payload) {
+  var bassValue = Number(payload.bass);
+  var trebleValue = Number(payload.treble);
+  var levelValue = Number(payload.level);
+  if (isFinite(bassValue)) { renderState.bassLevel = clampNumber(bassValue, 0, 1); }
+  if (isFinite(trebleValue)) { renderState.trebleLevel = clampNumber(trebleValue, 0, 1); }
+  if (isFinite(levelValue)) { renderState.beatLevel = clampNumber(levelValue, 0, 1); }
+  if (payload.playing === false) { renderState.playing = false; }
+}
+
+function currentLineText() {
+  var line = renderState.lines[renderState.lineIndex];
+  return (line && typeof line.text === 'string') ? line.text : '';
+}
+
+function resizeStage() {
+  var ratio = (typeof window.devicePixelRatio === 'number') ? window.devicePixelRatio : 1;
+  if (!isFinite(ratio) || ratio <= 0) { ratio = 1; }
+  stagePixelRatio = Math.min(ratio, 2);
+  var cssWidth = stageCanvas.clientWidth || window.innerWidth || 1440;
+  var cssHeight = stageCanvas.clientHeight || window.innerHeight || 900;
+  if (!isFinite(cssWidth) || cssWidth <= 0) { cssWidth = 1440; }
+  if (!isFinite(cssHeight) || cssHeight <= 0) { cssHeight = 900; }
+  stageWidth = Math.max(320, Math.round(cssWidth));
+  stageHeight = Math.max(240, Math.round(cssHeight));
+  stageCanvas.width = Math.max(1, Math.round(stageWidth * stagePixelRatio));
+  stageCanvas.height = Math.max(1, Math.round(stageHeight * stagePixelRatio));
+  refreshPalette();
+  updateLayout();
+  restartBake();
+  wordmarkDirty = true;
+}
+
+function bakeSkyLayer() {
+  var layer = createLayer(stageWidth, stageHeight, Math.min(stagePixelRatio, 1.5));
+  if (!layer) { return null; }
+  var context = layer.context;
+  var horizon = stageLayout.horizonY;
+  var skyGradient = context.createLinearGradient(0, 0, 0, Math.max(1, horizon));
+  paintStops(skyGradient, [
+    [0, rgbaOf(palette.skyTop, 1)],
+    [0.32, rgbaOf(palette.skyUpper, 1)],
+    [0.60, rgbaOf(palette.skyMid, 1)],
+    [0.83, rgbaOf(palette.skyLow, 1)],
+    [1, rgbaOf(palette.ember, 1)]
+  ]);
+  context.fillStyle = skyGradient;
+  context.fillRect(0, 0, stageWidth, horizon + 2);
+  context.fillStyle = rgbaOf(palette.night, 1);
+  context.fillRect(0, horizon, stageWidth, Math.max(0, stageHeight - horizon) + 2);
+
+  var random = createRandom(41077);
+  var starCount = Math.min(120, Math.round(stageWidth / 14));
+  for (var starIndex = 0; starIndex < starCount; starIndex += 1) {
+    var starX = random() * stageWidth;
+    var starY = random() * horizon * 0.62;
+    var starFade = 1 - starY / (horizon * 0.62);
+    var starAlpha = (0.10 + random() * 0.42) * starFade;
+    var starSize = 0.7 + random() * 1.1;
+    context.fillStyle = rgbaOf(palette.ivory, starAlpha);
+    context.fillRect(starX, starY, starSize, starSize);
+  }
+  return layer;
+}
+
+function bakeGlowLayer() {
+  var layer = createLayer(stageWidth, Math.max(1, stageLayout.parapetY * 1.15), 0.7);
+  if (!layer) { return null; }
+  var context = layer.context;
+  var centerX = stageWidth * 0.5;
+  var centerY = stageLayout.horizonY;
+  var radius = Math.max(stageWidth * 0.42, layer.height * 0.7);
+  var glowGradient = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius);
+  paintStops(glowGradient, [
+    [0, rgbaOf(palette.sun, 0.55)],
+    [0.18, rgbaOf(palette.ember, 0.38)],
+    [0.48, rgbaOf(palette.skyMid, 0.22)],
+    [1, rgbaOf(palette.skyMid, 0)]
+  ]);
+  context.fillStyle = glowGradient;
+  context.fillRect(0, 0, layer.width, layer.height);
+  return layer;
+}
+
+function bakeSkylineLayer(depth) {
+  var isNear = depth === 1;
+  var margin = isNear ? 0.10 : 0.16;
+  var layerWidth = stageWidth * (1 + margin * 2);
+  var layer = createLayer(layerWidth, stageHeight, Math.min(stagePixelRatio, 1.15));
+  if (!layer) { return null; }
+  var context = layer.context;
+  var shoulder = stageLayout.figureShoulder;
+  var baseY = stageLayout.horizonY + (isNear ? shoulder * 0.02 : -shoulder * 0.06);
+  var random = createRandom(isNear ? 20481 : 91377);
+  var bodyColor = isNear ? mixColor(palette.night, palette.accent, 0.10) : mixColor(palette.night, palette.haze, 0.52);
+  var windowBudget = isNear ? 760 : 120;
+  var cursor = -layerWidth * 0.03;
+  var maxTowers = 56;
+
+  context.fillStyle = rgbaOf(bodyColor, 1);
+  for (var towerIndex = 0; towerIndex < maxTowers; towerIndex += 1) {
+    if (cursor > layerWidth + layerWidth * 0.04) { break; }
+    var towerWidth = layerWidth * (0.026 + random() * 0.058) * (isNear ? 1 : 0.85);
+    var towerHeight = stageHeight * ((isNear ? 0.15 : 0.09) + random() * (isNear ? 0.30 : 0.22));
+    var topY = baseY - towerHeight;
+    var crownRoll = random();
+    var towerContext = context;
+
+    towerContext.fillStyle = rgbaOf(bodyColor, 1);
+    towerContext.fillRect(cursor, topY, towerWidth, baseY - topY + stageHeight * 0.02);
+
+    if (crownRoll > 0.70) {
+      var crownWidth = towerWidth * (0.44 + random() * 0.2);
+      var crownHeight = towerHeight * (0.12 + random() * 0.16);
+      var crownX = cursor + (towerWidth - crownWidth) * 0.5;
+      towerContext.fillRect(crownX, topY - crownHeight, crownWidth, crownHeight + 3);
+      if (crownRoll > 0.88) {
+        var mastWidth = Math.max(1.4, towerWidth * 0.06);
+        var mastHeight = towerHeight * (0.16 + random() * 0.2);
+        towerContext.fillRect(cursor + towerWidth * 0.5 - mastWidth * 0.5, topY - crownHeight - mastHeight,
+          mastWidth, mastHeight + 4);
+      }
+    }
+
+    if (windowBudget > 0) {
+      var columnStep = Math.max(4, shoulder * 0.115);
+      var rowStep = Math.max(5, shoulder * 0.15);
+      var columnCount = Math.floor(towerWidth / columnStep);
+      var rowCount = Math.floor((towerHeight * 0.86) / rowStep);
+      for (var rowIndex = 1; rowIndex < rowCount; rowIndex += 1) {
+        for (var columnIndex = 1; columnIndex < columnCount; columnIndex += 1) {
+          if (windowBudget <= 0) { break; }
+          if (random() > (isNear ? 0.30 : 0.16)) { continue; }
+          windowBudget -= 1;
+          var windowX = cursor + columnIndex * columnStep;
+          var windowY = topY + rowIndex * rowStep;
+          var windowSize = Math.max(1, columnStep * 0.30);
+          towerContext.fillStyle = rgbaOf(palette.window, 0.10 + random() * 0.46);
+          towerContext.fillRect(windowX, windowY, windowSize, Math.max(1, rowStep * 0.32));
+        }
+      }
+    }
+    cursor += towerWidth + layerWidth * (0.004 + random() * 0.014);
+  }
+
+  var hazeTop = baseY - stageHeight * (isNear ? 0.16 : 0.26);
+  var hazeGradient = context.createLinearGradient(0, hazeTop, 0, baseY + 2);
+  paintStops(hazeGradient, [
+    [0, rgbaOf(palette.haze, 0)],
+    [1, rgbaOf(palette.haze, isNear ? 0.30 : 0.52)]
+  ]);
+  context.fillStyle = hazeGradient;
+  context.fillRect(0, hazeTop, layerWidth, Math.max(1, baseY - hazeTop + 2));
+  return layer;
+}
+
+function bakeFinishLayer() {
+  var layer = createLayer(stageWidth, stageHeight, Math.min(stagePixelRatio, 1.5));
+  if (!layer) { return null; }
+  var context = layer.context;
+  var random = createRandom(77713);
+  var grainCount = Math.min(9000, Math.round(stageWidth * stageHeight / 420));
+  for (var grainIndex = 0; grainIndex < grainCount; grainIndex += 1) {
+    var grainX = random() * stageWidth;
+    var grainY = random() * stageHeight;
+    var grainAlpha = 0.02 + random() * 0.10;
+    var warmGrain = random() > 0.45;
+    context.fillStyle = warmGrain
+      ? 'rgba(255,238,212,' + grainAlpha.toFixed(3) + ')'
+      : 'rgba(8,4,12,' + (grainAlpha * 1.5).toFixed(3) + ')';
+    context.fillRect(grainX, grainY, 1.2, 1.2);
+  }
+  var centerX = stageWidth * 0.5;
+  var centerY = stageHeight * 0.44;
+  var radius = Math.max(stageWidth, stageHeight) * 0.80;
+  var vignetteGradient = context.createRadialGradient(centerX, centerY, radius * 0.28, centerX, centerY, radius);
+  paintStops(vignetteGradient, [
+    [0, 'rgba(4,3,9,0)'],
+    [0.60, 'rgba(4,3,9,0.18)'],
+    [1, 'rgba(3,2,7,0.66)']
+  ]);
+  context.fillStyle = vignetteGradient;
+  context.fillRect(0, 0, stageWidth, stageHeight);
+  var floorGradient = context.createLinearGradient(0, stageHeight * 0.86, 0, stageHeight);
+  paintStops(floorGradient, [
+    [0, 'rgba(3,2,6,0)'],
+    [1, 'rgba(3,2,6,0.42)']
+  ]);
+  context.fillStyle = floorGradient;
+  context.fillRect(0, stageHeight * 0.86, stageWidth, stageHeight * 0.14);
+  return layer;
+}
+
+function ensureLayers() {
+  if (!bakeStagesPending) { return; }
+  for (var stageStep = 0; stageStep < 2; stageStep += 1) {
+    if (bakeStageIndex >= bakeStages.length) { break; }
+    var bakeStage = bakeStages[bakeStageIndex];
+    try {
+      bakeStage.run();
+    } catch (error) {
+      reportFailure('bake ' + bakeStage.name, error);
+    }
+    bakeStageIndex += 1;
+  }
+  if (bakeStageIndex >= bakeStages.length) { bakeStagesPending = false; }
+}
+
+var bakeStages = [
+  { name: 'sky', run: function () { layerCache.sky = bakeSkyLayer(); } },
+  { name: 'glow', run: function () { layerCache.glow = bakeGlowLayer(); } },
+  { name: 'far-skyline', run: function () { layerCache.far = bakeSkylineLayer(0); } },
+  { name: 'near-skyline', run: function () { layerCache.near = bakeSkylineLayer(1); } },
+  { name: 'finish', run: function () { layerCache.finish = bakeFinishLayer(); } },
+  { name: 'bulbs', run: function () { layerCache.bulbGlow = bakeBulbSprite(); } },
+  { name: 'figures', run: function () { bakeFigureAssets(); } }
+];
+
+function restartBake() {
+  bakeStageIndex = 0;
+  bakeStagesPending = true;
+}
+
+function drawSkyline(context, layer, parallax, driftX) {
+  if (!layer) { return; }
+  var destX = -layer.width * 0.5 + stageWidth * 0.5 + driftX * parallax;
+  safeDrawImage(context, layer.canvas, destX, 0, layer.width, layer.height);
+}
+
+function drawBackdrop(context) {
+  if (layerCache.sky) {
+    safeDrawImage(context, layerCache.sky.canvas, 0, 0, stageWidth, stageHeight);
+  } else {
+    var fallbackSky = context.createLinearGradient(0, 0, 0, stageHeight);
+    paintStops(fallbackSky, [
+      [0, rgbaOf(palette.skyTop, 1)],
+      [0.55, rgbaOf(palette.skyMid, 1)],
+      [1, rgbaOf(palette.skyLow, 1)]
+    ]);
+    context.fillStyle = fallbackSky;
+    context.fillRect(0, 0, stageWidth, stageHeight);
+  }
+  if (layerCache.glow) {
+    var glowPulse = 0.72 + renderState.beatPulse * 0.2 + renderState.bassLevel * 0.16;
+    context.globalAlpha = clampNumber(glowPulse, 0.4, 1);
+    safeDrawImage(context, layerCache.glow.canvas, 0, 0, layerCache.glow.width, layerCache.glow.height);
+    context.globalAlpha = 1;
+  }
+  drawSkyline(context, layerCache.far, 0.26, renderState.cameraX);
+  drawSkyline(context, layerCache.near, 0.52, renderState.cameraX);
+}
+
+function gownOutline() {
+  return [
+    { type: 'C', c1: [0.160, 0.004], c2: [0.245, 0.075], to: [0.262, 0.160] },
+    { type: 'C', c1: [0.283, 0.245], c2: [0.262, 0.340], to: [0.212, 0.404] },
+    { type: 'C', c1: [0.168, 0.452], c2: [0.100, 0.545], to: [0.072, 0.612] },
+    { type: 'L', to: [0.072, 0.668] },
+    { type: 'C', c1: [0.200, 0.685], c2: [0.375, 0.735], to: [0.462, 0.818] },
+    { type: 'C', c1: [0.508, 0.965], c2: [0.532, 1.200], to: [0.528, 1.440] },
+    { type: 'C', c1: [0.522, 1.630], c2: [0.482, 1.790], to: [0.442, 1.885] },
+    { type: 'C', c1: [0.424, 1.940], c2: [0.400, 1.990], to: [0.392, 2.060] },
+    { type: 'C', c1: [0.400, 2.300], c2: [0.470, 2.550], to: [0.505, 2.780] },
+    { type: 'C', c1: [0.550, 3.050], c2: [0.600, 3.350], to: [0.625, 3.620] },
+    { type: 'C', c1: [0.655, 4.000], c2: [0.665, 4.350], to: [0.672, 4.620] },
+    { type: 'L', to: [0.672, 4.740] },
+    { type: 'L', to: [0.000, 4.740] }
+  ];
+}
+
+function suitOutline() {
+  return [
+    { type: 'C', c1: [0.145, 0.000], c2: [0.232, 0.055], to: [0.245, 0.135] },
+    { type: 'C', c1: [0.258, 0.235], c2: [0.238, 0.342], to: [0.196, 0.405] },
+    { type: 'C', c1: [0.155, 0.462], c2: [0.098, 0.545], to: [0.070, 0.606] },
+    { type: 'L', to: [0.070, 0.660] },
+    { type: 'C', c1: [0.225, 0.678], c2: [0.405, 0.722], to: [0.492, 0.802] },
+    { type: 'C', c1: [0.532, 0.950], c2: [0.552, 1.190], to: [0.545, 1.440] },
+    { type: 'C', c1: [0.538, 1.620], c2: [0.512, 1.780], to: [0.482, 1.860] },
+    { type: 'C', c1: [0.474, 1.920], c2: [0.470, 1.980], to: [0.468, 2.060] },
+    { type: 'C', c1: [0.470, 2.280], c2: [0.488, 2.520], to: [0.500, 2.740] },
+    { type: 'C', c1: [0.508, 2.980], c2: [0.512, 3.220], to: [0.514, 3.500] },
+    { type: 'C', c1: [0.516, 3.950], c2: [0.516, 4.350], to: [0.514, 4.620] },
+    { type: 'L', to: [0.514, 4.740] },
+    { type: 'L', to: [0.000, 4.740] }
+  ];
+}
+
+function buildFigurePath(kind) {
+  if (typeof Path2D !== 'function') { return null; }
+  var commands = (kind === 'suit') ? suitOutline() : gownOutline();
+  var path = new Path2D();
+  path.moveTo(0, 0);
+  var recorded = [];
+  var cursorX = 0;
+  var cursorY = 0;
+  for (var commandIndex = 0; commandIndex < commands.length; commandIndex += 1) {
+    var command = commands[commandIndex];
+    var fromPoint = [cursorX, cursorY];
+    if (command.type === 'L') {
+      path.lineTo(command.to[0], command.to[1]);
+    } else {
+      path.bezierCurveTo(command.c1[0], command.c1[1], command.c2[0], command.c2[1], command.to[0], command.to[1]);
+    }
+    recorded.push({ type: command.type, c1: command.c1, c2: command.c2, from: fromPoint });
+    cursorX = command.to[0];
+    cursorY = command.to[1];
+  }
+  for (var reverseIndex = recorded.length - 1; reverseIndex >= 0; reverseIndex -= 1) {
+    var reversed = recorded[reverseIndex];
+    if (reversed.type === 'L') {
+      path.lineTo(-reversed.from[0], reversed.from[1]);
+    } else {
+      path.bezierCurveTo(-reversed.c2[0], reversed.c2[1], -reversed.c1[0], reversed.c1[1], -reversed.from[0], reversed.from[1]);
+    }
+  }
+  path.closePath();
+  return path;
+}
+
+function buildSequinBank(path, kind) {
+  if (!path) { return []; }
+  var probeCanvas = document.createElement('canvas');
+  probeCanvas.width = 1;
+  probeCanvas.height = 1;
+  var probeContext = probeCanvas.getContext('2d');
+  if (!probeContext || typeof probeContext.isPointInPath !== 'function') { return []; }
+  var random = createRandom(kind === 'suit' ? 63211 : 14887);
+  var points = [];
+  var stepX = 0.052;
+  var stepY = 0.062;
+  var limit = kind === 'suit' ? 150 : 190;
+  for (var gridY = 0.98; gridY < 3.42 && points.length < limit; gridY += stepY) {
+    for (var gridX = -0.72; gridX < 0.72 && points.length < limit; gridX += stepX) {
+      var jitterX = gridX + (random() - 0.5) * stepX;
+      var jitterY = gridY + (random() - 0.5) * stepY;
+      if (!probeContext.isPointInPath(path, jitterX, jitterY)) { continue; }
+      var density = random();
+      if (density > (kind === 'suit' ? 0.34 : 0.42)) { continue; }
+      points.push({
+        x: jitterX,
+        y: jitterY,
+        size: 0.009 + random() * 0.014,
+        phase: random() * Math.PI * 2,
+        delay: random() * 0.16,
+        tone: random() > 0.62 ? 1 : 0
+      });
+    }
+  }
+  return points;
+}
+
+function bakeFigureAssets() {
+  var gownPath = buildFigurePath('gown');
+  var suitPath = buildFigurePath('suit');
+  layerCache.gownPath = gownPath;
+  layerCache.suitPath = suitPath;
+  layerCache.gownSequins = buildSequinBank(gownPath, 'gown');
+  layerCache.suitSequins = buildSequinBank(suitPath, 'suit');
+
+  var faceLayer = createLayer(72, 72);
+  if (faceLayer) {
+    var faceContext = faceLayer.context;
+    var faceGradient = faceContext.createRadialGradient(36, 42, 2, 36, 42, 34);
+    paintStops(faceGradient, [
+      [0, rgbaOf(palette.sequinWarm, 0.46)],
+      [0.45, rgbaOf(palette.ember, 0.20)],
+      [1, rgbaOf(palette.ember, 0)]
+    ]);
+    faceContext.fillStyle = faceGradient;
+    faceContext.fillRect(0, 0, 72, 72);
+    layerCache.faceGlow = faceLayer;
+  }
+}
+
+var figureDefinitions = [
+  { kind: 'gown', offset: -2.02, heightFactor: 1.000, tilt: -0.012, depth: 0 },
+  { kind: 'suit', offset: -1.01, heightFactor: 1.014, tilt: -0.005, depth: 2 },
+  { kind: 'gown', offset: 0.00, heightFactor: 1.024, tilt: 0.000, depth: 4 },
+  { kind: 'suit', offset: 1.01, heightFactor: 1.014, tilt: 0.005, depth: 3 },
+  { kind: 'gown', offset: 2.02, heightFactor: 1.000, tilt: 0.012, depth: 1 }
+];
+
+function drawSequinField(context, sequins, warmth, coolness, phaseOffset) {
+  if (!sequins || !sequins.length) { return; }
+  var motionScale = renderState.reducedMotion ? 0.32 : 1;
+  var beatGlow = 0.26 + renderState.beatPulse * 0.80 + renderState.trebleLevel * 0.30;
+  var timePhase = renderState.time * 2.15 * motionScale + phaseOffset;
+  var beatAge = renderState.beatAge;
+  var warmPass = true;
+  for (var passIndex = 0; passIndex < 2; passIndex += 1) {
+    warmPass = passIndex === 0;
+    context.fillStyle = warmPass ? rgbaOf(warmth, 1) : rgbaOf(coolness, 1);
+    for (var pointIndex = 0; pointIndex < sequins.length; pointIndex += 1) {
+      var point = sequins[pointIndex];
+      if ((point.tone === 1) !== warmPass) { continue; }
+      var wave = Math.sin(timePhase + point.phase + point.x * 3.4 + point.y * 0.7);
+      var shimmer = Math.max(0, wave);
+      var alpha = 0.05 + shimmer * shimmer * beatGlow * 0.9;
+      var sweepLocal = beatAge - (point.x + 0.75) * 0.22 - point.delay;
+      if (sweepLocal > 0) {
+        alpha += Math.max(0, 1 - sweepLocal * 3.4) * 0.52 * motionScale;
+      }
+      if (renderState.reducedMotion) { alpha *= 0.62; }
+      if (alpha <= 0.02) { continue; }
+      context.globalAlpha = clampNumber(alpha, 0, 0.88);
+      context.fillRect(point.x, point.y, point.size, point.size);
+    }
+  }
+  context.globalAlpha = 1;
+}
+
+function drawFaceHints(context, kind) {
+  var glowLayer = layerCache.faceGlow;
+  if (glowLayer) {
+    context.globalAlpha = 0.72 + renderState.beatPulse * 0.16;
+    safeDrawImage(context, glowLayer.canvas, -0.30, 0.08, 0.60, 0.60);
+    context.globalAlpha = 1;
+  }
+  var smileAlpha = 0.22 + renderState.beatPulse * 0.10;
+  context.strokeStyle = rgbaOf(palette.sequinWarm, smileAlpha);
+  context.lineWidth = 0.016;
+  context.lineCap = 'round';
+  context.beginPath();
+  context.moveTo(-0.062, 0.444);
+  context.quadraticCurveTo(0, 0.486, 0.062, 0.444);
+  context.stroke();
+
+  context.fillStyle = rgbaOf(palette.ivory, 0.14);
+  context.beginPath();
+  context.ellipse(-0.077, 0.272, 0.030, 0.013, 0, 0, Math.PI * 2);
+  context.ellipse(0.077, 0.272, 0.030, 0.013, 0, 0, Math.PI * 2);
+  context.fill();
+
+  if (kind === 'suit') {
+    var shirtGradient = context.createLinearGradient(0, 0.66, 0, 1.95);
+    paintStops(shirtGradient, [
+      [0, rgbaOf(palette.ivory, 0.30)],
+      [1, rgbaOf(palette.ivory, 0.04)]
+    ]);
+    context.fillStyle = shirtGradient;
+    context.beginPath();
+    context.moveTo(-0.070, 0.664);
+    context.lineTo(0.070, 0.664);
+    context.lineTo(0.030, 1.930);
+    context.lineTo(-0.030, 1.930);
+    context.closePath();
+    context.fill();
+  } else {
+    context.strokeStyle = rgbaOf(palette.gold, 0.34);
+    context.lineWidth = 0.011;
+    context.beginPath();
+    context.moveTo(-0.115, 0.706);
+    context.quadraticCurveTo(0, 0.760, 0.115, 0.706);
+    context.stroke();
+  }
+}
+
+function drawQuintet(context) {
+  var shoulder = stageLayout.figureShoulder;
+  var gownPath = layerCache.gownPath;
+  var suitPath = layerCache.suitPath;
+  if (!gownPath || !suitPath) { return; }
+  if (!hasPathApi(context) || typeof context.fill !== 'function') { return; }
+  var spacing = shoulder * 1.02;
+  var centerX = stageWidth * 0.5 + renderState.cameraX * 0.55;
+  var figureRun = shoulder * 3.35;
+  var drawnOrder = [0, 1, 2, 3, 4];
+  var glowStrength = 0.55 + renderState.bassLevel * 0.45;
+
+  context.save();
+  context.beginPath();
+  context.rect(-stageWidth, -stageHeight * 0.2, stageWidth * 3, stageLayout.parapetY + stageHeight * 0.2);
+  context.clip();
+
+  for (var orderIndex = 0; orderIndex < drawnOrder.length; orderIndex += 1) {
+    var figure = null;
+    for (var definitionIndex = 0; definitionIndex < figureDefinitions.length; definitionIndex += 1) {
+      if (figureDefinitions[definitionIndex].depth === drawnOrder[orderIndex]) {
+        figure = figureDefinitions[definitionIndex];
+      }
+    }
+    if (!figure) { continue; }
+    var scale = shoulder * figure.heightFactor;
+    var figureTop = stageLayout.parapetY - figureRun * figure.heightFactor - shoulder * 0.02;
+    var figureX = centerX + figure.offset * spacing;
+    var figurePath = figure.kind === 'suit' ? suitPath : gownPath;
+
+    context.save();
+    context.translate(figureX, figureTop);
+    context.rotate(figure.tilt);
+    context.scale(scale, scale);
+
+    var bodyGradient = context.createLinearGradient(0, 0.4, 0, 4.2);
+    paintStops(bodyGradient, [
+      [0, rgbaOf(mixColor(palette.night, palette.haze, 0.30), 0.99)],
+      [0.35, rgbaOf(mixColor(palette.night, palette.haze, 0.14), 0.99)],
+      [1, rgbaOf(palette.night, 0.99)]
+    ]);
+    context.fillStyle = bodyGradient;
+    context.fill(figurePath);
+
+    context.save();
+    context.beginPath();
+    context.clip(figurePath);
+    var sheen = context.createLinearGradient(-0.62, 0, 0.66, 0);
+    paintStops(sheen, [
+      [0, rgbaOf(palette.sequinWarm, 0)],
+      [0.16, rgbaOf(palette.sequinWarm, 0.11 * glowStrength)],
+      [0.38, rgbaOf(palette.ember, 0.05 * glowStrength)],
+      [0.62, rgbaOf(palette.sequinCool, 0.05)],
+      [1, rgbaOf(palette.night, 0)]
+    ]);
+    context.fillStyle = sheen;
+    context.fillRect(-0.8, 0.4, 1.6, 3.2);
+    drawSequinField(context, figure.kind === 'suit' ? layerCache.suitSequins : layerCache.gownSequins,
+      palette.sequinWarm, palette.sequinCool, figure.depth * 1.31);
+    drawFaceHints(context, figure.kind);
+    context.restore();
+
+    var rimWidth = clampNumber(1.05 / scale, 0.006, 0.05);
+    var warmRim = context.createLinearGradient(-0.62, 0, 0.62, 0);
+    paintStops(warmRim, [
+      [0, rgbaOf(palette.sequinWarm, 0.92)],
+      [0.28, rgbaOf(palette.sequinWarm, 0.52)],
+      [0.52, rgbaOf(palette.ember, 0.16)],
+      [1, rgbaOf(palette.ember, 0)]
+    ]);
+    context.globalAlpha = clampNumber(0.62 + glowStrength * 0.38, 0, 1);
+    context.strokeStyle = warmRim;
+    context.lineWidth = rimWidth * 2.1;
+    context.stroke(figurePath);
+
+    var coolRim = context.createLinearGradient(0.62, 0, -0.62, 0);
+    paintStops(coolRim, [
+      [0, rgbaOf(palette.sequinCool, 0.60)],
+      [0.34, rgbaOf(palette.sequinCool, 0.30)],
+      [0.66, rgbaOf(palette.sequinCool, 0.06)],
+      [1, rgbaOf(palette.sequinCool, 0)]
+    ]);
+    context.strokeStyle = coolRim;
+    context.lineWidth = rimWidth * 1.3;
+    context.stroke(figurePath);
+    context.globalAlpha = 1;
+
+    context.restore();
+  }
+  context.restore();
+}
+
+function drawStageFrame() {
+  var context = stageContext;
+  if (!hasPathApi(context)) { return; }
+  ensureLayers();
+  context.setTransform(stagePixelRatio, 0, 0, stagePixelRatio, 0, 0);
+  context.clearRect(0, 0, stageWidth, stageHeight);
+  drawBackdrop(context);
+  drawQuintet(context);
+  drawForegroundBand(context);
+  drawLyricLayer(context);
+  drawCaptionLayer(context);
+  if (layerCache.finish) {
+    safeDrawImage(context, layerCache.finish.canvas, 0, 0, stageWidth, stageHeight);
+  }
+}
+
+var fontSerif = '"Songti SC", "Source Han Serif SC", "Noto Serif CJK SC", "Noto Serif SC", "SimSun", "STSong", "Georgia", serif';
+var fontScript = '"Snell Roundhand", "Segoe Script", "Brush Script MT", "Monotype Corsiva", "Lucida Handwriting", cursive';
+var fontSans = '"Gill Sans MT", "Gill Sans", "Segoe UI", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif';
+
+function bakeBulbSprite() {
+  var sprite = createLayer(28, 28);
+  if (!sprite) { return null; }
+  var context = sprite.context;
+  var gradient = context.createRadialGradient(14, 14, 0.5, 14, 14, 13);
+  paintStops(gradient, [
+    [0, rgbaOf([255, 246, 224], 1)],
+    [0.22, rgbaOf(palette.gold, 0.85)],
+    [0.55, rgbaOf(palette.ember, 0.28)],
+    [1, rgbaOf(palette.ember, 0)]
+  ]);
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 28, 28);
+  return sprite;
+}
+
+function drawForegroundBand(context) {
+  var parapetY = stageLayout.parapetY;
+  var bandHeight = Math.max(1, stageHeight - parapetY);
+  var shoulder = stageLayout.figureShoulder;
+  var spillHeight = shoulder * 0.72;
+
+  var spill = context.createLinearGradient(0, parapetY - spillHeight, 0, parapetY);
+  paintStops(spill, [
+    [0, rgbaOf(palette.ember, 0)],
+    [0.72, rgbaOf(palette.ember, 0.07)],
+    [1, rgbaOf(palette.gold, 0.20)]
+  ]);
+  context.fillStyle = spill;
+  context.fillRect(0, parapetY - spillHeight, stageWidth, spillHeight);
+
+  var marble = context.createLinearGradient(0, parapetY, 0, stageHeight);
+  paintStops(marble, [
+    [0, rgbaOf(mixColor(palette.night, palette.accent, 0.13), 0.99)],
+    [0.45, rgbaOf(mixColor(palette.night, palette.accent, 0.05), 1)],
+    [1, 'rgba(4,3,8,1)']
+  ]);
+  context.fillStyle = marble;
+  context.fillRect(0, parapetY, stageWidth, bandHeight + 1);
+
+  var fluteStep = clampNumber(shoulder * 0.24, 12, 48);
+  var fluteIndex = 0;
+  for (var fluteX = fluteStep * 0.5; fluteX < stageWidth + fluteStep; fluteX += fluteStep) {
+    fluteIndex += 1;
+    context.fillStyle = (fluteIndex % 2 === 0) ? 'rgba(255,231,198,0.045)' : 'rgba(0,0,0,0.20)';
+    context.fillRect(fluteX, parapetY + 2, Math.max(1, fluteStep * 0.16), bandHeight);
+  }
+
+  var railHeight = clampNumber(stageHeight * 0.0085, 4, 9);
+  var railGradient = context.createLinearGradient(0, parapetY - railHeight, 0, parapetY + railHeight * 0.9);
+  paintStops(railGradient, [
+    [0, rgbaOf(mixColor(palette.gold, [255, 255, 255], 0.45), 0.96)],
+    [0.34, rgbaOf(palette.gold, 0.88)],
+    [0.66, rgbaOf(mixColor(palette.gold, [90, 44, 24], 0.45), 0.92)],
+    [1, rgbaOf(mixColor(palette.gold, [20, 10, 6], 0.6), 0.85)]
+  ]);
+  context.fillStyle = railGradient;
+  context.fillRect(0, parapetY - railHeight, stageWidth, railHeight * 1.9);
+  context.fillStyle = 'rgba(9,6,12,0.62)';
+  context.fillRect(0, parapetY + railHeight * 0.9, stageWidth, railHeight * 0.55);
+
+  if (layerCache.bulbGlow) {
+    var bulbStep = clampNumber(stageWidth / 30, 26, 54);
+    var bulbSize = bulbStep * 1.15;
+    var bulbY = parapetY - railHeight * 1.9 - bulbSize * 0.30;
+    for (var bulbX = bulbStep * 0.5; bulbX < stageWidth; bulbX += bulbStep) {
+      var chase = 0.5 + 0.5 * Math.sin(renderState.time * 3.1 - bulbX * 0.021);
+      var bulbAlpha = 0.24 + chase * 0.46 + renderState.beatPulse * 0.20;
+      context.globalAlpha = clampNumber(bulbAlpha, 0, 0.95);
+      safeDrawImage(context, layerCache.bulbGlow.canvas, bulbX - bulbSize * 0.5, bulbY, bulbSize, bulbSize);
+    }
+    context.globalAlpha = 1;
+  }
+}
+
+function fitTextSize(context, text, maxWidth, startSize, family, weight, minSize) {
+  var size = startSize;
+  for (var stepIndex = 0; stepIndex < 26; stepIndex += 1) {
+    context.font = weight + ' ' + size + 'px ' + family;
+    if (context.measureText(text).width <= maxWidth) { break; }
+    if (size <= minSize) { break; }
+    size = Math.max(minSize, size * 0.92);
+  }
+  return Math.max(minSize, size);
+}
+
+function containsCjk(text) {
+  return /[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(text);
+}
+
+function bakeWordmark() {
+  wordmarkDirty = false;
+  var bandHeight = Math.max(96, Math.round(stageLayout.wordmarkBandHeight));
+  var layer = createLayer(stageWidth, bandHeight, Math.min(stagePixelRatio, 2));
+  if (!layer) { return null; }
+  var context = layer.context;
+  var centerX = stageWidth * 0.5;
+  var name = renderState.songName;
+  var artists = renderState.artists;
+  var hasText = !!name;
+
+  context.textAlign = 'center';
+  context.textBaseline = 'alphabetic';
+
+  var scriptSize = clampNumber(Math.min(stageWidth * 0.062, bandHeight * 0.40), 20, 92);
+  var scriptY = bandHeight * 0.56;
+  var ornamentY = bandHeight * 0.19;
+
+  context.strokeStyle = rgbaOf(palette.gold, 0.55);
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(centerX - Math.min(stageWidth * 0.16, 210), ornamentY);
+  context.lineTo(centerX - Math.min(stageWidth * 0.035, 44), ornamentY);
+  context.moveTo(centerX + Math.min(stageWidth * 0.035, 44), ornamentY);
+  context.lineTo(centerX + Math.min(stageWidth * 0.16, 210), ornamentY);
+  context.stroke();
+  context.fillStyle = rgbaOf(palette.gold, 0.85);
+  context.beginPath();
+  context.moveTo(centerX, ornamentY - 4.5);
+  context.lineTo(centerX + 4.5, ornamentY);
+  context.lineTo(centerX, ornamentY + 4.5);
+  context.lineTo(centerX - 4.5, ornamentY);
+  context.closePath();
+  context.fill();
+
+  if (hasText) {
+    var cjkName = containsCjk(name);
+    var nameFamily = cjkName ? fontSerif : fontScript;
+    var nameWeight = '600';
+    try {
+      context.letterSpacing = cjkName ? (scriptSize * 0.07).toFixed(1) + 'px' : '0px';
+    } catch (spacingError) {
+      reportFailure('letterSpacing', spacingError);
+    }
+    scriptSize = fitTextSize(context, name, stageWidth * 0.80, scriptSize, nameFamily, nameWeight, 18);
+    context.font = nameWeight + ' ' + scriptSize.toFixed(1) + 'px ' + nameFamily;
+    var nameGradient = context.createLinearGradient(0, scriptY - scriptSize * 0.8, 0, scriptY + scriptSize * 0.2);
+    paintStops(nameGradient, [
+      [0, rgbaOf(mixColor(palette.ivory, [255, 255, 255], 0.35), 0.98)],
+      [0.55, rgbaOf(palette.ivory, 0.95)],
+      [1, rgbaOf(mixColor(palette.gold, palette.accent, 0.35), 0.92)]
+    ]);
+    context.shadowColor = rgbaOf(palette.ember, 0.55);
+    context.shadowBlur = scriptSize * 0.34;
+    context.fillStyle = nameGradient;
+    context.fillText(name, centerX, scriptY);
+    context.shadowBlur = 0;
+    context.shadowColor = 'rgba(0,0,0,0)';
+    try { context.letterSpacing = '0px'; } catch (spacingError) { reportFailure('letterSpacing', spacingError); }
+  }
+
+  var ruleY = bandHeight * 0.735;
+  var ruleHalf = Math.min(stageWidth * 0.30, 360);
+  var ruleGradient = context.createLinearGradient(centerX - ruleHalf, 0, centerX + ruleHalf, 0);
+  paintStops(ruleGradient, [
+    [0, rgbaOf(palette.gold, 0)],
+    [0.24, rgbaOf(palette.gold, 0.55)],
+    [0.5, rgbaOf(mixColor(palette.ivory, palette.gold, 0.5), 0.8)],
+    [0.76, rgbaOf(palette.gold, 0.55)],
+    [1, rgbaOf(palette.gold, 0)]
+  ]);
+  context.fillStyle = ruleGradient;
+  context.fillRect(centerX - ruleHalf, ruleY, ruleHalf * 2, 1.2);
+  context.fillRect(centerX - ruleHalf * 0.62, ruleY + 4, ruleHalf * 1.24, 0.9);
+
+  if (artists) {
+    var artistSize = clampNumber(bandHeight * 0.085, 9, 16);
+    context.font = '400 ' + artistSize.toFixed(1) + 'px ' + fontSans;
+    try { context.letterSpacing = (artistSize * 0.22).toFixed(1) + 'px'; } catch (spacingError) { reportFailure('letterSpacing', spacingError); }
+    var artistText = artists.toUpperCase();
+    var artistFit = fitTextSize(context, artistText, stageWidth * 0.82, artistSize, fontSans, '400', 8);
+    context.font = '400 ' + artistFit.toFixed(1) + 'px ' + fontSans;
+    context.fillStyle = rgbaOf(mixColor(palette.ivory, palette.gold, 0.45), 0.72);
+    context.fillText(artistText, centerX, ruleY + artistFit * 2.1);
+    try { context.letterSpacing = '0px'; } catch (spacingError) { reportFailure('letterSpacing', spacingError); }
+  }
+  return layer;
+}
+
+function drawCaptionLayer(context) {
+  if (wordmarkDirty || !layerCache.wordmark) {
+    try {
+      layerCache.wordmark = bakeWordmark();
+    } catch (error) {
+      reportFailure('wordmark', error);
+      layerCache.wordmark = null;
+      wordmarkDirty = false;
+    }
+  }
+  if (layerCache.wordmark) {
+    safeDrawImage(context, layerCache.wordmark.canvas, 0, 0, layerCache.wordmark.width, layerCache.wordmark.height);
+  }
+}
+
+function buildCharTimings(line) {
+  var text = line.text || '';
+  var charCount = text.length;
+  if (!charCount) { return []; }
+  var timings = new Array(charCount);
+  var charSource = line.chars;
+  if (charSource && charSource.length === charCount) {
+    for (var alignIndex = 0; alignIndex < charCount; alignIndex += 1) {
+      var charTime = Number(charSource[alignIndex].t);
+      timings[alignIndex] = isFinite(charTime) ? charTime : line.t;
+    }
+    return timings;
+  }
+  var span = Math.max(0.35, line.dur);
+  for (var spreadIndex = 0; spreadIndex < charCount; spreadIndex += 1) {
+    timings[spreadIndex] = line.t + (span * spreadIndex) / charCount;
+  }
+  return timings;
+}
+
+function layoutLyricRows(context, line, fontSize, maxWidth) {
+  var text = line.text || '';
+  var rows = [];
+  var currentRow = { chars: [], width: 0 };
+  var index = 0;
+  var charCount = text.length;
+  var limit = Math.min(charCount, 260);
+  for (index = 0; index < limit; index += 1) {
+    var charText = text.charAt(index);
+    var charWidth = context.measureText(charText).width;
+    if (charText === ' ' && currentRow.chars.length === 0) { continue; }
+    if (currentRow.width + charWidth > maxWidth && currentRow.chars.length > 0) {
+      rows.push(currentRow);
+      currentRow = { chars: [], width: 0 };
+      if (charText === ' ') { continue; }
+    }
+    currentRow.chars.push({ c: charText, w: charWidth, index: index });
+    currentRow.width += charWidth;
+  }
+  if (currentRow.chars.length) { rows.push(currentRow); }
+  if (!rows.length) { rows.push({ chars: [], width: 0 }); }
+  return rows;
+}
+
+function drawRowText(context, row, originX, baselineY, fillStyle, alpha) {
+  var cursorX = originX;
+  context.fillStyle = fillStyle;
+  context.globalAlpha = alpha;
+  for (var rowIndex = 0; rowIndex < row.chars.length; rowIndex += 1) {
+    var glyph = row.chars[rowIndex];
+    context.fillText(glyph.c, cursorX, baselineY);
+    cursorX += glyph.w;
+  }
+  context.globalAlpha = 1;
+}
+
+var lyricLayoutCache = { key: '', fontSize: 0, rows: null, nextFontSize: 0, nextRows: null };
+
+function buildLyricRowSet(context, activeLine) {
+  var fontSize = stageLayout.lyricBaseSize;
+  var rowLimit = stageLayout.narrow ? 3 : 2;
+  context.font = '500 ' + fontSize.toFixed(1) + 'px ' + fontSerif;
+  var rows = layoutLyricRows(context, activeLine, fontSize, stageWidth * 0.86);
+  for (var fitStep = 0; fitStep < 10; fitStep += 1) {
+    if (rows.length <= rowLimit || fontSize <= 13) { break; }
+    fontSize = Math.max(13, fontSize * 0.90);
+    context.font = '500 ' + fontSize.toFixed(1) + 'px ' + fontSerif;
+    rows = layoutLyricRows(context, activeLine, fontSize, stageWidth * 0.86);
+  }
+  if (rows.length > rowLimit) { rows = rows.slice(0, rowLimit); }
+  return { fontSize: fontSize, rows: rows };
+}
+
+function getLyricLayout(context, activeLine, lineIndex, nextLine) {
+  var cacheKey = lineIndex + '|' + activeLine.t + '|' + Math.round(stageWidth) + '|' +
+    Math.round(stageHeight) + '|' + renderState.lines.length + '|' + stageLayout.lyricBaseSize.toFixed(1);
+  if (lyricLayoutCache.key === cacheKey && lyricLayoutCache.rows) { return lyricLayoutCache; }
+  var rowSet = buildLyricRowSet(context, activeLine);
+  var nextFontSize = 0;
+  var nextRows = null;
+  if (nextLine && typeof nextLine.text === 'string' && nextLine.text.trim()) {
+    nextFontSize = rowSet.fontSize * 0.60;
+    context.font = '400 ' + nextFontSize.toFixed(1) + 'px ' + fontSerif;
+    var candidateRows = layoutLyricRows(context, nextLine, nextFontSize, stageWidth * 0.78);
+    if (candidateRows.length === 1) { nextRows = candidateRows; }
+  }
+  lyricLayoutCache = {
+    key: cacheKey,
+    fontSize: rowSet.fontSize,
+    rows: rowSet.rows,
+    nextFontSize: nextFontSize,
+    nextRows: nextRows
+  };
+  return lyricLayoutCache;
+}
+
+function drawLyricRows(context, rows, fontSize, centerY, timings, alphaScale) {
+  var dimAlpha = 0.42 * alphaScale;
+  var litAlpha = 0.98 * alphaScale;
+  var lineHeight = fontSize * 1.36;
+  var totalHeight = rows.length * lineHeight;
+  var topY = centerY - totalHeight * 0.5 + fontSize * 0.86;
+
+  for (var rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    var row = rows[rowIndex];
+    var originX = (stageWidth - row.width) * 0.5;
+    var baselineY = topY + rowIndex * lineHeight;
+    drawRowText(context, row, originX, baselineY, rgbaOf(mixColor(palette.ivory, palette.haze, 0.35), 1), dimAlpha);
+
+    var litWidth = 0;
+    for (var glyphIndex = 0; glyphIndex < row.chars.length; glyphIndex += 1) {
+      var glyph = row.chars[glyphIndex];
+      var glyphTime = timings[glyph.index];
+      if (!isFinite(glyphTime)) { continue; }
+      if (renderState.time >= glyphTime) {
+        litWidth += glyph.w;
+      } else {
+        var previousTime = glyphIndex === 0 ? glyphTime - 0.3 : timings[row.chars[glyphIndex - 1].index];
+        var span = Math.max(0.08, glyphTime - previousTime);
+        var partial = clampNumber((renderState.time - (glyphTime - span)) / span, 0, 1);
+        litWidth += glyph.w * partial;
+        break;
+      }
+    }
+    if (litWidth > 0.5) {
+      context.save();
+      context.beginPath();
+      context.rect(originX - fontSize * 0.2, baselineY - fontSize * 1.5, litWidth + fontSize * 0.2, fontSize * 2.4);
+      context.clip();
+      drawRowText(context, row, originX, baselineY, rgbaOf(mixColor(palette.ivory, [255, 250, 240], 0.5), 1), litAlpha);
+      context.restore();
+    }
+  }
+  return totalHeight;
+}
+
+function drawLyricLayer(context) {
+  var parapetY = stageLayout.parapetY;
+  var bandHeight = Math.max(1, stageHeight - parapetY);
+  var centerX = stageWidth * 0.5;
+  var lines = renderState.lines;
+
+  if (!renderState.hasInit) { return; }
+
+  var spotlight = context.createRadialGradient(centerX, stageLayout.lyricCenterY, 0,
+    centerX, stageLayout.lyricCenterY, Math.max(stageWidth * 0.42, bandHeight * 1.15));
+  paintStops(spotlight, [
+    [0, rgbaOf(palette.accent, 0.17)],
+    [0.50, rgbaOf(palette.accent, 0.07)],
+    [1, rgbaOf(palette.accent, 0)]
+  ]);
+  context.fillStyle = spotlight;
+  context.fillRect(0, parapetY, stageWidth, bandHeight);
+
+  if (!lines.length) {
+    var emptyY = stageLayout.lyricCenterY;
+    var emptySize = clampNumber(bandHeight * 0.10, 12, 20);
+    context.textAlign = 'center';
+    context.textBaseline = 'alphabetic';
+    context.fillStyle = rgbaOf(palette.gold, 0.75);
+    context.beginPath();
+    context.moveTo(centerX, emptyY - emptySize * 0.9);
+    context.lineTo(centerX + emptySize * 0.30, emptyY - emptySize * 1.2);
+    context.lineTo(centerX, emptyY - emptySize * 1.5);
+    context.lineTo(centerX - emptySize * 0.30, emptyY - emptySize * 1.2);
+    context.closePath();
+    context.fill();
+    context.font = '400 ' + emptySize.toFixed(1) + 'px ' + fontSerif;
+    try { context.letterSpacing = (emptySize * 0.30).toFixed(1) + 'px'; } catch (spacingError) { reportFailure('letterSpacing', spacingError); }
+    context.fillStyle = rgbaOf(mixColor(palette.ivory, palette.haze, 0.4), 0.62);
+    context.fillText(renderState.emptyHint || '此曲暂无歌词', centerX, emptyY);
+    try { context.letterSpacing = '0px'; } catch (spacingError) { reportFailure('letterSpacing', spacingError); }
+    return;
+  }
+
+  var lineIndex = renderState.lineIndex;
+  var activeLine = lines[lineIndex];
+  var previewOnly = false;
+  if (!activeLine) {
+    activeLine = lines[0];
+    previewOnly = true;
+  }
+  context.textAlign = 'left';
+  context.textBaseline = 'alphabetic';
+
+  var isEmptyLine = !activeLine.text || !activeLine.text.trim();
+  var nextLine = null;
+  if (!previewOnly) {
+    var candidateNext = lines[lineIndex + 1];
+    if (candidateNext && typeof candidateNext.text === 'string' && candidateNext.text.trim()) {
+      nextLine = candidateNext;
+    }
+  }
+  var lyricLayout = getLyricLayout(context, activeLine, lineIndex, nextLine);
+  var rows = lyricLayout.rows;
+  var fontSize = lyricLayout.fontSize;
+
+  if (isEmptyLine) {
+    var markY = stageLayout.lyricCenterY;
+    var markSize = clampNumber(bandHeight * 0.05, 6, 12);
+    context.fillStyle = rgbaOf(palette.gold, 0.55);
+    for (var markIndex = -1; markIndex <= 1; markIndex += 1) {
+      context.beginPath();
+      context.moveTo(centerX + markIndex * markSize * 1.8, markY - markSize * 0.5);
+      context.lineTo(centerX + markIndex * markSize * 1.8 + markSize * 0.5, markY);
+      context.lineTo(centerX + markIndex * markSize * 1.8, markY + markSize * 0.5);
+      context.lineTo(centerX + markIndex * markSize * 1.8 - markSize * 0.5, markY);
+      context.closePath();
+      context.fill();
+    }
+  } else {
+    context.font = '500 ' + fontSize.toFixed(1) + 'px ' + fontSerif;
+    var timings = buildCharTimings(activeLine);
+    var centerY = stageLayout.lyricCenterY - (rows.length > 1 ? fontSize * 0.30 : 0);
+    var drawnHeight = drawLyricRows(context, rows, fontSize, centerY, timings, previewOnly ? 0.48 : 1);
+    if (nextLine && lyricLayout.nextRows && lyricLayout.nextRows.length) {
+      var nextY = centerY + drawnHeight * 0.5 + lyricLayout.nextFontSize * 1.5;
+      if (nextY < stageHeight - lyricLayout.nextFontSize * 0.5) {
+        context.font = '400 ' + lyricLayout.nextFontSize.toFixed(1) + 'px ' + fontSerif;
+        var nextRow = lyricLayout.nextRows[0];
+        var nextX = (stageWidth - nextRow.width) * 0.5;
+        drawRowText(context, nextRow, nextX, nextY, rgbaOf(mixColor(palette.ivory, palette.haze, 0.5), 1), 0.26);
+      }
+    }
+  }
+  context.textAlign = 'start';
+}
+
+function updateMotion(deltaSeconds) {
+  var motionScale = renderState.reducedMotion ? 0.15 : 1;
+  renderState.cameraFade += deltaSeconds;
+  renderState.cameraX = Math.sin(renderState.cameraFade * 0.16) * stageWidth * 0.012 * motionScale;
+  renderState.cameraY = Math.sin(renderState.cameraFade * 0.11) * stageHeight * 0.006 * motionScale;
+  renderState.beatPulse *= Math.exp(-deltaSeconds * 5.4);
+  renderState.beatAge += deltaSeconds;
+  renderState.bassLevel *= Math.exp(-deltaSeconds * 1.6);
+  renderState.trebleLevel *= Math.exp(-deltaSeconds * 2.2);
+}
+
+function scheduleNextFrame() {
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(frame);
+  } else {
+    window.setTimeout(function () { frame(nowMilliseconds()); }, 16);
+  }
+}
+
+function frame(nowMs) {
+  scheduleNextFrame();
+  sendReady();
+  var startMs = nowMilliseconds();
+  var deltaSeconds = 0;
+  if (typeof renderState.lastFrameMs === 'number') {
+    deltaSeconds = clampNumber((nowMs - renderState.lastFrameMs) / 1000, 0, 0.25);
+  }
+  renderState.lastFrameMs = nowMs;
+  try {
+    updateMotion(deltaSeconds);
+    drawStageFrame();
+  } catch (error) {
+    reportFailure('frame', error);
+  }
+  renderState.frames += 1;
+  renderState.jsMs = nowMilliseconds() - startMs;
+}
+
+window.addEventListener('message', function (event) {
+  var message = event && event.data;
+  if (!message || message.__c100 !== 1) { return; }
+  var payload = (message.payload && typeof message.payload === 'object') ? message.payload : {};
+  try {
+    if (message.type === 'init') {
+      applyInitPayload(payload);
+    } else if (message.type === 'tick') {
+      applyTickPayload(payload);
+    } else if (message.type === 'beat') {
+      applyBeatPayload(payload);
+    } else if (message.type === 'live') {
+      applyLivePayload(payload);
+    }
+  } catch (error) {
+    reportFailure('message ' + String(message.type), error);
+  }
+});
+
+function watchReducedMotion() {
+  try {
+    if (typeof window.matchMedia !== 'function') { return; }
+    var motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    renderState.reducedMotion = !!motionQuery.matches;
+    var handleMotionChange = function (motionEvent) {
+      try {
+        renderState.reducedMotion = !!motionEvent.matches;
+      } catch (error) {
+        reportFailure('reduced-motion change', error);
+      }
+    };
+    if (typeof motionQuery.addEventListener === 'function') {
+      motionQuery.addEventListener('change', handleMotionChange);
+    } else if (typeof motionQuery.addListener === 'function') {
+      motionQuery.addListener(handleMotionChange);
+    }
+  } catch (error) {
+    reportFailure('reduced-motion', error);
+  }
+}
+
+window.addEventListener('resize', function () {
+  try { resizeStage(); } catch (error) { reportFailure('resize', error); }
+});
+
+window.addEventListener('error', function (event) {
+  reportFailure('window', event && event.message);
+});
+
+try {
+  watchReducedMotion();
+  resizeStage();
+} catch (bootError) {
+  reportFailure('boot', bootError);
+}
+setTimeout(sendReady, 900);
+scheduleNextFrame();
+</script>
+</body>
+</html>

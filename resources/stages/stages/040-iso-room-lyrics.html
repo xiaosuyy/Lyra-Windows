@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>等距房间</title>
+<style>
+  html,body{margin:0;height:100%;background:#04050a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:5;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(205,190,165,.32);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+  body{background:radial-gradient(120% 100% at 50% 38%,#0b0e15,#04050a 68%)}
+  #hud{position:fixed;top:20px;right:22px;z-index:5;text-align:right;
+    font:500 10px/1.9 ui-monospace,Consolas,monospace;letter-spacing:.12em;
+    color:rgba(200,208,230,.46);pointer-events:none}
+  #hud b{display:block;font-weight:600;letter-spacing:.22em;color:rgba(240,243,252,.9);margin-bottom:4px}
+  #hud em{font-style:normal;color:rgba(255,206,150,.8)}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hud"><b>ISO ROOM / 040</b><span id="stat">-- TILE</span> · 浮雕墙<br><em id="mode">IDLE</em></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   040 · 等距房间 —— 词是墙上被顶出来的一片浮雕
+   ---------------------------------------------------------------------------
+   核心机制：**等距浮雕（iso relief）**。
+   参考文件是一个 2.5D 房间：地板 + 两面墙按等距投影摆好，
+   墙上挂着一扇窗、一张海报，所有东西都靠"面"拼出来。
+   这里不做"贴图"，做**浮雕**：
+     · 房间是真等距投影的（u/v 两根世界轴 → 屏幕，y 竖直向上）；
+       地板是 40×40 的菱形瓦片，两面墙各 32×18 格；
+     · 每一句词先画进一张离屏 canvas，再按网格采样成一张**高度图**；
+       墙上每个格子按自己那一格的字形覆盖度**朝观众顶出来**，
+       顶出来的格子同时被点亮 —— 于是字不是画在墙上的，是墙上鼓起来的；
+     · 浮雕高度有惯性：换句时旧的格子自己塌回去、新的格子涨起来，
+       中间有一段"半高"的过渡，字看起来是在墙里流动；
+     · 踩拍时一道**相干的行波**从墙角沿墙面推过去（所有格子按自己的
+       距离依次抬升再落回），不是逐格乱抖；同时整面墙的暖光被顶亮一下。
+
+   和已有 10 个的区别：001-010 没有一个是"墙面浮雕"这种**空间化的文字**；
+   和 020 的区别：020 是"灯柱 + 沿 z 的扫描前沿"（字立在网格上、被扫亮），
+   这里是"格子朝观众挤出"（字从墙里鼓出来、按字形覆盖度决定高度）。
+   一个动的是亮度，一个动的是几何。
+
+   性能：每个格子每帧只做一次加减和一次整数分档；
+   绘制按"档位 + 墙"合批，整帧只有约 30 次 fill（不是上千次）。
+   绝不逐格拼颜色字符串，绝不逐格 beginPath。
+
+   精修记录：歌词改为**等距墙贴**（离屏烤"底版 + 点亮版"双层，仿射映射贴到
+   右前墙；整句单墙折 1~3 行，41 字完整正读可读 —— 旧方案整句压成一行或拆两墙
+   都导致采样浮雕糊成横条/阅读别扭）；YRC 逐字揭示（持久揭示层：字成立时刻
+   chars[k].t 才把该字带盖进点亮层，只画一次，无 chars 均分；__stage 加 yrc）；
+   墙 2 留给下一句暗纹预告（酿造期淡入，开唱转正即清）；格子浮雕保留为发光
+   骨架（每格预存 ct，没唱到的格子不升）；镜头随当前唱到的字沿墙平移聚焦 +
+   呼吸漂移；beat 行波/辉光保留（相干）。
+   分词：不使用。逐字时间已精确到字，墙贴按带揭示，分词没有收益。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const statEl = document.getElementById('stat');
+const modeEl = document.getElementById('mode');
+
+let W = 0, H = 0, DPR = 1;
+const PI = Math.PI, TAU = PI * 2;
+
+/* 房间尺寸（世界单位） */
+const ROOM = 40, WALLH = 22;
+const STEP = 1.25;                       // 格子边长：可读字由墙贴负责，浮雕只做发光骨架，网格粗一点保 fps
+const CU = Math.round(ROOM / STEP);      // 32 列
+const CJ = Math.round(WALLH / STEP);     // 18 行
+const GX = 1 / Math.SQRT2, GY = 1 / Math.sqrt(6);
+const FLOOR_T = 1.6;                     // 地板厚度
+
+/* 投影基底：世界 x → (GX, GY)，世界 z → (-GX, GY)，世界 y → (0, -2GY) */
+const PX = GX, PY = GY, QX = -GX, QY = GY, RY = -2 * GY;
+
+let s = 1, ox = 0, oy = 0, oxBase = 0, oyBase = 0;
+let bg = null, pool = null;
+
+/* 两面墙 + 地板 */
+const S1 = { u: new Float32Array(CU * CJ), h: new Float32Array(CU * CJ), t: new Float32Array(CU * CJ) };
+const S2 = { u: new Float32Array(CU * CJ), h: new Float32Array(CU * CJ), t: new Float32Array(CU * CJ) };
+/* 每格所属字的成立时刻（秒）。两面墙各自有一份（句子拆到两面墙上）。
+   Infinity = 该格无字（背景），YRC 门直接给 0。 */
+const CTC1 = new Float32Array(CU * CJ).fill(Infinity);
+const CTC2 = new Float32Array(CU * CJ).fill(Infinity);
+const FCHK = new Float32Array(CU * CU);
+
+const BUCK = 16;
+const shade1 = [], shade2 = [], shadeF = [];
+const acc1 = [], acc2 = [];
+
+/* 绘制批次：按 层×档位 合批，每批一条路径一次 fill
+   层 0/1 = 两面墙的"墙皮"（石色），2/3 = 两面墙被顶亮的面（accent 色），4 = 地板 */
+const bq = [];
+const PAL = [shade1, shade2, acc1, acc2, shadeF];
+const GROUPS = PAL.length;
+for (let b = 0; b < BUCK * GROUPS; b++) bq.push([]);
+
+let accent = [255, 170, 90];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let curLineObj = null;
+let camX = 0, camY = 0;
+let curYrc = false;
+const CAM_K = 8;           // 镜头跟随的响应（每秒）
+const driftY = (t) => Math.cos(t * 0.08) * 1.4;
+
+let lines = [];
+let curText = '';
+let lineT0 = 0, lineDur = 4;
+let rippleT = 99, rippleA = 0, glow = 0;
+let sweep = 0;
+
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+/* 注意：这些分量是拼进 **rgb(...)** 的（不是 #hex），必须输出十进制。
+   原来输出 16 进制 → 'rgb(22,1c,17)' 是非法颜色，Chrome 直接忽略赋值，
+   整间房被 fillStyle 的旧值（黑）涂掉，看起来就是全黑。 */
+function comp(v) { return String(Math.round(clamp(v, 0, 255))); }
+function rgba(r, g, b, a) { return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')'; }
+function smooth(t) { return t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t); }
+
+/* 投影 */
+function proj(u, v, y, out) {
+  out[0] = ox + s * ((u - v) * GX);
+  out[1] = oy + s * ((u + v) * GY - y * 2 * GY);
+}
+
+/* ---- 调色板：地板木色 / 两面墙的石色，各 16 档亮度 ---- */
+function buildPalette() {
+  shade1.length = 0; shade2.length = 0; shadeF.length = 0;
+  acc1.length = 0; acc2.length = 0;
+  for (let b = 0; b < BUCK; b++) {
+    const k = b / (BUCK - 1);
+    /* v=0 那面墙（朝向镜头右下）稍暗，u=0 那面墙稍亮 —— 房间的角才立得住 */
+    shade1.push('rgb(' + comp(34 + 30 * k) + ',' + comp(28 + 25 * k) + ',' + comp(23 + 20 * k) + ')');
+    shade2.push('rgb(' + comp(27 + 27 * k) + ',' + comp(23 + 23 * k) + ',' + comp(20 + 19 * k) + ')');
+    shadeF.push('rgb(' + comp(40 + 62 * k) + ',' + comp(31 + 46 * k) + ',' + comp(24 + 33 * k) + ')');
+    acc1.push('rgb(' + comp(60 + accent[0] * 0.72 * k) + ',' + comp(48 + accent[1] * 0.72 * k) + ',' + comp(38 + accent[2] * 0.72 * k) + ')');
+    acc2.push('rgb(' + comp(48 + accent[0] * 0.62 * k) + ',' + comp(40 + accent[1] * 0.62 * k) + ',' + comp(32 + accent[2] * 0.62 * k) + ')');
+  }
+}
+
+function buildBG() {
+  bg = document.createElement('canvas');
+  bg.width = Math.max(4, Math.round(W)); bg.height = Math.max(4, Math.round(H));
+  const g = bg.getContext('2d');
+  const w = bg.width, h = bg.height, m = Math.max(w, h);
+  g.fillStyle = '#04050a'; g.fillRect(0, 0, w, h);
+  let r = g.createRadialGradient(w * 0.5, h * 0.36, 0, w * 0.5, h * 0.36, m * 0.62);
+  r.addColorStop(0, '#0e1220'); r.addColorStop(0.6, 'rgba(4,5,10,0)');
+  g.fillStyle = r; g.fillRect(0, 0, w, h);
+  /* 台灯的暖光池（预渲染，每帧只 blit 一次） */
+  pool = document.createElement('canvas');
+  const pw = Math.round(s * ROOM * 1.05), ph = Math.round(s * ROOM * 0.62);
+  pool.width = Math.max(8, pw); pool.height = Math.max(8, ph);
+  const pg = pool.getContext('2d');
+  const pr = pg.createRadialGradient(pool.width * 0.5, pool.height * 0.5, 0,
+    pool.width * 0.5, pool.height * 0.5, pool.width * 0.5);
+  pr.addColorStop(0, rgba(accent[0], accent[1], accent[2], 0.26));
+  pr.addColorStop(0.45, rgba(accent[0], accent[1], accent[2], 0.09));
+  pr.addColorStop(1, rgba(accent[0], accent[1], accent[2], 0));
+  pg.fillStyle = pr; pg.fillRect(0, 0, pool.width, pool.height);
+}
+
+/* ---- 布局：把房间的包围盒量出来，按比例铺满画布 ---- */
+function layout() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  /* 包围盒（s=1 时）：地板 (0,0) → (ROOM,ROOM)，两面墙各向上 WALLH */
+  const minX = -ROOM * GX, maxX = ROOM * GX;
+  const minY = -WALLH * 2 * GY, maxY = ROOM * 2 * GY + FLOOR_T * 2 * GY;
+  const pad = 26;
+  /* 世界单位很小：整间房在 s=1 时只有 57px 宽，所以 s 就是"铺满画布"的比例。
+     原来上限夹在 1.25，房间只剩 75px 一粒、整屏等于全黑 —— 上限必须去掉，只留下限。 */
+  s = Math.max(0.4, Math.min((W - pad * 2) / (maxX - minX), (H - pad * 2) / (maxY - minY)));
+  ox = (W - (maxX + minX) * s) / 2;
+  oy = (H - (maxY + minY) * s) / 2;
+  oxBase = ox; oyBase = oy;
+  buildPalette();
+  buildBG();
+  if (curText) bakeText(curText, curLineObj);
+  resample();
+}
+
+/* ---- 字形 → 高度图（每句只采一次；句子拆到两面墙，每墙 1~2 行） ---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+let field1 = null, field2 = null, fw = 0, fh = 0;
+
+/* 折行：优先标点/空格断，均衡切分；n≤14 一行、≤30 两行、否则三行（单墙） */
+function wrapRows(text) {
+  const n = text.length;
+  const cutsAt = (k) => {                   // 第 k 个均分点：最近的标点/空格
+    const ideal = Math.round(n * k);
+    let b = ideal, bd = 1e9;
+    for (let i = 2; i < n - 2; i++) {
+      const c = text[i - 1];
+      if (c === ' ' || /[，。！？、；：…—,.!?;:]/.test(c)) {
+        const d = Math.abs(i - ideal);
+        if (d < bd) { bd = d; b = i; }
+      }
+    }
+    return b;
+  };
+  if (n <= 14) return [text];
+  const parts = [];
+  if (n <= 30) {
+    const b = cutsAt(0.5);
+    parts.push(text.slice(0, b), text.slice(b));
+  } else {
+    let b1 = cutsAt(1 / 3), b2 = cutsAt(2 / 3);
+    if (!(b1 + 3 < b2 && b2 < n - 2)) { b1 = Math.round(n / 3); b2 = Math.round(n * 2 / 3); }
+    parts.push(text.slice(0, b1), text.slice(b1, b2), text.slice(b2));
+  }
+  return parts;
+}
+
+/* 把一组行画进离屏画布：白色底版（墙贴基色）+ 亮色版（YRC 点亮后显出），
+   返回 {field, chX, chY, rowY0, LH, F}；field 供格子浮雕采样，其余供墙贴与揭示裁剪 */
+function bakeWall(rows, litColor) {
+  off.width = fw; off.height = fh;
+  octx.clearRect(0, 0, fw, fh);
+  const nr = rows.length;
+  let F = Math.max(24, Math.round(fh * 0.44 / Math.max(1, nr * 0.66)));
+  octx.font = '800 ' + F + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  let wMax = 0;
+  for (const r of rows) wMax = Math.max(wMax, octx.measureText(r).width);
+  const maxW = fw * 0.92;
+  if (wMax > maxW) {
+    F = Math.max(22, Math.round(F * (maxW / wMax)));
+    octx.font = '800 ' + F + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+  }
+  const LH = F * 1.24;
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  const cy0 = fh / 2 - (nr - 1) * LH / 2;
+  /* 笔画加粗一点：格子浮雕的采样才连得成笔画 */
+  octx.lineWidth = Math.max(2, F * 0.055);
+  octx.lineJoin = 'round'; octx.miterLimit = 2;
+
+  const tex = document.createElement('canvas'); tex.width = fw; tex.height = fh;
+  const tg = tex.getContext('2d');
+  const lit = document.createElement('canvas'); lit.width = fw; lit.height = fh;
+  const lg = lit.getContext('2d');
+  const rv = document.createElement('canvas'); rv.width = fw; rv.height = fh;
+  const rvg = rv.getContext('2d');       // 持久揭示层：字成立时把 lit 的那条带盖进来（只画一次）
+  const chX = [], chY = [];
+  for (let pass = 0; pass < 2; pass++) {
+    const g2 = pass === 0 ? tg : lg;
+    g2.clearRect(0, 0, fw, fh);
+    g2.textAlign = 'center'; g2.textBaseline = 'middle';
+    g2.font = '800 ' + F + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+    g2.lineJoin = 'round'; g2.miterLimit = 2;
+    for (let r = 0; r < nr; r++) {
+      const y = cy0 + r * LH;
+      g2.strokeStyle = pass === 0 ? 'rgba(255,255,255,0.55)' : litColor;
+      g2.lineWidth = Math.max(2, F * 0.055);
+      g2.strokeText(rows[r], fw / 2, y);
+      g2.fillStyle = pass === 0 ? 'rgba(214,206,238,0.30)' : litColor;
+      g2.fillText(rows[r], fw / 2, y);
+    }
+  }
+  /* field 从白底版取（浮雕高度只看字形覆盖）；逐字中心按 advance 累加 */
+  for (let r = 0; r < nr; r++) {
+    const y = cy0 + r * LH;
+    let ax = fw / 2 - tg.measureText(rows[r]).width / 2;
+    for (let k = 0; k < rows[r].length; k++) {
+      const cw = tg.measureText(rows[r][k]).width;
+      chX.push(ax + cw / 2); chY.push(y);
+      ax += cw;
+    }
+  }
+  const field = tg.getImageData(0, 0, fw, fh).data;
+  return { field: field, tex: tex, lit: lit, rv: rv, rvg: rvg, chX: chX, chY: chY, rowY0: cy0, LH: LH, F: F };
+}
+
+function bakeText(text, line) {
+  fw = Math.max(8, Math.round(s * ROOM * 1.1));
+  fh = Math.max(8, Math.round(s * WALLH * 1.1));
+  if (!text) { field1 = null; field2 = null; tex1 = null; tex2 = null; lit1 = null; lit2 = null; charMeta.length = 0; return; }
+  const rows = wrapRows(text);
+  const n = text.length;
+  /* 逐字成立时刻（全局字序）：chars 可信用它，否则均分；单调化 */
+  const ct = new Float32Array(n);
+  const chs = line && line.chars;
+  const dur = line && line.dur > 0 ? line.dur : 4;
+  let yrcOK = !!(chs && chs.length === n);
+  if (yrcOK) {
+    for (let k = 0; k < n; k++) {
+      const v = +chs[k].t;
+      if (!isFinite(v)) { yrcOK = false; break; }
+      ct[k] = v;
+    }
+  }
+  if (!yrcOK) for (let k = 0; k < n; k++) ct[k] = (line ? line.t : 0) + dur * k / Math.max(1, n);
+  for (let k = 1; k < n; k++) if (ct[k] < ct[k - 1]) ct[k] = ct[k - 1];
+  bakeYrc = yrcOK; bakeCT = ct;
+  const litColor = 'rgb(' + Math.min(255, accent[0] * 0.75 + 70) + ',' + Math.min(255, accent[1] * 0.72 + 62) + ',' + Math.min(255, accent[2] * 0.7 + 58) + ')';
+  /* 整句在**同一面墙**（墙 1，正对镜头的右前墙）上折 1~3 行；
+     墙 2 留给下一句的暗纹预告（bakeNext），不参与本句的任何字段。 */
+  const w1 = bakeWall(wrapRows(text), litColor);
+  field1 = w1.field; field2 = w1.field;
+  tex1 = w1.tex; tex2 = null; lit1 = w1.lit; lit2 = null;
+  rv1 = w1.rv; rv1g = w1.rvg; rv2 = null; rv2g = null;
+  charMeta.length = 0;
+  for (let k = 0; k < n; k++) {
+    charMeta.push({ w: 0, gx: w1.chX[k] / fw, gy: 1 - w1.chY[k] / fh, x0: (w1.chX[k] - w1.F * 0.62) / fw, x1: (w1.chX[k] + w1.F * 0.62) / fw, t: ct[k], done: false });
+  }
+}
+
+/* 下一句预告：只烘暗纹贴图（不点亮、无 ct），墙 2 在酝酿期淡入 */
+let nextPreview = null;      // {tex, until}
+function bakePreview(L) {
+  if (!L) { nextPreview = null; tex2 = null; return; }
+  const rows = wrapRows(L.text || '');
+  const keepFw = fw, keepFh = fh;
+  const w = bakeWall(rows, 'rgba(190,196,225,0.9)');
+  nextPreview = { tex: w.tex };
+  fw = keepFw; fh = keepFh;
+}
+
+let bakeYrc = false, bakeCT = null;
+const charMeta = [];       // 每字：哪面墙、墙内相对位置（x0/x1 揭示带）、成立时刻
+let tex1 = null, tex2 = null, lit1 = null, lit2 = null;   // 墙贴：底版 + 点亮版
+let rv1 = null, rv2 = null, rv1g = null, rv2g = null;     // 持久揭示层（墙贴坐标系）
+
+function pick(f, u, j) {
+  if (!f) return 0;
+  const x = Math.round(u / ROOM * (fw - 1));
+  const y = Math.round((1 - j / WALLH) * (fh - 1));
+  if (x < 0 || x >= fw || y < 0 || y >= fh) return 0;
+  return f[(y * fw + x) * 4 + 3] / 255;
+}
+
+function resample() {
+  CTC1.fill(Infinity); CTC2.fill(Infinity);
+  const vstep = WALLH / CJ;
+  const n = charMeta.length;
+  if (!field1 || !n) {
+    S1.t.fill(0); S2.t.fill(0);
+    return;
+  }
+  /* 每个字：以字形中心为圆心，把覆盖到的格子标记上它的 ct + 字权重。
+     R=1.6 格 → 笔画厚度 ≥2 格，格子级浮雕连得成字。 */
+  const R = 1.6;
+  for (let k = 0; k < n; k++) {
+    const m = charMeta[k];
+    const fx = m.gx * CU, fy = m.gy * CJ;
+    const i0 = Math.max(0, Math.floor(fx - R)), i1 = Math.min(CU - 1, Math.ceil(fx + R));
+    const j0 = Math.max(0, Math.floor(fy - R)), j1 = Math.min(CJ - 1, Math.ceil(fy + R));
+    const CTC = m.w === 0 ? CTC1 : CTC2;
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        const d2 = (i + 0.5 - fx) * (i + 0.5 - fx) + (j + 0.5 - fy) * (j + 0.5 - fy);
+        if (d2 <= R * R) {
+          const idx = j * CU + i;
+          if (m.t < CTC[idx]) CTC[idx] = m.t;
+        }
+      }
+    }
+  }
+  for (let j = 0; j < CJ; j++) {
+    const jc = (j + 0.5) * vstep;
+    for (let i = 0; i < CU; i++) {
+      const uc = (i + 0.5) * STEP;
+      /* 5 点采样取最大：细笔画/斜笔画不会在格心漏掉 */
+      const du = STEP * 0.3, dv = vstep * 0.3;
+      S1.t[j * CU + i] = Math.max(pick(field1, uc, jc), pick(field1, uc - du, jc), pick(field1, uc + du, jc),
+        pick(field1, uc, jc - dv), pick(field1, uc, jc + dv));
+      S2.t[j * CU + i] = Math.max(pick(field2, uc, jc), pick(field2, uc - du, jc), pick(field2, uc + du, jc),
+        pick(field2, uc, jc - dv), pick(field2, uc, jc + dv));
+    }
+  }
+}
+
+/* 镜头聚焦：当前正在唱的字（最后一次 ct<=T 的）的墙内坐标 → 世界坐标 */
+function focusOf(T) {
+  let fx = null;
+  for (let k = 0; k < charMeta.length; k++) {
+    if (charMeta[k].t <= T) fx = charMeta[k];
+    else break;
+  }
+  if (!fx) fx = charMeta[0] || null;
+  if (!fx) return null;
+  /* 墙 1：u = gx*ROOM, v=0；墙 2：u=0, v = (1-gx)*ROOM（绘制时 v 取反序，屏幕读向才正） */
+  return fx.w === 0 ? { u: fx.gx * ROOM, v: 0 } : { u: 0, v: (1 - fx.gx) * ROOM };
+}
+
+function loadText(text, line) {
+  curText = text || '';
+  curLineObj = line || null;
+  bakeText(curText, line);
+  resample();
+}
+
+/* ---- 节奏 ---- */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1; rippleT = 99;
+    S1.h.fill(0); S2.h.fill(0);
+    loadText('', null);
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      const L = lines[ci];
+      lineT0 = L.t;
+      lineDur = L.dur > 0 ? L.dur : 4;
+      loadText(L.text, L);         // 旧格子自己塌回去，新格子涨起来
+      nextPreview = null;          // 预告转正，墙 2 清空
+    } else { loadText('', null); nextPreview = null; }
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      bakePreview(lines[nx]);     // 下一句暗纹预告上墙 2
+    }
+  }
+  curYrc = !!bakeYrc;
+}
+
+/* ---- 路径累加（全局点表，按批 flush） ---- */
+const bx = [], by = [];
+let bp = 0;
+function emit(x, y) { bx[bp] = x; by[bp] = y; bp++; }
+function flush(bucket) {
+  if (!bp) return;
+  const list = bq[bucket];
+  let at = list.length;
+  for (let i = 0; i < bp; i++) { list[at++] = bx[i]; list[at++] = by[i]; }
+  bp = 0;
+}
+function paintBatches() {
+  /* 按层序画：墙皮 → 被顶亮的面 → 地板（地板在最前，必须最后画） */
+  for (let g = 0; g < GROUPS; g++) {
+    const pal = PAL[g];
+    for (let b = 0; b < BUCK; b++) {
+      const list = bq[g * BUCK + b];
+      const cnt = list.length;
+      if (!cnt) continue;
+      ctx.beginPath();
+      for (let i = 0; i < cnt; i += 8) {
+        ctx.moveTo(list[i], list[i + 1]);
+        ctx.lineTo(list[i + 2], list[i + 3]);
+        ctx.lineTo(list[i + 4], list[i + 5]);
+        ctx.lineTo(list[i + 6], list[i + 7]);
+      }
+      ctx.closePath();
+      ctx.fillStyle = pal[b];
+      ctx.fill();
+      list.length = 0;
+    }
+  }
+}
+
+const PT = [0, 0], PT2 = [0, 0];
+
+let last = performance.now();
+let t0 = 0;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+
+  /* 行波：从墙角沿墙面推出去，相干，所有格子按自己的距离依次抬升 */
+  rippleT += dt;
+  const rw = rippleT * 17 - 3;
+  const rAmp = rippleA * Math.exp(-rippleT * 1.5);
+  glow *= Math.pow(0.06, dt);
+  sweep = curIdx >= 0 ? clamp((T - lineT0) / lineDur, 0, 1) : 0;
+
+  /* 镜头：跟随当前正在唱的字（墙内聚焦）+ 呼吸漂移；每帧从 base 重算，不累计 */
+  const foc = charMeta.length ? focusOf(T) : null;
+  const tgtU = foc ? foc.u : 0, tgtV = foc ? foc.v : 0;
+  camX += (tgtU - camX) * (1 - Math.exp(-dt * CAM_K));
+  camY += (tgtV - camY) * (1 - Math.exp(-dt * CAM_K));
+  const driftX = Math.sin(t0 * 0.11) * 1.6;
+  ox = oxBase - (camX + driftX) * GX * s * 0.34;
+  oy = oyBase - ((camX + driftX) * GY + (camY + driftY(t0)) * GY) * s * 0.34;
+
+  /* 浮雕高度：一阶跟随，换句时旧的塌、新的涨；逐字 YRC —— 没唱到的格子不升 */
+  const k = 1 - Math.exp(-dt * 3.6);
+  const HMAX = 2.6;
+  for (let i = 0; i < S1.h.length; i++) {
+    const on1 = T >= CTC1[i] ? 1 : 0;
+    const on2 = T >= CTC2[i] ? 1 : 0;
+    S1.h[i] += (S1.t[i] * HMAX * on1 - S1.h[i]) * k;
+    S2.h[i] += (S2.t[i] * HMAX * on2 - S2.h[i]) * k;
+  }
+
+  /* ---- 背景 + 地板光池 ---- */
+  ctx.drawImage(bg, 0, 0, W, H);
+  if (pool) {
+    ctx.globalCompositeOperation = 'screen';
+    ctx.globalAlpha = 0.5 + glow * 0.5;
+    ctx.drawImage(pool, ox + s * ROOM * 0.5 - pool.width / 2,
+      oy + s * ROOM * GY - pool.height / 2);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---- 地板：菱形瓦片 + 侧壁（按 u+v 的等值线走 = 画家算法，远的先画） ---- */
+  const ft = FLOOR_T;
+  for (let d = 0; d <= (CU - 1) * 2; d++) {
+    const uLo = d < CU ? 0 : d - (CU - 1);
+    const uHi = d < CU ? d : CU - 1;
+    for (let u = uLo; u <= uHi; u++) {
+      const v = d - u;
+      const u0 = u * STEP, u1 = u0 + STEP, v0 = v * STEP, v1 = v0 + STEP;
+      const b = (FCHK[v * CU + u] | 0) + (u > v ? 1 : 0);
+      proj(u0, v0, ft, PT); emit(PT[0], PT[1]);
+      proj(u1, v0, ft, PT); emit(PT[0], PT[1]);
+      proj(u1, v1, ft, PT); emit(PT[0], PT[1]);
+      proj(u0, v1, ft, PT); emit(PT[0], PT[1]);
+      flush(BUCK * 4 + b);
+      /* 朝向镜头的两条侧壁 */
+      proj(u1, v0, ft, PT); proj(u1, v1, ft, PT2);
+      proj(u1, v1, 0, PT); proj(u1, v0, 0, PT2);
+      emit(PT[0], PT[1]); emit(PT[0], PT[1]);
+      proj(u0, v1, ft, PT); proj(u1, v1, ft, PT2);
+      proj(u1, v1, 0, PT); proj(u0, v1, 0, PT2);
+      emit(PT[0], PT[1]); emit(PT[0], PT[1]);
+      flush(BUCK * 4 + (b > 1 ? 1 : 0));
+    }
+  }
+  paintBatches();
+
+  /* ---- 两面墙：墙贴字（底版 + 逐字揭示的点亮层）+ 格子浮雕（发光骨架） ---- */
+  const vstep = WALLH / CJ;
+  /* 墙贴仿射映射（贴图像素 → 等距墙面）。
+     贴图 (px,py)：px 0→fw 沿墙横轴，py 0→fh 从墙顶到墙底。
+     wall1 横轴 = 世界 u（proj: ox+u*GX*s, oy+u*GY*s）；
+     wall2 横轴 = 世界 v 反序（屏幕读向从左到右），起点在 u=0,v=ROOM 那个角。
+     竖直：每像素向上 2*GY*s（世界 y 向上），基点在墙底。 */
+  const TA = ROOM * GX * s / fw, TB = ROOM * GY * s / fw, TK = WALLH * 2 * GY * s / fh;
+  const decal = (img, wall) => {
+    if (wall === 1) ctx.setTransform(TA, TB, 0, TK, ox, oy - fh * TK);
+    else ctx.setTransform(TA, -TB, 0, TK, ox - ROOM * GX * s, oy + ROOM * GY * s - fh * TK);
+    ctx.drawImage(img, 0, 0);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  };
+  const stampReveals = (wall) => {
+    const g = wall === 1 ? rv1g : rv2g, src = wall === 1 ? lit1 : lit2;
+    if (!g) return;
+    for (let k = 0; k < charMeta.length; k++) {
+      const m = charMeta[k];
+      if (m.w !== wall || m.done || T < m.t) continue;
+      m.done = true;
+      const px0 = Math.max(0, Math.floor(m.x0 * fw)), px1 = Math.min(fw, Math.ceil(m.x1 * fw));
+      g.clearRect(px0, 0, px1 - px0, fh);
+      g.drawImage(src, px0, 0, px1 - px0, fh, px0, 0, px1 - px0, fh);
+    }
+  };
+  for (let j = 0; j < CJ; j++) {
+    const j0 = j * vstep, j1 = j0 + vstep;
+    for (let i = 0; i < CU; i++) {
+      const u0 = i * STEP, u1 = u0 + STEP;
+      /* 墙 2 的格子沿 v 轴展开：v 从墙角（v=0）往外长，和墙 1 的 u 轴对称。
+         i 到 v 取反序，字在屏幕上才还是从左往右读（否则整面墙是镜像字）。 */
+      const v0 = (CU - 1 - i) * STEP, v1 = v0 + STEP;
+      const ci = j * CU + i;
+      /* 每格先铺一张"墙皮"（最暗档）。不铺的话，被顶出来的格子会在原位留下一块
+         背景色的黑洞，一片连起来就是画面上那几道黑带 —— 这是 040 看起来"全黑"的一半原因 */
+      const bBase = clamp((0.05 + glow * 0.1) * (BUCK - 1), 0, 3) | 0;
+      /* 墙 1（v=0，沿 u 展开） */
+      proj(u0, 0, j1, PT); emit(PT[0], PT[1]);
+      proj(u1, 0, j1, PT); emit(PT[0], PT[1]);
+      proj(u1, 0, j0, PT); emit(PT[0], PT[1]);
+      proj(u0, 0, j0, PT); emit(PT[0], PT[1]);
+      flush(bBase);
+      let h = S1.h[ci];
+      if (h > 0.02) {
+        let lit = 0;
+        const dist = u0 + 0.6;
+        if (rippleT < 4) {
+          const w = Math.exp(-((dist - rw) * (dist - rw)) / 9);
+          h += rAmp * w * (0.4 + S1.t[ci] * 1.6);
+          lit = w * 0.7;
+        }
+        const sw = Math.exp(-((u0 / ROOM - sweep) * (u0 / ROOM - sweep)) / 0.012);
+        lit = Math.max(lit, sw * 0.55 * (0.25 + S1.t[ci]));
+        const b = clamp(((h / HMAX) * 0.55 + lit * 0.5 + glow * 0.25) * (BUCK - 1), 0, BUCK - 1) | 0;
+        proj(u0, 0, j1 + h, PT); emit(PT[0], PT[1]);
+        proj(u1, 0, j1 + h, PT); emit(PT[0], PT[1]);
+        proj(u1, 0, j0 + h, PT); emit(PT[0], PT[1]);
+        proj(u0, 0, j0 + h, PT); emit(PT[0], PT[1]);
+        flush(BUCK * 2 + b);
+      }
+      /* 墙 2（u=0，沿 v 展开） */
+      proj(0, v0, j1, PT); emit(PT[0], PT[1]);
+      proj(0, v1, j1, PT); emit(PT[0], PT[1]);
+      proj(0, v1, j0, PT); emit(PT[0], PT[1]);
+      proj(0, v0, j0, PT); emit(PT[0], PT[1]);
+      flush(BUCK + bBase);
+      let h2 = S2.h[ci];
+      if (h2 > 0.02) {
+        let lit2 = 0;
+        const dist = v0 + 0.6;
+        if (rippleT < 4) {
+          const w = Math.exp(-((dist - rw) * (dist - rw)) / 9);
+          h2 += rAmp * w * (0.4 + S2.t[ci] * 1.6);
+          lit2 = w * 0.7;
+        }
+        const sw = Math.exp(-((v0 / ROOM - sweep) * (v0 / ROOM - sweep)) / 0.012);
+        lit2 = Math.max(lit2, sw * 0.55 * (0.25 + S2.t[ci]));
+        const b = clamp(((h2 / HMAX) * 0.55 + lit2 * 0.5 + glow * 0.25) * (BUCK - 1), 0, BUCK - 1) | 0;
+        proj(0, v0, j1 + h2, PT); emit(PT[0], PT[1]);
+        proj(0, v1, j1 + h2, PT); emit(PT[0], PT[1]);
+        proj(0, v1, j0 + h2, PT); emit(PT[0], PT[1]);
+        proj(0, v0, j0 + h2, PT); emit(PT[0], PT[1]);
+        flush(BUCK * 3 + b);
+      }
+    }
+  }
+  paintBatches();
+
+  /* 墙贴最后画（盖在墙皮上，别被格子批处理盖掉）；浮雕骨架在其下方透出 */
+  if (tex1) { decal(tex1, 1); stampReveals(1); decal(rv1, 1); }
+  if (nextPreview) {          // 墙 2：下一句暗纹预告（酿造期出现，开唱即换成本句的墙贴）
+    decal(nextPreview.tex, 2);
+  }
+
+  if (curIdx >= 0) {
+    modeEl.textContent = 'SINGING';
+    statEl.textContent = (CU * CJ * 2) + ' TILE';
+  } else {
+    modeEl.textContent = 'IDLE';
+    statEl.textContent = '-- TILE';
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1; rippleT = 99;
+    if (p.accent) { accent = p.accent; buildPalette(); buildBG(); }
+    S1.h.fill(0); S2.h.fill(0); S1.t.fill(0); S2.t.fill(0);
+    loadText('', null);
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：一道行波从墙角推出去（按距离依次抬升），不是逐格乱踢 */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    rippleT = 0;
+    rippleA = 0.7 + lv * 1.5;
+    glow = Math.min(1, glow + 0.45 + lv * 0.5);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* 棋盘：启动时算一次，绘制时只查表 */
+for (let v = 0; v < CU; v++)
+  for (let u = 0; u < CU; u++)
+    FCHK[v * CU + u] = ((u + v) & 1) ? 2 : 0;
+
+layout();
+requestAnimationFrame(frame);
+addEventListener('resize', layout);
+
+window.__stage = () => {
+  let raised = 0, maxH = 0;
+  for (let i = 0; i < S1.h.length; i++) {
+    if (S1.h[i] > 0.15) raised++;
+    if (S1.h[i] > maxH) maxH = S1.h[i];
+  }
+  return {
+    lines: lines.length, cur: curIdx, brew: brewIdx, t: +now().toFixed(2),
+    text: curText, scale: +s.toFixed(3), raised: raised, maxH: +maxH.toFixed(2),
+    yrc: curYrc, cam: [+camX.toFixed(2), +camY.toFixed(2)],
+    ripple: +rippleT.toFixed(2), sweep: +sweep.toFixed(2)
+  };
+};
+</script>
+</body>
+</html>

@@ -20,6 +20,7 @@ export default [
     ignores: [
       "**/node_modules",
       "**/dist",
+      "**/dist-release*",
       "**/out",
       "**/.gitignore",
       "**/docs",
@@ -27,6 +28,7 @@ export default [
       "**/components.d.ts",
       "native/**/index.d.ts",
       "resources/sources",
+      "resources/stages",
     ],
   },
   ...compat.extends("eslint:recommended", "plugin:@typescript-eslint/recommended"),

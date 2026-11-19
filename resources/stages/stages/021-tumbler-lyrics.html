@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>动态字体</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#07080e}
+  /* bg 比 viewport 大一圈：整场慢漂移时不会露出边缘 */
+  #bg{position:fixed;inset:-44px;background:radial-gradient(1200px 800px at 50% 44%,#0d0f1c,#05060a 72%)}
+  /* 两个槽位统一绝对居中：谁当主句谁当酝酿，坐标体系一致 */
+  #stage{position:fixed;inset:0}
+  .line{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;
+        box-sizing:border-box;padding:0 3vw .30em;text-align:center;
+        font-family:"Songti SC","Noto Serif SC","STSong","SimSun",serif;font-weight:700;
+        line-height:1.16;letter-spacing:.03em;
+        text-shadow:0 0 46px rgba(130,145,255,.26)}
+  /* 每行一个 .lrow：行宽在 build 时按测量保证 ≤ 86vw，所以行内 nowrap 是安全的 */
+  .lrow{display:block;white-space:nowrap}
+  /* 字形用渐变裁切；渐变是垂直方向的，逐字裁切与整行裁切等价 */
+  .line .ch{display:inline-block;will-change:transform,opacity,filter;
+        background-image:linear-gradient(180deg,#ffffff 8%,var(--acc-grad,#aeb6e2) 94%);
+        -webkit-background-clip:text;background-clip:text;color:transparent}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(175,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<div id="bg"></div>
+<div id="stage">
+  <div class="line" id="lineA"></div>
+  <div class="line" id="lineB"></div>
+</div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   021 · 动态字体 —— 每个字是一台**老虎机滚轮**
+   ----------------------------------------------------------------------------
+   和已有 10 个形态的区别：这里根本没有粒子。字形就是字形本身，
+   动的是**排版**：整句在开唱之前就已经在屏幕下方「预滚」，
+   开唱瞬间从上往下逐字落位（滚轮减速），一个字一个字砸进基线。
+
+   和 022 的区别：022 是水平扫描线逐列锁定（字符原地闪替），
+   这里是垂直滚轮逐字落位（字符从上方滑入 + 运动模糊 + 微旋转）。
+
+   精修记录（批次B）：① YRC 逐字落位 —— 第 k 个字的**落定时刻压在 chars[k].t 上**
+   （nextAt = 字时间 - 0.55s，预备期滚轮在下方可见地空转）；无 chars 按
+   t + dur*i/n 均分。② 长句排版 —— 原 .line white-space:nowrap 长句必溢出，
+   改为自适应字号 + 显式折行（最多 3 行，行宽按 canvas 测量保证 ≤ 86vw）。
+   ③ A/B 槽位统一绝对居中（原 B 槽 arm 时 transform 会丢 -50%,-50% 中心）。
+   ④ 动效：整场慢漂移镜头（bg 缓慢平移+微缩放）、accent 主色接入字形渐变
+   （--acc-grad）、beat 相干脉冲保留、进场升起/出场滑出保留。
+   分词：接入 segdict.bin（同 004）。**有 YRC 时逐字时刻本身已带词节奏，
+   词典只用于无 chars 的兜底铺排**（按词团落位：词内 stagger 密、词间稍停）；
+   拿不到词典退回标点+字数规则切分。
+   ========================================================================== */
+const lineA = document.getElementById('lineA');
+const lineB = document.getElementById('lineB');
+const hint  = document.getElementById('hint');
+const bg    = document.getElementById('bg');
+
+const FONTFAM = '"Songti SC","Noto Serif SC","STSong","SimSun",serif';
+const POOL = '日月水火木金土气光尘影风烟云雨天地玄黄宇宙洪荒时空创意灵感星夜晨曦';
+
+let accent = [130, 145, 255];
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ---------- 两个槽位：cur = 正在唱的那句，nxt = 下一句（提前滚好） ---------- */
+const A = { el: lineA, chars: [], text: '', spin: false, dur: 0.55, active: 0, yrc: false, _o: -1, _b: -1 };
+const B = { el: lineB, chars: [], text: '', spin: false, dur: 0.55, active: 0, yrc: false, _o: -1, _b: -1 };
+let cur = A, nxt = B;
+let entered = false;          // 是否已经进过第一句（决定 hint 什么时候灭）
+let beat = 0;                 // 踩拍包络，只用来抬亮度，不碰落位
+let lastT = -1;
+let drift = 0;                // 整场慢漂移相位
+
+/* ============================================================================
+   分词：决定"哪几个字一起落"（仅在无 YRC chars 的兜底路径使用）
+   · 词典 = public/segdict.bin —— 33 万个 2~4 字词的 32 位哈希。
+   · 拿不到词典自动退回"按标点 + 字数"硬切，形态不崩。
+   ========================================================================== */
+let DICT = null;
+fetch('/segdict.bin')
+  .then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); })
+  .catch(() => {});
+
+const fnv = (s) => {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+};
+
+function isWord(s, i, L) {
+  const h = fnv(s.substr(i, L));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1, v = DICT[m];
+    if (v === h) return true;
+    if (v < h) lo = m + 1; else hi = m - 1;
+  }
+  return false;
+}
+
+/* 正/反向最大匹配，取词数少的那个 */
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let L = Math.min(4, text.length - i); L >= 2; L--) if (isWord(text, i, L)) { hit = L; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let L = Math.min(4, j); L >= 2; L--) if (isWord(text, j - L, L)) { hit = L; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+
+function isLatin(text) {
+  let la = 0, cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++;
+    else if (c >= '\u4e00' && c <= '\u9fff') cjk++;
+  }
+  return la > cjk;
+}
+
+function latinSpans(text) {
+  const out = [];
+  let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i;
+    while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j });
+    i = j;
+  }
+  return out;
+}
+
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+
+function countChars(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++;
+  return n;
+}
+
+function groupByWords(text) {
+  const words = segWords(text);
+  const out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos;
+    pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; }
+    else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+
+function groupByRule(text) {
+  const out = [];
+  let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const sep = PUNCT.test(c) || SPACE.test(c);
+    if (!sep) chars++;
+    if (sep && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!sep && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+
+function spansForLine(text) {
+  if (isLatin(text)) return latinSpans(text);
+  return DICT ? groupByWords(text) : groupByRule(text);
+}
+
+/* ---------- 排版规划：自适应字号 + 最多 3 行（保证任何字数完整可见） ---------- */
+const meas = document.createElement('canvas').getContext('2d');
+const w100 = (t) => { meas.font = '700 100px ' + FONTFAM; return meas.measureText(t).width + 3 * Math.max(0, t.length - 1); };
+const BREAK = /[\s，。！？、；：,.!?;:…—～·「」『』（）()《》【】]/;
+
+/* 均分 R 行，断点优先落在标点/空格附近 */
+function splitRows(text, R) {
+  const L = text.length, rows = [];
+  let prev = 0;
+  for (let r = 1; r < R; r++) {
+    const ideal = prev + Math.max(1, Math.round((L - prev) / (R - r + 1)));
+    let i = ideal;
+    for (const d of [0, 1, 2, 3, -1, -2, -3]) {
+      const j = ideal + d;
+      if (j > prev && j < L && (BREAK.test(text[j - 1]) || BREAK.test(text[j]))) { i = j; break; }
+    }
+    i = Math.max(prev + 1, Math.min(L - (R - r), i));
+    rows.push(text.slice(prev, i));
+    prev = i;
+  }
+  rows.push(text.slice(prev));
+  return rows;
+}
+
+/* 两行切法：枚举所有断点，取 max(左宽,右宽) 最小的（有标点/空格奖励） */
+function best2(text) {
+  let bi = -1, bw = Infinity;
+  for (let i = 1; i < text.length; i++) {
+    const m = Math.max(w100(text.slice(0, i)), w100(text.slice(i)))
+      - ((BREAK.test(text[i - 1]) || BREAK.test(text[i])) ? 1e5 : 0);
+    if (m < bw) { bw = m; bi = i; }
+  }
+  return bi > 0 ? [text.slice(0, bi), text.slice(bi)] : [text];
+}
+
+function planLayout(text) {
+  const base = Math.min(112, Math.max(42, innerWidth * 0.086));
+  if (!text) return { fs: base, rows: [''] };
+  const maxW = innerWidth * 0.86;
+  const maxH = innerHeight * 0.52;
+  const fsFor = (rows) => {
+    let mw = 1;
+    for (const r of rows) mw = Math.max(mw, w100(r));
+    return Math.min(base, maxW * 100 / mw, maxH / (1.16 * rows.length));
+  };
+  const one = [text];
+  const f1 = fsFor(one);
+  if (f1 >= base * 0.58) return { fs: f1, rows: one };
+  const two = text.length > 3 ? best2(text) : one;
+  const f2 = fsFor(two);
+  if (f2 >= base * 0.58 || text.length <= 8) return { fs: Math.max(16, f2), rows: two };
+  const three = splitRows(text, 3);
+  const f3 = fsFor(three);
+  return f2 >= f3 ? { fs: Math.max(16, f2), rows: two } : { fs: Math.max(16, f3), rows: three };
+}
+
+function build(slot, text) {
+  const plan = planLayout(text);
+  slot.text = text;
+  slot.chars.length = 0;
+  slot.el.innerHTML = '';
+  slot.el.style.fontSize = plan.fs.toFixed(1) + 'px';
+  for (let r = 0; r < plan.rows.length; r++) {
+    const row = document.createElement('div');
+    row.className = 'lrow';
+    const rt = plan.rows[r];
+    for (let i = 0; i < rt.length; i++) {
+      const raw = rt[i];
+      const sp = document.createElement('span');
+      sp.className = 'ch';
+      const ch = document.createElement('span');
+      ch.textContent = raw === ' ' ? '\u00A0' : raw;
+      sp.appendChild(ch);
+      /* 幽灵预览：落位前显示真实的字但压得很暗 —— 长句唱到一半时
+         整句依然可读，滚轮乱码只出现在每个字落位前的预备窗口里 */
+      sp.style.opacity = '0.15';
+      row.appendChild(sp);
+      slot.chars.push({ el: sp, ch, raw, cur: raw, next: 0, nextAt: 0, settled: true, ox: 0 });
+    }
+    slot.el.appendChild(row);
+  }
+}
+
+const OFF = () => Math.min(innerHeight * 0.22, 230);   // 酝酿位/升起起点
+
+/** 让一句开始「滚」：落定时刻逐字压在 YRC 上（land - dur 起跑）。
+    rise = 这一句是升到主位（真唱）还是先待在下方（酝酿） */
+function arm(slot, t0, rise, line, tEnd) {
+  const n = slot.chars.length;
+  if (!n) return;
+  slot.dur = 0.55;
+  /* YRC 的 chars 是逐字绝对秒；只有和正文逐字对齐时才敢用（004/012 同款判断） */
+  const chs = line && line.chars && line.chars.length === slot.text.length ? line.chars : null;
+  slot.yrc = !!chs;
+  const dur = Math.max(0.8, (line && line.dur) || 2.4);
+  const end = isFinite(tEnd) ? tEnd : t0 + dur * 1.5;
+  /* 无 YRC：按词团铺落位节奏（词内 stagger 密、词间稍停） */
+  let fb = null;
+  if (!chs) {
+    const spans = spansForLine(slot.text);
+    fb = new Float32Array(n);
+    const last = Math.min(end, t0 + Math.max(0.9, dur * 0.72));
+    for (let q = 0; q < spans.length; q++) {
+      const s = spans[q];
+      const g0 = Math.min(last, t0 + 0.10 + (last - t0 - 0.10) * (q / Math.max(1, spans.length)));
+      for (let i = s.i0; i < Math.min(n, s.i1); i++) fb[i] = g0 + (i - s.i0) * 0.045;
+    }
+    for (let i = 1; i < n; i++) if (fb[i] < fb[i - 1]) fb[i] = fb[i - 1];
+  }
+  slot.active = 1;
+  let prev = 0;
+  for (let i = 0; i < n; i++) {
+    const c = slot.chars[i];
+    let land = chs && isFinite(+chs[i].t) ? +chs[i].t : (fb ? fb[i] : t0 + 0.1 + i * 0.05);
+    if (!(land >= t0)) land = t0;          // 不早于开唱
+    if (land > end) land = end;            // 不晚于下一句进场
+    if (i && land < prev) land = prev;     // 单调
+    prev = land;
+    c.nextAt = land - slot.dur;            // 落定时刻 = 字时间
+    c.next = 0;
+    c.ox = (Math.random() - 0.5) * 26;     // 每台滚轮有自己的横向余摆
+    c.cur = c.raw;                         // 预备期前显示真字（幽灵态），落位窗口内才滚乱码
+    c.settled = false;
+    c.el.style.opacity = '0.15';
+    c.el.style.filter = 'none';
+    c.el.style.transform = 'none';
+  }
+  slot.spin = true;
+  slot.el.style.transition = 'none';
+  slot.el.style.opacity = '1';
+  slot.el.style.filter = 'none';
+  slot.el.style.zIndex = rise ? 3 : 1;
+  /* 酝酿位：按主句和自己的实际高度算 —— 长句 3 行时也绝不能和主句叠上 */
+  let brewOff = OFF();
+  if (!rise && cur !== slot) {
+    const mainH = cur.el.getBoundingClientRect().height || 0;
+    const ownH = slot.el.getBoundingClientRect().height || 0;
+    brewOff = Math.min(innerHeight * 0.34, mainH / 2 + ownH / 2 + 34);
+  }
+  slot.el.style.transform = 'translate(-50%,-50%) translateY(' + (rise ? OFF() : brewOff).toFixed(1) + 'px)';
+  if (rise) {
+    void slot.el.offsetWidth;
+    slot.el.style.transition = 'transform .62s cubic-bezier(.16,.84,.30,1)';
+    slot.el.style.transform = 'translate(-50%,-50%)';
+  }
+  slot._o = 1; slot._b = -1;
+  hint.style.opacity = '0';
+  entered = true;
+}
+
+function hide(slot) {
+  slot.active = 0;
+  slot._o = 0; slot._b = -1;
+  slot.el.style.transition = 'transform .34s ease,opacity .34s ease,filter .34s ease';
+  slot.el.style.transform = 'translate(-50%,-50%) translateY(' + (-Math.min(innerHeight * 0.20, 180)).toFixed(1) + 'px)';
+  slot.el.style.opacity = '0';
+  slot.el.style.filter = 'blur(6px)';
+}
+
+function clearAll() {
+  lineA.innerHTML = ''; lineB.innerHTML = '';
+  A.chars.length = 0; B.chars.length = 0;
+  A.text = ''; B.text = '';
+  cur = A; nxt = B;
+  A.active = 0; B.active = 0;
+  A.yrc = false; B.yrc = false;
+  entered = false;
+  for (const el of [lineA, lineB]) {
+    el.style.transition = 'none';
+    el.style.transform = 'translate(-50%,-50%)';
+    el.style.opacity = '0';
+    el.style.filter = 'none';
+    el.style.zIndex = el === lineA ? 3 : 1;
+  }
+}
+
+/* ---------- 滚轮动画：只有还在转的字需要逐帧写样式 ---------- */
+function animate(slot, T) {
+  if (!slot.active || !slot.spin) return;
+  let spinning = 0;
+  const ch = slot.chars;
+  for (let i = 0; i < ch.length; i++) {
+    const c = ch[i];
+    if (c.settled) continue;
+    const dt = T - c.nextAt;
+    if (dt <= 0) { spinning++; continue; }   // 幽灵预览期：什么都不做，字是暗的真字
+    const k = dt / slot.dur;
+    if (k >= 1) {
+      c.settled = true;
+      c.el.style.transform = 'none';
+      c.el.style.filter = 'none';
+      c.el.style.opacity = '1';
+      if (c.ch.textContent !== c.raw) c.ch.textContent = c.raw;
+      continue;
+    }
+    spinning++;
+    const e = 1 - Math.pow(1 - k, 3);
+    const inv = 1 - e;
+    c.el.style.transform = 'translate(' + (c.ox * inv).toFixed(1) + 'px,' + (-46 * inv).toFixed(1) + 'px)';
+    c.el.style.filter = inv > 0.06 ? 'blur(' + (inv * 2.4).toFixed(2) + 'px)' : 'none';
+    c.el.style.opacity = (0.55 + 0.45 * e).toFixed(3);
+    /* 落位窗口内滚轮上的字符在换 —— 每字 0.55s 里换 3~4 个，这就是「滚」 */
+    if (T >= c.next) {
+      c.cur = POOL[(Math.random() * POOL.length) | 0];
+      c.ch.textContent = c.cur;
+      c.next = T + 0.15;
+    }
+  }
+  slot.spin = spinning > 0;
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1;
+const LEAD = 1.3;
+function lineEnd(i) {
+  const ln = lines[i];
+  return i + 1 < lines.length ? lines[i + 1].t - 0.06
+                              : ln.t + Math.max(1.2, ln.dur || 2.4) * 1.8;
+}
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; clearAll(); }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      /* 换句：上一句整行滑出去（它的 DOM 会被复用，所以没有粒子池泄漏这回事） */
+      const old = cur;
+      cur = nxt; nxt = old;
+      hide(nxt);
+      cur.el.style.zIndex = 3; nxt.el.style.zIndex = 1;
+      const ln = lines[ci];
+      const text = ln.text || '';
+      /* 第一句（以及任何没经过酝酿的句）切进来时槽位还是空的 —— 必须在这里补 build，
+         否则 arm() 面对一个空槽直接 return，整句永远不出现（原始版整屏空白的根因） */
+      if (cur.text !== text) build(cur, text);
+      arm(cur, ln.t, true, ln, lineEnd(ci));
+    } else {
+      clearAll();
+    }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      /* 提前准备：下一句先在下方滚起来，开唱那一刻它刚好升到主位 */
+      const text = lines[nx].text || '';
+      if (nxt.text !== text) build(nxt, text);
+      arm(nxt, lines[nx].t, false, lines[nx], lineEnd(nx));
+    }
+  }
+}
+
+let last = performance.now();
+let lastBeat = -1;
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  const T = now();
+  timing(T);
+
+  beat *= Math.exp(-dt * 5.2);
+  drift += dt;
+  animate(cur, T);
+  animate(nxt, T);
+
+  /* 踩拍：整场一起抬亮 + 一次极小的整行下压（相干，不逐字随机踢）。
+     样式只在数值变化超过阈值时写 —— 未变化帧零重排 */
+  const db = Math.abs(beat - lastBeat) > 0.012;
+  lastBeat = beat;
+  if (cur.active) {
+    const o = Math.min(1, 0.96 + beat * 0.06);
+    if (o !== cur._o) { cur.el.style.opacity = o.toFixed(3); cur._o = o; }
+    if (db) {
+      cur.el.style.filter = beat > 0.02 ? 'brightness(' + (1 + 0.16 * beat).toFixed(3) + ')' : 'none';
+      cur.el.style.textShadow = '0 0 ' + (46 + 70 * beat).toFixed(0) + 'px rgba(' +
+        Math.min(255, accent[0] + 40) + ',' + Math.min(255, accent[1] + 35) + ',' +
+        Math.min(255, accent[2] + 20) + ',' + (0.22 + 0.30 * beat).toFixed(3) + ')';
+    }
+  }
+  if (nxt.active && db) {
+    nxt.el.style.filter = 'brightness(' + (0.40 + 0.16 * beat).toFixed(3) + ')';
+  }
+  /* 整场慢漂移镜头：bg 缓慢平移 + 微缩放，beat 只贡献一次极小的下压 */
+  const bx = Math.sin(drift * 0.11) * 13, by = Math.cos(drift * 0.073) * 8;
+  bg.style.transform = 'translate(' + bx.toFixed(2) + 'px,' + (by + 3.4 * beat).toFixed(2) + 'px)' +
+                       ' scale(' + (1.03 + 0.012 * Math.sin(drift * 0.05)).toFixed(4) + ')';
+
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => {
+  /* 字号是按窗口算的，尺寸变化后重建并立即补位（已唱过的字直接落定） */
+  if (curIdx >= 0 && cur.text) { build(cur, cur.text); arm(cur, Math.max(lines[curIdx].t, now()), true, lines[curIdx], lineEnd(curIdx)); }
+  if (brewIdx >= 0 && nxt.text && brewIdx !== curIdx) { build(nxt, nxt.text); arm(nxt, Math.max(lines[brewIdx].t, now()), false, lines[brewIdx], lineEnd(brewIdx)); }
+});
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    if (p.accent) {
+      accent = p.accent;
+      /* accent 主色接到字形渐变上 —— 整场色调跟歌走 */
+      const mix = (v, add) => Math.min(255, Math.round(v * 0.52 + add));
+      document.documentElement.style.setProperty('--acc-grad',
+        'rgb(' + mix(accent[0], 92) + ',' + mix(accent[1], 96) + ',' + Math.min(255, accent[2] + 55) + ')');
+    }
+    clearAll();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：相干 —— 整行一起抬亮、整行一起下压 */
+    beat = Math.min(1.4, beat + 0.35 + 0.65 * (d.payload.level || 0));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+requestAnimationFrame(frame);
+window.__stage = () => ({ lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2), spinning: cur.spin, yrc: !!cur.yrc });
+</script>
+</body>
+</html>

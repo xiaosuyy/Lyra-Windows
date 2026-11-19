@@ -1,0 +1,1434 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>379 · 天幕低垂</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #07080a; overflow: hidden; }
+  #stage { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+/* ---------- 自检口：脚本最外层，无条件赋值 ---------- */
+var stageState = {
+  time: 0, playing: true, lines: [], idx: -1, frames: 0, js: 0,
+  err: '', text: '', reduced: false, readySent: false
+};
+window.__stage = function () {
+  return {
+    lines: stageState.lines.length,
+    idx: stageState.idx,
+    t: stageState.time,
+    playing: stageState.playing,
+    frames: stageState.frames,
+    js: stageState.js,
+    err: stageState.err,
+    text: stageState.text,
+    gl: false,
+    rm: stageState.reduced
+  };
+};
+
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var viewWidth = 1440, viewHeight = 900, dpr = 1;
+  var reducedQuery = (typeof window.matchMedia === 'function')
+    ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  stageState.reduced = !!(reducedQuery && reducedQuery.matches);
+
+  function reportError(where, error) {
+    var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    if (now - lastErrorAt < 1000) { return; }
+    lastErrorAt = now;
+    stageState.err = where + ': ' + (error && error.message ? error.message : String(error));
+    console.error('[379] ' + where, error);
+  }
+  var lastErrorAt = -10000;
+
+  function safeNumber(value, fallback) {
+    var num = Number(value);
+    return isFinite(num) ? num : fallback;
+  }
+
+  function nowMs() {
+    return (window.performance && performance.now) ? performance.now() : Date.now();
+  }
+
+  /* ---------- 色与数：进 canvas 前一律取整夹取 ---------- */
+  var layout = { width: 1440, height: 900, horizonY: 518, lightX: 914, compact: false };
+  var accentTint = [126, 134, 140];
+  var SKY_PAD = 46;
+
+  function clampNumber(value, low, high) {
+    var num = Number(value);
+    if (!isFinite(num)) { return low; }
+    if (num < low) { return low; }
+    if (num > high) { return high; }
+    return num;
+  }
+
+  function channelToByte(value) {
+    return Math.round(clampNumber(value, 0, 255));
+  }
+
+  function mixColor(from, to, ratio) {
+    var amount = clampNumber(ratio, 0, 1);
+    return [
+      channelToByte(from[0] + (to[0] - from[0]) * amount),
+      channelToByte(from[1] + (to[1] - from[1]) * amount),
+      channelToByte(from[2] + (to[2] - from[2]) * amount)
+    ];
+  }
+
+  function colorString(color, alpha) {
+    var opacity = clampNumber(alpha === undefined ? 1 : alpha, 0, 1);
+    return 'rgba(' + channelToByte(color[0]) + ',' + channelToByte(color[1]) + ',' +
+      channelToByte(color[2]) + ',' + opacity.toFixed(3) + ')';
+  }
+
+  function addStopSafely(gradient, offset, color) {
+    try {
+      gradient.addColorStop(clampNumber(offset, 0, 1), color);
+    } catch (error) {
+      reportError('addColorStop', error);
+    }
+  }
+
+  function makeRandom(seed) {
+    var state = seed >>> 0;
+    return function nextRandom() {
+      state = (state + 0x6d2b79f5) >>> 0;
+      var mixed = state;
+      mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+      mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+      return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ---------- 天空：离屏烘焙，逐帧小步填充 ---------- */
+  var skySurface = null;
+  var skySize = { width: 0, height: 0, scale: 1, cssHeight: 0 };
+  var skyBake = { phase: 0, cursor: 0, blobs: [], done: false };
+  var grainPattern = null;
+
+  function makeSkyBlobs() {
+    var random = makeRandom(379137);
+    var blobs = [];
+    var skyH = Math.max(80, layout.horizonY);
+    var count = layout.compact ? 132 : 240;
+    var index = 0;
+    while (index < count) {
+      var kind = index < count * 0.32 ? 0 : (index < count * 0.62 ? 3 : (index < count * 0.86 ? 1 : 2));
+      var blob = { kind: kind, x: 0, y: 0, radius: 0, squash: 1, rotation: 0, color: [0, 0, 0], alpha: 0.1 };
+      if (kind === 0) {
+        blob.x = viewWidth * (random() * 1.12 - 0.06);
+        blob.y = skyH * (0.02 + random() * 0.46);
+        blob.radius = skyH * (0.10 + random() * 0.15);
+        blob.squash = 0.5 + random() * 0.35;
+        blob.rotation = (random() - 0.5) * 0.16;
+        blob.color = mixColor([7, 9, 12], accentTint, 0.05 + random() * 0.05);
+        blob.alpha = 0.10 + random() * 0.16;
+      } else if (kind === 3) {
+        blob.x = viewWidth * (random() * 1.14 - 0.07);
+        blob.y = skyH * (0.08 + random() * 0.66);
+        blob.radius = skyH * (0.16 + random() * 0.2);
+        blob.squash = 0.11 + random() * 0.1;
+        blob.rotation = -0.16 - random() * 0.3;
+        blob.color = mixColor([11, 14, 18], accentTint, 0.05 + random() * 0.05);
+        blob.alpha = 0.05 + random() * 0.1;
+      } else if (kind === 1) {
+        blob.x = viewWidth * (random() * 1.1 - 0.05);
+        blob.y = skyH * (0.24 + random() * 0.56);
+        blob.radius = skyH * (0.06 + random() * 0.1);
+        blob.squash = 0.34 + random() * 0.26;
+        blob.rotation = (random() - 0.5) * 0.22;
+        blob.color = mixColor([20, 25, 30], [72, 80, 86], 0.25 + random() * 0.55);
+        blob.alpha = 0.05 + random() * 0.11;
+      } else {
+        blob.x = layout.lightX + (random() - 0.5) * viewWidth * 0.72;
+        blob.y = skyH * (0.55 + random() * 0.42);
+        blob.radius = skyH * (0.05 + random() * 0.09);
+        blob.squash = 0.3 + random() * 0.25;
+        blob.rotation = (random() - 0.5) * 0.18;
+        blob.color = mixColor([128, 134, 138], [232, 232, 226], 0.28 + random() * 0.5);
+        blob.alpha = 0.05 + random() * 0.1;
+      }
+      blobs.push(blob);
+      index += 1;
+    }
+    return blobs;
+  }
+
+  function prepareSkySurface() {
+    var scale = viewWidth > 820 ? 0.62 : 0.85;
+    var cssHeight = layout.horizonY + SKY_PAD;
+    skySize.scale = scale;
+    skySize.cssHeight = cssHeight;
+    skySize.width = Math.max(2, Math.round(viewWidth * scale));
+    skySize.height = Math.max(2, Math.round(cssHeight * scale));
+    try {
+      if (!skySurface) { skySurface = document.createElement('canvas'); }
+      skySurface.width = skySize.width;
+      skySurface.height = skySize.height;
+      var surface = skySurface.getContext('2d');
+      if (surface) {
+        surface.setTransform(scale, 0, 0, scale, 0, 0);
+        surface.clearRect(0, 0, viewWidth, cssHeight);
+      }
+    } catch (error) {
+      reportError('prepareSky', error);
+    }
+    skyBake.phase = 0;
+    skyBake.cursor = 0;
+    skyBake.done = false;
+    skyBake.blobs = makeSkyBlobs();
+  }
+
+  function paintSkyBase() {
+    var surface = skySurface ? skySurface.getContext('2d') : null;
+    if (!surface) { return; }
+    var skyH = layout.horizonY + SKY_PAD;
+    surface.globalCompositeOperation = 'source-over';
+    var base = surface.createLinearGradient(0, 0, 0, skyH);
+    addStopSafely(base, 0, colorString([8, 10, 13], 1));
+    addStopSafely(base, 0.34, colorString(mixColor([19, 24, 29], accentTint, 0.10), 1));
+    addStopSafely(base, 0.62, colorString(mixColor([48, 55, 62], accentTint, 0.14), 1));
+    addStopSafely(base, 0.85, colorString(mixColor([92, 99, 104], accentTint, 0.16), 1));
+    addStopSafely(base, 1, colorString(mixColor([124, 130, 132], accentTint, 0.10), 1));
+    surface.fillStyle = base;
+    surface.fillRect(0, 0, viewWidth, skyH);
+
+    var glowRadius = Math.max(viewWidth * 0.42, skyH * 0.75);
+    var glow = surface.createRadialGradient(layout.lightX, skyH * 0.82, 0, layout.lightX, skyH * 0.82, glowRadius);
+    addStopSafely(glow, 0, colorString(mixColor([236, 235, 228], accentTint, 0.18), 0.5));
+    addStopSafely(glow, 0.28, colorString(mixColor([190, 194, 192], accentTint, 0.2), 0.22));
+    addStopSafely(glow, 0.62, colorString([120, 128, 134], 0.07));
+    addStopSafely(glow, 1, colorString([120, 128, 134], 0));
+    surface.fillStyle = glow;
+    surface.fillRect(0, 0, viewWidth, skyH);
+  }
+
+  function paintSkyBlob(blob) {
+    var surface = skySurface ? skySurface.getContext('2d') : null;
+    if (!surface || !blob) { return; }
+    var radius = Math.max(2, blob.radius);
+    surface.save();
+    surface.translate(blob.x, blob.y);
+    if (blob.rotation) { surface.rotate(blob.rotation); }
+    surface.scale(1, clampNumber(blob.squash, 0.05, 1));
+    var gradient = surface.createRadialGradient(0, 0, 0, 0, 0, radius);
+    addStopSafely(gradient, 0, colorString(blob.color, blob.alpha));
+    addStopSafely(gradient, 0.48, colorString(blob.color, blob.alpha * 0.55));
+    addStopSafely(gradient, 1, colorString(blob.color, 0));
+    surface.fillStyle = gradient;
+    surface.beginPath();
+    surface.arc(0, 0, radius, 0, Math.PI * 2);
+    surface.fill();
+    surface.restore();
+  }
+
+  function paintSkyGrain() {
+    var surface = skySurface ? skySurface.getContext('2d') : null;
+    if (!surface || !grainPattern) { return; }
+    surface.save();
+    surface.setTransform(1, 0, 0, 1, 0, 0);
+    surface.globalAlpha = 0.055;
+    surface.fillStyle = grainPattern;
+    surface.fillRect(0, 0, skySize.width, skySize.height);
+    surface.restore();
+    surface.setTransform(skySize.scale, 0, 0, skySize.scale, 0, 0);
+  }
+
+  function stepSkyBake(budgetMs) {
+    if (skyBake.done || !skySurface) { return; }
+    var startedAt = nowMs();
+    if (skyBake.phase === 0) {
+      paintSkyBase();
+      skyBake.phase = 1;
+      return;
+    }
+    if (skyBake.phase === 1) {
+      var guard = 0;
+      while (skyBake.cursor < skyBake.blobs.length && guard < 24) {
+        paintSkyBlob(skyBake.blobs[skyBake.cursor]);
+        skyBake.cursor += 1;
+        guard += 1;
+        if (nowMs() - startedAt > budgetMs) { break; }
+      }
+      if (skyBake.cursor >= skyBake.blobs.length) { skyBake.phase = 2; }
+      return;
+    }
+    if (skyBake.phase === 2) {
+      paintSkyGrain();
+      skyBake.phase = 3;
+      skyBake.done = true;
+    }
+  }
+
+  function drawSky(context) {
+    var skyH = layout.horizonY + SKY_PAD;
+    if (skySurface && skySurface instanceof HTMLCanvasElement &&
+        skySurface.width > 0 && skySurface.height > 0 && skySize.width > 0 && skySize.height > 0) {
+      context.drawImage(skySurface, 0, 0, skySize.width, skySize.height, 0, 0, viewWidth, skyH);
+    } else {
+      context.fillStyle = '#12161b';
+      context.fillRect(0, 0, viewWidth, skyH);
+    }
+  }
+
+  /* ---------- 海：同样离屏烘焙，之后只做呼吸与浪 ---------- */
+  var seaSurface = null;
+  var seaSize = { width: 0, height: 0, scale: 1, top: 0, heightCss: 0 };
+  var seaBake = { phase: 0, cursor: 0, ops: [], done: false };
+  var motion = { time: 0, lastAt: -1 };
+
+  function makeSeaOps() {
+    var random = makeRandom(379301);
+    var ops = [];
+    var seaTop = layout.horizonY - 18;
+    var seaHeight = Math.max(40, viewHeight - seaTop);
+    var strokeCount = layout.compact ? 42 : 66;
+    var strokeIndex = 0;
+    while (strokeIndex < strokeCount) {
+      var depth = Math.pow(random(), 1.45);
+      ops.push({
+        type: 'trough',
+        x: viewWidth * (random() * 1.14 - 0.07),
+        y: seaTop + seaHeight * (0.03 + depth * 0.95),
+        width: viewWidth * (0.05 + random() * 0.22) * (0.5 + depth),
+        height: 1.5 + depth * seaHeight * 0.045 * (0.4 + random()),
+        alpha: 0.04 + random() * 0.1
+      });
+      strokeIndex += 1;
+    }
+    var speckCount = layout.compact ? 130 : 240;
+    var speckIndex = 0;
+    while (speckIndex < speckCount) {
+      var speckDepth = Math.pow(random(), 1.9);
+      ops.push({
+        type: 'foam',
+        x: viewWidth * (random() * 1.08 - 0.04),
+        y: seaTop + seaHeight * (0.03 + speckDepth * 0.9),
+        radius: 0.6 + speckDepth * 2.4 * (0.5 + random()),
+        alpha: (0.06 + random() * 0.18) * (1 - speckDepth * 0.5)
+      });
+      speckIndex += 1;
+    }
+    return ops;
+  }
+
+  function prepareSeaSurface() {
+    var scale = viewWidth > 900 ? 0.7 : 0.9;
+    var seaTop = layout.horizonY - 18;
+    var heightCss = Math.max(40, viewHeight - seaTop);
+    seaSize.scale = scale;
+    seaSize.top = seaTop;
+    seaSize.heightCss = heightCss;
+    seaSize.width = Math.max(2, Math.round(viewWidth * scale));
+    seaSize.height = Math.max(2, Math.round(heightCss * scale));
+    try {
+      if (!seaSurface) { seaSurface = document.createElement('canvas'); }
+      seaSurface.width = seaSize.width;
+      seaSurface.height = seaSize.height;
+      var surface = seaSurface.getContext('2d');
+      if (surface) {
+        surface.setTransform(scale, 0, 0, scale, 0, 0);
+        surface.clearRect(0, 0, viewWidth, heightCss);
+      }
+    } catch (error) {
+      reportError('prepareSea', error);
+    }
+    seaBake.phase = 0;
+    seaBake.cursor = 0;
+    seaBake.done = false;
+    seaBake.ops = makeSeaOps();
+  }
+
+  function paintSeaBase() {
+    var surface = seaSurface ? seaSurface.getContext('2d') : null;
+    if (!surface) { return; }
+    var seaHeight = seaSize.heightCss;
+    surface.globalCompositeOperation = 'source-over';
+    var base = surface.createLinearGradient(0, 0, 0, seaHeight);
+    addStopSafely(base, 0, colorString(mixColor([116, 122, 124], accentTint, 0.12), 1));
+    addStopSafely(base, 0.10, colorString(mixColor([74, 82, 88], accentTint, 0.10), 1));
+    addStopSafely(base, 0.34, colorString(mixColor([34, 40, 46], accentTint, 0.08), 1));
+    addStopSafely(base, 0.68, colorString([15, 19, 24], 1));
+    addStopSafely(base, 1, colorString([5, 7, 9], 1));
+    surface.fillStyle = base;
+    surface.fillRect(0, 0, viewWidth, seaHeight);
+
+    /* 天光在水面拉出的那道碎金 —— 透纳式的反光柱 */
+    var columnX = layout.lightX;
+    var columnWidth = Math.max(40, viewWidth * 0.17);
+    var column = surface.createLinearGradient(columnX - columnWidth, 0, columnX + columnWidth, 0);
+    addStopSafely(column, 0, colorString([210, 210, 202], 0));
+    addStopSafely(column, 0.5, colorString(mixColor([214, 214, 206], accentTint, 0.16), 0.16));
+    addStopSafely(column, 1, colorString([210, 210, 202], 0));
+    surface.fillStyle = column;
+    surface.fillRect(0, 0, viewWidth, seaHeight);
+
+    var halo = surface.createRadialGradient(columnX, 0, 0, columnX, 0, Math.max(seaHeight * 0.9, viewWidth * 0.3));
+    addStopSafely(halo, 0, colorString(mixColor([176, 180, 176], accentTint, 0.14), 0.24));
+    addStopSafely(halo, 0.42, colorString([150, 156, 158], 0.07));
+    addStopSafely(halo, 1, colorString([120, 126, 130], 0));
+    surface.fillStyle = halo;
+    surface.fillRect(0, 0, viewWidth, seaHeight);
+  }
+
+  function paintSeaOp(op) {
+    var surface = seaSurface ? seaSurface.getContext('2d') : null;
+    if (!surface || !op) { return; }
+    if (op.type === 'trough') {
+      surface.globalCompositeOperation = 'source-over';
+      var troughRadius = Math.max(4, op.width * 0.5);
+      var troughGradient = surface.createRadialGradient(0, 0, 0, 0, 0, troughRadius);
+      addStopSafely(troughGradient, 0, colorString([3, 5, 7], op.alpha));
+      addStopSafely(troughGradient, 0.55, colorString([3, 5, 7], op.alpha * 0.5));
+      addStopSafely(troughGradient, 1, colorString([3, 5, 7], 0));
+      surface.save();
+      surface.translate(op.x, op.y);
+      surface.scale(1, clampNumber(op.height * 0.5 / troughRadius, 0.02, 1));
+      surface.fillStyle = troughGradient;
+      surface.beginPath();
+      surface.arc(0, 0, troughRadius, 0, Math.PI * 2);
+      surface.fill();
+      surface.restore();
+    } else if (op.type === 'foam') {
+      surface.globalCompositeOperation = 'lighter';
+      surface.fillStyle = colorString(mixColor([205, 208, 204], accentTint, 0.2), op.alpha);
+      surface.beginPath();
+      surface.arc(op.x, op.y, Math.max(0.4, op.radius), 0, Math.PI * 2);
+      surface.fill();
+      surface.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  function maskSeaTop() {
+    var surface = seaSurface ? seaSurface.getContext('2d') : null;
+    if (!surface) { return; }
+    var fadeHeight = Math.max(12, 34 * seaSize.scale);
+    surface.save();
+    surface.setTransform(1, 0, 0, 1, 0, 0);
+    surface.globalCompositeOperation = 'destination-in';
+    var fade = surface.createLinearGradient(0, 0, 0, fadeHeight);
+    addStopSafely(fade, 0, 'rgba(0,0,0,0)');
+    addStopSafely(fade, 1, 'rgba(0,0,0,1)');
+    surface.fillStyle = fade;
+    surface.fillRect(0, 0, seaSize.width, seaSize.height);
+    surface.restore();
+  }
+
+  function stepSeaBake(budgetMs) {
+    if (seaBake.done || !seaSurface) { return; }
+    var startedAt = nowMs();
+    if (seaBake.phase === 0) {
+      paintSeaBase();
+      seaBake.phase = 1;
+      return;
+    }
+    if (seaBake.phase === 1) {
+      var guard = 0;
+      while (seaBake.cursor < seaBake.ops.length && guard < 26) {
+        paintSeaOp(seaBake.ops[seaBake.cursor]);
+        seaBake.cursor += 1;
+        guard += 1;
+        if (nowMs() - startedAt > budgetMs) { break; }
+      }
+      if (seaBake.cursor >= seaBake.ops.length) { seaBake.phase = 2; }
+      return;
+    }
+    if (seaBake.phase === 2) {
+      maskSeaTop();
+      seaBake.phase = 3;
+      seaBake.done = true;
+    }
+  }
+
+  function drawSeaSurface(context) {
+    var surface = seaSurface;
+    if (!surface || !(surface instanceof HTMLCanvasElement) || surface.width <= 0 || surface.height <= 0) { return false; }
+    var driftY = Math.sin(motion.time * 0.62) * 2.4;
+    var driftX = Math.sin(motion.time * 0.23) * 3.2;
+    context.drawImage(surface, 0, 0, seaSize.width, seaSize.height,
+      driftX - 4, seaSize.top + driftY, viewWidth + 8, seaSize.heightCss + 6);
+    return true;
+  }
+
+  /* ---------- 涌浪：逐帧的少数几条波带，给静态底子喂动感 ---------- */
+  var swellStyles = [];
+
+  function rebuildSwellStyles() {
+    swellStyles = [];
+    var rows = layout.compact ? 16 : 22;
+    var index = 1;
+    while (index <= rows) {
+      var depth = Math.pow(index / rows, 1.7);
+      var bodyTone = mixColor([8, 11, 14], mixColor([86, 94, 100], accentTint, 0.12), 0.35 * (1 - depth) + 0.08);
+      swellStyles.push({
+        row: index,
+        depth: depth,
+        body: colorString(bodyTone, 0.05 + depth * 0.16),
+        crest: colorString(mixColor([176, 182, 182], accentTint, 0.2), 0.03 + (1 - depth) * 0.1),
+        bodyWidth: 1 + depth * 5.5,
+        crestWidth: 0.9 + depth * 1.4
+      });
+      index += 1;
+    }
+  }
+
+  function drawSwellBands(context, timeSeconds) {
+    var horizon = layout.horizonY;
+    var seaHeight = Math.max(1, viewHeight - horizon);
+    var segments = 14;
+    var bass = clampNumber(audioState.bass, 0, 1);
+    var stepX = (viewWidth + 60) / segments;
+    context.lineCap = 'butt';
+    var styleIndex = 0;
+    while (styleIndex < swellStyles.length) {
+      var style = swellStyles[styleIndex];
+      var depth = style.depth;
+      var rowY = horizon + seaHeight * (0.015 + depth * 0.95);
+      var amplitude = (1.4 + depth * 16) * (0.7 + bass * 0.7);
+      var phase = timeSeconds * (0.5 + depth * 1.3) + style.row * 1.17;
+      context.beginPath();
+      var unit = 0;
+      while (unit <= segments) {
+        var pointX = -30 + stepX * unit;
+        var wave = Math.sin(pointX * (0.0042 + depth * 0.0026) + phase) +
+          Math.sin(pointX * 0.0113 - phase * 1.6 + style.row) * 0.34;
+        var pointY = rowY + wave * amplitude * 0.5;
+        if (unit === 0) { context.moveTo(pointX, pointY); } else { context.lineTo(pointX, pointY); }
+        unit += 1;
+      }
+      context.strokeStyle = style.body;
+      context.lineWidth = style.bodyWidth;
+      context.stroke();
+      context.strokeStyle = style.crest;
+      context.lineWidth = style.crestWidth;
+      context.stroke();
+      styleIndex += 1;
+    }
+  }
+
+  /* ---------- 主体：一道正在崩解的巨浪 ---------- */
+  function drawBreakingWave(context, timeSeconds) {
+    var horizon = layout.horizonY;
+    var seaHeight = Math.max(1, viewHeight - horizon);
+    var heave = (Math.sin(timeSeconds * 0.5) * 0.5 + 0.5);
+    var bass = clampNumber(audioState.bass, 0, 1);
+    var crestX = viewWidth * (layout.compact ? 0.36 : 0.285);
+    var crestY = horizon - seaHeight * (layout.compact ? 0.15 : 0.255) +
+      seaHeight * 0.016 * heave + seaHeight * 0.045 * bass;
+    var reach = viewWidth * (layout.compact ? 0.10 : 0.075);
+    var footY = viewHeight + 6;
+
+    context.save();
+    context.beginPath();
+    context.moveTo(-viewWidth * 0.03, footY);
+    context.lineTo(-viewWidth * 0.03, horizon + seaHeight * 0.32);
+    context.bezierCurveTo(
+      viewWidth * 0.05, horizon + seaHeight * 0.14,
+      crestX - reach * 2.4, crestY + seaHeight * 0.22,
+      crestX - reach * 0.55, crestY + seaHeight * 0.03
+    );
+    context.quadraticCurveTo(crestX - reach * 0.15, crestY - seaHeight * 0.045, crestX + reach * 0.75, crestY + seaHeight * 0.055);
+    context.bezierCurveTo(
+      crestX + reach * 2.1, horizon + seaHeight * 0.055,
+      viewWidth * 0.55, horizon + seaHeight * 0.14,
+      viewWidth * 0.63, footY
+    );
+    context.closePath();
+    var body = context.createLinearGradient(0, crestY, 0, footY);
+    addStopSafely(body, 0, colorString(mixColor([78, 84, 90], accentTint, 0.18), 0.96));
+    addStopSafely(body, 0.18, colorString(mixColor([40, 46, 52], accentTint, 0.14), 0.98));
+    addStopSafely(body, 0.62, colorString([12, 15, 19], 1));
+    addStopSafely(body, 1, colorString([4, 6, 8], 1));
+    context.fillStyle = body;
+    context.fill();
+
+    /* 浪脊上的背光：光从右侧的裂隙来 */
+    context.globalCompositeOperation = 'lighter';
+    var crestLight = mixColor([226, 228, 220], accentTint, 0.15);
+    context.beginPath();
+    context.moveTo(crestX - reach * 1.5, crestY + seaHeight * 0.075);
+    context.quadraticCurveTo(crestX - reach * 0.1, crestY - seaHeight * 0.02, crestX + reach * 1.5, crestY + seaHeight * 0.06);
+    context.strokeStyle = colorString(crestLight, 0.30);
+    context.lineWidth = Math.max(1.2, seaHeight * 0.006);
+    context.stroke();
+    context.strokeStyle = colorString(crestLight, 0.16);
+    context.lineWidth = Math.max(3, seaHeight * 0.016);
+    context.stroke();
+    context.globalCompositeOperation = 'source-over';
+
+    /* 卷落的水舌 */
+    context.beginPath();
+    context.moveTo(crestX - reach * 0.2, crestY + seaHeight * 0.005);
+    context.bezierCurveTo(
+      crestX + reach * 1.2, crestY + seaHeight * 0.01,
+      crestX + reach * 1.9, crestY + seaHeight * 0.09,
+      crestX + reach * 1.45, crestY + seaHeight * 0.20
+    );
+    context.bezierCurveTo(
+      crestX + reach * 1.05, crestY + seaHeight * 0.13,
+      crestX + reach * 0.2, crestY + seaHeight * 0.075,
+      crestX - reach * 0.2, crestY + seaHeight * 0.005
+    );
+    context.closePath();
+    var tongue = context.createLinearGradient(crestX, crestY, crestX + reach * 2, crestY + seaHeight * 0.2);
+    addStopSafely(tongue, 0, colorString(mixColor([120, 126, 128], accentTint, 0.2), 0.22));
+    addStopSafely(tongue, 1, colorString([40, 45, 50], 0.02));
+    context.fillStyle = tongue;
+    context.fill();
+
+    context.restore();
+  }
+
+  /* ---------- 孤松：整幅画里唯一的尺度参照 ---------- */
+  var treeSurface = null;
+  var treeGlowSurface = null;
+  var treeBox = { width: 0, height: 0, x: 0, y: 0 };
+
+  function paintPine(surface, width, height) {
+    var random = makeRandom(379519);
+    surface.clearRect(0, 0, width, height);
+    surface.lineCap = 'round';
+    surface.strokeStyle = '#04060a';
+    surface.fillStyle = '#04060a';
+
+    surface.beginPath();
+    surface.ellipse(width * 0.5, height * 0.962, width * 0.33, height * 0.036, 0, 0, Math.PI * 2);
+    surface.fill();
+
+    var samples = 22;
+    var points = [];
+    var step = 0;
+    while (step <= samples) {
+      var ratio = step / samples;
+      var inv = 1 - ratio;
+      var pointX = inv * inv * inv * (width * 0.56) + 3 * inv * inv * ratio * (width * 0.50) +
+        3 * inv * ratio * ratio * (width * 0.42) + ratio * ratio * ratio * (width * 0.33);
+      var pointY = inv * inv * inv * (height * 0.955) + 3 * inv * inv * ratio * (height * 0.66) +
+        3 * inv * ratio * ratio * (height * 0.34) + ratio * ratio * ratio * (height * 0.09);
+      points.push({ x: pointX, y: pointY, ratio: ratio });
+      step += 1;
+    }
+
+    var segment = 0;
+    while (segment < points.length - 1) {
+      surface.lineWidth = Math.max(1, width * (0.055 * (1 - points[segment].ratio * 0.88) + 0.004));
+      surface.beginPath();
+      surface.moveTo(points[segment].x, points[segment].y);
+      surface.lineTo(points[segment + 1].x, points[segment + 1].y);
+      surface.stroke();
+      segment += 1;
+    }
+
+    var tier = 0;
+    while (tier < 7) {
+      var anchorRatio = 0.16 + tier * 0.108;
+      var anchorIndex = Math.min(points.length - 1, Math.round(anchorRatio * (points.length - 1)));
+      var anchor = points[anchorIndex];
+      var reach = width * (0.34 - tier * 0.031);
+      var branch = 0;
+      while (branch < 3) {
+        var endX = anchor.x + reach * (0.62 + random() * 0.42);
+        var endY = anchor.y - reach * (0.16 - branch * 0.09) + reach * (0.1 + random() * 0.16);
+        surface.lineWidth = Math.max(0.8, width * Math.max(0.004, 0.013 - tier * 0.0012));
+        surface.beginPath();
+        surface.moveTo(anchor.x, anchor.y);
+        surface.quadraticCurveTo(anchor.x + reach * 0.5, anchor.y - reach * 0.12, endX, endY);
+        surface.stroke();
+        var needle = 0;
+        while (needle < 4) {
+          var along = 0.3 + needle * 0.18;
+          var needleX = anchor.x + (endX - anchor.x) * along;
+          var needleY = anchor.y + (endY - anchor.y) * along;
+          var needleLength = reach * (0.34 - needle * 0.05);
+          surface.lineWidth = Math.max(0.6, width * 0.006);
+          surface.beginPath();
+          surface.moveTo(needleX, needleY);
+          surface.lineTo(needleX + needleLength * 0.55, needleY + needleLength * (0.55 + random() * 0.45));
+          surface.stroke();
+          needle += 1;
+        }
+        branch += 1;
+      }
+      tier += 1;
+    }
+  }
+
+  function buildTree() {
+    var height = clampNumber(viewHeight * (layout.compact ? 0.1 : 0.125), 54, 210);
+    var width = height * 0.66;
+    treeBox.width = width;
+    treeBox.height = height;
+    treeBox.x = viewWidth * (layout.compact ? 0.72 : 0.795);
+    treeBox.y = layout.horizonY + 2;
+    try {
+      treeSurface = document.createElement('canvas');
+      treeSurface.width = Math.round(width * 2);
+      treeSurface.height = Math.round(height * 2);
+      var surface = treeSurface.getContext('2d');
+      if (!surface) { return; }
+      surface.setTransform(2, 0, 0, 2, 0, 0);
+      paintPine(surface, width, height);
+
+      treeGlowSurface = document.createElement('canvas');
+      treeGlowSurface.width = treeSurface.width;
+      treeGlowSurface.height = treeSurface.height;
+      var glow = treeGlowSurface.getContext('2d');
+      if (!glow) { return; }
+      glow.drawImage(treeSurface, 0, 0);
+      glow.globalCompositeOperation = 'source-in';
+      glow.fillStyle = colorString(mixColor([232, 230, 218], accentTint, 0.2), 0.5);
+      glow.fillRect(0, 0, treeGlowSurface.width, treeGlowSurface.height);
+    } catch (error) {
+      reportError('buildTree', error);
+      treeSurface = null;
+      treeGlowSurface = null;
+    }
+  }
+
+  function drawTree(context, timeSeconds) {
+    if (!treeSurface || !(treeSurface instanceof HTMLCanvasElement) ||
+        treeSurface.width <= 0 || treeSurface.height <= 0) { return; }
+    var sway = stageState.reduced ? 0 : Math.sin(timeSeconds * 0.9) * 0.006;
+    context.save();
+    context.translate(treeBox.x, treeBox.y);
+    context.rotate(sway);
+    if (treeGlowSurface && treeGlowSurface instanceof HTMLCanvasElement &&
+        treeGlowSurface.width > 0 && treeGlowSurface.height > 0) {
+      context.globalAlpha = 0.6;
+      context.drawImage(treeGlowSurface, -treeBox.width / 2 + 1.6, -treeBox.height - 1.6, treeBox.width, treeBox.height);
+      context.globalAlpha = 1;
+    }
+    context.drawImage(treeSurface, -treeBox.width / 2, -treeBox.height, treeBox.width, treeBox.height);
+    context.restore();
+  }
+
+  /* ---------- 斜雨：透纳式的风暴，全靠它成立 ---------- */
+  var rainStreaks = [];
+
+  function rebuildRain() {
+    rainStreaks = [];
+    var count = layout.compact ? 72 : 118;
+    var random = makeRandom(379641);
+    var index = 0;
+    var baseColor = mixColor([198, 202, 200], accentTint, 0.18);
+    while (index < count) {
+      var alpha = 0.03 + random() * 0.07;
+      rainStreaks.push({
+        x: random() * viewWidth * 1.2 - viewWidth * 0.1,
+        y: random() * viewHeight,
+        length: 26 + random() * 130,
+        speed: 320 + random() * 620,
+        alpha: alpha,
+        color: colorString(baseColor, alpha),
+        lean: 0.18 + random() * 0.2
+      });
+      index += 1;
+    }
+  }
+
+  function drawRain(context, deltaSeconds) {
+    var fall = stageState.reduced ? 0.4 : 1;
+    var index = 0;
+    context.lineCap = 'round';
+    context.lineWidth = 0.9;
+    while (index < rainStreaks.length) {
+      var streak = rainStreaks[index];
+      streak.y += streak.speed * deltaSeconds * fall;
+      streak.x += streak.speed * deltaSeconds * streak.lean * 0.35 * fall;
+      if (streak.y - streak.length > viewHeight) {
+        streak.y = -streak.length - 20;
+        streak.x = Math.random() * viewWidth * 1.2 - viewWidth * 0.1;
+      }
+      if (streak.x > viewWidth + 40) { streak.x = -40; }
+      context.strokeStyle = streak.color;
+      context.beginPath();
+      context.moveTo(streak.x, streak.y);
+      context.lineTo(streak.x - streak.length * streak.lean, streak.y - streak.length);
+      context.stroke();
+      index += 1;
+    }
+  }
+
+  /* ---------- 光：云隙、闪电、暗角（全部预烘焙，逐帧只做贴图） ---------- */
+  var audioState = { bpm: 92, level: 0.34, bass: 0.3, mid: 0.3, treble: 0.2, beatAge: 9 };
+  var audioTarget = { bpm: 92, level: 0.34, bass: 0.3, mid: 0.3, treble: 0.2 };
+  var flashState = { value: 0, cooldown: 3.5, x: 0, y: 0 };
+  var overlay = { glow: null, haze: null, hazeTop: 0, vignette: null, flashSprite: null };
+
+  function createLayer(cssWidth, cssHeight, scale) {
+    var layerCanvas = document.createElement('canvas');
+    layerCanvas.width = Math.max(2, Math.round(cssWidth * scale));
+    layerCanvas.height = Math.max(2, Math.round(cssHeight * scale));
+    var surface = layerCanvas.getContext('2d');
+    if (surface) { surface.setTransform(scale, 0, 0, scale, 0, 0); }
+    return { canvas: layerCanvas, surface: surface, cssWidth: cssWidth, cssHeight: cssHeight };
+  }
+
+  function blitLayer(context, layer, x, y, width, height, alpha, blend) {
+    if (!layer || !layer.canvas || !(layer.canvas instanceof HTMLCanvasElement) ||
+        layer.canvas.width <= 0 || layer.canvas.height <= 0) { return; }
+    context.globalCompositeOperation = blend || 'source-over';
+    context.globalAlpha = clampNumber(alpha === undefined ? 1 : alpha, 0, 1);
+    context.drawImage(layer.canvas, x, y, width, height);
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = 'source-over';
+  }
+
+  function buildFlashSprite() {
+    var sprite = createLayer(256, 256, 1);
+    if (!sprite.surface) { return null; }
+    var gradient = sprite.surface.createRadialGradient(128, 128, 0, 128, 128, 128);
+    addStopSafely(gradient, 0, colorString([240, 244, 248], 0.85));
+    addStopSafely(gradient, 0.35, colorString([214, 222, 230], 0.28));
+    addStopSafely(gradient, 0.7, colorString([200, 210, 220], 0.06));
+    addStopSafely(gradient, 1, colorString([200, 210, 220], 0));
+    sprite.surface.fillStyle = gradient;
+    sprite.surface.fillRect(0, 0, 256, 256);
+    return sprite;
+  }
+
+  function buildOverlays() {
+    try {
+      var skyHeight = layout.horizonY + 10;
+      var glow = createLayer(viewWidth, skyHeight, 0.34);
+      if (glow.surface) {
+        var glowRadius = Math.max(viewWidth * 0.32, layout.horizonY * 0.92);
+        var glowGradient = glow.surface.createRadialGradient(
+          layout.lightX, layout.horizonY * 0.96, 0,
+          layout.lightX, layout.horizonY * 0.96, glowRadius);
+        addStopSafely(glowGradient, 0, colorString(mixColor([240, 238, 228], accentTint, 0.18), 0.62));
+        addStopSafely(glowGradient, 0.3, colorString(mixColor([210, 212, 204], accentTint, 0.2), 0.22));
+        addStopSafely(glowGradient, 0.66, colorString([162, 168, 170], 0.06));
+        addStopSafely(glowGradient, 1, colorString([162, 168, 170], 0));
+        glow.surface.fillStyle = glowGradient;
+        glow.surface.fillRect(0, 0, viewWidth, skyHeight);
+      }
+      overlay.glow = glow;
+
+      var hazeHeight = viewHeight * 0.42;
+      overlay.hazeTop = layout.horizonY - viewHeight * 0.17;
+      var haze = createLayer(viewWidth, hazeHeight, 0.42);
+      if (haze.surface) {
+        var hazeGradient = haze.surface.createLinearGradient(0, 0, 0, hazeHeight);
+        addStopSafely(hazeGradient, 0, colorString(mixColor([152, 158, 160], accentTint, 0.14), 0));
+        addStopSafely(hazeGradient, 0.34, colorString(mixColor([152, 158, 160], accentTint, 0.14), 0.13));
+        addStopSafely(hazeGradient, 0.62, colorString(mixColor([138, 144, 148], accentTint, 0.12), 0.07));
+        addStopSafely(hazeGradient, 1, colorString([120, 126, 132], 0));
+        haze.surface.fillStyle = hazeGradient;
+        haze.surface.fillRect(0, 0, viewWidth, hazeHeight);
+      }
+      overlay.haze = haze;
+
+      var vignette = createLayer(viewWidth, viewHeight, 0.45);
+      if (vignette.surface) {
+        var centerX = viewWidth * 0.5;
+        var centerY = viewHeight * 0.46;
+        var vignetteRadius = Math.max(viewWidth, viewHeight) * 0.8;
+        var vignetteGradient = vignette.surface.createRadialGradient(
+          centerX, centerY, vignetteRadius * 0.3, centerX, centerY, vignetteRadius);
+        addStopSafely(vignetteGradient, 0, colorString([0, 0, 0], 0));
+        addStopSafely(vignetteGradient, 0.66, colorString([3, 4, 6], 0.2));
+        addStopSafely(vignetteGradient, 1, colorString([2, 3, 5], 0.6));
+        vignette.surface.fillStyle = vignetteGradient;
+        vignette.surface.fillRect(0, 0, viewWidth, viewHeight);
+      }
+      overlay.vignette = vignette;
+
+      overlay.flashSprite = buildFlashSprite();
+    } catch (error) {
+      reportError('buildOverlays', error);
+    }
+  }
+
+  function drawBloom(context) {
+    var level = clampNumber(audioState.level, 0, 1);
+    var alpha = 0.17 + level * 0.13 + flashState.value * 0.45;
+    blitLayer(context, overlay.glow, 0, 0, viewWidth + 2, layout.horizonY + 10, alpha, 'lighter');
+  }
+
+  function drawFlash(context) {
+    if (flashState.value <= 0.004) { return; }
+    var strength = clampNumber(flashState.value, 0, 1);
+    var radius = Math.max(viewWidth * 0.44, viewHeight * 0.5);
+    blitLayer(context, overlay.flashSprite, flashState.x - radius, flashState.y - radius,
+      radius * 2, radius * 2, 0.5 * strength, 'lighter');
+    context.fillStyle = colorString([228, 232, 236], 0.03 * strength);
+    context.fillRect(0, 0, viewWidth, viewHeight);
+  }
+
+  function drawHaze(context) {
+    blitLayer(context, overlay.haze, 0, overlay.hazeTop, viewWidth, viewHeight * 0.42, 1, 'source-over');
+  }
+
+  function drawVignette(context) {
+    blitLayer(context, overlay.vignette, 0, 0, viewWidth, viewHeight, 1, 'source-over');
+  }
+
+  function updateAtmosphere(deltaSeconds) {
+    var ease = Math.min(1, deltaSeconds * 5.5);
+    audioTarget.level += (0.26 - audioTarget.level) * Math.min(1, deltaSeconds * 1.3);
+    audioTarget.bass += (0.22 - audioTarget.bass) * Math.min(1, deltaSeconds * 1.5);
+    audioState.level += (audioTarget.level - audioState.level) * ease;
+    audioState.bass += (audioTarget.bass - audioState.bass) * ease;
+    audioState.mid += (audioTarget.mid - audioState.mid) * ease;
+    audioState.treble += (audioTarget.treble - audioState.treble) * ease;
+    audioState.beatAge += deltaSeconds;
+    if (flashState.cooldown > 0) { flashState.cooldown -= deltaSeconds; }
+    flashState.value *= Math.max(0, 1 - deltaSeconds * 3.6);
+    if (!stageState.reduced && audioState.beatAge < 0.08 && flashState.cooldown <= 0 && audioTarget.level > 0.62) {
+      flashState.value = 0.55 + clampNumber(audioTarget.level, 0, 1) * 0.4;
+      flashState.cooldown = 1.8 + Math.random() * 2.2;
+      flashState.x = viewWidth * (0.28 + Math.random() * 0.5);
+      flashState.y = layout.horizonY * (0.2 + Math.random() * 0.55);
+    }
+  }
+  var sprayParticles = [];
+  var sprayColor = 'rgba(214,216,208,0.1)';
+
+  function rebuildSpray() {
+    sprayParticles = [];
+    sprayColor = colorString(mixColor([214, 216, 208], accentTint, 0.22), 1);
+    var count = layout.compact ? 54 : 84;
+    var random = makeRandom(379407);
+    var index = 0;
+    while (index < count) {
+      sprayParticles.push({
+        x: random() * viewWidth,
+        y: layout.horizonY + random() * (viewHeight - layout.horizonY) * 0.55,
+        vx: 18 + random() * 46,
+        vy: -16 - random() * 34,
+        life: random(),
+        size: 0.7 + random() * 1.8
+      });
+      index += 1;
+    }
+  }
+
+  function drawSpray(context, deltaSeconds) {
+    var horizon = layout.horizonY;
+    var seaHeight = Math.max(1, viewHeight - horizon);
+    var wind = 1 + clampNumber(audioState.level, 0, 1) * 0.9;
+    var index = 0;
+    context.globalCompositeOperation = 'lighter';
+    context.fillStyle = sprayColor;
+    while (index < sprayParticles.length) {
+      var particle = sprayParticles[index];
+      particle.life -= deltaSeconds * (0.35 + (index % 7) * 0.02);
+      if (particle.life <= 0) {
+        particle.life = 1;
+        particle.y = horizon + seaHeight * (0.1 + (index % 13) * 0.045);
+        particle.x = viewWidth * (0.05 + ((index * 37) % 100) / 110);
+      }
+      particle.x += particle.vx * deltaSeconds * wind;
+      particle.y += particle.vy * deltaSeconds * 0.5;
+      if (particle.x > viewWidth + 20) { particle.x = -20; }
+      context.globalAlpha = clampNumber(0.05 + particle.life * 0.16, 0, 1);
+      context.beginPath();
+      context.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+      context.fill();
+      index += 1;
+    }
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = 'source-over';
+  }
+
+  function resize() {
+    var width = (window.innerWidth && isFinite(window.innerWidth)) ? window.innerWidth : 0;
+    var height = (window.innerHeight && isFinite(window.innerHeight)) ? window.innerHeight : 0;
+    if (!(width > 0)) { width = 1440; }
+    if (!(height > 0)) { height = 900; }
+    dpr = clampNumber(window.devicePixelRatio || 1, 1, 2);
+    viewWidth = width;
+    viewHeight = height;
+    canvas.width = Math.max(1, Math.round(width * dpr));
+    canvas.height = Math.max(1, Math.round(height * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    layout.width = width;
+    layout.height = height;
+    layout.compact = width < 640 || height > width * 1.25;
+    layout.horizonY = Math.round(height * (layout.compact ? 0.615 : 0.575));
+    layout.lightX = Math.round(width * (layout.compact ? 0.66 : 0.632));
+    ctx.fillStyle = '#07080a';
+    ctx.fillRect(0, 0, width, height);
+    resetScenery();
+  }
+
+  function ensureGrainPattern(context) {
+    if (grainPattern) { return; }
+    try {
+      var tile = document.createElement('canvas');
+      tile.width = 96;
+      tile.height = 96;
+      var tileContext = tile.getContext('2d');
+      if (!tileContext) { return; }
+      var image = tileContext.createImageData(96, 96);
+      var random = makeRandom(20261102);
+      var pixel = 0;
+      while (pixel < image.data.length) {
+        var shade = 90 + Math.floor(random() * 110);
+        image.data[pixel] = shade;
+        image.data[pixel + 1] = shade;
+        image.data[pixel + 2] = shade;
+        image.data[pixel + 3] = 255;
+        pixel += 4;
+      }
+      tileContext.putImageData(image, 0, 0);
+      grainPattern = context.createPattern(tile, 'repeat');
+    } catch (error) {
+      reportError('grain', error);
+    }
+  }
+
+  function resetScenery() {
+    ensureGrainPattern(ctx);
+    prepareSkySurface();
+    prepareSeaSurface();
+    buildTree();
+    buildOverlays();
+    rebuildSwellStyles();
+    rebuildRain();
+    rebuildSpray();
+    scrimCache.key = '';
+    motion.lastAt = -1;
+  }
+
+  function normalizeLines(rawLines) {
+    if (!rawLines || typeof rawLines.length !== 'number') { return []; }
+    var out = [];
+    var count = Math.min(rawLines.length, 400);
+    var index = 0;
+    while (index < count) {
+      var item = rawLines[index];
+      index += 1;
+      if (!item) { continue; }
+      var text = (item.text === null || item.text === undefined) ? '' : String(item.text);
+      if (!text.length) { continue; }
+      out.push({
+        t: safeNumber(item.t, 0),
+        dur: Math.max(0.35, safeNumber(item.dur, 3.5)),
+        text: text,
+        chars: Array.isArray(item.chars) ? item.chars : null
+      });
+    }
+    out.sort(function (firstItem, secondItem) { return firstItem.t - secondItem.t; });
+    return out;
+  }
+
+  var lastAccentKey = '';
+
+  function applyInit(payload) {
+    var safePayload = payload || {};
+    /* 歌词先落地：即使后面的画面重建出错，这一句也必须生效 */
+    stageState.lines = normalizeLines(safePayload.lines);
+    stageState.playing = (safePayload.playing === undefined) ? true : !!safePayload.playing;
+    stageState.idx = -1;
+    stageState.text = '';
+    var song = safePayload.song || {};
+    var artists = song.artists;
+    if (artists && typeof artists.length === 'number' && typeof artists !== 'string') {
+      artists = Array.prototype.slice.call(artists, 0, 4).join(' / ');
+    }
+    stageState.song = { name: song.name ? String(song.name) : '', artists: artists ? String(artists) : '' };
+    stageState.duration = Math.max(0, safeNumber(safePayload.duration, 0));
+
+    try {
+      var accent = safePayload.accent;
+      if (accent && typeof accent.length === 'number' && accent.length >= 3) {
+        var nextTint = [channelToByte(accent[0]), channelToByte(accent[1]), channelToByte(accent[2])];
+        var accentKey = nextTint.join(',');
+        if (accentKey !== lastAccentKey) {
+          lastAccentKey = accentKey;
+          accentTint = nextTint;
+          resetScenery();
+        }
+      }
+    } catch (error) {
+      reportError('init-accent', error);
+    }
+  }
+
+  function findIndex(time) {
+    var lines = stageState.lines;
+    var found = -1;
+    var index = 0;
+    while (index < lines.length) {
+      if (time >= lines[index].t - 0.05) { found = index; } else { break; }
+      index += 1;
+    }
+    return found;
+  }
+
+  /* ---------- 歌词：刻在浪上的铭文 ---------- */
+  var LYRIC_FONT = '"Songti SC", "Noto Serif SC", "Source Han Serif SC", "Times New Roman", serif';
+  var lyricCache = { key: '', layout: null };
+
+  function ensureCharTimes(line) {
+    if (line.times) { return line.times; }
+    var text = line.text;
+    var count = text.length;
+    var times = new Array(count);
+    var duration = Math.max(0.8, line.dur);
+    var source = line.chars;
+    var usable = (source && source.length === count) ? source : null;
+    var step = 0;
+    var index = 0;
+    while (index < count) {
+      var entry = usable ? usable[index] : null;
+      if (entry && typeof entry.t === 'number' && isFinite(entry.t)) {
+        times[index] = entry.t;
+      } else {
+        times[index] = line.t + duration * 0.9 * (count <= 1 ? 0 : index / (count - 1));
+      }
+      index += 1;
+    }
+    /* 时间必须单调，脏数据不至于让字倒着亮 */
+    var previous = line.t - 0.01;
+    while (step < count) {
+      if (!(times[step] > previous)) { times[step] = previous + 0.02; }
+      previous = times[step];
+      step += 1;
+    }
+    line.times = times;
+    return times;
+  }
+
+  function layoutTextRun(context, text, spacing, maxWidth) {
+    var rows = [];
+    var current = [];
+    var currentWidth = 0;
+    var index = 0;
+    while (index < text.length) {
+      var character = text.charAt(index);
+      if (character === ' ' && current.length === 0) { index += 1; continue; }
+      var charWidth = context.measureText(character).width;
+      var advance = charWidth + spacing;
+      if (current.length > 0 && currentWidth + advance > maxWidth) {
+        rows.push(current);
+        current = [];
+        currentWidth = 0;
+        continue;
+      }
+      current.push({ c: character, x: currentWidth, width: charWidth });
+      currentWidth += advance;
+      index += 1;
+    }
+    if (current.length > 0) { rows.push(current); }
+    return rows;
+  }
+
+  function rowWidth(row) {
+    if (!row.length) { return 0; }
+    var last = row[row.length - 1];
+    return last.x + last.width;
+  }
+
+  function buildLyricLayout(context, line) {
+    var compact = layout.compact;
+    var maxWidth = viewWidth * (compact ? 0.84 : 0.78);
+    var baseSize = compact ? Math.min(viewWidth * 0.074, viewHeight * 0.046)
+      : Math.min(viewWidth * 0.041, viewHeight * 0.057);
+    var fontSize = clampNumber(baseSize, 15, 62);
+    var charCount = Math.max(1, line.text.length);
+    if (charCount > 22) {
+      fontSize = clampNumber(fontSize * Math.max(0.55, 22 / charCount), 10, 62);
+    }
+    var spacing = fontSize * 0.1;
+    var fontSpec = function (size) { return '300 ' + size.toFixed(1) + 'px ' + LYRIC_FONT; };
+    context.font = fontSpec(fontSize);
+    var rows = layoutTextRun(context, line.text, spacing, maxWidth);
+    if (rows.length > 2) {
+      fontSize = clampNumber(fontSize * 0.76, 10, 62);
+      spacing = fontSize * 0.1;
+      context.font = fontSpec(fontSize);
+      rows = layoutTextRun(context, line.text, spacing, maxWidth);
+    }
+    if (rows.length > 4) {
+      fontSize = clampNumber(fontSize * 0.8, 9, 62);
+      spacing = fontSize * 0.1;
+      context.font = fontSpec(fontSize);
+      rows = layoutTextRun(context, line.text, spacing, maxWidth);
+    }
+    var order = 0;
+    var rowIndex = 0;
+    while (rowIndex < rows.length) {
+      var row = rows[rowIndex];
+      var charIndex = 0;
+      while (charIndex < row.length) {
+        row[charIndex].order = order;
+        order += 1;
+        charIndex += 1;
+      }
+      rowIndex += 1;
+    }
+    return { rows: rows, fontSize: fontSize, spacing: spacing, fontSpec: fontSpec(fontSize), lineHeight: fontSize * 1.42 };
+  }
+
+  function drawEmptyState(context) {
+    var centerX = viewWidth / 2;
+    var ruleY = viewHeight * (layout.compact ? 0.7 : 0.735);
+    var ruleWidth = Math.min(110, viewWidth * 0.16);
+    var pulse = stageState.reduced ? 0.5 : 0.42 + Math.sin(motion.time * 0.7) * 0.06;
+    var accentLine = mixColor([228, 224, 212], accentTint, 0.22);
+    context.save();
+    context.globalCompositeOperation = 'source-over';
+    context.strokeStyle = colorString(accentLine, pulse * 0.55);
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(centerX - ruleWidth / 2, ruleY);
+    context.lineTo(centerX + ruleWidth / 2, ruleY);
+    context.stroke();
+    var textSize = clampNumber(Math.min(viewWidth * 0.019, 20), 12, 22);
+    context.font = '300 ' + textSize.toFixed(1) + 'px ' + LYRIC_FONT;
+    context.fillStyle = colorString(accentLine, pulse);
+    context.textAlign = 'center';
+    context.textBaseline = 'top';
+    context.fillText('纯器乐 · 无词', centerX, ruleY + textSize * 1.1);
+    context.restore();
+  }
+
+  function drawLineRow(context, style, row, rowWidthValue, baselineY, alpha, revealTimes, time, riseAmount) {
+    var startX = viewWidth / 2 - rowWidthValue / 2;
+    var index = 0;
+    while (index < row.length) {
+      var glyph = row[index];
+      var litTime = revealTimes ? revealTimes[glyph.order] : 0;
+      var progress = revealTimes ? clampNumber((time - litTime) / 0.3, 0, 1) : 1;
+      var glyphAlpha = alpha * (0.15 + 0.85 * progress);
+      if (glyphAlpha > 0.012) {
+        var rise = (1 - progress) * riseAmount;
+        context.fillStyle = colorString(style.color, glyphAlpha);
+        context.fillText(glyph.c, startX + glyph.x, baselineY + rise);
+      }
+      index += 1;
+    }
+  }
+
+  var scrimCache = { key: '', gradient: null };
+
+  function drawLyricScrim(context, baseY, fontSize) {
+    var top = baseY - fontSize * 2.1;
+    var bottom = baseY + fontSize * 1.4;
+    var key = Math.round(top) + '|' + Math.round(bottom);
+    if (scrimCache.key !== key || !scrimCache.gradient) {
+      var gradient = context.createLinearGradient(0, top, 0, bottom);
+      addStopSafely(gradient, 0, colorString([4, 6, 9], 0));
+      addStopSafely(gradient, 0.42, colorString([4, 6, 9], 0.26));
+      addStopSafely(gradient, 0.72, colorString([4, 6, 9], 0.3));
+      addStopSafely(gradient, 1, colorString([4, 6, 9], 0));
+      scrimCache.key = key;
+      scrimCache.gradient = gradient;
+    }
+    context.fillStyle = scrimCache.gradient;
+    context.fillRect(0, top, viewWidth, bottom - top);
+  }
+
+  function drawLyrics(context) {
+    stageState.idx = findIndex(stageState.time);
+    if (!stageState.lines.length) {
+      stageState.text = '';
+      drawEmptyState(context);
+      return;
+    }
+    var current = stageState.idx >= 0 ? stageState.lines[stageState.idx] : null;
+    if (!current) {
+      stageState.text = '';
+      return;
+    }
+    stageState.text = current.text;
+    var time = stageState.time;
+    var baseY = viewHeight * (layout.compact ? 0.735 : 0.775);
+
+    var cacheKey = stageState.idx + '|' + Math.round(viewWidth) + 'x' + Math.round(viewHeight) + '|' + current.text;
+    if (lyricCache.key !== cacheKey) {
+      lyricCache.key = cacheKey;
+      lyricCache.layout = buildLyricLayout(context, current);
+      lyricCache.layout.color = mixColor([240, 234, 220], accentTint, 0.1);
+      lyricCache.times = ensureCharTimes(current);
+      lyricCache.line = current;
+    }
+    var cache = lyricCache.layout;
+    var times = lyricCache.times;
+    var lastTime = times.length ? times[times.length - 1] : current.t;
+    var lineEnd = Math.max(current.t + current.dur, lastTime + 0.9);
+    var fadeIn = clampNumber((time - current.t + 0.42) / 0.42, 0, 1);
+    var fadeOut = clampNumber((lineEnd + 0.5 - time) / 0.5, 0, 1);
+    var lineAlpha = Math.min(fadeIn, fadeOut);
+    if (lineAlpha <= 0.01) { return; }
+    if (!cache.rows.length) { return; }
+
+    context.save();
+    context.textAlign = 'left';
+    context.textBaseline = 'alphabetic';
+    context.font = cache.fontSpec;
+    context.shadowColor = 'rgba(2, 3, 5, 0.55)';
+    context.shadowBlur = 0;
+    context.shadowOffsetY = 2;
+
+    var rows = cache.rows;
+    var blockHeight = (rows.length - 1) * cache.lineHeight;
+    var firstY = baseY - blockHeight / 2;
+    drawLyricScrim(context, firstY, cache.fontSize);
+
+    var rowIndex = 0;
+    while (rowIndex < rows.length) {
+      var row = rows[rowIndex];
+      drawLineRow(context, cache, row, rowWidth(row), firstY + rowIndex * cache.lineHeight,
+        lineAlpha, times, time, cache.fontSize * 0.16);
+      rowIndex += 1;
+    }
+
+    /* 上一句的残影：换行像潮水退去，而不是幻灯片切换 */
+    var previous = stageState.idx > 0 ? stageState.lines[stageState.idx - 1] : null;
+    var freshness = clampNumber((time - current.t) / 2.4, 0, 1);
+    if (previous && freshness < 1) {
+      var ghostAlpha = (1 - freshness) * 0.2;
+      var ghostSize = clampNumber(cache.fontSize * 0.62, 10, 38);
+      context.font = '300 ' + ghostSize.toFixed(1) + 'px ' + LYRIC_FONT;
+      context.textAlign = 'center';
+      context.fillStyle = colorString(cache.color, ghostAlpha);
+      context.fillText(previous.text, viewWidth / 2, firstY - cache.fontSize * 1.2, viewWidth * 0.88);
+      context.textAlign = 'left';
+    }
+
+    context.restore();
+  }
+
+  function drawFrame() {
+    var startedAt = nowMs();
+    var delta = motion.lastAt < 0 ? 0.016 : Math.min(0.06, Math.max(0.001, (startedAt - motion.lastAt) / 1000));
+    motion.lastAt = startedAt;
+    motion.time += delta * (stageState.playing ? 1 : 0.16);
+
+    updateAtmosphere(delta);
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#06070a';
+    ctx.fillRect(0, 0, viewWidth, viewHeight);
+
+    stepSkyBake(2.4);
+    stepSeaBake(2.4);
+
+    drawSky(ctx);
+    drawBloom(ctx);
+    if (!drawSeaSurface(ctx)) {
+      ctx.fillStyle = '#0a0d11';
+      ctx.fillRect(0, layout.horizonY, viewWidth, viewHeight - layout.horizonY);
+    }
+    drawHaze(ctx);
+    drawSwellBands(ctx, motion.time);
+    drawBreakingWave(ctx, motion.time);
+    drawSpray(ctx, delta);
+    drawTree(ctx, motion.time);
+    drawFlash(ctx);
+    drawRain(ctx, delta);
+    drawVignette(ctx);
+    drawLyrics(ctx);
+  }
+
+  function tickFrame() {
+    var startedAt = nowMs();
+    try {
+      drawFrame();
+    } catch (error) {
+      reportError('drawFrame', error);
+    }
+    stageState.frames += 1;
+    stageState.js = nowMs() - startedAt;
+    if (stageState.err && nowMs() - lastErrorAt > 2500) { stageState.err = ''; }
+    window.requestAnimationFrame(tickFrame);
+  }
+
+  function sendReady() {
+    if (stageState.readySent) { return; }
+    stageState.readySent = true;
+    try {
+      parent.postMessage({ __c100: 1, type: 'ready' }, '*');
+    } catch (error) {
+      reportError('ready', error);
+    }
+  }
+
+  window.addEventListener('message', function (event) {
+    var data = event && event.data;
+    if (!data || data.__c100 !== 1) { return; }
+    try {
+      if (data.type === 'init') {
+        applyInit(data.payload);
+      } else if (data.type === 'tick') {
+        var tickPayload = data.payload || {};
+        if (typeof tickPayload.time === 'number' && isFinite(tickPayload.time)) {
+          stageState.time = tickPayload.time;
+        }
+        if (tickPayload.playing !== undefined) { stageState.playing = !!tickPayload.playing; }
+      } else if (data.type === 'beat') {
+        var beatPayload = data.payload || {};
+        var beatLevel = clampNumber(beatPayload.level, 0, 1);
+        audioTarget.level = Math.max(audioTarget.level, beatLevel);
+        audioTarget.bass = Math.max(audioTarget.bass, beatLevel);
+        audioState.beatAge = 0;
+      } else if (data.type === 'live') {
+        var livePayload = data.payload || {};
+        audioTarget.bpm = safeNumber(livePayload.bpm, audioTarget.bpm);
+        audioTarget.level = clampNumber(livePayload.level, 0, 1);
+        audioTarget.bass = clampNumber(livePayload.bass, 0, 1);
+        audioTarget.mid = clampNumber(livePayload.mid, 0, 1);
+        audioTarget.treble = clampNumber(livePayload.treble, 0, 1);
+        if (livePayload.playing === false) { audioTarget.level *= 0.35; }
+      }
+    } catch (error) {
+      reportError('message:' + data.type, error);
+    }
+  }, false);
+
+  window.addEventListener('resize', function () {
+    try {
+      resize();
+    } catch (error) {
+      reportError('resize', error);
+    }
+  }, false);
+
+  if (reducedQuery && reducedQuery.addEventListener) {
+    reducedQuery.addEventListener('change', function (event) {
+      stageState.reduced = !!event.matches;
+    });
+  } else if (reducedQuery && reducedQuery.addListener) {
+    reducedQuery.addListener(function (event) {
+      stageState.reduced = !!event.matches;
+    });
+  }
+
+  try {
+    resize();
+  } catch (error) {
+    reportError('resize-init', error);
+  }
+
+  window.addEventListener('error', function (event) {
+    var detail = event && event.error ? event.error : new Error(String(event && event.message));
+    reportError('window', detail);
+  });
+
+  window.requestAnimationFrame(function () {
+    sendReady();
+    tickFrame();
+  });
+  setTimeout(sendReady, 1200);
+})();
+</script>
+</body>
+</html>

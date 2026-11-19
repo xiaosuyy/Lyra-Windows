@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>沙漏</title>
+<!--
+  机制：十万颗沙粒在一只看不见玻璃的沙漏里走 —— 上斗的沙面随时间真的往下掉，孔口的沙线落下去，在
+        下斗堆成一座越来越高的沙锥；拍点一到整只沙漏"翻"过来（y 乘 cos(翻转角)，沙线反向、上下镜像），
+        翻转的半程沙柱在腰线上收成一条亮线。字在画面左侧的纯黑留白里，被沙漏的暖光从右边擦亮。
+  用了：WebGL2 实例化（drawArraysInstanced，10 万沙粒 = 10 万实例，每帧 CPU 只发 12 个 uniform）；
+        沙的下落 / 落点 / 沙锥 / 上斗沙面 / 堵孔 / 爆开全部在顶点着色器里解析算出，CPU 每帧不碰粒子。
+        无 getImageData：字是真 DOM 文字，进场像沙粒落地一样"落定"。
+  最像的三个：004 沙粒歌词（字形采样成沙） / 121 沙漏（沙漏造型的粒子） / 092 沙丘风蚀
+  差在哪：那些是"字变成沙"或"沙摆成沙漏的形"；这里沙漏有自己的一套物理（沙面随时间下降、孔口收束、
+        自由落体、落点堆锥、拍点翻转重力），字根本不在沙道上，是被这只沙漏照亮的一块留白。
+-->
+<style>
+  html,body{margin:0;height:100%;background:#070504;overflow:hidden}
+  body{font-family:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;
+       color:#fff3e2}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;z-index:1}
+  #type{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:2;--lit:.25}
+  .slot{position:absolute;left:27%;top:46%;width:max-content;max-width:46vw;
+        transform:translate(-50%,-50%);text-align:left;opacity:0;filter:blur(6px);z-index:2;isolation:isolate}
+  .slot::before{content:'';position:absolute;inset:-60% -14%;z-index:-1;pointer-events:none;
+        background:radial-gradient(52% 42% at 50% 50%,rgba(7,5,4,.86) 0%,rgba(7,5,4,.42) 52%,rgba(7,5,4,0) 78%)}
+  .slot .in{display:block;font-weight:900;font-size:clamp(32px,6.0vh,84px);line-height:1.30;
+        letter-spacing:.09em;color:#fff8ee;text-wrap:balance;white-space:pre-wrap;
+        text-shadow:0 0 40px rgba(0,0,0,.92),0 3px 18px rgba(0,0,0,.9),0 1px 2px rgba(0,0,0,.9),
+                    1px 0 0 rgba(255,196,132,calc(var(--lit) * .55)),
+                    14px 3px 26px rgba(255,150,58,calc(var(--lit) * .42)),
+                    26px 6px 64px rgba(255,120,30,calc(var(--lit) * .22))}
+  .slot .in span{display:inline-block}
+  #vig{position:fixed;inset:0;pointer-events:none;z-index:3;
+       background:radial-gradient(120% 94% at 50% 50%,rgba(0,0,0,0) 34%,rgba(0,0,0,.66) 100%)}
+  #hint{position:fixed;left:50%;bottom:15px;transform:translateX(-50%);pointer-events:none;z-index:4;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(255,198,136,.36);transition:opacity .8s;white-space:nowrap}
+  html.fb #c{display:none}
+  html.fb body{background:radial-gradient(120% 92% at 50% 50%,#271809 0%,#110b07 56%,#060404 100%)}
+  html.fb #type{z-index:1}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="type"></div>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ══════════════════════════════════════════════════════════════════════
+   A 车道内核（单文件内联，每个形态自带一份）
+   协议 / 时钟 / 两句槽位（前奏·进场·余韵）/ 暂停冻结 / resize / RM / 降级
+   形态只提供：片元与顶点着色器、配色、以及 stage 钩子
+   ══════════════════════════════════════════════════════════════════════ */
+const cv = document.getElementById('c');
+const typeBox = document.getElementById('type');
+const hint = document.getElementById('hint');
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+
+const N = 100000;                 /* 10 万颗粒子，全部住在 GPU 上 */
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, beatN = 0, bass = 0, treb = 0, beatAt = -9;
+let frames = 0, jsMs = 0, errMsg = '';
+let readySent = false, hintOn = true;
+let inAmt = 0, preAmt = 0, act = 0, pol = 0, sweep = 1, camZ = 1, camY = 0;
+let cur = null, ghost = null, ghostAt = 0, slotFlip = 0, ghostStartV = 0;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+const ease3 = (x) => 1 - Math.pow(1 - x, 3);
+
+/* prefers-reduced-motion：随时切换都要跟得上 */
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const onMQ = (e) => { RM = !!e.matches; skipToEnd(); };
+    if (mq.addEventListener) mq.addEventListener('change', onMQ);
+    else if (mq.addListener) mq.addListener(onMQ);
+  }
+} catch (_) {}
+function skipToEnd() { if (cur && cur.chars) for (const c of cur.chars) { c.style.opacity = '1'; c.style.transform = 'none'; } }
+
+/* ---------------- 文字槽位：两句交替，旧句留残影 ---------------- */
+function mkSlot() {
+  const el = document.createElement('div'); el.className = 'slot';
+  const inner = document.createElement('div'); inner.className = 'in';
+  el.appendChild(inner); typeBox.appendChild(el);
+  return { el, inner, chars: [], cx: [], t0: 0, voice: 0, dir: 1, noanim: false, text: '' };
+}
+const slots = [mkSlot(), mkSlot()];
+
+function fillSlot(slot, text) {
+  slot.inner.textContent = '';
+  slot.chars = [];
+  slot.cx = [];
+  const arr = Array.from(text);
+  for (let i = 0; i < arr.length; i++) {
+    const sp = document.createElement('span');
+    sp.textContent = arr[i];
+    sp.style.opacity = '0';
+    slot.inner.appendChild(sp);
+    slot.chars.push(sp);
+  }
+  slot.text = text;
+  /* 每个字在画面里的 x（NDC）：沙漏的光扫到哪儿，字哪儿才亮 */
+  for (const sp of slot.chars) {
+    const r = sp.getBoundingClientRect();
+    slot.cx.push((r.left + r.width / 2) / W * 2 - 1);
+  }
+}
+
+function showLine(ci, instant) {
+  const s = slots[slotFlip]; slotFlip ^= 1;
+  if (cur && cur !== s) { ghost = cur; ghostAt = now(); ghostStartV = vT; }
+  cur = s; ghost === s && (ghost = null);
+  s.el.style.transform = 'translate(-50%,-50%)';
+  fillSlot(s, (lines[ci] || {}).text || '');
+  s.noanim = true;
+  s.t0 = instant ? now() - 2 : lines[ci].t;
+  s.voice = ci % 3;
+  s.dir = (ci % 2) ? 1 : -1;
+  s.amb = ci % 2;
+  s.el.style.zIndex = '3';
+  if (ghost) ghost.el.style.zIndex = '2';
+  s.el.style.opacity = '1';
+  s.el.style.filter = 'none';
+  for (const c of s.chars) { c.style.opacity = instant ? '1' : '0'; c.style.transform = instant ? 'none' : ''; }
+  hintOn = false; hint.style.opacity = '0';
+}
+
+function hideAll() {
+  cur = null; ghost = null;
+  for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; }
+  hintOn = true; hint.style.opacity = '0.9';
+}
+
+/* ---------------- 时钟：空歌词 / seek / 句首 ---------------- */
+function timing(T) {
+  if (!lines.length) { if (idx !== -1) { idx = -1; hideAll(); } lastT = T; return; }
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) {
+    const jump = (lastT > -1e8 && (Math.abs(T - lastT) > 0.9 || ci > idx + 1 || ci < idx));
+    idx = ci;
+    if (ci < 0) { hideAll(); }
+    else showLine(ci, jump);
+  }
+  lastT = T;
+}
+
+/* ---------------- 每帧：uniform 状态 ---------------- */
+let flipA = 0, flipFrom = 0, flipAt = -1e9, lastTgt = -1, plugNow = 0;
+function state(T) {
+  const tn = performance.now();
+  if (idx >= 0 && lines[idx]) {
+    const lt = lines[idx].t;
+    inAmt = clamp01((T - lt) / 1.10);
+    const nx = lines[idx + 1];
+    preAmt = nx ? clamp01(1 - (nx.t - T) / 0.30) : 0;
+  } else { inAmt = 0; preAmt = 0; }
+  act = (vT > 8.6 && vT < 12.4) ? 1 : 0;
+  pol = beatN % 2;
+  sweep = idx >= 0 ? clamp01((inAmt * 1.10 - 0.02) / 0.95) : 0;
+  /* ── 三段镜头循环（15s 一轮）：全景 → 推近到下斗的沙锥 → 拉远成一只立着的小沙漏
+        （机位自己换，沙漏的机制不变：同一件事在三种取景下看） ── */
+  const sstep = (a, b, x) => { const u = clamp01((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+  const cc = vT % 15.0;
+  const camIn = sstep(4.4, 5.6, cc) * (1 - sstep(9.6, 10.8, cc));
+  const camOut = sstep(10.0, 11.2, cc) * (1 - sstep(13.6, 14.8, cc));
+  camZ = 1.0 + 0.55 * camIn - 0.22 * camOut;
+  camY = -0.34 * camIn + 0.12 * camOut;
+  /* ── 拍点换重力；uAct 窗口里每 1.7s 再自己翻一次（堵→爆→翻） ── */
+  const actFlip = act ? (Math.floor((vT - 8.6) / 1.7) % 2) : 0;
+  const tgt = (pol ^ actFlip) & 1;
+  if (tgt !== lastTgt) { lastTgt = tgt; flipFrom = flipA; flipAt = tn; }
+  const fp = RM ? 1 : clamp01((tn - flipAt) / 430);
+  flipA = flipFrom + (tgt * Math.PI - flipFrom) * (1 - Math.pow(1 - fp, 3));
+  /* ── 堵孔 / 爆开 ── */
+  const cyc = (vT / 1.7) % 1;
+  plugNow = (RM || !act) ? 0 : clamp01(Math.min((cyc - 0.04) / 0.09, (0.44 - cyc) / 0.09));
+  /* 文字：沙漏的光从右边擦过来；前奏先把字压暗一点，余韵留热 */
+  typeBox.style.setProperty('--lit', (0.16 + 0.84 * Math.max(beatPulse, preAmt * 0.5, inAmt * 0.55, plugNow)).toFixed(3));
+}
+
+/* ---------------- 文字：像沙粒落地一样"落定" ---------------- */
+function updDom(T) {
+  if (cur) {
+    const stg = 0.036, dur = 0.52;
+    for (let i = 0; i < cur.chars.length; i++) {
+      const p = cur.noanim ? 1 : clamp01((T - (cur.t0 + i * stg)) / dur);
+      /* easeOutBack：字是从上面掉下来的，落地时回弹一下（像沙粒落定） */
+      const e = 1 + 2.15 * Math.pow(p - 1, 3) + 1.15 * Math.pow(p - 1, 2);
+      const c = cur.chars[i];
+      const vis = RM ? 1 : clamp01((inAmt * 1.55 + 0.10 - i * 0.016) / 0.28);
+      c.style.transform = 'translateY(' + ((1 - e) * 30).toFixed(2) + 'px) scale(' + (0.96 + 0.04 * e).toFixed(3) + ')';
+      c.style.opacity = (clamp01(p * 1.2) * vis).toFixed(3);
+    }
+    cur.el.style.filter = 'blur(' + ((1 - clamp01((T - cur.t0) / 0.30)) * 5.0).toFixed(2) + 'px)';
+    /* 前景层 2.5×：整句跟着沙漏的呼吸轻轻漂，拍上被顶一下 */
+    const px = (sweep * 2 - 1) * 9 + beatPulse * 3;
+    const py = -beatPulse * 5;
+    cur.el.style.transform = 'translate(-50%,-50%) translate(' + px.toFixed(2) + 'px,' + py.toFixed(2) + 'px)';
+  }
+  if (ghost) {
+    const q = clamp01((T - ghostAt) / 0.80);
+    if (q >= 1) { ghost.el.style.opacity = '0'; ghost = null; }
+    else {
+      ghost.el.style.opacity = (0.28 * (1 - q) * (1 - q)).toFixed(3);
+      ghost.el.style.filter = 'blur(' + (q * 12).toFixed(2) + 'px)';
+      ghost.el.style.transform = 'translate(-50%,-50%) translateY(' + (20 - q * 26).toFixed(2) + 'px) scale(' + (1 + q * 0.04).toFixed(3) + ')';
+    }
+  }
+}
+
+/* ══════════════════════════════ GPU ══════════════════════════════ */
+const GL_OPT = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false };
+let gl = null, P = null, U = {}, bgP = null, bgU = {}, pVao = null, bgVao = null, glOk = false;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'shader');
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link');
+  return p;
+}
+function locs(p, names) { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; }
+
+/* —— 背景：暗场 + 玻璃的两道口沿高光 + 颈口收束 + 极弱的色散晕 —— */
+const BG_VS = `#version 300 es
+in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform float uT, uFlip, uAct, uPre; uniform vec2 uRes;
+const float DX = 0.300;                       /* 沙漏的轴往右挪 */
+float tiltNow(float t){ return -0.100 + 0.028*sin(t*0.09); }
+float glassW(float y){ float t = clamp(abs(y)/0.780, 0.0, 1.0); return 0.035 + 0.300*pow(t, 1.30); }
+void main(){
+  vec2 p = vUV;
+  float asp = uRes.x / uRes.y;
+  vec2 q = (p - 0.5) * vec2(asp, 1.0);
+  float cf = cos(uFlip);
+  /* 转到沙漏的轴坐标 */
+  vec2 u0 = q - vec2(DX * asp * 0.5, 0.0);
+  float tl = tiltNow(uT), ct = cos(tl), st = sin(tl);
+  vec2 v = vec2(u0.x*ct + u0.y*st, -u0.x*st + u0.y*ct);
+  float hy = v.y * 2.0;
+  float hx = v.x * 2.0 / asp;
+  float hyE = hy * cf;                         /* 口沿跟着翻转走 */
+
+  vec3 c = vec3(0.011, 0.008, 0.006);
+  /* 沙漏背后一团很淡的暖晕（不是线，是光） */
+  float halo = exp(-pow((hy)/0.95, 2.0)) * exp(-pow((hx)/0.62, 2.0));
+  c += vec3(0.115, 0.058, 0.020) * halo * (0.75 + 0.25*sin(uT*0.31));
+  /* 玻璃壁：极淡的一层（有它才像"壳里有东西"） */
+  float g = glassW(hy);
+  float inGlass = 1.0 - smoothstep(0.0, g, abs(hx));
+  c += vec3(0.026, 0.015, 0.007) * inGlass * smoothstep(1.0, 0.35, abs(hy));
+  /* 色散：贴着玻璃边一丝冷色折射（很弱） */
+  float disp = exp(-pow((abs(hx) - g) / 0.028, 2.0));
+  c += vec3(0.012, 0.030, 0.052) * disp * 0.55;
+
+  /* 上口沿：一道细高光（略拱起来，像从下面看玻璃口） */
+  float wTop = glassW(0.780) * 0.96;
+  float rimTop = 0.780 + 0.055 * (1.0 - pow(clamp(hx/wTop, -1.0, 1.0), 2.0));
+  float lTop = exp(-pow((hyE - rimTop) / 0.0055, 2.0)) * smoothstep(wTop, wTop*0.90, abs(hx));
+  /* 下口沿：弱线 */
+  float rimBot = -0.905 - 0.050 * (1.0 - pow(clamp(hx/wTop, -1.0, 1.0), 2.0));
+  float lBot = exp(-pow((hyE - rimBot) / 0.008, 2.0)) * smoothstep(wTop, wTop*0.86, abs(hx));
+  /* 颈部收束：一小段高光 + 挤压的发亮 */
+  float neckW = glassW(0.0);
+  float lNeck = exp(-pow(hyE / 0.030, 2.0)) * exp(-pow(hx / (neckW*1.6), 2.0));
+  lNeck *= 1.0 + 1.4*uPre;                     /* 前奏：颈口先亮，字还没到 */
+  float glassHi = lTop * 1.00 + lBot * 0.40 + lNeck * 0.85;
+  c += vec3(0.62, 0.60, 0.56) * glassHi * (0.55 + 0.45*abs(cf)) * (0.85 + 0.35*uAct);
+  /* 口沿外侧的暖色溢出（沙漏自己在发光） */
+  c += vec3(0.10, 0.048, 0.014) * (exp(-pow((hyE - rimTop - 0.045)/0.10, 2.0))
+                                + exp(-pow((hyE - rimBot + 0.045)/0.12, 2.0)))
+       * inGlass * 0.8;
+  /* 腰上一道横光：孔口漏出来的 */
+  c += vec3(0.150, 0.078, 0.026) * exp(-pow(hyE/0.055, 2.0)) * exp(-pow(hx/0.42, 2.0)) * (0.35 + 0.65*abs(sin(uT*0.50)));
+  /* 翻转半程：整片被抽亮 */
+  c += vec3(0.115, 0.062, 0.024) * pow(1.0 - abs(cf), 8.0);
+  /* 底噪：极慢的横向砂纹 */
+  c += vec3(0.005, 0.004, 0.002) * (0.5 + 0.5*sin(p.x*24.0 + uT*0.12));
+  o = vec4(c, 1.0);
+}`;
+
+/* —— 粒子：一粒一粒的沙（上斗沙面 / 孔口沙线 / 下斗沙锥 / 浮尘） —— */
+const P_VS = `#version 300 es
+precision highp float;
+in vec2 aQ; in vec4 aSeed;
+uniform float uT, uBass, uTre, uBeat, uPre, uIn, uPol, uAct, uFlip, uCamZ, uCamY;
+uniform vec2 uRes;
+uniform vec4 uText;
+out vec2 vQ; out vec3 vCol; out float vA;
+
+const float DX = 0.300;
+float h21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+
+float glassW(float y){ float t = clamp(abs(y)/0.780, 0.0, 1.0); return 0.035 + 0.300*pow(t, 1.30); }
+/* 时间感：上斗沙面往下掉，下斗沙锥往上长（90 秒走完一轮） */
+float drain(float t){ return clamp(t/90.0, 0.0, 1.0); }
+float surfY(float x, float dr){ return (0.700 - 0.320*dr) - 0.115*exp(-pow(x/0.13, 2.0)); }
+float coneY(float x, float dr){
+  float peak = -0.620 + 0.330*dr;
+  float base = -0.905;
+  return base + (peak - base) * exp(-pow(abs(x)/0.235, 1.45));
+}
+float tiltNow(float t){ return -0.100 + 0.028*sin(t*0.09); }
+vec2 rotv(vec2 p, float ang, float asp){
+  vec2 v = vec2(p.x*asp, p.y); float c = cos(ang), s = sin(ang);
+  v = vec2(v.x*c - v.y*s, v.x*s + v.y*c); return vec2(v.x/asp, v.y);
+}
+
+void main(){
+  float asp = uRes.x / uRes.y;
+  float act = step(0.5, uAct);
+  float cf = cos(uFlip);
+  float tl = tiltNow(uT);
+  float dr = drain(uT);
+  vec2 lq; vec3 col; float a = 0.0; float b = 0.0;
+  vec2 lp;
+
+  /* ── 堵孔 / 爆开：uAct 窗口里每 1.7s 一次 ── */
+  float cyc = fract(uT / 1.7);
+  float plug  = act * smoothstep(0.02, 0.11, cyc) * (1.0 - smoothstep(0.38, 0.47, cyc));
+  float burst = act * smoothstep(0.47, 0.53, cyc) * (1.0 - smoothstep(0.58, 0.94, cyc));
+  /* 去相关：Halton 的 x/y 不能直接当角度用，否则会拉出辐条 */
+  float jw = h21(vec2(aSeed.x * 97.13, aSeed.y * 41.70));
+
+  if (aSeed.z > 0.980) {
+    /* ── 前层：空气里的浮尘（2.5× 层，不跟翻转） ── */
+    float dx = fract(aSeed.x + uT*0.011) * 2.0 - 1.0;
+    float dy = (fract(aSeed.y + uT*0.007) * 2.0 - 1.0) * 0.92;
+    float r = 0.0013 + aSeed.w*0.0022;
+    lp = vec2(dx, dy + 0.010*sin(uT*0.9 + aSeed.y*23.0));
+    lq = (aQ - 0.5) * r * 2.0; lq.x /= asp;
+    a = 0.10 + 0.28*aSeed.w + burst*0.20;
+    col = vec3(1.0, 0.72, 0.40);
+    gl_Position = vec4((rotv(lp, tl, asp) + vec2(DX, 0.0))*uCamZ + vec2(0.0, uCamY) + lq*uCamZ, 0.0, 1.0);
+    vA = a; vQ = aQ; vCol = col; return;
+  }
+
+  float lx, ly;
+  if (aSeed.z > 0.700) {
+    /* ── 下斗的沙锥：一层一层堆起来，越靠锥面越亮 ── */
+    lx = (jw*2.0 - 1.0) * 0.42;
+    float top = coneY(lx, dr) + 0.020*vn(vec2(lx*15.0, uT*0.12) + 9.0);
+    ly = top - 0.30*pow(aSeed.y, 2.0);
+    ly = max(ly, -0.900);                         /* 不越过玻璃底 */
+    ly += 0.0026*sin(uT*0.85 + jw*61.0);
+    lx = clamp(lx, -glassW(ly)*0.94, glassW(ly)*0.94);
+    b = 0.55 + 0.55*vn(vec2(lx*26.0, ly*26.0) + uT*0.05);
+    b *= 0.85 + 0.45*exp(-pow(lx/0.20, 2.0)) + 0.30*uBeat;
+    a = 0.52 * (0.55 + 0.55*aSeed.w) * (0.75 + 0.5*vn(vec2(lx*60.0, ly*60.0)));
+    col = mix(vec3(0.95,0.46,0.13), vec3(1.0,0.94,0.80), clamp(b, 0.0, 1.0));
+    col = mix(col, vec3(1.0,0.98,0.94), burst*0.6);
+    float r2 = 0.0011 + aSeed.w*0.0018;
+    lq = (aQ - 0.5) * r2 * 2.0; lq.x /= asp;
+    ly *= cf;
+    col *= 1.0 - 0.10*abs(ly);
+  } else if (aSeed.z > 0.360) {
+    /* ── 上斗的沙：沙面随时间往下掉，中间被抽出一个坑 ── */
+    float sy = surfY(0.0, dr);
+    ly = 0.020 + (sy - 0.020) * pow(aSeed.y, 0.52);
+    float w = glassW(ly) * (0.94 + 0.10*vn(vec2(ly*11.0, 3.1)));   /* 壁面毛一点 */
+    lx = (jw*2.0 - 1.0) * w;
+    float sf = surfY(lx, dr) - 0.022*vn(vec2(lx*17.0, uT*0.15) + 5.0);
+    float over = step(sf, ly);                     /* 露出沙面的不要 */
+    float sink = smoothstep(0.12, 0.0, abs(lx));
+    b = 0.52 + 0.52*vn(vec2(lx*26.0, ly*26.0) + uT*0.04);
+    b *= 0.80 + 0.40*smoothstep(0.0, 0.65, ly);
+    b *= 1.0 + 0.50*uPre + 0.35*uBeat + 0.9*plug;
+    a = 0.50 * (1.0 - over) * (0.55 + 0.55*aSeed.w) * (0.9 + 0.5*sink);
+    a *= 0.75 + 0.55*vn(vec2(lx*70.0, ly*70.0) + uT*0.3);
+    /* 贴着玻璃壁的那一圈：沙在壁上更亮 */
+    float wallT = smoothstep(0.80, 1.02, abs(lx)/max(w, 0.02));
+    a *= 0.72 + 0.55*wallT;
+    b *= 1.0 + 0.65*wallT;
+    col = mix(vec3(0.92,0.44,0.12), vec3(1.0,0.86,0.62), clamp(b*0.95, 0.0, 1.0));
+    col = mix(col, vec3(1.0,0.96,0.90), burst*0.5 + plug*0.25);
+    float r3 = 0.0011 + aSeed.w*0.0018;
+    lq = (aQ - 0.5) * r3 * 2.0; lq.x /= asp;
+    ly *= cf;
+  } else {
+    /* ── 孔口那一股沙线：细、亮、一缕一缕 ── */
+    float spd = 0.140 + 0.070*uBass;
+    spd *= 1.0 + 0.55*burst + 0.30*uBeat;
+    float ph = fract(aSeed.x + uT*spd);
+    lx = (jw*2.0 - 1.0) * (0.006 + 0.020*pow(ph, 1.2));
+    lx += 0.012 * sin(uT*1.4 + ph*9.0 + jw*6.0) * ph;
+    ly = 0.020 - 1.00 * pow(ph, 1.25);
+    float lit = 1.10 - 0.60*ph;
+    float fy = coneY(lx, dr) + 0.005*(aSeed.w - 0.5);
+    ly = max(ly, fy);                                  /* 落到锥面就停 */
+    a = (0.30 + 0.26*aSeed.w) * (0.55 + 0.60*lit);
+    a *= (1.0 - 0.95*plug);
+    a *= 1.0 + 1.1*burst;
+    ly = mix(ly, 0.024 + 0.20*(jw - 0.5), plug * smoothstep(0.62, 0.0, ph));
+    b = lit * (0.60 + 0.40*vn(vec2(jw*90.0, ph*70.0) + uT*0.6));
+    b *= 1.0 + 0.35*burst + 0.90*plug + 0.40*uPre;
+    a *= 0.35 + 1.00*vn(vec2(jw*5.0, ph*2.2 - uT*1.9));   /* 一缕一缕 */
+    float lqx = (aQ.x - 0.5) * 0.0012;
+    float lqy = (aQ.y - 0.5) * (0.005 + 0.008*ph);
+    lq = vec2(lqx, lqy * cf);
+    lx *= 1.0 + burst*1.8;                             /* 爆开：整柱向外炸 */
+    ly *= cf;
+    col = mix(vec3(1.0,0.56,0.18), vec3(1.0,0.90,0.72), clamp(b*0.9, 0.0, 1.0));
+    col = mix(col, vec3(1.0,0.98,0.94), burst*0.6 + plug*0.35);
+  }
+
+  /* 字区：沙漏的光扫到字上（字不在沙道上，但被这只沙漏照着） */
+  lp = vec2(lx, ly);
+  vec2 tq = vec2((lx - uText.x)/max(uText.z, 0.06), (ly - uText.y)/max(uText.w, 0.05));
+  float inText = smoothstep(1.35, 0.55, length(tq));
+  col *= 1.0 + 0.20*inText;
+
+  vA = a * (0.70 + 0.55*clamp(b, 0.0, 1.2));
+  vQ = aQ; vCol = col;
+  gl_Position = vec4((rotv(lp, tl, asp) + vec2(DX, 0.0))*uCamZ + vec2(0.0, uCamY) + lq*uCamZ, 0.0, 1.0);
+}`;
+
+const P_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec3 vCol; in float vA; out vec4 o;
+void main(){
+  vec2 d = vQ - 0.5;
+  float l = length(d);
+  /* 硬边小点：一粒是一粒，中间留黑 */
+  float f = 1.0 - smoothstep(0.26, 0.50, l);
+  o = vec4(vCol * vA * f, 1.0);
+}`;
+
+function initGL() {
+  try { gl = cv.getContext('webgl2', GL_OPT); } catch (_) { gl = null; }
+  if (!gl) { document.documentElement.classList.add('fb'); return false; }
+  P = program(P_VS, P_FS);
+  U = locs(P, ['uT','uBass','uTre','uBeat','uPre','uIn','uPol','uAct','uFlip','uCamZ','uCamY','uRes','uText']);
+  bgP = program(BG_VS, BG_FS);
+  bgU = locs(bgP, ['uT','uFlip','uAct','uPre','uRes']);
+
+  const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  /* 分层抽样（Halton）保证 10 万颗铺得均匀，不结块 */
+  const hal = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+  let sd = 20260243;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  const seeds = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    seeds[i*4] = hal(i + 1, 2); seeds[i*4+1] = hal(i + 1, 3);
+    seeds[i*4+2] = rnd(); seeds[i*4+3] = rnd();
+  }
+  const sb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+
+  pVao = gl.createVertexArray(); gl.bindVertexArray(pVao);
+  const aQ = gl.getAttribLocation(P, 'aQ'), aS = gl.getAttribLocation(P, 'aSeed');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(aQ); gl.vertexAttribPointer(aQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(aS, 1);
+
+  bgVao = gl.createVertexArray(); gl.bindVertexArray(bgVao);
+  const bQ = gl.getAttribLocation(bgP, 'aQ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(bQ); gl.vertexAttribPointer(bQ, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(null);
+  gl.clearColor(0.012, 0.008, 0.006, 1);
+  gl.disable(gl.DEPTH_TEST);
+  glOk = true;
+  return true;
+}
+
+let uTextV = [0, 0, 0.3, 0.1];
+function draw() {
+  if (!glOk) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.BLEND);
+  gl.useProgram(bgP); gl.bindVertexArray(bgVao);
+  gl.uniform1f(bgU.uT, vT); gl.uniform1f(bgU.uFlip, flipA); gl.uniform1f(bgU.uAct, act); gl.uniform1f(bgU.uPre, preAmt);
+  gl.uniform2f(bgU.uRes, W, H);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.useProgram(P); gl.bindVertexArray(pVao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniform1f(U.uT, vT); gl.uniform1f(U.uBass, bass); gl.uniform1f(U.uTre, treb);
+  gl.uniform1f(U.uBeat, beatPulse); gl.uniform1f(U.uPre, preAmt); gl.uniform1f(U.uIn, inAmt);
+  gl.uniform1f(U.uPol, pol); gl.uniform1f(U.uAct, act); gl.uniform1f(U.uFlip, flipA);
+  gl.uniform1f(U.uCamZ, camZ); gl.uniform1f(U.uCamY, camY);
+  gl.uniform2f(U.uRes, W, H); gl.uniform4f(U.uText, uTextV[0], uTextV[1], uTextV[2], uTextV[3]);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+  gl.bindVertexArray(null);
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  if (glOk) { gl.viewport(0, 0, cv.width, cv.height); }
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+function textRect() {
+  if (!cur || !cur.chars.length) return [0, 0, 0.34, 0.09];
+  const r = cur.el.getBoundingClientRect();
+  return [ (r.left + r.width/2) / W * 2 - 1, 1 - (r.top + r.height/2) / H * 2,
+           Math.max(0.02, r.width / W), Math.max(0.02, r.height / H) ];
+}
+
+/* ══════════════════════════════ 主循环 ══════════════════════════════ */
+let last = performance.now(), raf = 0, dirty = true;
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  /* 视觉时钟 = 歌词时钟（seek 时画面与字一起重建；暂停时一起冻住） */
+  vT = RM ? T * 0.24 : T;
+  if (playing) {
+    beatPulse *= Math.exp(-dt * 3.6);
+    bass *= Math.exp(-dt * 0.08);
+    treb *= Math.exp(-dt * 0.10);
+  }
+  try { timing(T); } catch (e) { errMsg = 'timing: ' + (e && e.message ? e.message : e); }
+  state(T);
+  if (!RM && cur) uTextV = textRect();
+  try {
+    if (playing || dirty) { draw(); updDom(T); dirty = false; }
+  } catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ---------------- 协议 ---------------- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9;
+    cur = null; ghost = null;
+    for (const s of slots) { s.el.style.opacity = '0'; s.chars = []; s.el.style.transform = 'translate(-50%,-50%)'; }
+    vT = 0; beatPulse = 0; bass = 0; treb = 0; beatN = 0; beatAt = -9;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    inAmt = 0; preAmt = 0;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now();
+    playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5);
+    beatN++; dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, clamp01(l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, clamp01(l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+/* ---------------- 自查 ---------------- */
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx]) ? lines[idx].text : '',
+  gl: glOk, rm: RM, vT: +vT.toFixed(2)
+});
+
+/* ---------------- 启动 ---------------- */
+resize();
+try { initGL(); } catch (e) { errMsg = 'gl: ' + (e && e.message ? e.message : e); document.documentElement.classList.add('fb'); }
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

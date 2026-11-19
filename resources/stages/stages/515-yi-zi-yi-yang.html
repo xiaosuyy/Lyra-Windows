@@ -1,0 +1,1169 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>515 · 一字一羊</title>
+<style>
+  :root { --ac: 150, 165, 255; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #070b19; overflow: hidden; }
+  body { user-select: none; -webkit-user-select: none; cursor: default; }
+  #cv {
+    position: fixed; left: 0; top: 0; width: 100%; height: 100%; display: block;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: -webkit-crisp-edges;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+  /* 歌词层：只在当前句上工作，每格两层（淡影 + 实字） */
+  #lyr {
+    position: fixed; left: 5vw; right: 5vw; top: 20%;
+    display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-end;
+    pointer-events: none;
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    font-weight: 600; line-height: 1.12; letter-spacing: .02em;
+    color: #fff6e9;
+    opacity: 0; transition: opacity .3s ease;
+  }
+  #lyr.on { opacity: 1; }
+  #lyr .c { position: relative; display: inline-block; white-space: pre; padding: 0 .01em; }
+  #lyr .c i { font-style: normal; display: inline-block; }
+  #lyr .g { opacity: .19; color: #c6d4f2; transition: opacity .38s ease; }
+  #lyr .k {
+    position: absolute; left: 0; top: 0; opacity: 0; color: #fff8ec;
+    text-shadow: 0 0 20px rgba(var(--ac), .55), 0 0 7px rgba(var(--ac), .28), 0 2px 10px rgba(0, 0, 0, .6);
+  }
+  #lyr .c.on .g { opacity: 0; }
+  #lyr .c.on .k { opacity: 1; }
+  /* 字还在飞的时候，先别抽掉底下的淡影，落位了再收 */
+  #lyr .c.flying .g { opacity: .16; }
+
+  /* 空位模式：未唱的字只留一个点 */
+  #lyr.mode-slot .g { opacity: 0; }
+  #lyr.mode-slot .c::after {
+    content: ""; position: absolute; left: 50%; bottom: .16em;
+    width: .15em; height: .15em; margin-left: -.075em;
+    background: #c9d6f5; opacity: .26; border-radius: 50%;
+  }
+  #lyr.mode-slot .c.on::after { opacity: 0; }
+
+  #empty {
+    position: fixed; left: 0; right: 0; top: 31%; text-align: center; text-shadow: 0 2px 14px rgba(0,0,0,.7);
+    color: #93a6c8; font: 600 clamp(13px, 1.35vw, 19px)/1.7 "PingFang SC", "Microsoft YaHei", sans-serif;
+    letter-spacing: .2em; opacity: 0; transition: opacity .6s ease; pointer-events: none;
+  }
+  #empty.on { opacity: .5; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="lyr"></div>
+<div id="empty">这首歌没有歌词 · 一起数羊吧</div>
+<script>
+(function () {
+  'use strict';
+
+  /* ==================================================================
+     0. 自检口 —— 最外层、无条件、直接从状态现算
+     ================================================================== */
+  var RM = false;
+  try { RM = !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { }
+
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: '' };
+
+  window.__stage = function () {
+    var i = S.idx, L = (i >= 0 && S.lines[i]) ? S.lines[i] : null;
+    return {
+      lines: S.lines.length,
+      idx: i,
+      t: S.t,
+      playing: S.playing,
+      frames: S.frames,
+      js: Math.round(S.js * 100) / 100,
+      err: S.err,
+      text: L ? String(L.text || '') : '',
+      gl: false,
+      rm: RM
+    };
+  };
+
+  /* ==================================================================
+     1. 形态设置：只暴露「未唱的字」这一个
+     ================================================================== */
+  var P = { unsung: 'ghost' };
+  window.__stagePanel = {
+    title: '一字一羊',
+    hint: '只影响还没唱到的字，改完自动记住。',
+    items: [
+      {
+        key: 'unsung', label: '未唱的字', type: 'segment', def: 'ghost',
+        options: [{ v: 'ghost', t: '暗影' }, { v: 'slot', t: '空位' }]
+      }
+    ]
+  };
+
+  /* ==================================================================
+     2. ready —— 第一个 rAF 无条件发，只发一次
+     ================================================================== */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (e) { }
+  }
+  requestAnimationFrame(sendReady);
+  setTimeout(sendReady, 800);
+
+  var lastLog = 0;
+  function fail(e) {
+    S.err = String((e && e.message) || e);
+    var n = performance.now();
+    if (n - lastLog > 1000) { lastLog = n; try { console.error(e); } catch (_) { } }
+  }
+
+  /* ==================================================================
+     3. 画布与场景尺寸
+     ================================================================== */
+  var cv = document.getElementById('cv');
+  var ctx = cv.getContext('2d', { alpha: false });
+  var lyr = document.getElementById('lyr');
+  var emptyEl = document.getElementById('empty');
+
+  var W = 420, H = 236;
+  var SX = 3.8, SY = 3.8;      // 1 逻辑像素 = SX 个 CSS 像素
+  var GY = 165;                // 地平线
+  var fenceX = 126, railW = 67;
+  var bg = null;
+
+  var T_JUMP = 0.54, T_CROUCH = 0.13;
+  var PREROLL = 2.70;
+  var RUN_SPEED = 78, EXIT_SPEED = 96;
+
+  function rnd(i) { var x = Math.sin(i * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }
+
+  ctx.imageSmoothingEnabled = false;
+
+  var moonX = 0, moonY = 0;
+
+  function resize() {
+    var cw = window.innerWidth || 1440;
+    var ch = window.innerHeight || 900;
+    if (!isFinite(cw) || cw <= 0) cw = 1440;
+    if (!isFinite(ch) || ch <= 0) ch = 900;
+    var px = Math.min(cw / 420, ch / 236);
+    px = Math.max(1.8, Math.min(6, px));
+    W = Math.max(200, Math.round(cw / px));
+    H = Math.max(150, Math.round(ch / px));
+    SX = cw / W; SY = ch / H;
+    cv.width = W; cv.height = H;
+    ctx.imageSmoothingEnabled = false;
+    GY = Math.round(H * 0.70);
+    fenceX = Math.round(W * 0.30);
+    railW = Math.max(36, Math.round(W * 0.16));
+    moonX = W - 46;
+    moonY = Math.round(H * 0.08);
+    bakeBG();
+    layoutText();
+    // 尺寸一变，正在飞的字的位移就失效了：直接收掉，别让它停在半空
+    if (cellEls) {
+      for (var ci = 0; ci < cellEls.length; ci++) {
+        try {
+          var ans = cellEls[ci].k.getAnimations ? cellEls[ci].k.getAnimations() : [];
+          for (var aj = 0; aj < ans.length; aj++) ans[aj].cancel();
+        } catch (e) { }
+        cellEls[ci].c.classList.remove('flying');
+      }
+    }
+  }
+
+  /* ==================================================================
+     4. 像素羊：帧矩阵 + 毛色 + 预渲染
+     ================================================================== */
+  var SHEEP_FRAMES = {
+    runA: [
+      ".......ooooo............",
+      ".....ooLLLLLoo..........",
+      "...ooLLLLLLLLLo...oo....",
+      "..oLLWWWWWWWWSSo.oEEo...",
+      ".oLLWWWWWWWWWWSSooEEEo..",
+      ".oLLWWWWWWWWWWWSSFFEEo..",
+      "oLLWWWWWWWWWWWWSFFFFFFo.",
+      ".oLLWWWWWWWWWWWWFFFYFFFo",
+      "oLLWWWWWWWWWWWWWFFFFFFFo",
+      "SWLLWWWWWWWWWWWSFFCFFNFo",
+      "SLLWWWWWWWWWWWWSSFFFFFo.",
+      "ooLLWSWWWWWWWWSSoooooo..",
+      "..oSSSSSSSSSSSSo........",
+      "...ooSSSSSSSSoo.........",
+      "....GGooooooGG..........",
+      "....GG......GG..........",
+      "....GG......GG..........",
+      "....HH......HH..........",
+      "........................",
+    ],
+    runB: [
+      ".......ooooo............",
+      ".....ooLLLLLoo..........",
+      "...ooLLLLLLLLLo...oo....",
+      "..oLLWWWWWWWWSSo.oEEo...",
+      ".oLLWWWWWWWWWWSSooEEEo..",
+      ".oLLWWWWWWWWWWWSSFFEEo..",
+      "oLLWWWWWWWWWWWWSFFFFFFo.",
+      ".oLLWWWWWWWWWWWWFFFYFFFo",
+      "oLLWWWWWWWWWWWWWFFFFFFFo",
+      "SWLLWWWWWWWWWWWSFFCFFNFo",
+      "SLLWWWWWWWWWWWWSSFFFFFo.",
+      "ooLLWSWWWWWWWWSSoooooo..",
+      "..oSSSSSSSSSSSSo........",
+      "...ooSSSSSSSSoo.........",
+      ".....oooooooo...........",
+      "...GG........GG.........",
+      "...GG........GG.........",
+      "...GG........GG.........",
+      "...HH........HH.........",
+    ],
+    crouch: [
+      ".......ooooo............",
+      ".....ooLLLLLoo..........",
+      "...ooLLLLLLLLLo...oo....",
+      "..oLLWWWWWWWWSSo.oEEo...",
+      ".oLLWWWWWWWWWWSSooEEEo..",
+      ".oLLWWWWWWWWWWWSSFFEEo..",
+      "oLLWWWWWWWWWWWWSFFFFFFo.",
+      ".oLLWWWWWWWWWWWWFFFYFFFo",
+      "oLLWWWWWWWWWWWWWFFFFFFFo",
+      "SWLLWWWWWWWWWWWSFFCFFNFo",
+      "SLLWWWWWWWWWWWWSSFFFFFo.",
+      "ooLLWSWWWWWWWWSSoooooo..",
+      "..oSSSSSSSSSSSSo........",
+      "...ooSSSSSSSSoo.........",
+      "....GGooooooGG..........",
+      "....GG......GG..........",
+      "....HH......HH..........",
+      "........................",
+      "........................",
+    ],
+    jumpUp: [
+      ".......ooooo............",
+      ".....ooLLLLLoo..........",
+      "...ooLLLLLLLLLo...oo....",
+      "..oLLWWWWWWWWSSo.oEEo...",
+      ".oLLWWWWWWWWWWSSooEEEo..",
+      ".oLLWWWWWWWWWWWSSFFEEo..",
+      "oLLWWWWWWWWWWWWSFFFFFFo.",
+      ".oLLWWWWWWWWWWWWFFFYFFFo",
+      "oLLWWWWWWWWWWWWWFFFFFFFo",
+      "SWLLWWWWWWWWWWWSFFCFFNFo",
+      "SLLWWWWWWWWWWWWSSFFFFFo.",
+      "ooLLWSWWWWWWWWSSoooooo..",
+      "..oSSSSSSSSSSSSo........",
+      "...ooSSSSSSSSoo.........",
+      ".....oooooooo...........",
+      "..GG..........GG........",
+      "..GG..........GG........",
+      "..HH..........HH........",
+      "........................",
+    ],
+    jumpApex: [
+      ".......ooooo............",
+      ".....ooLLLLLoo..........",
+      "...ooLLLLLLLLLo...oo....",
+      "..oLLWWWWWWWWSSo.oEEo...",
+      ".oLLWWWWWWWWWWSSooEEEo..",
+      ".oLLWWWWWWWWWWWSSFFEEo..",
+      "oLLWWWWWWWWWWWWSFFFFFFo.",
+      ".oLLWWWWWWWWWWWWFFFYFFFo",
+      "oLLWWWWWWWWWWWWWFFFFFFFo",
+      "SWLLWWWWWWWWWWWSFFCFFNFo",
+      "SLLWWWWWWWWWWWWSSFFFFFo.",
+      "ooLLWSWWWWWWWWSSoooooo..",
+      "..oSSSSSSSSSSSSo........",
+      "...ooSSSSSSSSoo.........",
+      ".....oooooooo...........",
+      "...GG........GG.........",
+      "...HH........HH.........",
+      "........................",
+      "........................",
+    ]
+  };
+
+  var COATS = [
+    // 云朵白（默认）
+    { o: '#0a1020', L: '#ffffff', W: '#e9eef7', S: '#b9c7db', F: '#2f3a52', E: '#1c2334', Y: '#fdfefe', C: '#f4a9b6', N: '#0b0f17', G: '#3d4a63', H: '#0b0f17' },
+    // 樱花粉
+    { o: '#160a18', L: '#fff7fa', W: '#fbe4ef', S: '#f0b5d0', F: '#4a2340', E: '#331529', Y: '#ffffff', C: '#fb7185', N: '#1a0713', G: '#5a3350', H: '#1a0713' },
+    // 星空蓝
+    { o: '#080f1e', L: '#f6fcff', W: '#dceefb', S: '#a4cbe4', F: '#25304f', E: '#182238', Y: '#ffffff', C: '#f472b6', N: '#0a1120', G: '#33445f', H: '#0a1120' },
+    // 奶油黄
+    { o: '#1a1208', L: '#fffdf7', W: '#fdf1d2', S: '#efd08e', F: '#4a3418', E: '#33230f', Y: '#ffffff', C: '#fb923c', N: '#1a1208', G: '#57462a', H: '#1a1208' }
+  ];
+
+  var SPR = [];
+  var FRAME_KEYS = ['runA', 'runB', 'crouch', 'jumpUp', 'jumpApex'];
+
+  function bakeSprites() {
+    SPR = [];
+    var p, k, r, c, m, rows, cols, ch, col, cnv, g, set;
+    for (p = 0; p < COATS.length; p++) {
+      set = {};
+      for (k = 0; k < FRAME_KEYS.length; k++) {
+        m = SHEEP_FRAMES[FRAME_KEYS[k]];
+        rows = m.length; cols = m[0].length;
+        cnv = document.createElement('canvas');
+        cnv.width = cols; cnv.height = rows;
+        g = cnv.getContext('2d');
+        g.imageSmoothingEnabled = false;
+        for (r = 0; r < rows; r++) {
+          for (c = 0; c < cols; c++) {
+            ch = m[r].charAt(c);
+            if (ch === '.') continue;
+            col = COATS[p][ch] || '#000000';
+            g.fillStyle = col;
+            g.fillRect(c, r, 1, 1);
+          }
+        }
+        set[FRAME_KEYS[k]] = cnv;
+      }
+      SPR.push(set);
+    }
+  }
+  bakeSprites();
+
+  function coatOf(k) {
+    var h = (k * 37 + 11) % 100;
+    if (h < 66) return 0;
+    if (h < 80) return 1;
+    if (h < 92) return 2;
+    return 3;
+  }
+
+  function drawSheep(frame, x, y, coat, alpha) {
+    var set = SPR[coat] || SPR[0];
+    var img = set[frame] || set.runA;
+    if (!img || !img.width || !img.height) return;
+    if (alpha != null && alpha < 1) {
+      ctx.globalAlpha = alpha < 0 ? 0 : alpha;
+    }
+    ctx.drawImage(img, Math.round(x - img.width / 2), Math.round(y - img.height));
+    if (alpha != null && alpha < 1) ctx.globalAlpha = 1;
+  }
+
+  /* ==================================================================
+     5. 背景烘焙（静态底：天空 / 星带 / 远山 / 草地 / 后栅栏 / 月亮）
+     ================================================================== */
+  var stars = [], clouds = [], fireflies = [];
+
+  function buildAmbient() {
+    var i;
+    stars = [];
+    for (i = 0; i < 46; i++) {
+      stars.push({
+        x: Math.floor(rnd(i * 1.7) * (W || 400)),
+        y: Math.floor(rnd(i * 3.3 + 9) * Math.max(20, GY - 26)),
+        s: rnd(i * 5.1) > 0.82 ? 2 : 1,
+        ph: rnd(i * 7.7) * 6.283,
+        sp: 1.1 + rnd(i * 2.9) * 2.0
+      });
+    }
+    clouds = [
+      { x: W * 0.10, y: H * 0.10, w: 34, sp: 2.0 },
+      { x: W * 0.48, y: H * 0.06, w: 44, sp: 1.4 },
+      { x: W * 0.78, y: H * 0.16, w: 26, sp: 2.5 }
+    ];
+    fireflies = [];
+    for (i = 0; i < 7; i++) {
+      fireflies.push({
+        x: 14 + rnd(i * 4.4) * (W - 28),
+        y: GY - 26 + rnd(i * 6.1) * 22,
+        vx: (rnd(i * 8.2) - 0.5) * 10,
+        vy: (rnd(i * 9.4) - 0.5) * 5,
+        ph: rnd(i * 2.2) * 6.283
+      });
+    }
+  }
+
+  var SKY_BANDS = ['#05070f', '#070b19', '#0a1020', '#0c1327', '#101a31', '#131d3a', '#162042', '#19264b'];
+
+  function skyColorAt(y) {
+    var i = Math.floor(y / Math.max(1, GY / SKY_BANDS.length));
+    if (i < 0) i = 0;
+    if (i > SKY_BANDS.length - 1) i = SKY_BANDS.length - 1;
+    return SKY_BANDS[i];
+  }
+
+  function drawFenceBackInto(g) {
+    var i, px;
+    g.fillStyle = '#3a2415';
+    for (i = 0; i < 3; i++) {
+      px = fenceX + Math.round(railW * i / 2);
+      g.fillRect(px - 1, GY - 27, 3, 24);
+    }
+    g.fillStyle = '#4a2e1b';
+    g.fillRect(fenceX - 1, GY - 23, railW + 2, 2);
+    g.fillRect(fenceX - 1, GY - 14, railW + 2, 2);
+  }
+
+  function bakeBG() {
+    bg = document.createElement('canvas');
+    bg.width = Math.max(1, W); bg.height = Math.max(1, H);
+    var g = bg.getContext('2d');
+    g.imageSmoothingEnabled = false;
+    var i, x, y0, y1, hh, gx, gy;
+
+    var bands = SKY_BANDS;
+    for (i = 0; i < bands.length; i++) {
+      y0 = Math.round(GY * i / bands.length);
+      y1 = Math.round(GY * (i + 1) / bands.length);
+      g.fillStyle = bands[i];
+      g.fillRect(0, y0, W, Math.max(1, y1 - y0));
+    }
+
+    // 远山
+    g.fillStyle = '#14213d';
+    for (x = 0; x < W; x += 2) {
+      hh = Math.round(Math.sin(x * 0.030) * 7 + Math.cos(x * 0.018) * 5 + 14);
+      g.fillRect(x, GY - hh, 2, hh);
+    }
+    g.fillStyle = '#172744';
+    for (x = 0; x < W; x += 3) {
+      hh = Math.round(Math.sin(x * 0.021 + 1.7) * 5 + Math.cos(x * 0.041) * 3 + 9);
+      g.fillRect(x, GY - hh, 3, hh);
+    }
+
+    // 月亮（右上）
+    var mc = skyColorAt(moonY + 7);
+    g.fillStyle = '#fef08a';
+    g.fillRect(moonX + 3, moonY, 8, 14);
+    g.fillRect(moonX + 1, moonY + 2, 12, 10);
+    g.fillRect(moonX, moonY + 4, 14, 6);
+    g.fillStyle = mc;
+    g.fillRect(moonX, moonY + 1, 6, 10);
+    g.fillRect(moonX - 1, moonY + 3, 6, 6);
+
+    // 草地
+    g.fillStyle = '#14332b'; g.fillRect(0, GY - 2, W, 4);
+    g.fillStyle = '#0f2922'; g.fillRect(0, GY + 2, W, Math.max(1, 18));
+    g.fillStyle = '#091c17'; g.fillRect(0, GY + 18, W, Math.max(1, H - GY - 42));
+    g.fillStyle = '#071411'; g.fillRect(0, H - 24, W, 24);
+
+    // 地平线薄雾（抖动网点）
+    g.fillStyle = 'rgba(150,178,220,.11)';
+    for (x = 0; x < W; x++) {
+      var amp = 1 + Math.round((Math.sin(x * 0.13) + 1) * 1.3);
+      for (var dy = 1; dy <= amp; dy++) {
+        if ((x + dy) % 2 === 0) g.fillRect(x, GY - dy, 1, 1);
+      }
+    }
+    // 草簇
+    g.fillStyle = '#22543d';
+    for (i = 0; i < 30; i++) {
+      gx = Math.round(rnd(i * 3.1 + 5) * W);
+      gy = GY + 4 + Math.round(rnd(i * 7.7 + 2) * Math.max(2, H - GY - 8));
+      g.fillRect(gx, gy, 2, 2);
+      g.fillRect(gx + 3, gy - 1, 1, 2);
+      g.fillRect(gx - 2, gy - 1, 1, 2);
+    }
+
+    drawFenceBackInto(g);
+
+    buildAmbient();
+  }
+
+  function drawFenceFront() {
+    var i, px;
+    ctx.fillStyle = '#5b3a22';
+    ctx.fillRect(fenceX - 1, GY - 19, railW + 2, 2);
+    ctx.fillRect(fenceX - 1, GY - 9, railW + 2, 2);
+    ctx.fillStyle = '#7a4c2c';
+    ctx.fillRect(fenceX - 1, GY - 18, railW + 2, 1);
+
+    for (i = 0; i < 3; i++) {
+      px = fenceX + Math.round(railW * i / 2);
+      ctx.fillStyle = '#452712'; ctx.fillRect(px - 2, GY - 24, 5, 25);
+      ctx.fillStyle = '#8c5832'; ctx.fillRect(px - 1, GY - 23, 3, 23);
+      ctx.fillStyle = '#b07246'; ctx.fillRect(px, GY - 23, 1, 22);
+      ctx.fillStyle = '#d69e6c'; ctx.fillRect(px - 1, GY - 24, 3, 2);
+      ctx.fillStyle = '#1e293b'; ctx.fillRect(px, GY - 16, 1, 1); ctx.fillRect(px, GY - 7, 1, 1);
+    }
+  }
+
+  /* ==================================================================
+     6. 歌词模型
+     ================================================================== */
+  function num(v, d) { v = Number(v); return isFinite(v) ? v : d; }
+
+  var RE_WORD = /[^\s\p{P}\p{S}]/u;
+  function isWordChar(ch) {
+    try { return RE_WORD.test(ch); } catch (e) { return !/\s/.test(ch); }
+  }
+
+  function charTimes(t, dur, n, cs) {
+    var out = new Array(n), i, j, c, ct, first, rel;
+    if (cs && cs.length) {
+      first = cs[0] && cs[0].t;
+      rel = isFinite(first) && first < t - 0.08;
+      for (i = 0; i < n; i++) {
+        j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+        c = cs[j];
+        ct = c && c.t;
+        out[i] = isFinite(ct) ? (rel ? t + ct : ct) : t;
+        if (out[i] < t) out[i] = t;
+      }
+    } else {
+      var d = (isFinite(dur) && dur > 0) ? dur : 3.4;
+      for (i = 0; i < n; i++) out[i] = t + d * 0.90 * i / Math.max(1, n);
+    }
+    return out;
+  }
+
+  function prepLine(t, dur, text, cs) {
+    var chars = Array.from(text);
+    var n = chars.length;
+    var times = charTimes(t, dur, n, cs);
+    var cells = [], sheep = [], i, j, owner;
+
+    for (i = 0; i < n; i++) {
+      var ch = chars[i];
+      var word = isWordChar(ch);
+      var cell = { ch: ch, word: word, sheep: -1 };
+      if (word) {
+        cell.sheep = sheep.length;
+        sheep.push({ k: cell.sheep, t: times[i], cells: [i], fired: false });
+      }
+      cells.push(cell);
+    }
+    // 标点 / 空格跟着前一个字（行首的跟后一个字）
+    for (i = 0; i < n; i++) {
+      if (cells[i].word) continue;
+      owner = -1;
+      for (j = i - 1; j >= 0; j--) { if (cells[j].word) { owner = cells[j].sheep; break; } }
+      if (owner < 0) { for (j = i + 1; j < n; j++) { if (cells[j].word) { owner = cells[j].sheep; break; } } }
+      cells[i].sheep = owner;
+      if (owner >= 0) sheep[owner].cells.push(i);
+    }
+
+    return { t: t, dur: dur, text: text, cells: cells, sheep: sheep, prefix: 0 };
+  }
+
+  function prepAll(p) {
+    var raw = Array.isArray(p.lines) ? p.lines : [];
+    var out = [], i, l, t;
+    for (i = 0; i < raw.length; i++) {
+      l = raw[i];
+      if (!l || typeof l !== 'object') continue;
+      t = num(l.t, 0);
+      if (t < 0) t = 0;
+      out.push(prepLine(
+        t,
+        num(l.dur, 0),
+        (l.text == null) ? '' : String(l.text),
+        (Array.isArray(l.chars) && l.chars.length) ? l.chars : null
+      ));
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    var pre = 0;
+    for (i = 0; i < out.length; i++) { out[i].prefix = pre; pre += out[i].sheep.length; }
+    return out;
+  }
+
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    while (lo <= hi) {
+      var m = (lo + hi) >> 1;
+      if (a[m].t <= t + 0.02) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return best;
+  }
+
+  /* ==================================================================
+     7. 文字层
+     ================================================================== */
+  var cellEls = [];     // { c, g, k, on }
+
+  function layoutText() {
+    var L = (S.idx >= 0) ? S.lines[S.idx] : null;
+    if (!L || !L.cells.length) { lyr.style.fontSize = ''; return; }
+    var n = Math.max(1, L.cells.length);
+    var cw = window.innerWidth || 1440;
+    var ch = window.innerHeight || 900;
+    var availW = cw * 0.90;
+    var byW = availW / (n * 1.08);
+    var byH = ch * 0.071;
+    var fs = Math.min(byW, byH, 78);
+    fs = Math.max(15, fs);
+    lyr.style.fontSize = fs.toFixed(1) + 'px';
+    // 保险：真放不下就按实际量到的宽度缩，绝不把最后一个字甩到第二行
+    try {
+      var total = 0, kids = lyr.children, i;
+      for (i = 0; i < kids.length; i++) total += kids[i].getBoundingClientRect().width;
+      if (total > availW && total > 0) {
+        fs = Math.max(13, fs * (availW / total) * 0.995);
+        lyr.style.fontSize = fs.toFixed(1) + 'px';
+      }
+    } catch (e) { }
+  }
+
+  function buildLyric(idx) {
+    var L = (idx >= 0) ? S.lines[idx] : null;
+    cellEls = [];
+    lyr.innerHTML = '';
+    if (!L || !L.cells.length) {
+      lyr.classList.remove('on');
+      layoutText();
+      return;
+    }
+    var frag = document.createDocumentFragment(), i, cell, el, g, k, txt;
+    for (i = 0; i < L.cells.length; i++) {
+      cell = L.cells[i];
+      el = document.createElement('span');
+      el.className = 'c' + (cell.word ? '' : ' np');
+      txt = (cell.ch === ' ') ? '\u00A0' : cell.ch;
+      g = document.createElement('i'); g.className = 'g'; g.textContent = txt;
+      k = document.createElement('i'); k.className = 'k'; k.textContent = txt;
+      el.appendChild(g); el.appendChild(k);
+      frag.appendChild(el);
+      cellEls.push({ c: el, g: g, k: k, on: false });
+    }
+    lyr.appendChild(frag);
+    lyr.classList.add('on');
+    layoutText();
+    applyPanel();
+  }
+
+  function setCellOn(el, on, instant) {
+    if (!el) return;
+    if (el.on === on) return;
+    el.on = on;
+    var ink = el.k;
+    // 清掉正在跑的动画
+    try {
+      var anims = ink.getAnimations ? ink.getAnimations() : [];
+      for (var i = 0; i < anims.length; i++) anims[i].cancel();
+    } catch (e) { }
+    el.c.classList.remove('flying');
+    ink.style.transform = '';
+    ink.style.opacity = '';
+    if (on) el.c.classList.add('on');
+    else el.c.classList.remove('on');
+  }
+
+  function anchorFor(k) {
+    var ax = (laneX(k) + landX(k)) * 0.5;
+    var ay = GY + 1 - (32 + (k % 3) * 4);
+    return { x: ax * SX, y: ay * SY };
+  }
+
+  function flyCell(el, k, delay) {
+    if (RM || !el.k.animate) return;
+    var a = anchorFor(k);
+    var r = el.k.getBoundingClientRect();
+    if (!r.width && !r.height) return;
+    var dx = a.x - (r.left + r.width / 2);
+    var dy = a.y - (r.top + r.height / 2);
+    el.c.classList.add('flying');
+    try {
+      var an = el.k.animate([
+        { transform: 'translate(' + dx.toFixed(1) + 'px,' + dy.toFixed(1) + 'px) scale(.46)', opacity: 0 },
+        { transform: 'translate(0px,0px) scale(1.06)', opacity: 1, offset: 0.82 },
+        { transform: 'translate(0px,0px) scale(1)', opacity: 1 }
+      ], { duration: 470, delay: delay || 0, easing: 'cubic-bezier(.16,.86,.24,1)', fill: 'backwards' });
+      an.onfinish = function () { el.c.classList.remove('flying'); };
+      an.oncancel = function () { el.c.classList.remove('flying'); };
+      // 飞到最后一段时把底下的淡影收掉，免得短暂出现两个字
+      setTimeout(function () { try { el.c.classList.remove('flying'); } catch (e) { } }, 320 + (delay || 0));
+    } catch (e) { el.c.classList.remove('flying'); }
+  }
+
+  function revealSheep(L, s, instant) {
+    var i, el;
+    for (i = 0; i < s.cells.length; i++) {
+      el = cellEls[s.cells[i]];
+      if (!el || el.on) continue;
+      setCellOn(el, true, instant);
+      if (!instant) flyCell(el, s.k, i * 26);
+      if (!instant && !RM && i === 0) puff(landX(s.k) * SX, (GY + 1) * SY);
+    }
+  }
+
+  function syncLineInstant() {
+    var L = (S.idx >= 0) ? S.lines[S.idx] : null;
+    if (!L) return;
+    for (var i = 0; i < L.sheep.length; i++) {
+      var s = L.sheep[i];
+      var on = s.t <= S.t;
+      s.fired = on;
+      if (on) revealSheep(L, s, true);
+    }
+  }
+
+  function revealDue(L, T) {
+    for (var i = 0; i < L.sheep.length; i++) {
+      var s = L.sheep[i];
+      if (!s.fired && s.t <= T) {
+        s.fired = true;
+        revealSheep(L, s, false);
+      } else if (s.fired && s.t > T + 0.05) {
+        s.fired = false;
+        for (var j = 0; j < s.cells.length; j++) setCellOn(cellEls[s.cells[j]], false, true);
+      }
+    }
+  }
+
+  function applyPanel() {
+    lyr.classList.toggle('mode-slot', P.unsung === 'slot');
+  }
+
+  /* ==================================================================
+     8. 羊的位置（纯时间函数 —— 拖进度条 / 暂停都自动正确）
+        左边一只只走进来 → 跳栏 → 右边挤成一堆 → 整堆一起往右走掉
+     ================================================================== */
+  var ENTER_X = -30;       // 入场点（画面外）
+
+  function laneX(k) { return fenceX - 32 - (k % 3) * 11; }
+  function landX(k) { return fenceX + railW + 12 + (k % 3) * 8; }
+
+  // 右边那堆羊：横向 9 个、叠 3 层以上，带一点错位，看起来是挤在一起
+  var PILE_COLS = 9;
+  function pileSlot(k) {
+    var col = k % PILE_COLS, row = Math.floor(k / PILE_COLS);
+    var x0 = Math.round(W * 0.575), x1 = Math.round(W * 0.945);
+    var sp = (x1 - x0) / (PILE_COLS - 1);
+    var jx = ((k * 37) % 5) - 2;
+    var jy = ((k * 53) % 3) - 1;
+    return { x: x0 + sp * col + jx, y: (GY + 1) - row * 9 + jy, row: row };
+  }
+
+  function idleFrame(k, T) {
+    var ph = (T * 0.55 + k * 0.41) % 1;
+    if (ph < 0.10) return 'crouch';
+    return (Math.floor(T * 1.5 + k * 0.7) % 2) ? 'runB' : 'runA';
+  }
+  function runFrame(k, T) {
+    return (Math.floor(T * 10 + k * 0.5) % 2) ? 'runB' : 'runA';
+  }
+
+  function poseAt(L, s, k, T) {
+    var tJump = s.t - T_JUMP;
+    var tCrouch = tJump - T_CROUCH;
+    var lx = laneX(k), lxp = landX(k), arc = 30 + (k % 3) * 4;
+    var walkD = (lx - ENTER_X) / RUN_SPEED;
+    var tWalk = tCrouch - walkD;
+
+    // 还没入场：在画面外，不画
+    if (T < tWalk) return { x: ENTER_X, y: GY + 1, row: 0, frame: 'runA', alpha: 0 };
+
+    // 从左边跑过来（匀速）
+    if (T < tCrouch) {
+      var q = (T - tWalk) / Math.max(0.001, walkD);
+      return {
+        x: ENTER_X + (lx - ENTER_X) * q,
+        y: GY + 1, row: 0, frame: runFrame(k, T), phase: 'run', alpha: 1
+      };
+    }
+    // 起跳前微蹲
+    if (T < tJump) {
+      return { x: lx, y: GY + 1, row: 0, frame: 'crouch', phase: 'crouch', alpha: 1 };
+    }
+    // 越过栅栏
+    if (T < s.t) {
+      var p = (T - tJump) / T_JUMP;
+      return {
+        x: lx + (lxp - lx) * p,
+        y: (GY + 1) - 4 * p * (1 - p) * arc,
+        row: 0,
+        frame: (p < 0.30 || p > 0.76) ? 'jumpUp' : 'jumpApex',
+        phase: 'jump',
+        alpha: 1
+      };
+    }
+    // 落地后走向右边的羊堆
+    var slot = pileSlot(k);
+    var st = Math.min(1, (T - s.t) / 0.42);
+    var se = st * st * (3 - 2 * st);
+    return {
+      x: lxp + (slot.x - lxp) * se,
+      y: (GY + 1) + (slot.y - (GY + 1)) * se - Math.round(beat * 1.2),
+      row: slot.row,
+      frame: st < 0.999 ? runFrame(k, T) : idleFrame(k, T),
+      phase: 'pile',
+      alpha: 1
+    };
+  }
+  /* ==================================================================
+     9. 粒子 / 计数
+     ================================================================== */
+  var parts = [];
+
+  function puff(x, y) {
+    if (RM || parts.length > 90) return;
+    for (var i = 0; i < 4; i++) {
+      parts.push({
+        x: x + (Math.random() - 0.5) * 10,
+        y: y - Math.random() * 2,
+        vx: (Math.random() - 0.5) * 14,
+        vy: -6 - Math.random() * 10,
+        life: 0.34 + Math.random() * 0.2
+      });
+    }
+  }
+
+  function updateParts(dt) {
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var p = parts[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 26 * dt;
+      p.life -= dt;
+      if (p.life <= 0) parts.splice(i, 1);
+    }
+  }
+
+  function drawParts() {
+    ctx.fillStyle = 'rgba(148,163,184,.6)';
+    for (var i = 0; i < parts.length; i++) {
+      ctx.fillRect(Math.round(parts[i].x / SX), Math.round(parts[i].y / SY), 1, 1);
+    }
+  }
+
+  var DIG = {
+    '0': ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
+    '1': ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
+    '2': ['01110', '10001', '00001', '00010', '00100', '01000', '11111'],
+    '3': ['11111', '00010', '00100', '00010', '00001', '10001', '01110'],
+    '4': ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
+    '5': ['11111', '10000', '11110', '00001', '00001', '10001', '01110'],
+    '6': ['00110', '01000', '10000', '11110', '10001', '10001', '01110'],
+    '7': ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
+    '8': ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
+    '9': ['01110', '10001', '10001', '01111', '00001', '00010', '01100']
+  };
+
+  var SHEEP_ICON = [
+    '..###..',
+    '.#####.',
+    '#######',
+    '#######',
+    '.#####.',
+    '..#.#..',
+    '..#.#..'
+  ];
+
+  function drawIcon(x, y, col) {
+    ctx.fillStyle = col;
+    for (var r = 0; r < SHEEP_ICON.length; r++) {
+      var row = SHEEP_ICON[r];
+      for (var c = 0; c < row.length; c++) {
+        if (row.charAt(c) === '#') ctx.fillRect(x + c, y + r, 1, 1);
+      }
+    }
+  }
+
+  function drawDigits(str, x, y, col) {
+    ctx.fillStyle = col;
+    for (var i = 0; i < str.length; i++) {
+      var d = DIG[str.charAt(i)];
+      if (!d) continue;
+      for (var r = 0; r < 7; r++) {
+        for (var c = 0; c < 5; c++) {
+          if (d[r].charAt(c) === '1') ctx.fillRect(x + i * 6 + c, y + r, 1, 1);
+        }
+      }
+    }
+  }
+
+  function drawCounter(n) {
+    if (!bg) return;
+    var str = String(Math.min(9999, Math.max(0, n | 0)));
+    var dw = str.length * 6 - 1;
+    var total = 7 + 3 + dw;
+    var x = W - 10 - total;
+    var y = H - 13;
+    ctx.globalAlpha = 0.9;
+    drawIcon(x, y + 1, 'rgba(226,232,240,.5)');
+    drawDigits(str, x + 10, y, 'rgba(226,232,240,.6)');
+    ctx.globalAlpha = 1;
+  }
+  /* 一句唱完：整堆羊一起往右走出去（不消失、不散架） */
+  var exiting = [];
+
+  function drawExiting(nowMs) {
+    for (var i = exiting.length - 1; i >= 0; i--) {
+      var ex = exiting[i];
+      var sec = (nowMs - ex.at) / 1000;
+      if (sec > 9) { exiting.splice(i, 1); continue; }
+      var line = ex.line;
+      var k, p, off, any = false;
+      for (k = 0; k < line.sheep.length; k++) {
+        p = poseAt(line, line.sheep[k], k, ex.tf);
+        if (p.alpha <= 0) continue;
+        off = Math.max(0, sec - (0.12 + k * 0.012)) * EXIT_SPEED;
+        if (p.x + off < W + 30) any = true;
+        drawSheep(runFrame(k, ex.tf), p.x + off, p.y, coatOf(k), 1);
+      }
+      if (!any) exiting.splice(i, 1);
+    }
+  }
+
+  /* ==================================================================
+     10. 场景绘制
+     ================================================================== */
+  function drawStars(T) {
+    for (var i = 0; i < stars.length; i++) {
+      var st = stars[i];
+      var tw = Math.sin(T * st.sp + st.ph);
+      if (tw <= -0.35) continue;
+      if (tw > 0.62) ctx.fillStyle = 'rgba(254,240,138,.95)';
+      else {
+        var a = 0.20 + 0.44 * ((tw + 0.35) / 1.35);
+        ctx.fillStyle = 'rgba(203,213,225,' + a.toFixed(2) + ')';
+      }
+      ctx.fillRect(st.x, st.y, st.s, st.s);
+    }
+  }
+
+  function drawClouds(dt) {
+    for (var i = 0; i < clouds.length; i++) {
+      var cl = clouds[i];
+      if (!RM) { cl.x += cl.sp * dt; if (cl.x > W + 14) cl.x = -cl.w - 14; }
+      var cx = Math.round(cl.x), cy = Math.round(cl.y), w = cl.w;
+      ctx.fillStyle = 'rgba(26,38,70,.85)';
+      ctx.fillRect(cx + 7, cy, w - 14, 2);
+      ctx.fillRect(cx + 3, cy + 2, w - 6, 2);
+      ctx.fillRect(cx, cy + 4, w, 2);
+      ctx.fillStyle = 'rgba(38,54,94,.9)';
+      ctx.fillRect(cx + 9, cy + 1, w - 20, 1);
+      ctx.fillRect(cx + 4, cy + 3, w - 11, 1);
+    }
+  }
+
+  function drawFireflies(T, dt) {
+    for (var i = 0; i < fireflies.length; i++) {
+      var f = fireflies[i];
+      if (!RM) {
+        f.x += f.vx * dt; f.y += f.vy * dt;
+        if (f.x < 8 || f.x > W - 8) f.vx *= -1;
+        if (f.y < GY - 36 || f.y > GY + 2) f.vy *= -1;
+      }
+      var g = Math.sin(T * 3.4 + f.ph);
+      if (g > 0.1) {
+        ctx.fillStyle = g > 0.7 ? 'rgba(253,224,71,.95)' : 'rgba(253,224,71,.45)';
+        ctx.fillRect(Math.round(f.x), Math.round(f.y), 1, 1);
+      }
+    }
+  }
+
+  function drawLineSheep(L, T, alpha, lift) {
+    var N = L.sheep.length;
+    var list = [], k, p;
+    var dy = lift || 0;
+    for (k = 0; k < N; k++) {
+      p = poseAt(L, L.sheep[k], k, T);
+      if (p.alpha <= 0) continue;
+      list.push({ k: k, p: p });
+    }
+    list.sort(function (a, b) { return b.p.row - a.p.row; });
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i], q = it.p;
+      var a = alpha * q.alpha;
+      if (a <= 0.01) continue;
+      var air = Math.max(0, (GY + 1) - q.y);
+      var sw = Math.max(6, Math.round(13 - air * 0.18));
+      if (q.row === 0 && a > 0.5 && !dy) {
+        ctx.globalAlpha = 0.42 * a;
+        ctx.fillStyle = '#040914';
+        ctx.fillRect(Math.round(q.x - sw / 2), GY + 1, sw, 2);
+        ctx.globalAlpha = 1;
+      }
+      drawSheep(q.frame, q.x, q.y + dy, coatOf(it.k), a);
+    }
+  }
+
+  function drawEmptyFlock(T) {
+    var spots = [{ x: 30, y: GY + 1 }, { x: 66, y: GY - 7 }, { x: 50, y: GY + 1 }];
+    for (var i = 0; i < spots.length; i++) {
+      drawSheep(idleFrame(i, T), spots[i].x, spots[i].y + Math.round(Math.sin(T * 1.5 + i) * 0.5), 0, 1);
+    }
+  }
+
+  function totalAt(idx, T) {
+    if (idx < 0) return 0;
+    var L = S.lines[idx];
+    if (!L) return 0;
+    var n = L.prefix;
+    for (var i = 0; i < L.sheep.length; i++) if (L.sheep[i].t <= T) n++;
+    return n;
+  }
+
+  /* ==================================================================
+     11. 主循环
+     ================================================================== */
+  var lastNow = performance.now();
+  var prevT = 0;
+  var built = -99;
+  var beat = 0, bass = 0;
+
+  function enterLine(idx, instant) {
+    if (idx !== S.idx && S.idx >= 0 && S.lines[S.idx]) {
+      // 上一句的羊整堆往右走出去
+      exiting.push({ line: S.lines[S.idx], at: performance.now(), tf: S.t });
+      while (exiting.length > 2) exiting.shift();
+    }
+    S.idx = Math.max(-1, idx);
+    buildLyric(S.idx);
+    built = S.idx;
+    if (instant) syncLineInstant();
+  }
+
+  function frame(now) {
+    var js0 = performance.now();
+    try {
+      var dt = Math.min(0.05, (now - lastNow) / 1000);
+      if (!(dt > 0)) dt = 0.016;
+      lastNow = now;
+
+      if (S.playing) S.t += dt;
+      if (!isFinite(S.t) || S.t < 0) S.t = 0;
+
+      var seek = Math.abs(S.t - prevT) > 0.55;
+      prevT = S.t;
+
+      beat *= Math.pow(0.0006, dt);
+      bass *= Math.pow(0.05, dt);
+
+      var idx = idxAt(S.t);
+      if (seek) exiting.length = 0;
+      if (idx !== S.idx || built !== idx) enterLine(idx, seek);
+      var cur = (S.idx >= 0) ? S.lines[S.idx] : null;
+      if (cur) revealDue(cur, S.t);
+
+      // 画面
+      if (bg && bg.width > 0) ctx.drawImage(bg, 0, 0);
+      drawStars(S.t);
+      drawClouds(dt);
+      drawFireflies(S.t, dt);
+
+      drawExiting(now);
+      if (cur) drawLineSheep(cur, S.t, 1);
+      else if (!S.lines.length) drawEmptyFlock(S.t);
+      // 下一句候场的羊先走起来
+      var nxt = (S.idx + 1 < S.lines.length) ? S.lines[S.idx + 1] : null;
+      if (nxt && S.t >= nxt.t - PREROLL) {
+        drawLineSheep(nxt, S.t, 1);
+      }
+
+      drawFenceFront();
+
+      updateParts(dt);
+      drawParts();
+      drawCounter(totalAt(S.idx, S.t));
+
+      S.frames++;
+    } catch (e) {
+      fail(e);
+    }
+    S.js = performance.now() - js0;
+    requestAnimationFrame(frame);
+  }
+
+  /* ==================================================================
+     12. 消息
+     ================================================================== */
+  function sanitizeAccent(a) {
+    if (!Array.isArray(a) || a.length < 3) return [150, 165, 255];
+    var r = Math.round(num(a[0], 150)), g = Math.round(num(a[1], 165)), b = Math.round(num(a[2], 255));
+    if (r === 0 && g === 0 && b === 0) return [150, 165, 255];
+    return [clamp255(r), clamp255(g), clamp255(b)];
+  }
+  function clamp255(v) { return Math.max(0, Math.min(255, v)); }
+
+  function applyAccent(rgb) {
+    try {
+      document.documentElement.style.setProperty('--ac', rgb[0] + ',' + rgb[1] + ',' + rgb[2]);
+    } catch (e) { }
+  }
+
+  addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === 'init') {
+        var acc = sanitizeAccent(p.accent);
+        applyAccent(acc);
+        S.lines = prepAll(p);
+        built = -99;
+        S.playing = (typeof p.playing === 'boolean') ? p.playing : true;
+        emptyEl.classList.toggle('on', S.lines.length === 0);
+        if (!S.lines.length) {
+          S.idx = -1;
+          buildLyric(-1);
+          built = -1;
+        } else {
+          // 先按当前时间落位
+          var i0 = idxAt(S.t);
+          S.idx = -2;
+          enterLine(i0, true);
+        }
+      } else if (d.type === 'tick') {
+        var t = Number(p.time);
+        if (isFinite(t)) S.t = t;              // 无条件采纳，只挡 NaN / Infinity
+        if (typeof p.playing === 'boolean') S.playing = p.playing;
+      } else if (d.type === 'beat') {
+        var lv = num(p.level, 0.5);
+        if (lv > beat) beat = Math.min(1, lv);
+      } else if (d.type === 'live') {
+        bass = Math.max(bass * 0.5, num(p.bass, 0) * 0.8);
+        if (typeof p.playing === 'boolean') S.playing = p.playing;
+      } else if (d.type === 'setting') {
+        if (p.key === 'unsung') {
+          P.unsung = (p.value === 'slot') ? 'slot' : 'ghost';
+          applyPanel();
+        }
+      }
+    } catch (e) { fail(e); }
+  });
+
+  /* 让播放器的 HUD 能重新出现；空格键转出去 */
+  var lastAct = 0;
+  function activity() {
+    var n = performance.now();
+    if (n - lastAct < 400) return;
+    lastAct = n;
+    try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (e) { }
+  }
+  addEventListener('mousemove', activity, { passive: true });
+  addEventListener('touchstart', activity, { passive: true });
+  addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.key === ' ') {
+      try { e.preventDefault(); } catch (_) { }
+      try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) { }
+    }
+  });
+
+  /* ==================================================================
+     13. 启动
+     ================================================================== */
+  addEventListener('resize', function () { resize(); });
+  resize();
+  buildLyric(-1);
+  requestAnimationFrame(frame);
+
+  window.__s515 = {
+    info: function () {
+      var L = (S.idx >= 0) ? S.lines[S.idx] : null;
+      return {
+        idx: S.idx, t: Math.round(S.t * 100) / 100, playing: S.playing,
+        lines: S.lines.length, sheep: L ? L.sheep.length : 0,
+        cells: L ? L.cells.length : 0,
+        on: cellEls.filter(function (e) { return e.on; }).length,
+        total: totalAt(S.idx, S.t), exiting: exiting.length, parts: parts.length,
+        panel: P.unsung, frames: S.frames
+      };
+    },
+    set: function (k, v) { if (k in P) { P[k] = v; applyPanel(); } }
+  };
+})();
+</script>
+</body>
+</html>

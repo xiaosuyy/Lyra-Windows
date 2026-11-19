@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>薄片重合</title>
+<!--
+  ============================================================================
+  这是「空壳」：只有协议层，没有任何画面。你要自己决定这一件作品长什么样。
+  ============================================================================
+  怎么用：
+    1. Copy-Item 本文件到 public/stages/<NNN>-<名字>.html
+    2. 把 <title> 改成中文名
+    3. 从「你的实现」那条线往下，全部是你的事。上面一行都别动。
+  ============================================================================
+-->
+<style>
+  html,body{margin:0;height:100%;background:#050506;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;pointer-events:none;z-index:2;
+       background:radial-gradient(126% 96% at 50% 44%,rgba(0,0,0,0) 30%,rgba(0,0,0,.70) 100%)}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);pointer-events:none;z-index:3;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(255,255,255,.28);transition:opacity .8s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ────────────────────────────────────────────────────────────────────────────
+   协议层（照抄，别改）：init / tick / beat / live → ready / activity / key
+   ──────────────────────────────────────────────────────────────────────────── */
+const cv = document.getElementById('c');
+const hint = document.getElementById('hint');
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+let W = 1, H = 1, PR = 1, MAXTEX = 4096;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, bass = 0, treb = 0, bassTgt = 0, trebTgt = 0, frames = 0, jsMs = 0, errMsg = '';
+let slow = 0, lastTickWall = 0, stale = false, lastFrameT = 0, lastDt = 0.016;
+let readySent = false, dirty = true, raf = 0;
+
+/* prefers-reduced-motion：随时切换都要跟得上 */
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const on = (e) => { RM = !!e.matches; };
+    if (mq.addEventListener) mq.addEventListener('change', on); else if (mq.addListener) mq.addListener(on);
+  }
+} catch (_) {}
+
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+/* ────────────────────────────────────────────────────────────────────────────
+   ↓↓↓ 你的实现 ↓↓↓  从这里往下随便写，上面一行都别动
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/* 这一件的前提：
+   字不是被写在什么东西上的图案。字是十万片悬在暗处的薄玻璃——
+   只有一个视点上，它们才互相叠成一个字；站偏一点，字就散成一片碎片。
+   所以「读」这件事在这里是一种站位：你退回到那个点，字才成立。
+*/
+
+const gl = cv.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false });
+
+/* ── 常量 ─────────────────────────────────────────────────────────────── */
+const COLS = 900, ROWS = 112, N = COLS * ROWS;      /* 100800 片 */
+const TEXW = 9.6;                                    /* 字块世界宽度恒定 */
+const FONT0 = 132, MAXCH = 64, MAXROW = 32;          /* 去 24 字截断；超过 32 字自动分两行 */
+const DEG = Math.PI / 180;
+const FAMILY = '"Microsoft YaHei","PingFang SC","Heiti SC","Noto Sans SC",system-ui,sans-serif';
+
+/* ── 数学 ─────────────────────────────────────────────────────────────── */
+function m4persp(o, fovy, asp, n, f) {
+  const t = 1 / Math.tan(fovy * 0.5);
+  o[0] = t / asp; o[1] = 0; o[2] = 0; o[3] = 0;
+  o[4] = 0; o[5] = t; o[6] = 0; o[7] = 0;
+  o[8] = 0; o[9] = 0; o[10] = (f + n) / (n - f); o[11] = -1;
+  o[12] = 0; o[13] = 0; o[14] = 2 * f * n / (n - f); o[15] = 0;
+  return o;
+}
+function m4look(o, e, c, u) {
+  let zx = e[0] - c[0], zy = e[1] - c[1], zz = e[2] - c[2];
+  let l = Math.hypot(zx, zy, zz) || 1; zx /= l; zy /= l; zz /= l;
+  let xx = u[1] * zz - u[2] * zy, xy = u[2] * zx - u[0] * zz, xz = u[0] * zy - u[1] * zx;
+  l = Math.hypot(xx, xy, xz) || 1; xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  o[0] = xx; o[1] = yx; o[2] = zx; o[3] = 0;
+  o[4] = xy; o[5] = yy; o[6] = zy; o[7] = 0;
+  o[8] = xz; o[9] = yz; o[10] = zz; o[11] = 0;
+  o[12] = -(xx * e[0] + xy * e[1] + xz * e[2]);
+  o[13] = -(yx * e[0] + yy * e[1] + yz * e[2]);
+  o[14] = -(zx * e[0] + zy * e[1] + zz * e[2]);
+  o[15] = 1;
+  return o;
+}
+function m4mul(o, a, b) {
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a || 1e-6), 0, 1); return t * t * (3 - 2 * t); };
+
+/* ── 着色器 ───────────────────────────────────────────────────────────── */
+const VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec4 aG;   /* u, v, 深度, 尺寸 */
+layout(location=1) in vec4 aR;   /* 四个随机量 */
+layout(location=2) in float aChar; /* 这一片属于哪个字（换句时重算） */
+uniform mat4 uVP;
+uniform vec3 uRight, uUp;
+uniform vec2 uCell;      /* 一个网格单元的世界尺寸 */
+uniform vec2 uWorld;     /* 整个字块的世界尺寸 */
+uniform float uT, uNCh, uFade, uPulse, uDs, uZs, uAlign;
+uniform float uCharT[64];
+out vec2 vQ;
+out vec2 vTuv;
+out float vA;
+out float vR;
+void main(){
+  vec3 base = vec3((aG.x - 0.5) * uWorld.x, (aG.y - 0.5) * uWorld.y, 0.0);
+
+  int ci = int(clamp(aChar + 0.5, 0.0, uNCh - 1.0));
+  float t0 = uCharT[ci];
+  float rv = smoothstep(t0, t0 + 0.66, uT);
+  float e = 1.0 - rv;
+
+  vec2 corner = vec2(gl_VertexID == 1 || gl_VertexID == 3 ? 1.0 : -1.0,
+                     gl_VertexID < 2 ? -1.0 : 1.0);
+
+  float z = (aG.z - 0.5) * 1.15 * uZs;
+  /* 每片按它离眼睛的深度重新定尺寸：同一个角，所以正对时正好叠满自己那一格 */
+  float comp = mix(1.0, clamp((uDs - z) / uDs, 0.55, 1.8), uAlign);
+  float sc = (2.45 + 0.95 * aR.y) * aG.w * comp;
+  vec2 szW = uCell * sc;
+
+  /* 还没归位的碎片：从散开的地方被叫回来，回来时还在转 */
+  vec3 off = vec3((aR.x - 0.5) * 2.6, (aR.y - 0.5) * 1.6, (aR.z - 0.5) * 3.0) * e * e;
+  float ang = (aR.w - 0.5) * 2.4 * e;
+  mat2 rot = mat2(cos(ang), sin(ang), -sin(ang), cos(ang));
+
+  vec3 p = vec3(base.xy * comp + off.xy, z + off.z);
+  vec3 wp = p + uRight * (rot * corner).x * szW.x * 0.5 + uUp * (rot * corner).y * szW.y * 0.5;
+
+  gl_Position = uVP * vec4(wp, 1.0);
+  vQ = corner;
+  vTuv = vec2(aG.x, 1.0 - aG.y) + (rot * corner) * vec2(szW.x / (2.0 * uWorld.x), szW.y / (2.0 * uWorld.y));
+  /* 未唱字不再完全消失：保留 16% 的碎片基线，让整句的形状先成立 */
+  vA = uFade * (0.16 + 0.84 * rv) * (1.0 + uPulse * 0.4);
+  vR = rv;
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+in vec2 vQ;
+in vec2 vTuv;
+in float vA;
+in float vR;
+out vec4 o;
+void main(){
+  float m = texture(uTex, vTuv).r;
+  float edge = 1.0 - 0.55 * smoothstep(0.86, 1.0, max(abs(vQ.x), abs(vQ.y)));
+  float g = smoothstep(0.16, 0.92, m);
+  vec3 col = mix(vec3(0.34, 0.70, 0.86), vec3(0.90, 0.99, 1.0), g);
+  /* 已唱 / 未唱：暖冷分离 */
+  col *= mix(vec3(0.86, 0.90, 1.00), vec3(1.06, 1.02, 0.94), smoothstep(0.0, 0.65, vR));
+  o = vec4(col * (g * 0.17 * edge) * vA, 1.0);
+
+}`;
+
+/* 背景 pass：暗部渐变 + 两层低频噪声 + 地平线雾 + 字形阴影（最低成本） */
+const BG_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform float uT, uA;
+uniform vec4 uBox;
+uniform sampler2D uTex;
+float h21(vec2 p){ p = fract(p*vec2(127.1,311.7)); p += dot(p,p+34.7); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=h21(i), b=h21(i+vec2(1,0)), c=h21(i+vec2(0,1)), d=h21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+void main(){
+  vec3 c = mix(vec3(0.018,0.020,0.026), vec3(0.055,0.060,0.075), pow(clamp(vUV.y,0.0,1.0), 2.0));
+  c += (vn(vUV * vec2(6.0,3.0) + uT * 0.03) - 0.5) * 0.012;
+  c += (vn(vUV * vec2(18.0,9.0) - uT * 0.012) - 0.5) * 0.006;
+  c += vec3(0.08,0.10,0.14) * exp(-abs(vUV.y - 0.52) * 18.0) * 0.55;
+  vec2 guv = (vUV - uBox.xy) / max(uBox.zw, vec2(1e-4));
+  if (guv.x > 0.0 && guv.x < 1.0 && guv.y > 0.0 && guv.y < 1.0) {
+    float m = texture(uTex, guv).r;
+    c *= 1.0 - 0.15 * smoothstep(0.18, 0.92, m) * uA;
+  }
+  c += (h21(vUV * 720.0 + uT * 0.6) - 0.5) * 0.004;
+  o = vec4(max(c, vec3(0.0)), 1.0);
+}`;
+
+/* ── 装配 ─────────────────────────────────────────────────────────────── */
+let prog = null, vao = null, vbo = null, tex = null, charBuf = null;
+let bgProg = null, bgVao = null, bgBuf = null;
+const U = {}, bgU = {};
+let tcv = document.createElement('canvas');
+let tctx = tcv.getContext('2d');
+let tcvB = document.createElement('canvas');
+let tctxB = tcvB.getContext('2d');
+let texB = null;
+let lineArr = null;         /* 上次 prepLines 的 lines 引用 */
+let lineT = [];
+let texLine = -1;
+let texW = 1, texH = 1, texRows = 1, worldH = 1;
+const charData = new Float32Array(N);
+const charDataB = new Float32Array(N);
+let prepIdx = -1, prepReady = false, prepMeta = null;
+
+function compile() {
+  const sh = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      errMsg = 'shader: ' + (gl.getShaderInfoLog(s) || '').slice(0, 160);
+      return null;
+    }
+    return s;
+  };
+  const v = sh(gl.VERTEX_SHADER, VS), f = sh(gl.FRAGMENT_SHADER, FS);
+  if (!v || !f) return;
+  const p = gl.createProgram();
+  gl.attachShader(p, v); gl.attachShader(p, f); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { errMsg = 'link: ' + (gl.getProgramInfoLog(p) || '').slice(0, 160); return; }
+  prog = p;
+  ['uVP', 'uRight', 'uUp', 'uCell', 'uWorld', 'uT', 'uNCh', 'uFade', 'uPulse', 'uDs', 'uZs', 'uAlign', 'uTex']
+    .forEach((k) => { U[k] = gl.getUniformLocation(p, k); });
+  U.uCharT = gl.getUniformLocation(p, 'uCharT[0]');
+
+  /* 背景 pass */
+  const bv = sh(gl.VERTEX_SHADER, BG_VS), bf = sh(gl.FRAGMENT_SHADER, BG_FS);
+  if (bv && bf) {
+    const bp = gl.createProgram();
+    gl.attachShader(bp, bv); gl.attachShader(bp, bf); gl.linkProgram(bp);
+    if (gl.getProgramParameter(bp, gl.LINK_STATUS)) {
+      bgProg = bp;
+      ['uT', 'uA', 'uBox', 'uTex'].forEach((k) => { bgU[k] = gl.getUniformLocation(bp, k); });
+    }
+  }
+  MAXTEX = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+
+  /* 100800 片碎玻璃的位置/深度/抖动一律在 CPU 一次性算好；
+     每帧只更新相机与时间，不再碰这块缓冲。 */
+  const data = new Float32Array(N * 8);
+  let s = 2207;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  let o = 0;
+  for (let j = 0; j < ROWS; j++) {
+    for (let i = 0; i < COLS; i++) {
+      data[o] = (i + 0.5 + (rnd() - 0.5) * 0.8) / COLS;
+      data[o + 1] = (j + 0.5 + (rnd() - 0.5) * 0.8) / ROWS;
+      data[o + 2] = rnd();
+      data[o + 3] = 0.72 + rnd() * 0.6;
+      data[o + 4] = rnd(); data[o + 5] = rnd(); data[o + 6] = rnd(); data[o + 7] = rnd();
+      o += 8;
+    }
+  }
+  vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 32, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 16);
+  gl.vertexAttribDivisor(0, 1);
+  gl.vertexAttribDivisor(1, 1);
+
+  /* 每个实例属于哪个字：换句时整块重算，CPU 只写 400KB/句 */
+  charBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, charBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, charData, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(2, 1);
+  gl.bindVertexArray(null);
+
+  /* 背景 pass 的全屏 quad */
+  bgBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bgBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]), gl.STATIC_DRAW);
+  bgVao = gl.createVertexArray();
+  gl.bindVertexArray(bgVao);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  tex = gl.createTexture();
+  texB = gl.createTexture();
+  for (const tt of [tex, texB]) {
+    gl.bindTexture(gl.TEXTURE_2D, tt);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,255]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+  gl.clearColor(0.006, 0.008, 0.014, 1);
+}
+
+/* 每句的逐字时间：有 chars 就用 audio 的真时间，没有就按句长均分（上限 64 字） */
+function prepLines() {
+  lineT = [];
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i], next = lines[i + 1];
+    const cps = Array.from(String(L.text || ''));
+    const n = Math.min(MAXCH, Math.max(1, cps.length));
+    const dur = (typeof L.dur === 'number' && L.dur > 0.4) ? L.dur : (next ? next.t - L.t : 3.6);
+    const hasChars = !!(L.chars && L.chars.length);
+    const per = Math.max(0.075, dur * 0.55 / n);
+    const vis = hasChars ? L.t : Math.max(0, L.t - 0.5);
+    const ct = new Float32Array(MAXCH);
+    for (let k = 0; k < MAXCH; k++) ct[k] = 1e6;
+    for (let k = 0; k < n; k++) {
+      let t = vis + k * per;
+      if (L.chars && L.chars[k] && typeof L.chars[k].t === 'number') t = L.chars[k].t;
+      ct[k] = t;
+    }
+    const end = next ? next.t : L.t + Math.max(3.2, dur);
+    lineT.push({ t0: L.t, vis: vis, t1: end, n, ct });
+  }
+}
+
+/* 排版：逐字宽 + 超过 32 字在标点/空格处自动分两行；整行一次 fillText */
+function layoutLine(i, cvX, ctxX, texX, dataOut) {
+  const LT = lineT[i];
+  if (!LT) return null;
+  const L = lines[i];
+  let cps = Array.from(String(L.text || '')).slice(0, MAXCH);
+  if (!cps.length) cps = [' '];
+  const n = cps.length;
+
+  let cut = n;
+  if (n > MAXROW) {
+    const mid = Math.ceil(n / 2);
+    for (let d = 0; d < mid; d++) {
+      const a = mid - d, b = mid + d;
+      if (a > 0 && a < n && /[，。！？、；：,.!?;:\s]/.test(cps[a])) { cut = a + 1; break; }
+      if (b > 0 && b < n && /[，。！？、；：,.!?;:\s]/.test(cps[b])) { cut = b + 1; break; }
+    }
+    if (cut === n) cut = mid;
+  }
+  const rows = cut < n ? [cps.slice(0, cut), cps.slice(cut)] : [cps];
+
+  let fontPx = FONT0, pad = Math.round(fontPx * 0.22);
+  ctxX.font = '700 ' + fontPx + 'px ' + FAMILY;
+  const measureRows = () => rows.map((r) => {
+    const pref = [0];
+    for (let k = 0; k < r.length; k++) pref.push(ctxX.measureText(r.slice(0, k + 1).join('')).width);
+    return { r, pref, w: pref[r.length] };
+  });
+  let info = measureRows();
+  let maxW = Math.max.apply(null, info.map((x) => x.w));
+  let w0 = Math.ceil(maxW + pad * 2);
+  if (w0 > MAXTEX - 4) {
+    const k = (MAXTEX - 4) / w0;
+    fontPx = Math.max(48, Math.floor(fontPx * k));
+    pad = Math.round(fontPx * 0.22);
+    ctxX.font = '700 ' + fontPx + 'px ' + FAMILY;
+    info = measureRows();
+    maxW = Math.max.apply(null, info.map((x) => x.w));
+    w0 = Math.ceil(maxW + pad * 2);
+  }
+  const rowH = Math.ceil(fontPx * 1.42);
+  const w = Math.min(MAXTEX, Math.max(32, w0));
+  const h = Math.max(32, Math.ceil(rows.length * rowH + pad * 2));
+  if (cvX.width !== w || cvX.height !== h) { cvX.width = w; cvX.height = h; }
+
+  ctxX.setTransform(1, 0, 0, 1, 0, 0);
+  ctxX.fillStyle = '#000';
+  ctxX.fillRect(0, 0, w, h);
+  ctxX.fillStyle = '#fff';
+  ctxX.textAlign = 'left';
+  ctxX.textBaseline = 'middle';
+  ctxX.font = '700 ' + fontPx + 'px ' + FAMILY;
+  const rowStart = [];
+  let abs = 0;
+  for (let r = 0; r < rows.length; r++) {
+    const ri = info[r];
+    const xoff = pad + (maxW - ri.w) * 0.5;
+    const y = pad + rowH * (r + 0.5) + fontPx * 0.04;
+    ctxX.fillText(ri.r.join(''), xoff, y);
+    ri.x0 = ri.pref.map((v) => (xoff + v) / w);
+    rowStart.push(abs);
+    abs += ri.r.length;
+  }
+
+  if (gl && texX) {
+    gl.bindTexture(gl.TEXTURE_2D, texX);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cvX);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.generateMipmap(gl.TEXTURE_2D);
+  }
+
+  /* 每个实例属于哪个字：每行只查一次 x→字，再把整行复制到该行带里 */
+  const rBand = rowH / h;
+  const topPad = pad / h;
+  const rowChar = [];
+  for (let r = 0; r < rows.length; r++) {
+    const ri = info[r], x0 = ri.x0, start = rowStart[r], len = ri.r.length;
+    const arr = new Int32Array(COLS);
+    for (let ii = 0; ii < COLS; ii++) {
+      const u = (ii + 0.5) / COLS;
+      let k = 0;
+      while (k < len - 1 && u > x0[k + 1]) k++;
+      arr[ii] = start + k;
+    }
+    rowChar.push(arr);
+  }
+  for (let j = 0; j < ROWS; j++) {
+    const v = 1 - (j + 0.5) / ROWS;
+    let rr = Math.floor((v - topPad) / rBand);
+    rr = Math.max(0, Math.min(rows.length - 1, rr));
+    const src = rowChar[rr], base = j * COLS;
+    for (let ii = 0; ii < COLS; ii++) dataOut[base + ii] = src[ii];
+  }
+
+  return { w, h, rows: rows.length, worldH: TEXW * h / w, n, fontPx };
+}
+
+function applyMeta(m) {
+  texW = m.w; texH = m.h; texRows = m.rows; worldH = m.worldH;
+}
+function uploadChar(data) {
+  if (!gl) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, charBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+}
+function buildLineTex(i) {
+  const m = layoutLine(i, tcv, tctx, tex, charData);
+  if (!m) return;
+  applyMeta(m);
+  uploadChar(charData);
+  texLine = i;
+}
+
+/* 提前 0.6–1.5s 把下一句的纹理和字索引烘到 B 槽 */
+function prepNext(T) {
+  if (!gl || idx < 0 || idx + 1 >= lines.length) return;
+  if (lineArr !== lines) return;                 /* 等 prepLines 建好逐字时间 */
+  const nx = idx + 1;
+  if (prepReady && (prepIdx === nx || prepIdx === idx)) return;
+  const gap = Math.max(0.7, lines[nx].t - lines[idx].t);
+  const lead = Math.min(1.5, Math.max(0.6, gap * 0.6));
+  if (T >= lines[nx].t - lead) {
+    const m = layoutLine(nx, tcvB, tctxB, texB, charDataB);
+    if (m) { prepMeta = m; prepIdx = nx; prepReady = true; }
+  }
+}
+
+/* 逐句机位：正面 / 偏中景 / 贴侧面（散开）/ 另一侧半散 —— 每句换一次，指数平滑 */
+const SHOTS = [
+  { e: [0.0, 0.20, 9.4], t: [0.0, 0.02, 0.0], f: 40, a: 1.0 },
+  { e: [1.55, 0.46, 7.50], t: [0.25, -0.01, 0.0], f: 44, a: 1.0 },
+  { e: [4.15, 0.62, 6.45], t: [0.0, 0.04, 0.0], f: 50, a: 0.25 },
+  { e: [-3.55, 0.36, 7.15], t: [-0.30, 0.02, 0.0], f: 46, a: 0.75 }
+];
+let cp = { e: SHOTS[0].e.slice(), t: SHOTS[0].t.slice(), f: SHOTS[0].f, a: SHOTS[0].a };
+
+let camAlign = 1.0;
+let vpM = new Float32Array(16), pM = new Float32Array(16), vM = new Float32Array(16);
+let eye = [0, 0, 10], tgt = [0, 0, 0], fwd = [0, 0, -1], rgt = [1, 0, 0], upv = [0, 1, 0];
+
+function cameraFor(v) {
+  const s = SHOTS[idx >= 0 ? (idx % SHOTS.length) : 0];
+  const k = 1 - Math.exp(-(lastDt || 0.016) * 3.1);
+  for (let a = 0; a < 3; a++) {
+    cp.e[a] += (s.e[a] - cp.e[a]) * k;
+    cp.t[a] += (s.t[a] - cp.t[a]) * k;
+  }
+  cp.f += (s.f - cp.f) * k;
+  cp.a += (s.a - cp.a) * k;
+  const amp = RM ? 0.25 : 1;
+  /* 微微的呼吸，让画面永远有生命 */
+  eye = [cp.e[0] + Math.sin(v * 0.31) * 0.085 * amp,
+         cp.e[1] + Math.sin(v * 0.23 + 1.2) * 0.055 * amp,
+         cp.e[2] + Math.sin(v * 0.19 + 0.4) * 0.10 * amp];
+  tgt = [cp.t[0], cp.t[1], cp.t[2]];
+  camAlign = cp.a;
+  /* 鼓点：很轻地推近 + 抬 FOV，不改机位序列 */
+  const kick = RM ? 0 : clamp(beatPulse, 0, 1);
+  const kz = 1 - 0.022 * kick;
+  for (let a = 0; a < 3; a++) eye[a] = tgt[a] + (eye[a] - tgt[a]) * kz;
+  return (cp.f + (RM ? 0 : 0.8 * Math.sin(v * 0.061) * amp) + 1.0 * kick) * DEG;
+}
+
+function draw() {
+  if (!gl) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!prog) return;
+  if (lineArr !== lines) { prepLines(); lineArr = lines; texLine = -1; }
+  const hasLine = idx >= 0 && !!lineT[idx];
+  if (hasLine && texLine !== idx) {
+    /* 下一句已预烘好：直接换槽，不在换句那一帧做排版/上传 */
+    if (prepReady && prepIdx === idx && prepMeta) {
+      [tex, texB] = [texB, tex];
+      [tcv, tcvB] = [tcvB, tcv];
+      [tctx, tctxB] = [tctxB, tctx];
+      applyMeta(prepMeta);
+      uploadChar(charDataB);
+      texLine = idx;
+      prepReady = false; prepIdx = -1; prepMeta = null;
+    } else {
+      buildLineTex(idx);
+    }
+  }
+
+  const T = now();
+  const LT = hasLine ? lineT[idx] : null;
+  const fade = LT ? sstep(0, 0.30, T - LT.vis) * (1 - sstep(LT.t1, LT.t1 + 0.55, T)) : 0;
+
+  const fov = cameraFor(vT);
+  m4persp(pM, fov, W / H, 0.05, 90);
+  m4look(vM, eye, tgt, [0, 1, 0]);
+  m4mul(vpM, pM, vM);
+  for (let i = 0; i < 3; i++) { fwd[i] = tgt[i] - eye[i]; }
+  let l = Math.hypot(fwd[0], fwd[1], fwd[2]) || 1;
+  for (let i = 0; i < 3; i++) fwd[i] /= l;
+  {
+    rgt[0] = fwd[1] * 0 - fwd[2] * 1; rgt[1] = fwd[2] * 0 - fwd[0] * 0; rgt[2] = fwd[0] * 1 - fwd[1] * 0;
+    l = Math.hypot(rgt[0], rgt[1], rgt[2]) || 1;
+    for (let i = 0; i < 3; i++) rgt[i] /= l;
+    upv[0] = rgt[1] * fwd[2] - rgt[2] * fwd[1]; upv[1] = rgt[2] * fwd[0] - rgt[0] * fwd[2]; upv[2] = rgt[0] * fwd[1] - rgt[1] * fwd[0];
+    l = Math.hypot(upv[0], upv[1], upv[2]) || 1;
+    for (let i = 0; i < 3; i++) upv[i] /= l;
+  }
+
+  /* 背景 pass：把字块投影成一个屏幕矩形，用字形压暗 8–15%，字就“站”在场景里 */
+  if (bgProg) {
+    let minU = 2, maxU = -1, minV = 2, maxV = -1, ok = 0;
+    const hw = TEXW * 0.5, hh = worldH * 0.5;
+    const cs = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    for (let ci = 0; ci < 4; ci++) {
+      const x = cs[ci][0], y = cs[ci][1];
+      const cx = vpM[0] * x + vpM[4] * y + vpM[12];
+      const cy = vpM[1] * x + vpM[5] * y + vpM[13];
+      const cw2 = vpM[3] * x + vpM[7] * y + vpM[15];
+      if (Math.abs(cw2) < 1e-5) continue;
+      const u = (cx / cw2 + 1) * 0.5, v = (cy / cw2 + 1) * 0.5;
+      minU = Math.min(minU, u); maxU = Math.max(maxU, u);
+      minV = Math.min(minV, v); maxV = Math.max(maxV, v);
+      ok++;
+    }
+    if (ok < 4) { minU = 0.10; maxU = 0.90; minV = 0.30; maxV = 0.70; }
+    gl.disable(gl.BLEND);
+    gl.useProgram(bgProg);
+    gl.bindVertexArray(bgVao);
+    gl.uniform1f(bgU.uT, vT);
+    gl.uniform1f(bgU.uA, fade * camAlign);
+    gl.uniform4f(bgU.uBox, minU, minV, Math.max(1e-4, maxU - minU), Math.max(1e-4, maxV - minV));
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(bgU.uTex, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  if (!hasLine) return;
+
+  const nCh = LT.n;
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniformMatrix4fv(U.uVP, false, vpM);
+  gl.uniform3f(U.uRight, rgt[0], rgt[1], rgt[2]);
+  gl.uniform3f(U.uUp, upv[0], upv[1], upv[2]);
+  gl.uniform2f(U.uCell, TEXW / COLS, worldH / ROWS);
+  gl.uniform2f(U.uWorld, TEXW, worldH);
+  gl.uniform1f(U.uT, T);
+  gl.uniform1f(U.uNCh, nCh);
+  gl.uniform1f(U.uFade, fade);
+  gl.uniform1f(U.uPulse, beatPulse);
+  gl.uniform1f(U.uDs, Math.max(3.0, Math.hypot(eye[0], eye[1], eye[2])));
+  gl.uniform1f(U.uZs, 1.0 + 0.16 * Math.sin(vT * 0.33));
+  gl.uniform1f(U.uAlign, camAlign);
+  gl.uniform1fv(U.uCharT, LT.ct);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(U.uTex, 0);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, N);
+  gl.bindVertexArray(null);
+}
+
+/* ── 启动 ─────────────────────────────────────────────────────────────── */
+try {
+  if (gl) {
+    compile();
+    gl.getExtension('EXT_color_buffer_float');
+  } else {
+    errMsg = 'no webgl2';
+  }
+} catch (e) { errMsg = 'setup: ' + (e && e.message ? e.message : e); }
+
+/* 每帧：vT 是视觉时钟（暂停时它不动，画面就冻住） */
+let last = performance.now();
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++; lastDt = dt || 0.016;
+  /* 自适应降级：连续掉帧就把 DPR 降 0.25 */
+  if (dt > 0.024) slow++; else slow = Math.max(0, slow - 1);
+  if (slow > 45 && PR > 1.0) { PR = Math.max(1.0, PR - 0.25); resize(); slow = 0; }
+  if (playing && performance.now() - lastTickWall > 400) stale = true;
+  else if (!playing) stale = false;
+  const T = stale ? lastFrameT : now();
+  if (!stale) lastFrameT = T;
+  vT = RM ? T * 0.24 : T;           /* 减少动态时整体变慢，不是不变 */
+  const live = playing && !stale;
+  if (live) beatPulse *= Math.exp(-dt * 3.6);
+  bass += (bassTgt - bass) * Math.min(1, dt * 8);
+  treb += (trebTgt - treb) * Math.min(1, dt * 8);
+
+  /* 当前唱到哪一句（lines[i].t 是这句的起点，lines[i].chars[k] 是逐字时间） */
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) { idx = ci; dirty = true; }
+
+  try { if (live || dirty) { draw(); dirty = false; } }
+  catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  prepNext(T);
+
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   协议（照抄，别改）
+   ──────────────────────────────────────────────────────────────────────────── */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9; vT = 0; beatPulse = 0; bass = 0; treb = 0;
+    bassTgt = 0; trebTgt = 0;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    lineArr = null; texLine = -1; prepIdx = -1; prepReady = false; prepMeta = null;
+    cp = { e: SHOTS[0].e.slice(), t: SHOTS[0].t.slice(), f: SHOTS[0].f, a: SHOTS[0].a };
+    camAlign = 1.0; eye = [0, 0, 10]; tgt = [0, 0, 0];
+    lastTickWall = performance.now(); lastFrameT = 0; stale = false; slow = 0;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    const t = d.payload.time;
+    if (!d.payload.playing) {
+      clockT = t; clockAt = performance.now();
+    } else {
+      const e = t - now();
+      if (!isFinite(e) || Math.abs(e) > 0.5) {
+        /* seek / 严重漂移：硬重建画面状态，但不重置 readySent、不重载 iframe */
+        clockT = t; clockAt = performance.now();
+        onSeekRebuild();
+      } else {
+        clockT += Math.max(-0.12, Math.min(0.12, e)) * 0.35;
+        clockAt = performance.now();
+      }
+    }
+    playing = !!d.payload.playing; lastTickWall = performance.now(); stale = false; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5); dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bassTgt = Math.max(0, Math.min(1, l.bass));
+    if (typeof l.treble === 'number') trebTgt = Math.max(0, Math.min(1, l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+
+function onSeekRebuild() {
+  lineArr = null; texLine = -1; prepIdx = -1; prepReady = false; prepMeta = null;
+  beatPulse = 0; bass = 0; treb = 0; bassTgt = 0; trebTgt = 0;
+  idx = -1; lastT = -1e9;
+  dirty = true;
+}
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx]) ? lines[idx].text : '',
+  gl: !!gl, rm: RM, vT: +vT.toFixed(2)
+});
+
+resize();
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>摩尔纹</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  /* 光雾 / 暗角 / 颗粒原来各是一整屏的 DOM 覆盖层。合成器每帧要多混三整屏
+     （软件合成下实测 ≈ 8ms/帧），而它们全都是"只跟屏幕尺寸有关"的静态层 ——
+     现在连底图一起烘进 canvas 里（见 bakePlate），页面上只剩 canvas 这一层。 */
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(200,210,235,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   044 · 摩尔纹 —— 字是两片栅格错位之后**放大出来的干涉条纹**
+   ---------------------------------------------------------------------------
+   和已有 10 个的区别：这里不画一个点，也不画一条字的轮廓。
+   画面是两片周期栅格叠在一起（参考页的"两层透明胶片"），
+   肉眼看到的粗条纹是两片栅格周期之差被放大几百倍的结果 ——
+   所以**条纹本身不是被画出来的，是算出来的**。
+
+   机制：第二片栅格被字形的距离场**局部旋转 + 局部拉伸**。
+     · 第一片：整屏均匀竖线（预烘一条 Path2D，每帧只换变换）；
+     · 第二片：竖线在字形附近被转开最多 0.52 弧度、间距被拉开 12%，
+       转开的角度由"离笔画多远"决定，所以栅格夹角是一个连续场；
+     · 两片夹角 θ 处的摩尔条纹间距 = λ/(2·sin(θ/2)) ——
+       λ 只有 13px，θ 只有零点几弧度，条纹间距却是几十上百像素。
+       于是字的每一笔都被放大成一圈圈干涉条纹，
+       而字外两片栅格平行、条纹间距趋于无穷，只剩一片均匀的灰。
+   所以字是"干涉发生的地方"，不是"被涂亮的地方"。
+
+   为什么快（这一版的全部改动都在"每帧要光栅化多少"上）：
+     这条形态的帧时间是**纯像素成本**：软件光栅下一条 1px 宽的抗锯齿线大约
+     70ns/像素，整屏细线 ≈ 25 万像素 ≈ 20ms；带 alpha 的整屏叠加（哪怕只画了几根线）
+     是逐像素读改写，一次就 ≈ 11ms；而**不透明**整屏贴图走整块拷贝，只要 0.2~2ms。
+     所以凡是"每帧画出来一模一样"的东西一律烘成不透明图，每帧只做少量 drawImage：
+       · 底 + 同心圆栅格 + 光雾 + 暗角 + 颗粒：全都只跟屏幕尺寸有关，
+         压成**一张不透明底图**，只在 resize 时烘一次。
+         呼吸缩放（原同心圆那层 ±2% 的 scale）直接作用在这张贴图上；
+         原来每帧对同心圆做的那次 rotate 是恒等变换（圆绕自己圆心转 = 不动），删掉；
+       · 页面上的三个整屏 DOM 覆盖层（#halo/#vig/#grain）也一起烘进底图 ——
+         合成器每帧本来要多混三整屏，实测 ≈ 8ms/帧，现在页面上只剩 canvas 这一层；
+       · 第二片栅格：字形一换就整片重画，三条色散边各烘一张透明小图，
+         踩拍时只把红/青两张左右挪 ±sep —— 视觉上完全等价，但不再每帧描 3 遍；
+       · 竖线栅格保留实时描边：它只碰自己盖住的那 ~10 万像素（7ms），
+         比整屏 alpha 贴图（11ms）还便宜；
+       · 画布改成不透明：透明画布每帧 clearRect 整屏要 7ms，不透明画布
+         一次整屏贴图就能既铺底又擦掉上一帧，连 clearRect 都省了。
+     于是每帧只剩 1 次不透明底图贴图 + 1 次描边 + 3 次小图贴图。
+
+   精修记录：① YRC 逐字显影 —— 整句先以**潜影**（半分辨率的暗字，每帧一次
+   drawImage）铺在底片上，任何时刻整句完整可读；第 k 个字在 chars[k].t 那一刻
+   把第二片栅格（干涉条纹）"显影"出来：只把该字的栅格子区域叠加进 live 图层，
+   条纹从无到有地出现 + 一次显影闪光（chars 缺失 / 长度不符按 t+dur*k/n 均分，
+   __stage 增 yrc 字段）。② 长句自动折 2~3 行 + 字号自适应（41 字 @96px 三行，
+   旧版压成一行 28px、条纹根本分辨不出字）。③ 栅格图的采样倍率按区域面积
+   自适应封顶（三行时区域面积翻倍，仍把每帧的贴图像素压在单行时的量级）。
+   ④ 动效：镜头缓慢呼吸缩放 + 平移（两片栅格一起漂）、踩拍红青错位（原有）、
+   显影闪光的暖色（accent 调色）。
+   分词：不使用。逐字时间已精确到字、潜影保证整句可读，分词只会让"显影"
+   成团出现、看不出在唱哪个字。
+   ========================================================================== */
+const cv = document.getElementById('c');
+/* alpha:false —— 不透明画布，合成器不用跟 CSS 底做混色，栅格化也能走整块快路径 */
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const TAU = Math.PI * 2;
+const FONT = (fs) => '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+let W = 0, H = 0, DPR = 1, B = 1;
+const LAM = 13;                                  // 栅格间距
+
+/* 底 + 同心圆栅格压成一张不透明图（只在 resize 时重做） */
+let plateImg = null, plateW = 1, plateH = 1;
+/* 第二片栅格：红 / 青 / 白 三条各烘一张透明图（每句重做一次） */
+let gbR = null, gbC = null, gbWt = null, gbX = 0, gbY = 0, gbCw = 1, gbCh = 1, gbB = 1;
+/* 逐字"显影"图层：和 gbR/gbC/gbWt 同尺寸，只把已经唱到的字的子区域叠进去 */
+let litR = null, litC = null, litWt = null;
+
+/* ---- 潜影（半分辨率暗字，整句一直在）---- */
+let latent = null, latentG = null;
+
+/* ---- 字形距离场（一次建，之后每帧 O(1) 查表；坑⑯）---- */
+const CELL = 8;
+const SIG = 8;                                   // 影响半径（像素）：只让笔画附近的栅格被拧开
+let gw = 0, gh = 0, dist = null, wgt = null;
+let hasField = false;
+const box = { x0: 0, y0: 0, x1: 0, y1: 0 };
+let lastPts = null;
+
+/* ---- 排版 / 逐字 ---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+let lay = null, ctArr = null, curYrc = false, lit = 0, curT = 0;
+let curLineRef = null;
+
+/* ---- 显影闪光 ---- */
+const FLASH_MAX = 24;
+const flX = new Float32Array(FLASH_MAX), flY = new Float32Array(FLASH_MAX), flL = new Float32Array(FLASH_MAX);
+let flN = 0;
+let flashSprite = null;
+
+let lines = [], accent = [150, 200, 255];
+let ax = 0, ay = 0, kick = 0, kickV = 0, sepBoost = 0, beatPulse = 0;
+
+/* 造一张离屏图，回调里用的是 CSS 像素坐标（内含 sc 倍超采样） */
+function layer(wCss, hCss, draw, sc) {
+  const s = sc || B;
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(wCss * s));
+  c.height = Math.max(1, Math.round(hCss * s));
+  const g = c.getContext('2d');
+  g.scale(c.width / wCss, c.height / hCss);        // 1 = 1 CSS 像素，和主画布同一坐标系
+  g.lineCap = 'butt'; g.lineJoin = 'bevel';         // 细长线：butt/bevel 比 round 省两个圆
+  draw(g);
+  return c;
+}
+
+/* 底 + 同心圆栅格烘成**一张不透明图**（plate）。
+    为什么要"不透明"：整屏贴图在软件光栅下，带 alpha 的叠加不管内容多少都要
+    逐像素读改写（实测整屏一次 ≈ 11ms），不透明贴图走整块拷贝（≈ 1~2ms），差 7 倍。
+    底图按**屏幕像素坐标**烘（环距、线宽、暗角都是最终屏幕上的值），
+    每帧只再乘一个 ±2% 的呼吸缩放，所以烘成 1.04 倍就够盖满
+    （最小时 1.04×0.98 = 1.019 > 1）。 */
+const PLATE = 1.04;
+function bakePlate() {
+  const pw = Math.ceil(W * PLATE), ph = Math.ceil(H * PLATE);
+  plateW = pw; plateH = ph;
+  /* 同心圆那一层原本整个乘了 sc2 = min(W,H)/900，所以屏幕上的环距是 17×sc2 */
+  const sc = Math.min(W, H) / 900;
+  const ringStep = 17 * sc, ringLW = 1.35;
+  /* 同心圆只画到"最远的可见角"为止（和原来一模一样：局部 947×1.05 再乘 sc） */
+  const rext = Math.hypot(W / 2 + 96, H / 2 + 76) * 1.05 * sc;
+  plateImg = layer(pw, ph, (g) => {
+    /* 底：和 body 上那条 radial-gradient 一模一样（画布不透明之后 body 的底看不见了） */
+    const r = Math.max(W, H) * 0.72;
+    g.fillStyle = '#05060a';
+    g.fillRect(0, 0, pw, ph);
+    const rg = g.createRadialGradient(pw / 2, ph / 2, 0, pw / 2, ph / 2, r);
+    rg.addColorStop(0, '#11141c');
+    rg.addColorStop(0.55, '#090b11');
+    rg.addColorStop(1, '#05060a');
+    g.fillStyle = rg;
+    g.fillRect(0, 0, pw, ph);
+    g.save();
+    g.translate(pw / 2 - 96, ph / 2 + 76);
+    g.strokeStyle = 'rgba(236,242,255,0.20)';
+    g.lineWidth = ringLW;
+    const p = new Path2D();
+    for (let rr = ringStep; rr <= rext; rr += ringStep) { p.moveTo(rr, 0); p.arc(0, 0, rr, 0, TAU); }
+    g.stroke(p);
+    g.restore();
+
+    /* ---- 光雾（原 #halo 覆盖层）---- */
+    const hr = Math.min(W, H) * 0.62;
+    const hg = g.createRadialGradient(pw / 2, ph / 2, 0, pw / 2, ph / 2, hr);
+    hg.addColorStop(0, 'rgba(150,200,255,0.07)');
+    hg.addColorStop(0.62, 'rgba(90,130,220,0.02)');
+    hg.addColorStop(1, 'rgba(90,130,220,0)');
+    g.fillStyle = hg;
+    g.fillRect(0, 0, pw, ph);
+
+    /* ---- 暗角（原 #vig 覆盖层）：radial-gradient(110% 90% at 50% 50%) 是椭圆，
+       画到椭圆单位空间里正好复刻 ---- */
+    g.save();
+    g.translate(pw / 2, ph / 2);
+    g.scale(pw * 1.1, ph * 0.9);
+    const vg = g.createRadialGradient(0, 0, 0.40, 0, 0, 1);
+    vg.addColorStop(0, 'rgba(4,5,8,0)');
+    vg.addColorStop(0.76, 'rgba(4,5,8,0.34)');
+    vg.addColorStop(1, 'rgba(3,4,7,0.80)');
+    g.fillStyle = vg;
+    g.fillRect(-1.2, -1.2, 2.4, 2.4);
+    g.restore();
+
+    /* ---- 斜纹颗粒（原 #grain 覆盖层）：repeating-linear-gradient 1px 暗 / 3px 周期，
+       原来靠 opacity .16 × multiply 变暗 e = 0.34×0.16 = 0.0544；
+       "乘以 (1-e)" 在 canvas 里就是叠一层 alpha=e 的黑 ---- */
+    g.fillStyle = 'rgba(0,0,0,0.0544)';
+    for (let y = 0; y < ph; y += 3) g.fillRect(0, y, pw, 1);
+  }, 1);
+}
+
+/* 竖线栅格：125 条线，直接描边，不烘图。
+   实测描边 7ms < 烘成带 alpha 的整屏图再贴 11ms —— 因为带 alpha 的整屏贴图
+   是逐像素读改写，跟"线有多细"无关；而描边只碰它真正盖住的那些像素。 */
+let gratA = null;
+function buildGratA() {
+  /* 竖线只需要覆盖屏幕本身。原来两端各伸出 ext=1528px，而屏幕半对角只有 826px ——
+     多出来的 99% 都在屏幕外，却要陪着一起光栅化。这里按"最大位移 + 最大转角"给够余量：
+     位移 |ax|≤68 / |ay|≤40，转角 |θ|≤0.01rad，所以横竖各留 90 / 80+8px 就绝对够 */
+  const ex = W / 2 + 90;
+  const ey = H / 2 + 80 + ex * 0.012;
+  const p = new Path2D();
+  for (let x = -ex; x <= ex; x += LAM) { p.moveTo(x, -ey); p.lineTo(x, ey); }
+  gratA = p;
+}
+
+function resize() {
+  /* 封顶 1.5 倍：这条形态的成本是**逐像素**的，2 倍屏等于 4 倍像素，
+     真机上会直接掉出 30fps；1.5 倍在 1px 细线上看不出软，但便宜一半多 */
+  DPR = Math.min(1.5, window.devicePixelRatio || 1);
+  W = Math.max(1, Math.round(window.innerWidth));
+  H = Math.max(1, Math.round(window.innerHeight));
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  /* 全是细长线：butt/bevel 和 round 肉眼没差别，但圆帽/圆接头每段要多画两个小圆 */
+  ctx.lineCap = 'butt'; ctx.lineJoin = 'bevel';
+  /* 预烘图的超采样倍率：和画布像素 1:1 最好（DPR 已封顶在 1.5，所以这里也到不了 4000²） */
+  B = DPR;
+
+  bakePlate(); buildGratA();
+  if (curLineRef) relayout();
+}
+
+/* ---- 排版：长句折 2~3 行，字号自适应 ---- */
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => {
+    if (i > 0 && i < n) {
+      const c = text.charCodeAt(i);
+      if (c >= 0xDC00 && c <= 0xDFFF) return i - 1;
+    }
+    return i;
+  };
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+function makeLayout(text) {
+  if (!text) return null;
+  const rows = splitRows(text);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.78, 1250);
+  const maxH = H * 0.46;
+  const LHK = 1.22;
+  octx.font = FONT(96);
+  let widest = 0;
+  for (const r of rows) widest = Math.max(widest, octx.measureText(r).width);
+  let fs = 96 * Math.min(1, maxW / Math.max(1, widest), maxH / (nr * LHK * 96));
+  fs = Math.max(28, Math.floor(fs));
+  octx.font = FONT(fs);
+  let wMax = 0;
+  for (const r of rows) wMax = Math.max(wMax, octx.measureText(r).width);
+  if (wMax > maxW) { fs = Math.max(28, Math.floor(fs * maxW / wMax)); octx.font = FONT(fs); }
+  const LH = fs * LHK;
+  const glyphs = [], rowInfo = [];
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  let gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r];
+    let wsum = 0; const ws = [];
+    for (let j = 0; j < row.length; j++) { const w = octx.measureText(row[j]).width; ws.push(w); wsum += w; }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH;
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi++ });
+      x += w;
+    }
+    rowInfo.push({ text: row, x0: W / 2 - wsum / 2, w: wsum, y: y });
+  }
+  return { glyphs: glyphs, rowInfo: rowInfo, fs: fs, LH: LH, nr: nr };
+}
+
+function charTimes(line) {
+  const n = line.text.length;
+  const ct = new Float32Array(n);
+  const chs = line.chars;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      ct[k] = v;
+    }
+  }
+  if (!ok) {
+    const dur = line.dur > 0 ? line.dur : 3;
+    const t0 = +line.t || 0;
+    for (let k = 0; k < n; k++) ct[k] = t0 + dur * k / Math.max(1, n);
+  }
+  for (let k = 1; k < n; k++) if (ct[k] < ct[k - 1]) ct[k] = ct[k - 1];
+  return { ct: ct, yrc: ok };
+}
+
+/* ---- 单字采样（相对字心）---- */
+function sampleChar(ch, fs) {
+  octx.font = FONT(fs);
+  const w = Math.max(6, Math.ceil(octx.measureText(ch).width) + 8);
+  const h = Math.max(6, Math.ceil(fs * 1.35) + 8);
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(ch, w / 2, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const pts = [];
+  for (let y = 0; y < h; y += 2)
+    for (let x = 0; x < w; x += 2)
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - w / 2, y - h / 2);
+  return pts;
+}
+
+function layoutPoints(L) {
+  const out = [];
+  for (let i = 0; i < L.glyphs.length; i++) {
+    const g = L.glyphs[i], p = sampleChar(g.ch, L.fs);
+    for (let k = 0; k < p.length; k += 2) out.push(g.x + p[k], g.y + p[k + 1]);
+  }
+  return out;
+}
+
+function buildField(pts) {
+  gw = Math.ceil(W / CELL) + 1; gh = Math.ceil(H / CELL) + 1;
+  const n = gw * gh;
+  if (!dist || dist.length !== n) { dist = new Float32Array(n); wgt = new Float32Array(n); }
+  const INF = 1e6;
+  for (let i = 0; i < n; i++) dist[i] = INF;
+  const cx = W / 2, cy = H / 2;
+  let x0 = W, y0 = H, x1 = 0, y1 = 0;
+  for (let i = 0; i < pts.length; i += 2) {
+    const sx = pts[i], sy = pts[i + 1];            // 点云已是画布绝对坐标
+    const gx = (sx / CELL) | 0, gy = (sy / CELL) | 0;
+    if (gx >= 0 && gx < gw && gy >= 0 && gy < gh) dist[gy * gw + gx] = 0;
+    if (sx < x0) x0 = sx; if (sx > x1) x1 = sx;
+    if (sy < y0) y0 = sy; if (sy > y1) y1 = sy;
+  }
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const i = y * gw + x; let v = dist[i];
+    if (x > 0 && dist[i - 1] + 1 < v) v = dist[i - 1] + 1;
+    if (y > 0 && dist[i - gw] + 1 < v) v = dist[i - gw] + 1;
+    if (x > 0 && y > 0 && dist[i - gw - 1] + 1.414 < v) v = dist[i - gw - 1] + 1.414;
+    if (x < gw - 1 && y > 0 && dist[i - gw + 1] + 1.414 < v) v = dist[i - gw + 1] + 1.414;
+    dist[i] = v;
+  }
+  for (let y = gh - 1; y >= 0; y--) for (let x = gw - 1; x >= 0; x--) {
+    const i = y * gw + x; let v = dist[i];
+    if (x < gw - 1 && dist[i + 1] + 1 < v) v = dist[i + 1] + 1;
+    if (y < gh - 1 && dist[i + gw] + 1 < v) v = dist[i + gw] + 1;
+    if (x < gw - 1 && y < gh - 1 && dist[i + gw + 1] + 1.414 < v) v = dist[i + gw + 1] + 1.414;
+    if (x > 0 && y < gh - 1 && dist[i + gw - 1] + 1.414 < v) v = dist[i + gw - 1] + 1.414;
+    dist[i] = v;
+  }
+  for (let i = 0; i < n; i++) {
+    const t = dist[i] * CELL / SIG;
+    wgt[i] = t < 3 ? Math.exp(-t * t) : 0;
+  }
+  box.x0 = x0; box.y0 = y0; box.x1 = x1; box.y1 = y1;
+  hasField = pts.length > 0;
+  lastPts = pts;
+}
+
+/* 距离场查询：返回 0~1 的"离笔画多近" */
+function S(x, y) {
+  const gx = (x / CELL) | 0, gy = (y / CELL) | 0;
+  if (gx < 0 || gx >= gw || gy < 0 || gy >= gh) return 0;
+  return wgt[gy * gw + gx];
+}
+
+/* ---- 第二片栅格：被距离场局部旋转 + 拉伸（每句烘一次，不在帧里描）---- */
+function buildB() {
+  if (!hasField) { gbR = gbC = gbWt = null; litR = litC = litWt = null; return; }
+  const M = SIG * 4;                              // 边距 ≥ 4σ，场在边界已经归零，不会有硬边
+  const x0 = box.x0 - M, x1 = box.x1 + M, y0 = box.y0 - M, y1 = box.y1 + M;
+  /* 最左边那条线的起点按栅格对齐，可能比 x0 还左，图的左边界要把它包进去 */
+  const xs = Math.floor(x0 / LAM) * LAM;
+  const wCss = Math.max(8, Math.ceil(x1 - xs) + 2), hCss = Math.max(8, Math.ceil(y1 - y0) + 2);
+  const STEP = 13;
+  const p = new Path2D();
+  const gyMid = (y0 + y1) * 0.5;
+  for (let xb = xs; xb <= x1; xb += LAM) {
+    let x = xb + 0.12 * S(xb, gyMid) * (xb - W / 2);   // 局部间距拉伸
+    let y = y0;
+    p.moveTo(x - xs, y - y0);
+    let guard = 0;
+    while (y < y1 && guard++ < 400) {
+      const ang = 0.52 * S(x, y);                    // 局部转角（0 → 0.52 弧度）
+      x += -Math.sin(ang) * STEP;
+      y += Math.cos(ang) * STEP;
+      p.lineTo(x - xs, y - y0);
+    }
+  }
+  /* 三行排版时区域面积会翻倍：按面积给采样倍率封顶，把每帧贴图的像素量压回
+     单行时的量级（否则三行 @1.5 倍 = 4.5M 像素/帧，直接掉出 40fps）*/
+  const px = wCss * hCss;
+  gbB = Math.max(0.75, Math.min(B, Math.sqrt(1250000 / Math.max(1, px))));
+  /* 三条色散边各烘一张：踩拍时整张左右挪，不再每帧把这条路径描三遍 */
+  const dn = [0.07 + accent[0] / 255 * 0.06, 0.08 + accent[2] / 255 * 0.06];
+  const mk = (style, lw) => layer(wCss, hCss, (g) => { g.strokeStyle = style; g.lineWidth = lw; g.stroke(p); }, gbB);
+  gbR = mk('rgba(255,74,126,' + dn[0].toFixed(3) + ')', 1.1);
+  gbC = mk('rgba(72,208,255,' + dn[1].toFixed(3) + ')', 1.1);
+  gbWt = mk('rgba(' + Math.min(255, accent[0] * 0.35 + 200) + ',' + Math.min(255, accent[1] * 0.35 + 210) + ',' +
+            Math.min(255, accent[2] * 0.35 + 220) + ',0.36)', 1.05);
+  gbX = xs; gbY = y0; gbCw = wCss; gbCh = hCss;
+  /* 逐字显影图层：同尺寸，一开始全空（尺寸不变时复用，别每句新建 6 张画布）*/
+  const blank = (old) => {
+    if (old && old.width === gbR.width && old.height === gbR.height) {
+      const g = old.getContext('2d');
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.clearRect(0, 0, old.width, old.height);
+      return old;
+    }
+    return layer(wCss, hCss, () => {}, gbB);
+  };
+  litR = blank(litR); litC = blank(litC); litWt = blank(litWt);
+  lit = 0;
+}
+
+/* 把一个字的栅格子区域从母版叠进"已显影"图层 —— 只在它被唱到的那一帧做一次 */
+function developChar(k) {
+  if (!lay || !lay.glyphs[k] || !gbWt) return;
+  const g = lay.glyphs[k];
+  const pad = 10;
+  const x0 = g.x - g.w / 2 - pad, x1 = g.x + g.w / 2 + pad;
+  const y0 = g.y - lay.fs * 0.72 - pad, y1 = g.y + lay.fs * 0.72 + pad;
+  const sx = Math.max(0, (x0 - gbX) * gbB), sy = Math.max(0, (y0 - gbY) * gbB);
+  const sw = Math.min(gbR.width - sx, (x1 - x0) * gbB), sh = Math.min(gbR.height - sy, (y1 - y0) * gbB);
+  if (sw <= 0 || sh <= 0) return;
+  for (const [cont, src] of [[litR.getContext('2d'), gbR], [litC.getContext('2d'), gbC], [litWt.getContext('2d'), gbWt]]) {
+    cont.drawImage(src, sx, sy, sw, sh, sx, sy, sw, sh);
+  }
+  /* 显影 = 这个字在潜影图上被写实（字变亮）+ 干涉条纹出现 */
+  if (latentG) {
+    latentG.globalCompositeOperation = 'source-over';
+    latentG.fillStyle = 'rgba(236,242,255,0.92)';
+    latentG.fillText(lay.glyphs[k].ch, lay.glyphs[k].x, lay.glyphs[k].y);
+  }
+  if (flN < FLASH_MAX) {
+    flX[flN] = g.x; flY[flN] = g.y; flL[flN] = 0.55; flN++;
+  }
+}
+
+/* 潜影：整句烘成半分辨率暗字（"底片上的潜影"，任何时刻整句可读）*/
+function bakeLatent() {
+  const s = 0.5;
+  const w = Math.max(2, Math.round(W * s)), h = Math.max(2, Math.round(H * s));
+  if (!latent) latent = document.createElement('canvas');
+  latent.width = w; latent.height = h;
+  const g = latent.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, w, h);
+  if (!lay) return;
+  g.setTransform(s, 0, 0, s, 0, 0);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = FONT(lay.fs);
+  g.lineJoin = 'round';
+  g.fillStyle = 'rgba(' + Math.min(255, accent[0] * 0.4 + 120) + ',' +
+                Math.min(255, accent[1] * 0.4 + 130) + ',' + Math.min(255, accent[2] * 0.3 + 150) + ',0.30)';
+  latentG = g;
+  g.strokeStyle = 'rgba(230,236,255,0.24)';
+  g.lineWidth = Math.max(1, lay.fs * 0.02);
+  for (let r = 0; r < lay.rowInfo.length; r++) {
+    const row = lay.rowInfo[r], x = row.x0 + row.w / 2;
+    g.fillText(row.text, x, row.y);
+    g.strokeText(row.text, x, row.y);
+  }
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let pend = null, pendIdx = -1;
+
+function brewLine(i) {
+  const L = lines[i];
+  const tm = charTimes(L);
+  const ly = makeLayout(L.text);
+  pend = { lay: ly, ct: tm.ct, yrc: tm.yrc, pts: ly ? layoutPoints(ly) : [] };
+  pendIdx = i;
+}
+
+function relayout() {
+  if (!curLineRef) return;
+  const tm = charTimes(curLineRef);
+  lay = makeLayout(curLineRef.text);
+  ctArr = tm.ct; curYrc = tm.yrc;
+  buildField(lay ? layoutPoints(lay) : []);
+  buildB();
+  bakeLatent();
+}
+
+function startLine(i) {
+  if (pendIdx !== i) brewLine(i);
+  const b = pend;
+  pend = null; pendIdx = -1;
+  curLineRef = lines[i];
+  if (!b || !b.lay) {
+    lay = null; ctArr = null; curYrc = false;
+    buildField([]); buildB(); bakeLatent();
+    return;
+  }
+  lay = b.lay; ctArr = b.ct; curYrc = b.yrc;
+  buildField(b.pts || []);
+  buildB();                                       // 上一片栅格在这里被整块丢掉（坑③）
+  bakeLatent();
+  kickV = 55;                                     // 换句时两片栅格错开一下，条纹扫过整块字
+}
+
+function timing(T) {
+  curT = T;
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    pend = null; pendIdx = -1; hasField = false;
+    gbR = gbC = gbWt = null; litR = litC = litWt = null; lastPts = null;
+    latent = null; lay = null; ctArr = null; curLineRef = null; lit = 0; flN = 0;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci);
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine(nx); }
+  }
+  /* YRC：第 k 字的干涉条纹在 chars[k].t 那一刻"显影" */
+  if (ctArr) while (lit < ctArr.length && T >= ctArr[lit]) { developChar(lit); lit++; }
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    pend = null; pendIdx = -1; hasField = false; lastPts = null;
+    lay = null; ctArr = null; curLineRef = null; lit = 0; flN = 0;
+    gbR = gbC = gbWt = null; litR = litC = litWt = null; latent = null;
+    ax = 0; ay = 0; kick = 0; kickV = 0; sepBoost = 0;
+    if (p.accent) { accent = p.accent; bakeFlash(); }
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：两片栅格**相对**滑一下 —— 整场一起动，条纹整体平移。
+       逐颗乱踢在这里没有意义（根本没有颗粒），错位量才是唯一的自由度 */
+    kickV += 26 * (0.35 + (d.payload.level || 0));
+    sepBoost = Math.min(1, sepBoost + 0.7 * (0.35 + (d.payload.level || 0)));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+/* ---- 显影闪光的暖色光斑（预渲染，坑⑪）---- */
+function bakeFlash() {
+  const s = 128, c = document.createElement('canvas');
+  c.width = s; c.height = s;
+  const g = c.getContext('2d');
+  const rg = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  rg.addColorStop(0, 'rgba(255,248,235,0.55)');
+  rg.addColorStop(0.35, 'rgba(' + Math.min(255, accent[0] * 0.5 + 150) + ',' +
+    Math.min(255, accent[1] * 0.5 + 140) + ',' + Math.min(255, accent[2] * 0.4 + 160) + ',0.18)');
+  rg.addColorStop(1, 'rgba(120,160,255,0)');
+  g.fillStyle = rg; g.fillRect(0, 0, s, s);
+  flashSprite = c;
+}
+
+/* ---------------- 主循环 ---------------- */
+let last = performance.now();
+let t0 = 0;
+
+resize(); bakeFlash();
+requestAnimationFrame(frame);
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  beatPulse *= Math.exp(-dt * 3.0);
+  sepBoost *= Math.exp(-dt * 2.4);
+
+  /* 错位：弹簧回中 —— 这就是参考页里"松手后缓慢漂移"的手感 */
+  kickV += (-kick * 26 - kickV * 7.5) * dt;
+  kick += kickV * dt;
+  kick = Math.max(-9, Math.min(9, kick));
+
+  const cx = W / 2, cy = H / 2;
+  ax = 26 * Math.sin(t0 * 0.090) + 14 * Math.sin(t0 * 0.037) + kick * 3.1;
+  ay = 18 * Math.cos(t0 * 0.071) + 9 * Math.sin(t0 * 0.053) + kick * 1.4;
+
+  ctx.globalAlpha = 1;
+  /* 底 + 同心圆一次**不透明**贴图：既铺底、又把上一帧擦干净，连 clearRect 都省了。
+     只乘 ±2% 的呼吸缩放，所以同心圆还在慢慢"呼吸" ——
+     同心圆绕自己圆心旋转本来就是恒等变换，原来那次 rotate 对画面没有任何影响。 */
+  const breathe = 1 + 0.02 * Math.sin(t0 * 0.07);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.save();
+  ctx.translate(cx, cy);
+  /* 镜头：整块画面缓慢呼吸缩放 + 平移（两片栅格一起漂）*/
+  const camS = breathe * (1 + 0.010 * Math.sin(t0 * 0.043));
+  ctx.scale(camS, camS);
+  ctx.drawImage(plateImg, -plateW / 2, -plateH / 2, plateW, plateH);
+  ctx.restore();
+
+  /* 第一片：均匀竖线（它和第二片是错位关系的两半，必须自己动）。
+     ⚠这里是整个形态唯一剩下的热点，实测：同一笔描边用 'screen' 是 16ms，
+     用 'source-over' 只要 3ms —— 带混合方式的描边在软件光栅下会关掉快速路径。
+     而"17% 的白线叠在深色底上"这两种混合的差别不到 1/255，肉眼不可见。 */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.save();
+  ctx.translate(cx + ax, cy + ay);
+  ctx.rotate(Math.sin(t0 * 0.043) * 0.010);
+  ctx.strokeStyle = 'rgba(236,242,255,0.17)';
+  ctx.lineWidth = 0.8;
+  ctx.stroke(gratA);
+  ctx.restore();
+
+  /* 潜影 + 已显影的字在同一张图上（未显影 30%，显影的那几个字被写实到 1.0）*/
+  if (latent) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.92;
+    ctx.drawImage(latent, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  /* 第二片：被字形位移场拧过的竖线，只有已唱到的字（live 图层）才显影。
+     红青错位 = 参考页的色散边 */
+  if (litWt) {
+    const sep = 0.45 + 6.5 * sepBoost;
+    ctx.globalCompositeOperation = 'screen';
+    ctx.drawImage(litR, gbX + sep, gbY, gbCw, gbCh);
+    ctx.drawImage(litC, gbX - sep, gbY, gbCw, gbCh);
+    ctx.drawImage(litWt, gbX, gbY, gbCw, gbCh);
+  }
+
+  /* 显影闪光：刚显影的那个字上暖一下 */
+  if (flN > 0) {
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < flN; i++) {
+      flL[i] -= dt;
+      if (flL[i] <= 0) {
+        flN--; flX[i] = flX[flN]; flY[i] = flY[flN]; flL[i] = flL[flN]; i--; continue;
+      }
+      const a = flL[i] / 0.55;
+      const s = 40 + 46 * (1 - a);
+      ctx.globalAlpha = 0.55 * a * a;
+      ctx.drawImage(flashSprite, flX[i] - s, flY[i] - s, s * 2, s * 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  /* 踩拍的整屏提亮（beatPulse 平时衰减到 0，只有真踩拍时才会走这一笔） */
+  if (beatPulse > 0.01) {
+    ctx.globalCompositeOperation = 'screen';
+    ctx.fillStyle = 'rgba(' + Math.min(255, accent[0] * 0.5 + 80) + ',' + Math.min(255, accent[1] * 0.5 + 100) + ',' +
+                    Math.min(255, accent[2] * 0.4 + 130) + ',' + (0.05 * beatPulse).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx, hasField: hasField, yrc: !!curYrc,
+  hasB: !!litWt, lit: lit, rows: lay ? lay.rowInfo.length : 0, fs: lay ? lay.fs : 0,
+  chars: ctArr ? ctArr.length : 0, kick: +kick.toFixed(2), T: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

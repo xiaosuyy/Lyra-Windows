@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>贴金</title>
+<!--
+  机制：一块刷过漆、贴过金箔的板子，金箔被擦掉了一大半 ——
+        字是还留着金的那块，边上是手撕的口子，翘起一线亮；
+        擦过的地方发乌：漆上糊着一层擦剩的金粉，被布道子拉成灰糊糊的一片。
+  用了：WebGL2 实例化（10 万颗金屑/浮尘）＋ 真三维相机 ＋ 背景着色器全分辨率画字。
+        背景对每像素做 **射线→z=0 板面求交**，用世界坐标算金箔的片格
+        （一片 5.8 厘米、叠缝、翘边），折痕是脊状噪声叠出来的；
+        法线按"每一片贴上去的手劲不同"逐片偏摆 —— 光一斜，金就一片一片地亮灭。
+        字形纹理的 G 是箔还在的那块，撕口由三层高斯环（亮边 / 黑影 / 金屑）叠出来。
+  镜头：斜光刮过箔面 —— A 脸贴上去从左下蹭过撕口，箔压成一道长条；
+        B 退到半步外、压低斜看，几个字正对着光；
+        C 直起身正对板面，整句金贴着乌黑的漆一起退远。
+-->
+<style>
+  html,body{margin:0;height:100%;background:#05070a;overflow:hidden}
+  body{font-family:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;pointer-events:none;z-index:2;
+       background:radial-gradient(128% 96% at 50% 46%,rgba(0,0,0,0) 28%,rgba(0,0,0,.76) 100%)}
+  #hint{position:fixed;left:50%;bottom:15px;transform:translateX(-50%);pointer-events:none;z-index:3;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(240,206,168,.30);transition:opacity .8s;white-space:nowrap}
+  #type{position:fixed;inset:0;pointer-events:none;z-index:1;opacity:0}
+  html.fb #c{display:none}
+  html.fb #type{opacity:1;display:flex;align-items:center;justify-content:center}
+  html.fb #type .in{font-weight:900;font-size:clamp(30px,6vh,80px);letter-spacing:.10em;
+       color:#d8fbf8;text-align:center;text-shadow:0 0 40px rgba(120,240,255,.45)}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="type"><div class="in"></div></div>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ══════════════════════════════════════════════════════════════════════
+   278 · 贴金 —— 金箔叠贴 · 手撕的口子 · 斜光刮过箔面
+   ══════════════════════════════════════════════════════════════════════ */
+const cv = document.getElementById('c');
+const typeBox = document.getElementById('type');
+const typeIn = typeBox.querySelector('.in');
+const hint = document.getElementById('hint');
+const FAMILY = '"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif';
+
+const N = 100000;
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1, lastT = -1e9;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, beatN = 0, bass = 0, treb = 0;
+let frames = 0, jsMs = 0, errMsg = '';
+let readySent = false;
+let inAmt = 0, act = 0, uCut = 0.35, uProgG = 0;
+
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const mix = (a, b, t) => a + (b - a) * t;
+
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) { RM = !!mq.matches; const onMQ = (e) => { RM = !!e.matches; }; if (mq.addEventListener) mq.addEventListener('change', onMQ); else if (mq.addListener) mq.addListener(onMQ); }
+} catch (_) {}
+
+/* ══════════════════════════ 字形纹理（fillText → GPU，不回读） ══════════════════════════ */
+const gcv = document.createElement('canvas');
+const gctx = gcv.getContext('2d');
+const GT = { w: 0, h: 0, box: [-0.7, -0.1, 1.4, 0.35], chars: [], ready: false };
+const RAMP_N = 64;
+const ramp = new Uint8Array(RAMP_N * 4);
+const BOX_W = 1.40;
+
+function bakeText(text) {
+  const t = (text || '').trim();
+  if (!t) { GT.ready = false; return; }
+  const fsPx = 190;
+  const font = '900 ' + fsPx + 'px ' + FAMILY;
+  gctx.font = font;
+  const mt = gctx.measureText(t);
+  const pad = Math.round(fsPx * 0.26);
+  const w = Math.max(32, Math.ceil(mt.width + pad * 2));
+  const h = Math.max(32, Math.ceil(fsPx * 1.5));
+  gcv.width = w; gcv.height = h;
+  gctx.font = font;
+  gctx.textBaseline = 'middle';
+  gctx.textAlign = 'left';
+  gctx.fillStyle = '#000';
+  gctx.fillRect(0, 0, w, h);
+  gctx.globalCompositeOperation = 'source-over';
+  gctx.filter = 'none';
+  gctx.lineJoin = 'round';
+  gctx.lineCap = 'round';
+  /* G = 留空的那道缝（字本体）——笔画略收，缝才不至于糊成一团 */
+  gctx.lineWidth = fsPx * 0.060;
+  gctx.strokeStyle = '#00ff00';
+  gctx.strokeText(t, pad, h * 0.52);
+  gctx.fillStyle = '#00ff00';
+  gctx.fillText(t, pad, h * 0.52);
+  /* R = 凿开的砖断面：比缝宽一圈的那道毛边（砖被凿到缝边的地方） */
+  gctx.globalCompositeOperation = 'lighter';
+  gctx.lineWidth = fsPx * 0.148;
+  gctx.strokeStyle = '#ff0000';
+  gctx.strokeText(t, pad, h * 0.52);
+  gctx.globalCompositeOperation = 'source-over';
+
+  const arr = Array.from(t);
+  const chars = [];
+  let acc = 0;
+  for (const ch of arr) {
+    const cw = gctx.measureText(ch).width;
+    chars.push({ c: ch, x0: (pad + acc) / w, x1: (pad + acc + cw) / w });
+    acc += cw;
+  }
+  GT.chars = chars;
+  GT.w = w; GT.h = h;
+  const boxH = BOX_W * (h / w);
+  GT.box = [-BOX_W / 2, -boxH / 2, BOX_W, boxH];
+  GT.ready = true;
+  if (glOk) uploadGlyph();
+}
+
+function uploadGlyph() {
+  gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gcv);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+let charProg = [];
+function buildRamp() {
+  if (!GT.chars.length) { ramp.fill(0); if (glOk) pushRamp(); return; }
+  for (let i = 0; i < RAMP_N; i++) {
+    const u = (i + 0.5) / RAMP_N;
+    let v = 0;
+    for (let k = 0; k < GT.chars.length; k++) {
+      const c = GT.chars[k];
+      if (u >= c.x0 - 0.004 && u <= c.x1 + 0.004) { v = charProg[k] || 0; break; }
+      if (u < c.x0) { v = charProg[k] || 0; break; }
+    }
+    const b = Math.round(clamp01(v) * 255);
+    ramp[i * 4] = b; ramp[i * 4 + 1] = b; ramp[i * 4 + 2] = b; ramp[i * 4 + 3] = 255;
+  }
+  pushRamp();
+}
+function pushRamp() {
+  if (!glOk) return;
+  gl.bindTexture(gl.TEXTURE_2D, rampTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, RAMP_N, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, ramp);
+}
+
+/* ══════════════════════════ 线性代数 ══════════════════════════ */
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+function cameraBasis(eye, at, roll) {
+  let fx = at[0] - eye[0], fy = at[1] - eye[1], fz = at[2] - eye[2];
+  let fl = Math.hypot(fx, fy, fz) || 1; fx /= fl; fy /= fl; fz /= fl;
+  let rx = -fz, ry = 0, rz = fx;
+  let rl = Math.hypot(rx, ry, rz) || 1;
+  if (rl < 1e-4) { rx = 1; ry = 0; rz = 0; rl = 1; }
+  rx /= rl; ry /= rl; rz /= rl;
+  let ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+  const ul = Math.hypot(ux, uy, uz) || 1; ux /= ul; uy /= ul; uz /= ul;
+  const c = Math.cos(roll), s = Math.sin(roll);
+  const RX = rx * c + ux * s, RY = ry * c + uy * s, RZ = rz * c + uz * s;
+  const UX = ux * c - rx * s, UY = uy * c - ry * s, UZ = uz * c - rz * s;
+  const dt = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const view = new Float32Array([
+    RX, UX, -fx, 0,
+    RY, UY, -fy, 0,
+    RZ, UZ, -fz, 0,
+    -dt([RX, RY, RZ], eye), -dt([UX, UY, UZ], eye), dt([fx, fy, fz], eye), 1
+  ]);
+  return { view, right: [RX, RY, RZ], up: [UX, UY, UZ], fwd: [fx, fy, fz] };
+}
+
+/* ══════════════════════════ GLSL ══════════════════════════ */
+const BG_VS = `#version 300 es
+in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+
+/* 背景：一面没抹完的砖墙。射线打到 z=0 的墙面，用世界坐标算错缝砖列 ——
+   字是砌墙时留空的那道缝：灰浆没进去，凿断的砖断面朝光，缝心透过来一线暖光。 */
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform vec3 uEye, uRight, uUp, uFwd;
+uniform float uTan, uAsp, uT, uBass, uAct, uCut;
+uniform sampler2D uGlyph, uRamp;
+uniform vec4 uBox;
+
+float h21(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float vn(vec2 p){
+  vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float fbm(vec2 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++){ s += a * vn(p); p = p * 2.03 + 11.7; a *= 0.5; } return s; }
+
+void main(){
+  vec2 nd = vUV * 2.0 - 1.0;
+  vec3 dir = normalize(uRight * (nd.x * uTan * uAsp) + uUp * (nd.y * uTan) + uFwd);
+
+  vec3 col = vec3(0.008, 0.009, 0.011);
+  col += vec3(0.030, 0.024, 0.017) * pow(max(0.0, 1.0 - length(nd * vec2(0.82, 1.0))), 2.2);
+
+  /* 射线打到 z=0 的板面上：只有打中了，才谈得上箔和漆 */
+  float t = (dir.z < -0.004) ? -uEye.z / dir.z : -1.0;
+  float hit = step(0.02, t) * step(t, 22.0);
+  vec2 w = uEye.xy + dir.xy * max(t, 0.0);
+  vec3 Vv = normalize(uEye - vec3(w, 0.0));
+
+  /* ══════ 一块刷过漆、贴过金箔、又被擦掉大半的板子 ══════ */
+  const float LS = 0.0575;                        /* 一片金箔约 5.8 厘米见方 */
+  float pxs = max(fwidth(w).x, fwidth(w).y);      /* 一个像素在世界里有多大 */
+  float kdet = 1.0 - smoothstep(0.0018, 0.0060, pxs);
+
+  /* ── 箔片：一片压一片地贴，缝里翘着上一片的边 ── */
+  vec2 lg = w / LS;
+  vec2 lid = floor(lg);
+  vec2 lf = fract(lg);
+  vec3 lt = vec3(h21(lid + 3.31) - 0.5, h21(lid + 8.17) - 0.5, h21(lid + 15.7));
+  vec2 sj = (vec2(h21(lid + 2.3), h21(lid + 6.1)) - 0.5) * 0.26;
+  float dseam = min(min(lf.x + sj.x * 0.5, 1.0 - lf.x - sj.x * 0.5),
+                    min(lf.y + sj.y * 0.5, 1.0 - lf.y - sj.y * 0.5)) * LS;
+  float aa = fwidth(dseam) * 1.25 + 0.00028;
+  float seam = (1.0 - smoothstep(0.00028 - aa, 0.00100 + aa, dseam)) * kdet;
+  float lap = exp(-pow((dseam - 0.0026) / (0.0016 + aa), 2.0)) * kdet;
+
+  /* ── 折痕：箔被揉过，脊线一道一道，反光全碎在这上头 ── */
+  float cr1 = 0.0, cr2 = 0.0;
+  {
+    vec2 q = w * 40.0 + lt.xy * 6.0;
+    float amp = 0.58, s1 = 0.0, s2 = 0.0;
+    for (int i = 0; i < 3; i++) {
+      s1 += amp * (1.0 - abs(vn(q) * 2.0 - 1.0));
+      s2 += amp * (1.0 - abs(vn(q * 3.3 + 13.0) * 2.0 - 1.0));
+      q = q * 2.17 + 7.9;
+      amp *= 0.55;
+    }
+    cr1 = s1 - 0.50;
+    cr2 = s2 - 0.50;
+  }
+  vec2 mic = vec2(vn(w * 470.0), vn(w * 470.0 + 31.0)) - 0.5;
+
+  /* 每一片贴上去的手劲不同，法线各朝各的 —— 光一斜，金就一片一片地亮灭 */
+  vec3 N = normalize(vec3(
+      (cr1 * 1.90 + lt.x * 0.85 + mic.x * 0.80) * kdet,
+      (cr2 * 1.40 + lt.y * 0.85 + mic.y * 0.80) * kdet,
+      1.0));
+
+  /* 斜光：左上方低低地擦过来，稍稍游走 */
+  vec3 L = normalize(vec3(-0.62 + 0.07 * sin(uT * 0.13), 0.60, 0.50));
+  vec3 H = normalize(L + Vv);
+  vec3 Rf = reflect(-Vv, N);
+  float nh = max(dot(N, H), 0.0);
+  float nl = max(dot(N, L), 0.0);
+
+  /* 金是金属：亮的是它映着的那间屋子，暗的是它自己的分量 */
+  float up = clamp(Rf.y * 0.5 + 0.5, 0.0, 1.0);
+  vec3 env = mix(vec3(0.042, 0.031, 0.021), vec3(0.58, 0.49, 0.36), pow(up, 1.5));
+  env += vec3(1.60, 1.26, 0.80) * pow(max(dot(Rf, L), 0.0), 80.0) * 1.7;
+  vec3 gold = env * vec3(1.00, 0.82, 0.46) * (0.50 + 0.95 * lt.z);
+  gold += vec3(0.24, 0.170, 0.070) * (0.35 + 0.65 * nl);
+  gold += vec3(1.00, 0.90, 0.66) * pow(nh, 220.0) * 1.3;
+  gold *= 1.0 - 0.48 * seam;
+  gold += vec3(1.25, 0.98, 0.58) * lap * 0.34;
+  gold *= 1.0 - 0.85 * step(0.9950, h21(floor(w * 420.0)));   /* 针孔：底下的漆透出来 */
+
+  /* ── 被擦过的漆底：乌黑里一层橘皮纹，蒙着擦出来的灰道子 ── */
+  vec3 lac = vec3(0.018, 0.0095, 0.0075);
+  lac *= 0.62 + 0.76 * fbm(w * 2.6 + 4.0);
+  lac += vec3(0.010, 0.007, 0.005) * (fbm(w * 64.0) - 0.5);
+  float strk = vn(vec2(w.x * 5.0, w.y * 74.0)) * 0.62 + vn(vec2(w.x * 11.0 + 2.0, w.y * 31.0)) * 0.38;
+  vec3 wiped = lac * 1.05 + vec3(0.020, 0.018, 0.016) * (0.26 + 0.74 * strk);
+  wiped += vec3(0.042, 0.036, 0.029) * smoothstep(0.72, 0.97, strk);
+  /* 漆还有点半亮：擦过的地方泛一层糊着的柔光 */
+  vec3 Nw = normalize(vec3((vn(w * 34.0) - 0.5) * 0.09, (vn(w * 34.0 + 7.0) - 0.5) * 0.09, 1.0));
+  wiped += vec3(0.30, 0.235, 0.165) * pow(max(dot(reflect(-Vv, Nw), L), 0.0), 11.0) * 0.085;
+  /* 擦剩的金粉糊在漆里：乌里透出一点金，这是"擦过"的凭据 */
+  float res = vn(w * 26.0) * 0.60 + vn(w * 120.0) * 0.40;
+  wiped += vec3(0.062, 0.043, 0.020) * (0.25 + 0.75 * res) * 0.30;
+
+  /* ── 字：箔没被擦掉的那块，边上是手撕的口子 ── */
+  vec2 tz = vec2(1.0 / uBox.z, 1.0 / uBox.w);
+  vec2 uvD = (w - uBox.xy) * tz;
+  float tearOk = 1.0 - smoothstep(0.0032, 0.0095, pxs);
+  /* 细碎的口子，加偶尔撕掉的一大口 —— 手撕的边不是刀裁的 */
+  vec2 tu = (vec2(vn(w * 58.0 + 5.3), vn(w * 58.0 + 29.7)) - 0.5) * vec2(0.0022, 0.0020) * tearOk;
+  float biteAmt = smoothstep(0.46, 0.68, fbm(w * 5.0 + 17.0));
+  vec2 bt = (vec2(vn(w * 11.0 + 2.0), vn(w * 11.0 + 51.0)) - 0.5) * vec2(0.0085, 0.0068) * biteAmt;
+  vec2 uvT = uvD + (tu + bt) * tz;
+  float gate = step(-0.02, uvT.x) * step(uvT.x, 1.02) * step(-0.02, uvT.y) * step(uvT.y, 1.02)
+             * step(-0.03, uvD.x) * step(uvD.x, 1.03) * step(-0.03, uvD.y) * step(uvD.y, 1.03);
+  float m = texture(uGlyph, clamp(uvT, 0.0, 1.0)).g * gate;
+
+  /* 贴着箔边取四个样，估出"离箔边还有多远" —— 亮边和黑影都按世界尺寸走，远近都不糊 */
+  const float EPS = 0.0017;
+  vec2 ex = vec2(EPS * tz.x, 0.0), ey = vec2(0.0, EPS * tz.y);
+  vec2 gm = vec2(
+    texture(uGlyph, clamp(uvT + ex, 0.0, 1.0)).g - texture(uGlyph, clamp(uvT - ex, 0.0, 1.0)).g,
+    texture(uGlyph, clamp(uvT + ey, 0.0, 1.0)).g - texture(uGlyph, clamp(uvT - ey, 0.0, 1.0)).g);
+  float dEdge = (m - 0.5) * (EPS * 2.0) / (length(gm) + 1e-4);
+  float fol = smoothstep(-0.00035, 0.00045, dEdge);
+
+  /* 撕口三件套：翘起来的一线亮、外头压的一道黑影、边外还沾着金屑 */
+  float lip = exp(-pow((dEdge - 0.0008) / 0.0014, 2.0));
+  float dark = exp(-pow((dEdge + 0.0016) / 0.0016, 2.0)) * (1.0 - fol);
+  float flecks = exp(-pow((dEdge + 0.0042) / 0.0022, 2.0));
+
+  /* 擦剩下的小块残箔：擦布绕过去的地方金还贴着，已经发乌、翘着口子 */
+  float flakeN = fbm(w * 7.4 + 61.0) + (vn(w * 95.0) - 0.5) * 0.040;
+  float flake = smoothstep(0.660, 0.688, flakeN) * (1.0 - fol);
+  vec3 flakeC = gold * (0.34 + 0.40 * vn(w * 28.0 + 3.0)) + wiped * 0.30;
+
+  /* 箔也有被顺手擦薄的地方，擦薄处透出乌漆 */
+  float abr = smoothstep(0.54, 0.78, fbm(w * 5.2 + 19.0));
+  vec3 surf = mix(wiped, gold, fol);
+  /* 字边上那一圈被反复擦过：漆被擦亮了，箔屑糊得更厚 */
+  surf += vec3(0.085, 0.070, 0.048) * exp(-pow((dEdge + 0.017) / 0.013, 2.0)) * (0.45 + 0.55 * strk);
+  surf = mix(surf, wiped * 1.45, abr * fol * 0.42);
+  surf = mix(surf, flakeC, flake * 0.88);
+  surf += vec3(1.50, 1.10, 0.56) * lip * 0.34;
+  surf *= 1.0 - 0.42 * dark;
+  surf += vec3(0.95, 0.70, 0.34) * step(0.90, h21(floor(w * 300.0))) * flecks * 0.80;
+
+  col = mix(col, surf, hit);
+  col = mix(col, vec3(0.007, 0.006, 0.006), smoothstep(2.2, 12.0, t) * hit);
+  col += vec3(0.018, 0.013, 0.008) * uAct * h21(vUV * 380.0 + uT * 0.4);
+  col += (h21(vUV * 720.0 + uT * 0.5) - 0.5) * 0.006;
+  o = vec4(max(col, vec3(0.0)), 1.0);
+}`;
+
+/* 粒子：从撕口边上飘起来的金屑、板前的浮尘 */
+const P_VS = `#version 300 es
+precision highp float;
+in vec2 aQ; in vec4 aSeed;
+uniform mat4 uView, uProj;
+uniform vec3 uRight, uUp, uEye;
+uniform float uT, uBass, uTre, uBeat, uIn, uProg, uCut;
+uniform vec4 uBox;
+out vec2 vQ; out vec3 vCol; out float vA; out float vD;
+
+void main(){
+  vec2 off = vec2(sin(aSeed.w * 27.0 + uT * 0.31), cos(aSeed.x * 21.0 + uT * 0.23));
+  vec3 p;
+  vec3 col;
+  float b;
+  float sz;
+  if (aSeed.w > 0.74) {
+    /* 从撕口边上飘起来的金屑：往上翻，光在它身上一跳一跳 */
+    float up = fract(uT * 0.052 + aSeed.y);
+    p = vec3((aSeed.x * 2.0 - 1.0) * uBox.z * 0.64 + 0.030 * off.x,
+             uBox.w * 0.55 + up * uBox.w * 1.55 + 0.026 * off.y,
+             0.012 + aSeed.z * 0.26 + up * 0.04);
+    col = mix(vec3(1.00, 0.80, 0.42), vec3(0.72, 0.46, 0.16), aSeed.z);
+    b = 0.10 + 0.55 * aSeed.w;
+    sz = 0.0016 + 0.0034 * fract(aSeed.w * 31.0);
+  } else {
+    /* 板前的浮尘：贴着箔面悬着，几乎不动 */
+    p = vec3((aSeed.x * 2.0 - 1.0) * uBox.z * 1.10 + 0.020 * off.x,
+             (aSeed.y * 2.0 - 1.0) * uBox.w * 2.6 + 0.017 * off.y,
+             0.003 + aSeed.z * 0.065);
+    col = mix(vec3(0.95, 0.78, 0.50), vec3(0.62, 0.48, 0.30), aSeed.z);
+    b = 0.05 + 0.22 * aSeed.w;
+    sz = 0.0011 + 0.0022 * fract(aSeed.w * 31.0);
+  }
+  b *= 1.0 + 0.4 * uBeat;
+  vec4 mv = uView * vec4(p, 1.0);
+  mv.xyz += (uRight * (aQ.x - 0.5) + uUp * (aQ.y - 0.5)) * sz;
+  vD = -mv.z;
+  gl_Position = uProj * mv;
+  vQ = aQ;
+  vA = b * 0.13 * smoothstep(0.02, 0.20, vD) * (1.0 - smoothstep(1.0, 2.4, vD));
+  vCol = col;
+}`;
+
+const P_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec3 vCol; in float vA; in float vD; out vec4 o;
+void main(){
+  vec2 d = vQ - 0.5;
+  float f = 1.0 - smoothstep(0.08, 0.50, length(d * vec2(1.0, 1.15)));
+  o = vec4(vCol * vA * f, 1.0);
+}`;
+
+/* ══════════════════════════ GL 装配 ══════════════════════════ */
+const GL_OPT = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false };
+let gl = null, P = null, U = {}, bgP = null, bgU = {}, pVao = null, bgVao = null, glOk = false;
+let glyphTex = null, rampTex = null;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'shader');
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link');
+  return p;
+}
+function locs(p, names) { const o = {}; for (const n of names) o[n] = gl.getUniformLocation(p, n); return o; }
+
+function initGL() {
+  try { gl = cv.getContext('webgl2', GL_OPT); } catch (_) { gl = null; }
+  if (!gl) { document.documentElement.classList.add('fb'); return false; }
+  P = program(P_VS, P_FS);
+  U = locs(P, ['uView','uProj','uRight','uUp','uEye','uT','uBass','uTre','uBeat','uIn','uProg','uCut','uBox']);
+  bgP = program(BG_VS, BG_FS);
+  bgU = locs(bgP, ['uEye','uRight','uUp','uFwd','uTan','uAsp','uT','uBass','uAct','uCut','uGlyph','uRamp','uBox']);
+
+  const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  const hal = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+  let sd = 261261;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  const seeds = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    seeds[i*4] = hal(i + 1, 2); seeds[i*4+1] = hal(i + 1, 3);
+    seeds[i*4+2] = rnd(); seeds[i*4+3] = rnd();
+  }
+  const sb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+
+  pVao = gl.createVertexArray(); gl.bindVertexArray(pVao);
+  const aQ = gl.getAttribLocation(P, 'aQ'), aS = gl.getAttribLocation(P, 'aSeed');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(aQ); gl.vertexAttribPointer(aQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(aS, 1);
+
+  bgVao = gl.createVertexArray(); gl.bindVertexArray(bgVao);
+  const bQ = gl.getAttribLocation(bgP, 'aQ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(bQ); gl.vertexAttribPointer(bQ, 2, gl.FLOAT, false, 0, 0);
+
+  glyphTex = gl.createTexture();
+  rampTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, rampTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, RAMP_N, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, ramp);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  gl.bindVertexArray(null);
+  gl.clearColor(0.01, 0.008, 0.006, 1);
+  gl.disable(gl.DEPTH_TEST);
+  glOk = true;
+  if (GT.ready) uploadGlyph();
+  return true;
+}
+
+/* ══════════════════════════ 相机：沿陶壁绕飞 ══════════════════════════ */
+const FOVY = 64 * Math.PI / 180;
+const proj = new Float32Array(16);
+let cam = null;
+
+function camPose() {
+  /* 我站在砖墙前，眼睛齐着墙面：
+     A（0–3.6s）贴到很近、从左往右蹭着看 —— 砖被压成一条条横带，
+       只有前几个字的缝在画面里，砖的断面几乎贴着镜头；
+     B（5.0–8.4s）退到半步外、低低地斜着看，四个字连砖墙；
+     C（9.6–11.6s）往后退到一臂外、抬到齐眉，正对墙面，
+       整句缝连着砖墙一起收进画面。 */
+  /* 我站在那块漆板前头，斜下里来的光把箔面刮得一片一片地亮：
+     A（0–3.6s）脸几乎贴上去了，从左下角蹭着看那排撕口，箔压成一道长条；
+     B（5.0–8.4s）退到半步外、压低斜看，箔的碎块在乌漆上散着；
+     C（9.6–11.6s）直起身正对板面，整句金贴着乌黑的漆一起退远。 */
+  const cyc = 12, p = ((vT % cyc) + cyc) % cyc / cyc;
+  const sm = (t) => t * t * (3 - 2 * t);
+  const lp = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+  const A = [-0.46, -0.150, 0.165], B = [-0.30, -0.080, 0.300], C = [0.020, 0.055, 0.860];
+  const Aeye = [0.26, 0.020, 0.0], Beye = [0.11, 0.010, 0.0], Ceye = [0.010, -0.004, 0.0];
+  let P = A, Q = Aeye;
+  if (p < 0.30) { P = A; Q = Aeye; }
+  else if (p < 0.42) { const u = sm((p - 0.30) / 0.12); P = lp(A, B, u); Q = lp(Aeye, Beye, u); }
+  else if (p < 0.70) { P = B; Q = Beye; }
+  else if (p < 0.80) { const u = sm((p - 0.70) / 0.10); P = lp(B, C, u); Q = lp(Beye, Ceye, u); }
+  else if (p < 0.97) { P = C; Q = Ceye; }
+  else { const u = sm((p - 0.97) / 0.03); P = lp(C, A, u); Q = lp(Ceye, Aeye, u); }
+  /* 机位跟着擦到哪儿，往右挪一点 */
+  const sxW = GT.box[0] + uCut * GT.box[2];
+  const fx = sxW * 0.30;
+  const eye = [fx + P[0] + 0.028 * Math.sin(vT * 0.21), P[1] + 0.011 * Math.sin(vT * 0.15), P[2]];
+  const at = [fx * 0.90 + Q[0] * 1.6, Q[1], Q[2]];
+  const roll = 0.026 * Math.sin(vT * 0.17) + 0.010 * Math.sin(vT * 0.53);
+  const b = cameraBasis(eye, at, RM ? roll * 0.3 : roll);
+  return { eye, ...b };
+}
+function cutX(T) {
+  if (!GT.chars.length || idx < 0) return -1;
+  const L = lines[idx];
+  const chs = L && L.chars;
+  let k = 0;
+  if (chs && chs.length === GT.chars.length) {
+    for (let i = 0; i < chs.length; i++) if (T >= chs[i].t) k = i;
+    const a = GT.chars[k], bb = GT.chars[Math.min(k + 1, GT.chars.length - 1)];
+    const t0 = chs[k].t, t1 = chs[Math.min(k + 1, chs.length - 1)].t;
+    const f = clamp01((T - t0) / Math.max(0.18, t1 - t0));
+    return mix(a.x0, bb.x1, f);
+  }
+  return clamp01((T - L.t) / Math.max(0.4, L.dur || 4));
+}
+
+function updChars(T) {
+  if (idx < 0 || !lines[idx] || !GT.chars.length) return;
+  const L = lines[idx];
+  const chs = L.chars;
+  const n = GT.chars.length;
+  charProg.length = n;
+  if (chs && chs.length === n) {
+    for (let i = 0; i < n; i++) {
+      const d = (chs[i].d && chs[i].d > 0.05) ? chs[i].d : 0.42;
+      charProg[i] = clamp01((T - chs[i].t) / Math.min(0.60, Math.max(0.16, d)));
+    }
+  } else {
+    const d = Math.max(0.5, L.dur || 4);
+    for (let i = 0; i < n; i++) charProg[i] = clamp01((T - L.t - d * 0.86 * i / n) / 0.45);
+  }
+  buildRamp();
+  uCut = cutX(T);
+}
+
+/* ══════════════════════════ 句子 ══════════════════════════ */
+let curText = '';
+function showLine(ci) {
+  const L = lines[ci];
+  if (!L) return;
+  if (L.text !== curText) {
+    curText = L.text;
+    bakeText(L.text);
+    typeIn.textContent = L.text;
+  }
+  hint.style.opacity = '0';
+  dirty = true;
+}
+function hideAll() {
+  curText = ''; GT.ready = false; GT.chars = []; typeIn.textContent = '';
+  hint.style.opacity = '0.9';
+  hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+  dirty = true;
+}
+function timing(T) {
+  if (!lines.length) { if (idx !== -1) { idx = -1; hideAll(); } lastT = T; return; }
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) {
+    idx = ci;
+    if (ci < 0) hideAll(); else showLine(ci);
+    dirty = true;
+  }
+  lastT = T;
+}
+function state(T) {
+  inAmt = (idx >= 0 && lines[idx]) ? clamp01((T - lines[idx].t) / 1.10) : 0;
+  act = beatN % 2;
+}
+
+/* ══════════════════════════ 绘制 ══════════════════════════ */
+function draw() {
+  if (!glOk) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  let uProg = 0;
+  if (idx >= 0 && lines[idx]) {
+    const L = lines[idx];
+    const nxt = lines[idx + 1];
+    const dur = Math.max(0.9, (nxt ? nxt.t : L.t + (L.dur || 4)) - L.t);
+    uProg = clamp01((vT - L.t) / dur);
+  }
+  uProgG = uProg;
+  /* 刮刀走在声音前面一点：唱到哪，刀刚刮过去那儿；还没刮到的还盖着粉 */
+  const cx = cutX(vT);
+  uCut = Math.min(1.06, (cx < 0 ? 0.02 : cx) + 0.22);
+  cam = camPose();
+  const asp = W / H;
+  proj.set(perspective(FOVY, asp, 0.02, 26));
+
+  gl.disable(gl.BLEND);
+  gl.useProgram(bgP); gl.bindVertexArray(bgVao);
+  gl.uniform3f(bgU.uEye, cam.eye[0], cam.eye[1], cam.eye[2]);
+  gl.uniform3f(bgU.uRight, cam.right[0], cam.right[1], cam.right[2]);
+  gl.uniform3f(bgU.uUp, cam.up[0], cam.up[1], cam.up[2]);
+  gl.uniform3f(bgU.uFwd, cam.fwd[0], cam.fwd[1], cam.fwd[2]);
+  gl.uniform1f(bgU.uTan, Math.tan(FOVY / 2));
+  gl.uniform1f(bgU.uAsp, asp);
+  gl.uniform1f(bgU.uT, vT);
+  gl.uniform1f(bgU.uBass, bass);
+  gl.uniform1f(bgU.uAct, act ? 1 : 0);
+  gl.uniform1f(bgU.uCut, uCut);
+  gl.uniform4f(bgU.uBox, GT.box[0], GT.box[1], GT.box[2], GT.box[3]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  gl.uniform1i(bgU.uGlyph, 0);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, rampTex);
+  gl.uniform1i(bgU.uRamp, 3);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.useProgram(P); gl.bindVertexArray(pVao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniformMatrix4fv(U.uView, false, cam.view);
+  gl.uniformMatrix4fv(U.uProj, false, proj);
+  gl.uniform3f(U.uRight, cam.right[0], cam.right[1], cam.right[2]);
+  gl.uniform3f(U.uUp, cam.up[0], cam.up[1], cam.up[2]);
+  gl.uniform3f(U.uEye, cam.eye[0], cam.eye[1], cam.eye[2]);
+  gl.uniform1f(U.uT, vT); gl.uniform1f(U.uBass, bass); gl.uniform1f(U.uTre, treb);
+  gl.uniform1f(U.uBeat, beatPulse); gl.uniform1f(U.uIn, inAmt);
+  gl.uniform1f(U.uProg, uProg); gl.uniform1f(U.uCut, uCut);
+  gl.uniform4f(U.uBox, GT.box[0], GT.box[1], GT.box[2], GT.box[3]);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+  gl.bindVertexArray(null);
+}
+
+/* ══════════════════════════ 尺寸 / 主循环 ══════════════════════════ */
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  if (glOk) gl.viewport(0, 0, cv.width, cv.height);
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 120); });
+
+let last = performance.now(), raf = 0, dirty = true;
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  vT = RM ? T * 0.24 : T;
+  if (playing) { beatPulse *= Math.exp(-dt * 3.6); bass *= Math.exp(-dt * 0.08); treb *= Math.exp(-dt * 0.10); }
+  try { timing(T); state(T); updChars(T); } catch (e) { errMsg = 'timing: ' + (e && e.message ? e.message : e); }
+  try { if (playing || dirty) { draw(); dirty = false; } } catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+/* ══════════════════════════ 协议 ══════════════════════════ */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; lastT = -1e9; curText = '';
+    vT = 0; uCut = 0.35; beatPulse = 0; bass = 0; treb = 0; beatN = 0;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    inAmt = 0;
+    GT.ready = false; GT.chars = []; charProg = [];
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now();
+    playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5);
+    beatN++; dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, clamp01(l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, clamp01(l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+/* ══════════════════════════ 自查 ══════════════════════════ */
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx]) ? lines[idx].text : '',
+  gl: glOk, rm: RM, vT: +vT.toFixed(2),
+  cut: +uCut.toFixed(3), prog: +uProgG.toFixed(3), lit: +uCut.toFixed(3), chars: GT.chars.length
+});
+
+/* ══════════════════════════ 启动 ══════════════════════════ */
+resize();
+try { initGL(); } catch (e) { errMsg = 'gl: ' + (e && e.message ? e.message : e); document.documentElement.classList.add('fb'); }
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

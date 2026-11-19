@@ -1,0 +1,854 @@
+<!doctype html>
+<!-- 647 / S08A —— 皮影灯棚：歌词是被油灯投在绢幕上的影子，字从侧幕挑杆入场，灯一晃影子就荡。 -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>647 · 灯影</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;background:#070403;overflow:hidden}
+  #cv{position:fixed;inset:0;width:100%;height:100%;display:block;background:#070403}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+/* 647 / S08A —— 皮影灯棚：歌词是被油灯投在绢幕上的影子，字从侧幕挑杆入场，灯一晃影子就荡。 */
+(function () {
+  "use strict";
+
+  /* ============ 0. 状态 / 自检 ============ */
+  var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "" };
+  var RM = false;
+  try { RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) {}
+  var T0 = (window.performance && performance.now()) || Date.now();
+
+  var W = 1440, H = 900, DPR = 1;
+  var SX = 0, SY = 0, SW = 1, SH = 1;
+  var accent = [232, 170, 98];
+  var coverCol = null;
+
+  var live = { bpm: 0, level: 0, bass: 0, mid: 0, treble: 0 };
+  var beatT = -1e9, beatAmp = 0;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smoothstep(e0, e1, x) {
+    var t = clamp((x - e0) / ((e1 - e0) || 1e-6), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+  function hash(n) {
+    var x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  }
+  function mix(a, b, k) {
+    return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+  }
+  function rgb(c, br) {
+    br = (br == null) ? 1 : br;
+    return "rgb(" + Math.round(clamp(c[0] * br, 0, 255)) + "," +
+      Math.round(clamp(c[1] * br, 0, 255)) + "," +
+      Math.round(clamp(c[2] * br, 0, 255)) + ")";
+  }
+  function rgba(c, a) {
+    return "rgba(" + Math.round(clamp(c[0], 0, 255)) + "," +
+      Math.round(clamp(c[1], 0, 255)) + "," +
+      Math.round(clamp(c[2], 0, 255)) + "," + a + ")";
+  }
+
+  var lastErrAt = 0;
+  function logErr(e) {
+    try { S.err = String((e && e.message) || e); } catch (_) { S.err = "error"; }
+    var now = (window.performance && performance.now()) || Date.now();
+    if (now - lastErrAt > 1000) {
+      lastErrAt = now;
+      try { console.error(e); } catch (_) {}
+    }
+  }
+
+  window.__stage = function () {
+    var i = S.idx, L = S.lines, tx = "";
+    if (i >= 0 && L[i] && L[i].text != null) tx = String(L[i].text);
+    return {
+      lines: L.length, idx: i, t: S.t, playing: !!S.playing,
+      frames: S.frames, js: Math.round(S.js * 100) / 100, err: S.err,
+      text: tx, gl: false, rm: RM
+    };
+  };
+
+  /* ============ 1. ready：首帧无条件 + 800ms 兜底 ============ */
+  var readySent = false;
+  function sendReady() {
+    if (readySent) return;
+    readySent = true;
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); } catch (e) { logErr(e); }
+  }
+  requestAnimationFrame(function () { sendReady(); });
+  setTimeout(function () { sendReady(); }, 800);
+
+  /* ============ 2. 歌词语料 ============ */
+  function charTimes(line) {
+    var chars = Array.from(line.text || ""), n = chars.length, out = new Array(n);
+    var cs = line.chars, i, j, rec, ct;
+    if (cs && cs.length) {
+      var rel = cs[0] && isFinite(cs[0].t) && cs[0].t < line.t - 0.08;
+      for (i = 0; i < n; i++) {
+        j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+        rec = cs[j];
+        ct = rec && rec.t;
+        out[i] = isFinite(ct) ? (rel ? line.t + ct : ct) : null;
+      }
+      return out;
+    }
+    var d = line.dur > 0 ? line.dur : 3.4;
+    for (i = 0; i < n; i++) out[i] = line.t + d * 0.86 * i / Math.max(1, n);
+    return out;
+  }
+
+  function buildLines(raw) {
+    var out = [];
+    if (!Array.isArray(raw)) return out;
+    for (var i = 0; i < raw.length; i++) {
+      var l = raw[i];
+      if (!l || typeof l !== "object") continue;
+      var text = (l.text == null) ? "" : String(l.text);
+      if (!text.trim()) continue;
+      var t = Number(l.t); if (!isFinite(t) || t < 0) t = 0;
+      var dur = Number(l.dur); if (!isFinite(dur) || dur < 0) dur = 0;
+      var line = {
+        t: t, dur: dur, text: text,
+        chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null
+      };
+      line.times = charTimes(line);
+      out.push(line);
+    }
+    out.sort(function (a, b) { return a.t - b.t; });
+    return out;
+  }
+
+  function idxAt(t) {
+    var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+    while (lo <= hi) {
+      var m = (lo + hi) >> 1;
+      if (a[m].t <= t + 0.02) { best = m; lo = m + 1; } else hi = m - 1;
+    }
+    return best;
+  }
+
+  function normAccent(a) {
+    if (!Array.isArray(a) || a.length < 3) return [232, 170, 98];
+    var r = Number(a[0]), g = Number(a[1]), b = Number(a[2]);
+    if (!isFinite(r) || !isFinite(g) || !isFinite(b)) return [232, 170, 98];
+    r = clamp(Math.round(r), 0, 255); g = clamp(Math.round(g), 0, 255); b = clamp(Math.round(b), 0, 255);
+    if (r + g + b < 40) return [232, 170, 98];
+    return [r, g, b];
+  }
+
+  var coverImg = null;
+  function loadCover(src) {
+    try {
+      coverImg = new Image();
+      coverImg.crossOrigin = "anonymous";
+      coverImg.onload = function () {
+        try {
+          var c = document.createElement("canvas");
+          c.width = c.height = 1;
+          var g = c.getContext("2d");
+          g.drawImage(coverImg, 0, 0, 1, 1);
+          var px = g.getImageData(0, 0, 1, 1).data;
+          if (px[0] + px[1] + px[2] > 30) coverCol = [px[0], px[1], px[2]];
+        } catch (e) {}
+      };
+      coverImg.onerror = function () {};
+      coverImg.src = String(src);
+    } catch (e) {}
+  }
+
+  /* ============ 3. 排版：按“词 / 字”切分，逐字定位 ============ */
+  var LYRIC_FONT = '"Songti SC","STSong","SimSun","Noto Serif SC","Source Han Serif SC","Times New Roman",serif';
+  var UI_FONT = '"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif';
+  var mcv = document.createElement("canvas");
+  var mctx = mcv.getContext("2d");
+
+  function tokenize(text) {
+    var arr = Array.from(text || "");
+    var toks = [], buf = [];
+    function flush() { if (buf.length) { toks.push({ chars: buf, space: false }); buf = []; } }
+    for (var i = 0; i < arr.length; i++) {
+      var ch = arr[i];
+      if (/\s/.test(ch)) {
+        flush();
+        toks.push({ chars: [{ ch: ch, gi: i }], space: true });
+      } else if (/[A-Za-z0-9'’\-–—_.&/+]/.test(ch)) {
+        buf.push({ ch: ch, gi: i });
+      } else {
+        flush();
+        toks.push({ chars: [{ ch: ch, gi: i }], space: false });
+      }
+    }
+    flush();
+    return toks;
+  }
+
+  function buildLayout(line, fontPx) {
+    var font = "700 " + fontPx + "px " + LYRIC_FONT;
+    mctx.font = font;
+    var toks = tokenize(line.text), i, j;
+
+    for (i = 0; i < toks.length; i++) {
+      var tk = toks[i];
+      tk.w = 0;
+      for (j = 0; j < tk.chars.length; j++) {
+        tk.chars[j].w = mctx.measureText(tk.chars[j].ch).width;
+        tk.w += tk.chars[j].w;
+      }
+    }
+
+    var maxW = SW * 0.78;
+    var rows = [], cur = [], curW = 0;
+    for (i = 0; i < toks.length; i++) {
+      var tkn = toks[i];
+      if (tkn.space && cur.length === 0) continue;
+      if (!tkn.space && cur.length && curW + tkn.w > maxW) {
+        rows.push({ toks: cur, w: curW });
+        cur = []; curW = 0;
+        if (tkn.space) continue;
+      }
+      cur.push(tkn);
+      curW += tkn.w;
+    }
+    if (cur.length) rows.push({ toks: cur, w: curW });
+    if (!rows.length) rows.push({ toks: [], w: 0 });
+
+    var rowH = fontPx * 1.17;
+    var totalH = rows.length * rowH;
+    var outRows = [], maxRowW = 0;
+
+    for (i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var w = row.w;
+      while (row.toks.length && row.toks[row.toks.length - 1].space) {
+        w -= row.toks[row.toks.length - 1].w;
+        row.toks.pop();
+      }
+      if (w > maxRowW) maxRowW = w;
+      var x = -w / 2;
+      var y = -totalH / 2 + rowH * (i + 0.5);
+      var chars = [];
+      for (j = 0; j < row.toks.length; j++) {
+        var tok = row.toks[j];
+        for (var k = 0; k < tok.chars.length; k++) {
+          var c = tok.chars[k];
+          if (!tok.space) chars.push({ ch: c.ch, cx: x + c.w / 2, cy: y, gi: c.gi });
+          x += c.w;
+        }
+      }
+      outRows.push({ chars: chars });
+    }
+
+    return { font: fontPx, rows: outRows, h: totalH, maxW: maxRowW };
+  }
+
+  function getLayout(line) {
+    var key = Math.round(SW) + "|" + Math.round(SH);
+    if (line._lay && line._lay.key === key) return line._lay;
+    var base = clamp(Math.min(SW * 0.088, SH * 0.145), 19, 100);
+    var tries = [1, 0.87, 0.76, 0.66, 0.57, 0.49, 0.42];
+    var maxRows = SW < SH ? 4 : 3;
+    var lay = null;
+    for (var k = 0; k < tries.length; k++) {
+      lay = buildLayout(line, base * tries[k]);
+      if (lay.rows.length <= maxRows && (lay.maxW <= SW * 0.79 || k === tries.length - 1)) break;
+    }
+    lay.key = key;
+    line._lay = lay;
+    return lay;
+  }
+
+  /* ============ 4. 确定性弹簧 / 鼓点包络 ============ */
+  function springIn(p) {
+    if (p <= 0) return 0;
+    if (p >= 1) return 1;
+    var v = 1 - Math.exp(-6.5 * p) * Math.cos(8.2 * p);
+    return clamp(v, 0, 1.08);
+  }
+  function beatPulse(t) {
+    var dt = t - beatT;
+    if (dt < 0 || dt > 2) return 0;
+    return Math.exp(-7.5 * dt) * beatAmp;
+  }
+
+  /* ============ 5. 画布 / 画框 ============ */
+  var cvs = document.getElementById("cv");
+  var ctx = cvs.getContext("2d");
+  var frameCv = document.createElement("canvas");
+  var fctx = frameCv.getContext("2d");
+
+  function computeRect() {
+    var ax = W < H ? 0.075 : 0.085;
+    var top = H * (W < H ? 0.12 : 0.11);
+    var bot = H * (W < H ? 0.10 : 0.09);
+    SX = W * ax;
+    SY = top;
+    SW = Math.max(2, W * (1 - 2 * ax));
+    SH = Math.max(2, H - top - bot);
+  }
+
+  function curtainPath(f, side) {
+    var over = 22, y, x;
+    f.beginPath();
+    if (side < 0) {
+      f.moveTo(0, 0);
+      f.lineTo(SX + over, 0);
+      for (y = 0; y <= H; y += 5) {
+        x = SX + over + Math.sin(y * 0.05) * 6 + Math.sin(y * 0.017 + 1.7) * 4;
+        f.lineTo(x, y);
+      }
+      f.lineTo(0, H);
+    } else {
+      f.moveTo(W, 0);
+      f.lineTo(SX + SW - over, 0);
+      for (y = 0; y <= H; y += 5) {
+        x = SX + SW - over - Math.sin(y * 0.05) * 6 - Math.sin(y * 0.017 + 1.7) * 4;
+        f.lineTo(x, y);
+      }
+      f.lineTo(W, H);
+    }
+    f.closePath();
+  }
+
+  function drawCurtain(f, side) {
+    var over = 22;
+    f.save();
+    curtainPath(f, side);
+    var g = f.createLinearGradient(side < 0 ? 0 : W, 0, side < 0 ? SX + 60 : SX + SW - 60, 0);
+    g.addColorStop(0, "#24080d");
+    g.addColorStop(0.45, "#400f17");
+    g.addColorStop(0.75, "#2a0910");
+    g.addColorStop(1, "#160406");
+    f.fillStyle = g;
+    f.fill();
+    f.clip();
+    var x0 = side < 0 ? 0 : SX + SW - 50;
+    var x1 = side < 0 ? SX + 50 : W;
+    for (var x = x0; x < x1; x += 9) {
+      var a = 0.055 + 0.045 * Math.sin(x * 0.085 + (side < 0 ? 0 : 2.2));
+      if (a > 0) {
+        f.fillStyle = "rgba(0,0,0," + a.toFixed(3) + ")";
+        f.fillRect(x, 0, 3.5, H);
+      }
+    }
+    for (var x2 = x0; x2 < x1; x2 += 23) {
+      f.fillStyle = "rgba(255,128,96,0.028)";
+      f.fillRect(x2 + 4, 0, 1.4, H);
+    }
+    f.restore();
+
+    // 内侧金线
+    f.save();
+    curtainPath(f, side);
+    f.strokeStyle = "rgba(214,156,92,0.14)";
+    f.lineWidth = 1;
+    f.stroke();
+    f.restore();
+  }
+
+  function valancePath(f) {
+    f.beginPath();
+    f.moveTo(0, 0);
+    f.lineTo(W, 0);
+    f.lineTo(W, SY + 12);
+    for (var x = W; x >= 0; x -= 6) {
+      var y = SY + 16 + Math.sin(x * 0.045) * 7 + Math.sin(x * 0.013 + 0.8) * 5;
+      f.lineTo(x, y);
+    }
+    f.closePath();
+  }
+
+  function drawValance(f) {
+    f.save();
+    valancePath(f);
+    var g = f.createLinearGradient(0, 0, 0, SY + 34);
+    g.addColorStop(0, "#1a0509");
+    g.addColorStop(0.55, "#3b0e16");
+    g.addColorStop(1, "#20060b");
+    f.fillStyle = g;
+    f.fill();
+    f.clip();
+    for (var x = 0; x < W; x += 9) {
+      var a = 0.05 + 0.05 * Math.sin(x * 0.08 + 0.6);
+      if (a > 0) {
+        f.fillStyle = "rgba(0,0,0," + a.toFixed(3) + ")";
+        f.fillRect(x, 0, 3, SY + 40);
+      }
+    }
+    f.restore();
+    f.save();
+    valancePath(f);
+    f.strokeStyle = "rgba(222,165,98,0.16)";
+    f.lineWidth = 1;
+    f.stroke();
+    f.restore();
+  }
+
+  function skirtPath(f) {
+    f.beginPath();
+    f.moveTo(0, H);
+    f.lineTo(0, SY + SH - 12);
+    for (var x = 0; x <= W; x += 6) {
+      var y = SY + SH - 12 - Math.sin(x * 0.04 + 1.2) * 4;
+      f.lineTo(x, y);
+    }
+    f.lineTo(W, H);
+    f.closePath();
+  }
+
+  function drawSkirt(f) {
+    f.save();
+    skirtPath(f);
+    var g = f.createLinearGradient(0, SY + SH - 20, 0, H);
+    g.addColorStop(0, "#2b0b10");
+    g.addColorStop(0.35, "#170708");
+    g.addColorStop(1, "#0a0403");
+    f.fillStyle = g;
+    f.fill();
+    f.clip();
+    for (var x = 0; x < W; x += 11) {
+      f.fillStyle = "rgba(0,0,0,0.07)";
+      f.fillRect(x, SY + SH - 20, 4, H);
+    }
+    f.restore();
+    f.save();
+    f.strokeStyle = "rgba(210,156,94,0.13)";
+    f.lineWidth = 1;
+    f.beginPath();
+    for (var x2 = 0; x2 <= W; x2 += 6) {
+      var y = SY + SH - 12 - Math.sin(x2 * 0.04 + 1.2) * 4;
+      if (!x2) f.moveTo(x2, y); else f.lineTo(x2, y);
+    }
+    f.stroke();
+    f.restore();
+  }
+
+  function drawRod(f) {
+    var ry = Math.max(16, SY * 0.40);
+    f.save();
+    f.fillStyle = "#0b0503";
+    f.beginPath();
+    f.rect(-10, ry - 5, W + 20, 10);
+    f.fill();
+    f.fillStyle = "rgba(226,180,120,0.10)";
+    f.fillRect(0, ry - 3.5, W, 1.5);
+    f.fillStyle = "rgba(0,0,0,0.35)";
+    f.fillRect(0, ry + 2, W, 2);
+
+    var fx = 30, fy = ry;
+    [fx, W - fx].forEach(function (x, i) {
+      var g = f.createRadialGradient(x - 2, fy - 2, 1, x, fy, 13);
+      g.addColorStop(0, "#3a2416");
+      g.addColorStop(0.55, "#1a0f08");
+      g.addColorStop(1, "#080402");
+      f.fillStyle = g;
+      f.beginPath();
+      f.arc(x, fy, 11, 0, 6.2832);
+      f.fill();
+      f.strokeStyle = "rgba(214,160,96,0.16)";
+      f.lineWidth = 1;
+      f.beginPath();
+      f.arc(x, fy, 7.5, 0, 6.2832);
+      f.stroke();
+      f.fillStyle = "rgba(214,160,96,0.10)";
+      f.beginPath();
+      f.arc(x, fy - 3, 1.4, 0, 6.2832);
+      f.fill();
+    });
+    f.restore();
+  }
+
+  function buildFrame() {
+    var cw = Math.max(1, Math.round(W * DPR));
+    var ch = Math.max(1, Math.round(H * DPR));
+    frameCv.width = cw;
+    frameCv.height = ch;
+    fctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    fctx.clearRect(0, 0, W, H);
+
+    // 木质外框（挖去幕面）
+    var wg = fctx.createLinearGradient(0, 0, 0, H);
+    wg.addColorStop(0, "#251810");
+    wg.addColorStop(0.45, "#170e09");
+    wg.addColorStop(1, "#090503");
+    fctx.save();
+    fctx.beginPath();
+    fctx.rect(0, 0, W, H);
+    fctx.rect(SX, SY, SW, SH);
+    fctx.fillStyle = wg;
+    fctx.fill("evenodd");
+    fctx.clip("evenodd");
+    for (var i = 0; i < 64; i++) {
+      var gy = hash(i * 13.7 + 2.4) * H;
+      fctx.strokeStyle = (i % 2 ? "rgba(255,214,166," : "rgba(0,0,0,") + (0.012 + 0.022 * hash(i * 7.3 + 1.9)).toFixed(3) + ")";
+      fctx.lineWidth = 1;
+      fctx.beginPath();
+      fctx.moveTo(0, gy);
+      fctx.bezierCurveTo(W * 0.3, gy + 9, W * 0.7, gy - 9, W, gy + 3);
+      fctx.stroke();
+    }
+    fctx.restore();
+
+    // 幕面暖光外溢
+    fctx.save();
+    fctx.strokeStyle = "rgba(255,190,112,0.10)";
+    fctx.lineWidth = 16;
+    fctx.shadowColor = "rgba(255,168,84,0.38)";
+    fctx.shadowBlur = 36;
+    fctx.strokeRect(SX, SY, SW, SH);
+    fctx.restore();
+
+    drawCurtain(fctx, -1);
+    drawCurtain(fctx, 1);
+    drawValance(fctx);
+    drawSkirt(fctx);
+    drawRod(fctx);
+
+    // 内沿细金线
+    fctx.save();
+    fctx.strokeStyle = "rgba(233,186,120,0.13)";
+    fctx.lineWidth = 1.2;
+    fctx.strokeRect(SX + 1, SY + 1, SW - 2, SH - 2);
+    fctx.restore();
+
+    // 驼印
+    fctx.save();
+    fctx.font = "500 10px " + UI_FONT;
+    fctx.textAlign = "center";
+    fctx.textBaseline = "middle";
+    fctx.fillStyle = "rgba(226,180,122,0.20)";
+    fctx.fillText("S H A D O W   P L A Y   ·   6 4 7", W / 2, H - 13);
+    fctx.restore();
+  }
+
+  /* ============ 6. 幕面 / 灰尘 / 道具 ============ */
+  function drawScreen(lampX, lampY, t, bp) {
+    var cx = SX + SW / 2, cy = SY + SH / 2;
+    var tint = coverCol ? mix(accent, coverCol, 0.35) : accent;
+    var bright = 1 + 0.055 * live.level + 0.10 * live.bass + 0.20 * bp;
+    var inner = mix([255, 232, 174], tint, 0.05);
+    var mid = mix([238, 188, 118], tint, 0.10);
+    var outer = mix([92, 49, 23], tint, 0.06);
+
+    var g = ctx.createRadialGradient(lampX, lampY, SH * 0.02, lampX, lampY, Math.max(SW, SH) * 0.95);
+    g.addColorStop(0, rgb(inner, bright));
+    g.addColorStop(0.42, rgb(mid, bright));
+    g.addColorStop(1, rgb(outer, 1));
+    ctx.fillStyle = g;
+    ctx.fillRect(SX, SY, SW, SH);
+
+    var g2 = ctx.createRadialGradient(cx, cy, Math.min(SW, SH) * 0.30, cx, cy, Math.max(SW, SH) * 0.76);
+    g2.addColorStop(0, rgba(tint, 0));
+    g2.addColorStop(1, rgba(tint, 0.13));
+    ctx.fillStyle = g2;
+    ctx.fillRect(SX, SY, SW, SH);
+
+    // 绢面斜向柔光
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < 4; i++) {
+      var x0 = SX + SW * (0.08 + 0.23 * i) + Math.sin(t * 0.05 + i) * SW * 0.015;
+      var gs = ctx.createLinearGradient(x0, 0, x0 + SW * 0.13, 0);
+      gs.addColorStop(0, "rgba(255,220,160,0)");
+      gs.addColorStop(0.5, "rgba(255,224,172,0.032)");
+      gs.addColorStop(1, "rgba(255,220,160,0)");
+      ctx.fillStyle = gs;
+      ctx.fillRect(SX, SY, SW, SH);
+    }
+    ctx.restore();
+  }
+
+  function drawDust(t, bp, motion) {
+    var td = t * motion;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < 46; i++) {
+      var h1 = hash(i * 3.3 + 1.1);
+      var h2 = hash(i * 7.1 + 2.7);
+      var h3 = hash(i * 5.7 + 3.9);
+      var nx = (h1 + td * (0.0022 + 0.0042 * h3)) % 1;
+      if (nx < 0) nx += 1;
+      var ny = (h2 - td * (0.0036 + 0.0032 * hash(i * 9.4 + 4.3))) % 1;
+      if (ny < 0) ny += 1;
+      var x = SX + nx * SW;
+      var y = SY + ny * SH;
+      var tw = 0.5 + 0.5 * Math.sin(t * (0.7 + h3 * 1.6) + i * 1.7);
+      var a = (0.045 + 0.115 * tw) * (0.65 + 0.55 * bp);
+      var r = 0.7 + h1 * 1.8;
+      ctx.fillStyle = "rgba(255,240,210," + a.toFixed(3) + ")";
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawProp(t, motion) {
+    // 右上角一枝斜影，像戏台边挂的枝子
+    var bx = SX + SW * 0.985, by = SY + SH * 0.02;
+    var sway = Math.sin(t * 0.4 + 1.1) * 0.008 * motion;
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.rotate(-0.30 + sway);
+    ctx.strokeStyle = "rgba(32,15,7,0.115)";
+    ctx.lineWidth = Math.max(2, SW * 0.0028);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.quadraticCurveTo(-SW * 0.10, SH * 0.045, -SW * 0.255, SH * 0.115);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(30,14,7,0.10)";
+    for (var i = 0; i < 9; i++) {
+      var p = (i + 0.7) / 10;
+      var mx = -SW * 0.255 * p;
+      var my = SH * 0.115 * (2 * p * (1 - p) * 0.85 + p * p);
+      var lx = mx + (i % 2 ? -1 : 1) * SW * 0.018;
+      var ly = my - SH * 0.020 - (i % 3) * 3;
+      ctx.save();
+      ctx.translate(lx, ly);
+      ctx.rotate((i % 2 ? -0.7 : 0.5) + sway * 4);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, SW * 0.020, SH * 0.0052, 0, 0, 6.2832);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  /* ============ 7. 歌词影子 ============ */
+  function drawRodFor(item) {
+    var lay = item.lay, sc = item.sc;
+    var x0 = SX + SW / 2 + lay.maxW * 0.40 * sc;
+    var y0 = item.y + lay.h * 0.16 * sc;
+    var x1 = SX + SW * 0.995;
+    var y1 = SY + SH * 1.005;
+    ctx.save();
+    ctx.strokeStyle = "rgba(26,12,5,0.20)";
+    ctx.lineWidth = Math.max(1.4, SW * 0.0018);
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.bezierCurveTo(x0 + SW * 0.05, y0 + SH * 0.10, SX + SW * 0.92, SY + SH * 0.88, x1, y1);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(26,12,5,0.24)";
+    ctx.beginPath();
+    ctx.arc(x0, y0, Math.max(2.2, SW * 0.0026), 0, 6.2832);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function paintLine(item, t, lampX, lampY, motion, bp) {
+    var line = item.line, lay = item.lay, sc = item.sc, alpha = item.alpha;
+    var cx = SX + SW / 2;
+    var font = lay.font;
+
+    var sway = Math.sin(t * 0.52 + item.idx * 0.7) * 0.007 * motion;
+    var dx = (lampX - (SX + SW / 2)) * 0.05 + bp * 9 * motion;
+    var dy = (lampY - (SY + SH / 2)) * 0.045 - bp * 4 * motion;
+
+    ctx.save();
+    ctx.translate(cx, item.y + (item.step === 0 ? -bp * 2.2 * motion : 0));
+    ctx.rotate(sway);
+    ctx.scale(sc, sc);
+    ctx.font = "700 " + font + "px " + LYRIC_FONT;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowColor = "rgba(40,18,8," + (0.55 * alpha).toFixed(3) + ")";
+    ctx.shadowBlur = (9 + 16 * live.level) * (RM ? 0.6 : 1);
+    ctx.shadowOffsetX = dx;
+    ctx.shadowOffsetY = dy;
+
+    for (var r = 0; r < lay.rows.length; r++) {
+      var chars = lay.rows[r].chars;
+      for (var c = 0; c < chars.length; c++) {
+        var o = chars[c];
+        var st = line.times[o.gi];
+        if (st == null) st = line.t;
+        var p = (t - st) / 0.55;
+        if (p <= 0) continue;
+
+        var s = p >= 1 ? 1 : springIn(p);
+        var a = Math.min(1, p * 4) * alpha;
+        if (a <= 0.004) continue;
+
+        var dir = hash(o.gi * 7.3 + item.idx * 3.1) > 0.5 ? 1 : -1;
+        var ex = (1 - s) * dir * font * 0.55;
+        var ey = (1 - s) * font * 0.80;
+        var rot = (1 - s) * dir * 0.42;
+        rot += Math.sin(t * 1.15 + o.gi * 0.63 + item.idx) * 0.018 * motion;
+        ey += Math.sin(t * 0.8 + o.gi * 0.47) * 1.6 * motion;
+
+        ctx.save();
+        ctx.translate(o.cx + ex, o.cy + ey);
+        ctx.rotate(rot);
+        ctx.fillStyle = "rgba(24,11,6," + (a * 0.93).toFixed(3) + ")";
+        ctx.fillText(o.ch, 0, 0);
+        ctx.restore();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawLyrics(t, lampX, lampY, motion, bp) {
+    var idx = idxAt(t);
+    S.idx = idx;
+    if (idx < 0) return;
+
+    var baseCy = SY + SH * 0.55;
+    var items = [];
+    var prev = null;
+
+    for (var step = 0; step < 3; step++) {
+      var i = idx - step;
+      if (i < 0) break;
+      var line = S.lines[i];
+      var lay = getLayout(line);
+      var sc = step === 0 ? 1 : (step === 1 ? 0.60 : 0.42);
+      var y = step === 0 ? baseCy :
+        prev.y - (prev.lay.h * prev.sc * 0.5 + lay.h * sc * 0.5 + SH * 0.038);
+
+      var alpha = 1;
+      if (step > 0) {
+        var nt = S.lines[i + 1] ? S.lines[i + 1].t : line.t;
+        var pr = clamp((t - nt) / (step === 1 ? 1.9 : 2.6), 0, 1);
+        alpha = (step === 1 ? 0.30 : 0.12) * (1 - pr);
+      }
+
+      if (alpha > 0.006) {
+        items.push({ idx: i, line: line, lay: lay, sc: sc, y: y, alpha: alpha, step: step });
+      }
+      prev = { y: y, lay: lay, sc: sc };
+    }
+
+    if (items.length) drawRodFor(items[0]);
+
+    for (var k = items.length - 1; k >= 0; k--) {
+      paintLine(items[k], t, lampX, lampY, motion, bp);
+    }
+  }
+
+  /* ============ 8. 主循环 ============ */
+  function draw() {
+    var t = S.t;
+    var motion = RM ? 0.28 : 1;
+    var bp = beatPulse(t);
+
+    var lampX = SX + SW * (0.5 + 0.20 * Math.sin(t * 0.17) * motion + 0.04 * Math.sin(t * 0.51));
+    var lampY = SY + SH * (0.36 + 0.08 * Math.sin(t * 0.23 + 1.2) * motion + 0.012 * live.bass);
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#080403";
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(SX, SY, SW, SH);
+    ctx.clip();
+
+    drawScreen(lampX, lampY, t, bp);
+    drawProp(t, motion);
+    drawLyrics(t, lampX, lampY, motion, bp);
+    drawDust(t, bp, motion);
+
+    ctx.restore();
+
+    ctx.drawImage(frameCv, 0, 0, W, H);
+
+    // 暗角
+    var vg = ctx.createRadialGradient(W / 2, H * 0.47, Math.min(W, H) * 0.26, W / 2, H * 0.47, Math.max(W, H) * 0.74);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(0.62, "rgba(0,0,0,0.10)");
+    vg.addColorStop(1, "rgba(0,0,0,0.55)");
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  var raf = 0, dead = false;
+  function loop() {
+    if (dead) return;
+    raf = requestAnimationFrame(loop);
+    S.frames++;
+    S.js = (((window.performance && performance.now()) || Date.now()) - T0) / 1000;
+    try { draw(); } catch (e) { logErr(e); }
+  }
+
+  /* ============ 9. 尺寸 ============ */
+  function resize() {
+    W = window.innerWidth || 1440;
+    H = window.innerHeight || 900;
+    if (!isFinite(W) || W <= 0) W = 1440;
+    if (!isFinite(H) || H <= 0) H = 900;
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    cvs.width = Math.max(1, Math.round(W * DPR));
+    cvs.height = Math.max(1, Math.round(H * DPR));
+    computeRect();
+    for (var i = 0; i < S.lines.length; i++) S.lines[i]._lay = null;
+    buildFrame();
+  }
+  window.addEventListener("resize", resize, { passive: true });
+  window.addEventListener("pagehide", function () {
+    dead = true;
+    if (raf) cancelAnimationFrame(raf);
+  });
+
+  /* ============ 10. 消息 ============ */
+  function applyInit(p) {
+    var arr = buildLines(p.lines);
+    S.lines = arr;
+    S.idx = -1;
+    if (typeof p.playing === "boolean") S.playing = p.playing;
+    if (Array.isArray(p.accent)) accent = normAccent(p.accent);
+    if (p.song && p.song.cover) loadCover(p.song.cover);
+    beatT = -1e9;
+    beatAmp = 0;
+    for (var i = 0; i < arr.length; i++) arr[i]._lay = null;
+  }
+
+  window.addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.__c100 !== 1) return;
+    var p = d.payload || {};
+    try {
+      if (d.type === "init") {
+        applyInit(p);
+      } else if (d.type === "tick") {
+        var nt = Number(p.time);
+        if (isFinite(nt)) {
+          if (Math.abs(nt - S.t) > 0.5) {
+            beatT = -1e9;
+            beatAmp = 0;
+          }
+          S.t = nt;
+        }
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      } else if (d.type === "beat") {
+        var lv = Number(p.level);
+        var bi = Number(p.index);
+        var v = isFinite(lv) ? clamp(lv, 0, 1) : 0.5;
+        beatAmp = (bi === 0) ? (0.65 + v * 0.35) : (0.22 + v * 0.38);
+        beatT = S.t;
+      } else if (d.type === "live") {
+        var lvl = Number(p.level), bb = Number(p.bass), mm = Number(p.mid), tt = Number(p.treble), bpm = Number(p.bpm);
+        if (isFinite(lvl)) live.level = clamp(lvl, 0, 1);
+        if (isFinite(bb)) live.bass = clamp(bb, 0, 1);
+        if (isFinite(mm)) live.mid = clamp(mm, 0, 1);
+        if (isFinite(tt)) live.treble = clamp(tt, 0, 1);
+        if (isFinite(bpm)) live.bpm = bpm;
+        if (typeof p.playing === "boolean") S.playing = p.playing;
+      }
+    } catch (e) { logErr(e); }
+  });
+
+  /* ============ 11. 启动 ============ */
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

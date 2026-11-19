@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>波形文字</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(150,180,235,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   028 · 波形文字 —— 一句词是**几根两端夹紧的弦**，字是弦上的珠子
+   ----------------------------------------------------------------------------
+   核心机制：**一维波动方程的时域差分解 + 逐字拨弦**。
+   每一排字是一根看不见的弦（N=200 个格点，两端位移恒为 0），
+   u[i] 每帧按 u_tt = c²u_xx 用蛙跳格式推一步（带阻尼，库朗数靠子步压到 0.9 以内）。
+   字不是"坐在正弦波上"—— 每个字是这根弦上的一个珠子：
+   它上下多少、歪多少，完全由**此刻弦在这点的位移和斜率**决定（歪多少 = 弦的切线方向）。
+   而弦是被**歌词自己**拨响的：唱到第几个字，就在那个字的 x 上按下一记高斯位移，
+   于是一对行波从那个字出发、向左右跑开，撞到夹紧的端点再反射回来。
+
+   精修记录：① YRC 逐字拨弦沿用（chars[k].t 压拨弦时刻，无 chars 均分回退），
+     __stage 新增 yrc 标志（chars.length === text.length 才可信）；
+   ② 长句折行——>16 字 2 排、>30 字 3 排，**每排一根独立的弦**（同一套波动方程
+     各自解），整叠居中、字号自适应，修掉旧版"41 字单排 29px 不可读"；
+   ③ 镜头呼吸缩放（zoom = 1 + 0.020·sin + 0.022·beat）整场缓慢呼吸；
+   ④ 进出场：新句珠子 0.22s 淡入，句间不叠；beat 相干拨弦（整根弦半正弦驻波 +
+     中央宽脉冲）保留。
+   分词说明：不用分词——本形态的"释放"就是逐字拨弦（每字一记行波），
+     机关枪感被波动方程自身的传播/叠加/阻尼自然抹平，按词团拨会让弦失去逐字波源。
+
+   性能：弦求解是 O(排数×N) 纯数值循环；字绘制按色档合批思路由 bandCol 查表
+   （每字一次 fillText，字号统一时只设一次 font）。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1;
+let accent = [130, 150, 255];
+
+/* ---------- 弦（每排一根） ---------- */
+const N = 200;                     // 每根弦格点数
+let dx = 8, ML = 60, MR = 60;
+const WSPEED = 430;                // 波速 px/s（基准）
+const DAMP_PER_S = 0.72;           // 每秒振幅保留率（弦会慢慢安静下来）
+const MX = 34;                     // 单点冲量上限（px），防止连拨叠爆
+const MXF = 52;                    // 整场的保险上限（正常演奏时永远碰不到）
+let nStr = 1;
+let uS = [], uoS = [], unS = [];   // 每排的位移场
+let tension = 1, tensionT = 1;
+
+function allocWave(rows) {
+  nStr = Math.max(1, rows | 0);
+  uS = []; uoS = []; unS = [];
+  for (let r = 0; r < nStr; r++) {
+    uS.push(new Float32Array(N)); uoS.push(new Float32Array(N)); unS.push(new Float32Array(N));
+  }
+}
+allocWave(1);
+
+/** 在第 r 根弦的 x（屏幕 px）处拨一下。
+    冲量必须**同时**加到 u 和 u_prev 上 —— 那才是"拨一下、松手"（力）；
+    只加 u 等于给弦加位移台阶，低频分量会攒成永久偏置。 */
+function pluck(r, x, amp, width) {
+  const u = uS[r], uo = uoS[r];
+  const i0 = (x - ML) / dx;
+  const w = Math.max(1.2, width / dx);
+  const lo = Math.max(1, Math.floor(i0 - 4 * w) - 1);
+  const hi = Math.min(N - 2, Math.ceil(i0 + 4 * w) + 1);
+  for (let i = lo; i <= hi; i++) {
+    const d = (i - i0) / w;
+    if (d > 4 || d < -4) continue;
+    const b = amp * Math.exp(-d * d);
+    let v = u[i] + b;
+    if (v > MX) v = MX; else if (v < -MX) v = -MX;
+    u[i] = v;
+    let p = uo[i] + b;
+    if (p > MX) p = MX; else if (p < -MX) p = -MX;
+    uo[i] = p;
+  }
+}
+/** 第 r 根弦整根一起荡：两端为 0 的半正弦（基频驻波）推一把 */
+function pluckMode(r, amp) {
+  const u = uS[r], uo = uoS[r];
+  for (let i = 1; i < N - 1; i++) {
+    const b = amp * Math.sin(Math.PI * i / (N - 1));
+    let v = u[i] + b;
+    if (v > MX) v = MX; else if (v < -MX) v = -MX;
+    u[i] = v;
+    let p = uo[i] + b;
+    if (p > MX) p = MX; else if (p < -MX) p = -MX;
+    uo[i] = p;
+  }
+}
+function stepWave(dtSol) {
+  const c = WSPEED * tension;
+  const maxDt = 0.88 * dx / c;
+  let sub = Math.ceil(dtSol / maxDt);
+  if (sub < 1) sub = 1; else if (sub > 32) sub = 32;
+  const h = dtSol / sub;
+  const C = c * h / dx, C2 = C * C;
+  const dp = Math.pow(DAMP_PER_S, h);
+  for (let r = 0; r < nStr; r++) {
+    const u = uS[r], uo = uoS[r], un = unS[r];
+    for (let s = 0; s < sub; s++) {
+      for (let i = 1; i < N - 1; i++) {
+        un[i] = (2 * u[i] - uo[i] + C2 * (u[i + 1] - 2 * u[i] + u[i - 1])) * dp;
+      }
+      un[0] = 0; un[N - 1] = 0;        // 两端夹紧 —— 行波到这里反射
+      const t = uo; uoS[r] = u; uS[r] = un; unS[r] = t;
+      // 交换后本地引用也跟着换
+      const uu = uS[r], uup = uoS[r];
+      if (uu !== un) { /* 已换 */ }
+      void uu; void uup;
+    }
+    /* 保险：库朗数越界或 NaN 时位移停在 MXF 上，不会炸成 Infinity */
+    const uu = uS[r];
+    for (let i = 1; i < N - 1; i++) {
+      const v = uu[i];
+      if (v > MXF) uu[i] = MXF;
+      else if (v < -MXF) uu[i] = -MXF;
+      else if (v !== v) uu[i] = 0;
+    }
+  }
+}
+function uAt(r, px) {
+  const u = uS[r];
+  const f = (px - ML) / dx;
+  let i = f | 0;
+  if (i < 0) i = 0; else if (i > N - 2) i = N - 2;
+  const k = f - i;
+  return u[i] * (1 - k) + u[i + 1] * k;
+}
+function slopeAt(r, px) {
+  const u = uS[r];
+  const f = (px - ML) / dx;
+  let i = Math.round(f);
+  if (i < 1) i = 1; else if (i > N - 2) i = N - 2;
+  return (u[i + 1] - u[i - 1]) / (2 * dx);
+}
+
+/* ---------- 色带 ---------- */
+const NBAND = 24;
+const bandCol = new Array(NBAND);
+function buildBands() {
+  const cl = (v) => v < 0 ? 0 : (v > 255 ? 255 : v | 0);
+  const A = [56, 189, 248], Cc = [244, 114, 182];
+  const B = [cl(accent[0] * 0.7 + 96), cl(accent[1] * 0.7 + 84), cl(accent[2] * 0.7 + 132)];
+  for (let b = 0; b < NBAND; b++) {
+    const t = b / (NBAND - 1);
+    let r, g, bl;
+    if (t < 0.5) {
+      const k = t * 2;
+      r = A[0] + (B[0] - A[0]) * k; g = A[1] + (B[1] - A[1]) * k; bl = A[2] + (B[2] - A[2]) * k;
+    } else {
+      const k = (t - 0.5) * 2;
+      r = B[0] + (Cc[0] - B[0]) * k; g = B[1] + (Cc[1] - B[1]) * k; bl = B[2] + (Cc[2] - B[2]) * k;
+    }
+    bandCol[b] = 'rgb(' + cl(r) + ',' + cl(g) + ',' + cl(bl) + ')';
+  }
+}
+
+/* ---------- 长句折行：>16 字 2 排、>30 字 3 排，尽量不从拉丁词中间断开 ---------- */
+function splitRows(text) {
+  const want = text.length > 30 ? 3 : (text.length > 16 ? 2 : 1);
+  if (want === 1) return [{ text: text, off: 0 }];
+  const LAT = /[A-Za-z0-9'’]/;
+  const parts = [];
+  let start = 0;
+  for (let p = 1; p <= want; p++) {
+    let cut = (p === want) ? text.length : Math.round(text.length * p / want);
+    if (p < want) {
+      if (LAT.test(text[cut - 1]) && text[cut] && LAT.test(text[cut])) {
+        let best = -1;
+        for (let d = 1; d <= 8 && best < 0; d++) {
+          if (cut - d > start + 3 && /\s/.test(text[cut - d])) best = cut - d;
+          else if (cut + d < text.length - 3 && /\s/.test(text[cut + d])) best = cut + d + 1;
+        }
+        if (best > 0) cut = best;
+      }
+    }
+    parts.push({ text: text.slice(start, cut), off: start });
+    start = cut;
+  }
+  return parts.filter((r) => r.text.length);
+}
+
+/* ---------- 排版（这就是"酝酿"里真正要干的活） ---------- */
+function layoutLine(line) {
+  const text = (line && line.text) || '';
+  const n = text.length;
+  if (!n) return null;
+  const rowsArr = splitRows(text);
+  const R = rowsArr.length;
+  const maxRow = Math.max(...rowsArr.map((r) => r.text.length));
+  const fs = Math.max(18, Math.min(W * 0.90 / maxRow, H * (R > 1 ? 0.26 : 0.30), 190));
+  const sp = Math.min(W * 0.90 / maxRow, fs * 1.16);
+  const cx = W * 0.5;
+  const rows = [];
+  for (const r of rowsArr) {
+    const m = r.text.length;
+    const x = new Float64Array(m);
+    const band = new Uint8Array(m);
+    for (let i = 0; i < m; i++) {
+      x[i] = cx + (i - (m - 1) / 2) * sp;
+      band[i] = ((i / Math.max(1, m - 1)) * (NBAND - 1)) | 0;
+    }
+    rows.push({ s: r.text, off: r.off, n: m, x: x, band: band });
+  }
+  const ml = Math.min(rows[0].x[0] - sp * 0.95, cx - W * 0.22);
+  const mr = Math.max(rows[0].x[rows[0].n - 1] + sp * 0.95, cx + W * 0.22);
+  return { rows, R, fs, sp, n, ml: Math.max(24, ml), mr: Math.max(24, W - mr) };
+}
+/** 每个字的起唱时刻：chars 逐字可信才用 YRC，否则按句长均分 */
+function onsetOf(line, lay, k) {
+  const ch = line && line.chars;
+  if (ch && ch.length === lay.n && ch[k] && typeof ch[k].t === 'number') return ch[k].t;
+  const dur = (line && line.dur) || 4;
+  return ((line && line.t) || 0) + (k / Math.max(1, lay.n)) * dur * 0.85;
+}
+function charsTrust(line, lay) {
+  return !!(line && line.chars && line.chars.length === lay.n);
+}
+
+/* ---------- 当前句 / 下一句 ---------- */
+let cur = null, curLine = null, pend = null, pendLine = null;
+let nextChar = 0, charGlow = 0, yrcFlag = false, lineAt = 0;
+let beatPulse = 0;
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+function resetAll() {
+  /* lastT 一起归位：换歌时上一首的最后时间可能是 200s，新歌从 0 开始，
+     不归位的话"时间倒退"会一直成立，整根弦每帧都被清空 */
+  curIdx = -1; brewIdx = -1; lastT = -1;
+  cur = null; curLine = null; pend = null; pendLine = null; nextChar = 0;
+  tensionT = 1; tension = 1;
+  allocWave(1);
+  layoutStrings();
+}
+function layoutStrings() {
+  if (!cur) return;
+  ML = cur.ml; MR = cur.mr;
+  dx = (W - ML - MR) / (N - 1);
+}
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) resetAll();
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      /* 显示切到第 ci 句：珠子换成这一句的，弦换成同排数的。
+         上一句的余振不保留（排数可能不同），新句从静止的弦上开始拨 */
+      curLine = lines[ci];
+      const lay = (pendLine === curLine && pend) ? pend : layoutLine(curLine);
+      if (!lay) { cur = null; curLine = null; allocWave(1); }
+      else {
+        cur = lay;
+        pend = null; pendLine = null;
+        nextChar = 0;
+        yrcFlag = charsTrust(curLine, cur);
+        lineAt = T;
+        tensionT = 1;
+        allocWave(cur.R);
+        layoutStrings();
+        hint.style.opacity = '0';
+      }
+    } else {
+      cur = null; curLine = null;
+      allocWave(1);
+    }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) {
+      brewIdx = nx;
+      /* 开始准备第 nx 句：量排版 + 把弦绷紧一点（波速变快）——
+         屏幕上还没换字，但弦已经在为下一句调音了 */
+      pendLine = lines[nx];
+      pend = layoutLine(pendLine);
+      tensionT = 1.055;
+    }
+  }
+}
+
+/* ---------- 背景 ---------- */
+let bgGrad = null;
+function buildBg() {
+  bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrad.addColorStop(0, '#06070d');
+  bgGrad.addColorStop(0.46, '#0a0d18');
+  bgGrad.addColorStop(1, '#04050a');
+}
+
+function rowCy(R, r, rowGap) {
+  return H * 0.5 + (r - (R - 1) / 2) * rowGap;
+}
+
+let last = performance.now();
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs;
+  const T = now();
+  timing(T);
+
+  /* 张力回落到基准：酝酿时绷紧、开唱时松开 */
+  tension += (tensionT - tension) * Math.min(1, dt * 3.2);
+  beatPulse *= Math.exp(-dt * 2.6);
+
+  /* 拨弦：唱到哪个字就拨哪根弦的哪个位置 */
+  if (cur && curLine) {
+    while (nextChar < cur.n) {
+      const on = onsetOf(curLine, cur, nextChar);
+      if (T < on) break;
+      const late = T - on;
+      /* 只拨"刚刚唱到"的；拖进度条跳过的那一串不补拨，否则一帧里炸出几十记 */
+      if (late < 0.35) {
+        /* 找到这个全局字索引在哪一排 */
+        let r = 0, k = nextChar;
+        while (r < cur.R - 1 && k >= cur.rows[r].n) { k -= cur.rows[r].n; r++; }
+        const row = cur.rows[r];
+        if (k < row.n) {
+          const kk = k / Math.max(1, row.n - 1);
+          const amp = (15 + 19 * Math.sin(Math.PI * Math.min(1, kk * 1.15))) * (1 + charGlow * 0.5);
+          if (row.s.charAt(k) !== ' ') pluck(r, row.x[k], amp, Math.max(28, cur.sp * 0.55));
+        }
+      }
+      nextChar++;
+    }
+  }
+  charGlow *= Math.exp(-dt * 3.0);
+  stepWave(dt);
+
+  /* ---- 画（镜头呼吸缩放包住整场） ---- */
+  const zoom = 1 + 0.020 * Math.sin(T * 0.45) + 0.022 * beatPulse;
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(W / 2, H * 0.5);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W / 2, -H * 0.5);
+
+  /* 进场淡入：呈现不早于开唱、不晚于开唱后 0.3s 的可见性由换句时刻保证 */
+  const fadeIn = cur ? Math.min(1, Math.max(0, (T - lineAt) / 0.22)) : 0;
+  ctx.globalAlpha = 0.25 + 0.75 * fadeIn;
+
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  const rowGap = cur ? cur.fs * 1.55 : H * 0.5;
+  const Rn = cur ? cur.R : 1;
+  for (let r = 0; r < nStr; r++) {
+    const cy = rowCy(Rn, r, rowGap);
+    const u = uS[r];
+    const path = new Path2D();
+    path.moveTo(ML, cy + u[0]);
+    for (let i = 1; i < N; i++) path.lineTo(ML + i * dx, cy + u[i]);
+    ctx.strokeStyle = 'rgba(120,150,255,.055)';
+    ctx.lineWidth = 22; ctx.stroke(path);
+    ctx.strokeStyle = 'rgba(150,180,255,.085)';
+    ctx.lineWidth = 9; ctx.stroke(path);
+    ctx.strokeStyle = 'rgba(190,215,255,.34)';
+    ctx.lineWidth = 1.5; ctx.stroke(path);
+    /* 水面倒影：同一条路径压扁、翻转、淡一点 */
+    ctx.save();
+    ctx.translate(0, cy * 1.30);
+    ctx.scale(1, -0.42);
+    ctx.translate(0, -cy * 1.30);
+    ctx.strokeStyle = 'rgba(120,150,255,.07)';
+    ctx.lineWidth = 4; ctx.stroke(path);
+    ctx.restore();
+  }
+
+  /* 珠子（字）：位置和倾角全部来自它那一排的弦 */
+  if (cur) {
+    const fs = cur.fs;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '800 ' + fs.toFixed(1) + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+    for (let r = 0; r < cur.R; r++) {
+      const row = cur.rows[r];
+      const cy = rowCy(cur.R, r, rowGap);
+      /* 回声层只在波起时铺（静止的弦画它没有意义），密度减半省一半 fillText */
+      if (Math.abs(uAt(r, row.x[Math.floor(row.n / 2)])) > 1.2) {
+        ctx.globalAlpha = 0.22 * (0.25 + 0.75 * fadeIn);
+        for (let i = 0; i < row.n; i += 2) {
+          const ch = row.s.charAt(i);
+          if (ch === ' ') continue;
+          const px = row.x[i];
+          const py = cy + uAt(r, px);
+          const sl = slopeAt(r, px);
+          let rot = Math.atan(sl * 0.62) * 57.2958;
+          if (rot > 40) rot = 40; else if (rot < -40) rot = -40;
+          ctx.save();
+          ctx.translate(px, py + fs * 0.62);
+          ctx.rotate(rot * 0.0174533);
+          ctx.scale(1, 1.5);
+          ctx.fillStyle = bandCol[row.band[i]];
+          ctx.fillText(ch, 0, 0);
+          ctx.restore();
+        }
+      }
+      ctx.globalAlpha = 0.25 + 0.75 * fadeIn;
+      for (let i = 0; i < row.n; i++) {
+        const ch = row.s.charAt(i);
+        if (ch === ' ') continue;
+        const px = row.x[i];
+        const py = cy + uAt(r, px);
+        const sl = slopeAt(r, px);
+        let rot = Math.atan(sl * 0.62) * 57.2958;
+        if (rot > 40) rot = 40; else if (rot < -40) rot = -40;
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.rotate(rot * 0.0174533);
+        ctx.fillStyle = bandCol[row.band[i]];
+        ctx.fillText(ch, 0, 0);
+        ctx.restore();
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  requestAnimationFrame(frame);
+}
+
+let rzTimer = 0;
+addEventListener('resize', () => {
+  clearTimeout(rzTimer);
+  rzTimer = setTimeout(() => {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    buildBg();
+    if (curLine) cur = layoutLine(curLine);
+    if (pendLine) pend = layoutLine(pendLine);
+    layoutStrings();
+  }, 150);
+});
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length === 3) accent = p.accent;
+    buildBands();
+    resetAll();
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：相干 —— 每根弦都在正中拨一记又宽又低的、整根弦一起荡；
+       绝不逐字随机乱踢（那会变成一锅乱抖的粥） */
+    const lv = d.payload.level || 0;
+    if (cur) {
+      for (let r = 0; r < nStr; r++) {
+        pluckMode(r, (14 + lv * 20) / Math.sqrt(nStr));
+        pluck(r, W * 0.5, (11 + lv * 13) / Math.sqrt(nStr), W * 0.30);
+      }
+    }
+    tensionT = 1 + 0.02 + lv * 0.02;
+    beatPulse = Math.min(1.5, beatPulse + 0.45 + lv * 0.55);
+    charGlow = Math.min(1, 0.4 + lv * 0.6);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+DPR = Math.min(2, window.devicePixelRatio || 1);
+W = window.innerWidth; H = window.innerHeight;
+cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+buildBg();
+buildBands();
+layoutStrings();
+requestAnimationFrame(frame);
+window.__stage = () => ({ lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+  chars: cur ? cur.n : 0, nextChar, tension: +tension.toFixed(3), yrc: yrcFlag, rows: cur ? cur.R : 0 });
+</script>
+</body>
+</html>

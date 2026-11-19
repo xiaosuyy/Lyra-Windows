@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>潮汐水痕</title>
+<style>
+  html,body{margin:0;height:100%;background:#07100f;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #vig{position:fixed;inset:0;z-index:7;pointer-events:none;
+    background:radial-gradient(120% 96% at 50% 46%,transparent 34%,rgba(4,10,9,.5) 74%,rgba(2,6,5,.94))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(200,222,210,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   lyra16 · 潮汐水痕 —— 退潮的水线把沙粒推成字，沙粒是**被水推过去的**
+   ---------------------------------------------------------------------------
+   物理：
+     · 整片海滩先被水盖住。退潮时水线从上往下走，水线以上是刚露出来的湿沙。
+     · 每颗沙粒都归属于歌词里的一个字（YRC 逐字），那个字一开唱，
+       水下的沙就被**沿岸流**搅起来，硬弹簧把它送到该字在字形里的落点，
+       靠近落点强阻尼 + 速度上限，最终停住，一停就写进沙床（贴花，永久留痕）。
+     · 沙粒停下时沿水流方向拉出 2~3 个短划 → 是"被水推过"的水痕，不是圆点。
+     · 水线扫过的沙面被压暗一层（湿沙），字就浮在湿痕里。
+
+   AE 手法：
+     · 弹簧变焦（每个词团命中脉冲）+ 甩镜（横向冲刺再弹回）
+     · 多层级视差（烘焙沙纹 0.15 / 主沙粒 1.0 / 水面泡沫 1.25）
+     · 顿帧 + 白闪 + 定向震动（沿水流方向竖直抖）
+     · 焦点滑动：水线附近的沙粒亮度高于远处（湿/干两级）
+
+   粒子：5200~7600 颗沙，全部用 batch rect 绘制；沉积粒写进沙床离屏画布只画一次。
+   ========================================================================== */
+
+/* ============================ 0 · 画布 ============================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+let W = 0, H = 0, DPR = 1;
+let bgCv = null, bedCv = null, bed = null, watCv = null, BX = 0, BY = 0;
+let L = null, curIdx = -1;
+
+/* 相机 / 事件（必须在 resize 之前声明：resize 里会读 cam） */
+const cam = { x: 0, y: 0, tx: 0, ty: 0, z: 1, tz: 1, vz: 0, sh: 0, dirx: 0, diry: 0, shx: 0, shy: 0, rot: 0, vrot: 0 };
+const AE = { freeze: 0, flash: 0 };
+let whip = 0;
+
+function camShake(dx, dy, amp) {
+  const l = Math.hypot(dx, dy) || 1;
+  cam.dirx = dx / l; cam.diry = dy / l;
+  cam.sh = Math.min(26, Math.max(cam.sh, amp));
+}
+
+/* ============================ 1 · 沙粒 ============================ */
+const MAXN = 7600;
+const gx = new Float32Array(MAXN), gy = new Float32Array(MAXN);
+const gvx = new Float32Array(MAXN), gvy = new Float32Array(MAXN);
+const gtx = new Float32Array(MAXN), gty = new Float32Array(MAXN);
+const gat = new Float32Array(MAXN), gsz = new Float32Array(MAXN);
+const gdep = new Uint8Array(MAXN), gact = new Uint8Array(MAXN);
+const gown = new Int16Array(MAXN);
+let gN = 0;
+
+/* 沉积队列：按 4 个色调分桶（3 实体 + 1 柔光），一帧每桶一次 fill */
+const DQ = [[], [], [], []];
+function dab(x, y, w, h, tone) {
+  if (x < BX || y < BY) return;
+  const q = DQ[tone];
+  q.push(x - BX, y - BY, w, h);
+}
+
+/* 用 W/H 预撒点 —— 必须在 resize() 之后调用，否则全堆在 (0,0) */
+function initSand() {
+  if (!W || !H) return;
+  for (let i = 0; i < MAXN; i++) {
+    gx[i] = Math.random() * W;
+    gy[i] = Math.random() * H;
+    gvx[i] = 0; gvy[i] = 0;
+    gdep[i] = 0; gact[i] = 0; gown[i] = 0;
+    gsz[i] = 1.35 + Math.random() * 1.5;
+  }
+  gN = MAXN;
+}
+
+/* ============================ 2 · 时钟 ============================ */
+let lines = [];
+let accent = [214, 196, 158];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+/* ============================ 3 · 分词 ============================ */
+let DICT = null;
+fetch('/segdict.bin').then((r) => (r.ok ? r.arrayBuffer() : null))
+  .then((b) => { if (b) DICT = new Uint32Array(b); }).catch(() => {});
+const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+function isWord(s, i, Ln) {
+  if (!DICT) return false;
+  const h = fnv(s.substr(i, Ln));
+  let lo = 0, hi = DICT.length - 1;
+  while (lo <= hi) { const m = (lo + hi) >> 1, v = DICT[m]; if (v === h) return true; if (v < h) lo = m + 1; else hi = m - 1; }
+  return false;
+}
+function segWords(text) {
+  const fwd = [];
+  for (let i = 0; i < text.length;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, text.length - i); Ln >= 2; Ln--) if (isWord(text, i, Ln)) { hit = Ln; break; }
+    if (hit) { fwd.push(text.substr(i, hit)); i += hit; } else { fwd.push(text[i]); i++; }
+  }
+  const bwd = [];
+  for (let j = text.length; j > 0;) {
+    let hit = 0;
+    for (let Ln = Math.min(4, j); Ln >= 2; Ln--) if (isWord(text, j - Ln, Ln)) { hit = Ln; break; }
+    if (hit) { bwd.unshift(text.substr(j - hit, hit)); j -= hit; } else { bwd.unshift(text[j - 1]); j--; }
+  }
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+const MAXG = 3;
+const PUNCT = /[，。！？、；：,.!?;:…—~·「」『』（）()《》【】"]/;
+const SPACE = /\s/;
+function isLatin(text) { let la = 0, cjk = 0; for (let i = 0; i < text.length; i++) { const c = text[i]; if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) la++; else if (c >= '\u4e00' && c <= '\u9fff') cjk++; } return la > cjk; }
+function latinSpans(text) {
+  const out = []; let i = 0;
+  while (i < text.length) {
+    if (SPACE.test(text[i])) { i++; continue; }
+    let j = i; while (j < text.length && !SPACE.test(text[j])) j++;
+    out.push({ i0: i, i1: j }); i = j;
+  }
+  return out;
+}
+const SUFFIX = /^[的了着过地得吗呢吧啊嘛]$/;
+const PREFIX = /^[但还就才又也都把被在从向对和与而却很不没最更将已曾让给]$/;
+const countChars = (s) => { let n = 0; for (let i = 0; i < s.length; i++) if (!PUNCT.test(s[i]) && !SPACE.test(s[i])) n++; return n; };
+function groupByWords(text) {
+  const words = segWords(text), out = [];
+  let cur = '', start = 0, chars = 0, pos = 0;
+  const flush = (end) => { if (cur) { out.push({ i0: start, i1: end }); cur = ''; chars = 0; } };
+  for (const w of words) {
+    const at = pos; pos += w.length;
+    const isP = PUNCT.test(w);
+    if (!cur) { cur = w; start = at; chars = isP ? 0 : w.length; continue; }
+    if (isP) { cur += w; if (chars >= 2) flush(pos); continue; }
+    const single = w.length === 1;
+    if (single && SUFFIX.test(w)) { cur += w; chars++; if (chars >= MAXG) flush(pos); continue; }
+    if (single && PREFIX.test(w) && chars >= 2) { flush(at); cur = w; start = at; chars = 1; continue; }
+    if (chars + w.length <= MAXG) { cur += w; chars += w.length; } else { flush(at); cur = w; start = at; chars = w.length; }
+  }
+  flush(text.length);
+  for (let k = 0; k < out.length; k++) {
+    const g = out[k];
+    if (countChars(text.slice(g.i0, g.i1)) > 1) continue;
+    const prev = out[k - 1], next = out[k + 1];
+    if (prev && prev.i1 === g.i0 && countChars(text.slice(prev.i0, prev.i1)) < MAXG) { prev.i1 = g.i1; out.splice(k, 1); k--; }
+    else if (next && next.i0 === g.i1 && countChars(text.slice(next.i0, next.i1)) < MAXG) { next.i0 = g.i0; out.splice(k, 1); k--; }
+  }
+  return out;
+}
+function groupByRule(text) {
+  const out = []; let start = 0, chars = 0;
+  for (let i = 0; i < text.length; i++) {
+    const s = PUNCT.test(text[i]) || SPACE.test(text[i]);
+    if (!s) chars++;
+    if (s && chars >= 2) { out.push({ i0: start, i1: i + 1 }); start = i + 1; chars = 0; continue; }
+    if (!s && chars > MAXG) { out.push({ i0: start, i1: i }); start = i; chars = 1; }
+  }
+  if (start < text.length) out.push({ i0: start, i1: text.length });
+  return out;
+}
+const spansForLine = (t) => (isLatin(t) ? latinSpans(t) : (DICT ? groupByWords(t) : groupByRule(t)));
+
+/* ============================ 4 · 字形采样 ============================ */
+const offCv = document.createElement('canvas');
+const octx = offCv.getContext('2d', { willReadFrequently: true });
+const FONT = (px, wt) => `${wt || 800} ${px}px "PingFang SC","Microsoft YaHei",system-ui,sans-serif`;
+function wrapText(text, fs, maxW, wt) {
+  octx.font = FONT(fs, wt);
+  const latin = isLatin(text);
+  const rows = []; let start = 0, w = 0;
+  for (let i = 0; i < text.length; i++) {
+    const cw = octx.measureText(text[i]).width;
+    if (!cw) continue;
+    if (w + cw > maxW && i > start) {
+      let brk = i;
+      if (latin) { let j = i; while (j > start && !SPACE.test(text[j])) j--; if (j > start) brk = j; }
+      rows.push({ i0: start, i1: brk, w: octx.measureText(text.slice(start, brk)).width });
+      start = brk; w = 0;
+      while (start < text.length && SPACE.test(text[start])) start++;
+      if (start >= text.length) break;
+      i = start - 1; continue;
+    }
+    w += cw;
+  }
+  if (start < text.length) rows.push({ i0: start, i1: text.length, w: octx.measureText(text.slice(start)).width });
+  for (const r of rows) while (r.i1 - r.i0 > 1 && SPACE.test(text[r.i0])) r.i0++;
+  return rows.length ? rows : [{ i0: 0, i1: text.length, w: octx.measureText(text).width }];
+}
+function sampleGlyph(text, opt) {
+  opt = opt || {};
+  const wt = opt.weight || 800;
+  let fs = opt.fs || 92;
+  const maxW = opt.maxW || Math.min(W * 0.80, 1200);
+  const maxH = opt.maxH || H * 0.54;
+  let rows = wrapText(text, fs, maxW, wt);
+  let lh = fs * 1.16;
+  if (rows.length * lh > maxH) { fs *= maxH / (rows.length * lh); rows = wrapText(text, fs, maxW, wt); lh = fs * 1.16; }
+  octx.font = FONT(fs, wt);
+  const widest = Math.max(1, ...rows.map((r) => octx.measureText(text.slice(r.i0, r.i1)).width));
+  const padW = Math.ceil(widest) + 24, padH = Math.ceil(lh * rows.length) + 12;
+  offCv.width = padW; offCv.height = padH;
+  octx.font = FONT(fs, wt);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.clearRect(0, 0, padW, padH);
+  const n = text.length;
+  const charCx = new Float32Array(n), charCy = new Float32Array(n);
+  const rowMaps = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r], str = text.slice(row.i0, row.i1);
+    const cy = padH / 2 + (r - (rows.length - 1) / 2) * lh;
+    octx.fillText(str, padW / 2, cy);
+    const x0 = (padW - row.w) / 2, map = new Int16Array(padW).fill(-1);
+    let acc = 0;
+    for (let i = row.i0; i < row.i1; i++) {
+      const cw = octx.measureText(text[i]).width;
+      charCx[i] = x0 + acc + cw / 2 - padW / 2; charCy[i] = cy - padH / 2;
+      for (let x = Math.max(0, Math.floor(x0 + acc)); x < Math.min(padW, Math.ceil(x0 + acc + cw)); x++) map[x] = i;
+      acc += cw;
+    }
+    rowMaps.push({ y0: cy - lh / 2, y1: cy + lh / 2, map });
+  }
+  const d = octx.getImageData(0, 0, padW, padH).data;
+  const pxA = [], pyA = [], ownA = [];
+  const step = opt.step || 2;
+  for (let y = 0; y < padH; y += step) {
+    let rm = null;
+    for (let r = 0; r < rowMaps.length; r++) { const m = rowMaps[r]; if (y >= m.y0 && y < m.y1) { rm = m; break; } }
+    if (!rm) continue;
+    const map = rm.map, base = y * padW;
+    for (let x = 0; x < padW; x += step) {
+      if (d[(base + x) * 4 + 3] <= 128) continue;
+      const c = map[x]; if (c < 0) continue;
+      pxA.push(x - padW / 2); pyA.push(y - padH / 2); ownA.push(c);
+    }
+  }
+  return { px: Float32Array.from(pxA), py: Float32Array.from(pyA), own: Int16Array.from(ownA),
+           pc: pxA.length, n, charCx, charCy, fs, w: widest, h: lh * rows.length, rows: rows.length, padW, padH };
+}
+
+/* ============================ 5 · 句索引 ============================ */
+let brewIdx = -1, lastT = -1;
+const hintShow = (s, o) => { hint.textContent = s; hint.style.opacity = o; };
+
+/* ============================ 6 · 背景（烘焙沙纹） ============================ */
+function buildBg() {
+  if (!bgCv) bgCv = document.createElement('canvas');
+  const bw = Math.max(2, Math.round(W / 2)), bh = Math.max(2, Math.round(H / 2));
+  bgCv.width = bw; bgCv.height = bh;
+  const g = bgCv.getContext('2d');
+  const grd = g.createRadialGradient(bw * 0.5, bh * 0.4, 0, bw * 0.5, bh * 0.5, Math.max(bw, bh) * 0.82);
+  grd.addColorStop(0, '#2b3324');
+  grd.addColorStop(0.5, '#1a2219');
+  grd.addColorStop(1, '#0b100c');
+  g.fillStyle = grd; g.fillRect(0, 0, bw, bh);
+  /* 干沙上的风纹：几条极淡的正弦脊线 */
+  g.strokeStyle = 'rgba(168,178,146,0.075)';
+  g.lineWidth = 1;
+  for (let k = 0; k < 9; k++) {
+    const y0 = bh * (0.2 + k * 0.085);
+    g.beginPath();
+    for (let x = 0; x <= bw; x += 8) {
+      const y = y0 + Math.sin(x * 0.013 + k * 1.7) * 5 + Math.sin(x * 0.031 - k) * 2;
+      x ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.stroke();
+  }
+  /* 沙的颗粒感：一批小点，一次 fill */
+  g.fillStyle = 'rgba(198,204,176,0.14)';
+  g.beginPath();
+  for (let i = 0; i < 3400; i++) {
+    const x = Math.random() * bw, y = Math.random() * bh, s = Math.random() < 0.85 ? 1 : 1.6;
+    g.rect(x, y, s, s);
+  }
+  g.fill();
+  /* 水面：竖向渐变贴图，每帧只 blit（渐变绝不在 frame 里建） */
+  if (!watCv) watCv = document.createElement('canvas');
+  watCv.width = 4; watCv.height = 256;
+  const wg = watCv.getContext('2d');
+  wg.clearRect(0, 0, 4, 256);
+  const wgr = wg.createLinearGradient(0, 0, 0, 256);
+  wgr.addColorStop(0, 'rgba(34,58,62,0.34)');
+  wgr.addColorStop(0.22, 'rgba(11,27,34,0.76)');
+  wgr.addColorStop(1, 'rgba(2,8,12,0.95)');
+  wg.fillStyle = wgr; wg.fillRect(0, 0, 4, 256);
+}
+
+/* ============================ 7 · 布局（预取） ============================ */
+let prep = null;
+let spans = [];
+let charChars = null;
+let charGlow = new Float32Array(0);
+let blockGx = 0, blockGy = 0;
+let lineT = 0, lineDur = 4;
+
+function prepLine(idx) {
+  const line = lines[idx];
+  if (!line || !line.text) return null;
+  const text = line.text;
+  const latin = isLatin(text);
+  const fs0 = latin ? 92 : (text.length <= 10 ? 118 : text.length <= 16 ? 98 : 82);
+  const g = sampleGlyph(text, { fs: fs0, maxW: Math.min(W * 0.80, 1200), maxH: H * 0.54 });
+  if (!g.pc) return null;
+  g.text = text;
+  const cc = line.chars && line.chars.length === text.length ? line.chars : null;
+  const dur = line.dur || 4;
+  /* 每个字的触发时间：YRC 优先，没有就按句内均分 */
+  const at = new Float32Array(g.n);
+  for (let c = 0; c < g.n; c++) {
+    at[c] = cc && cc[c] && typeof cc[c].t === 'number' ? cc[c].t : line.t + dur * (c / Math.max(1, g.n));
+  }
+  const raw = spansForLine(text);
+  const spanOf = new Int16Array(g.n).fill(-1);
+  const spList = [];
+  for (let k = 0; k < raw.length; k++) {
+    const s = raw[k];
+    if (!s || s.i1 <= s.i0) continue;
+    const t = at[Math.min(g.n - 1, s.i0)];
+    spList.push({ i0: s.i0, i1: s.i1, t, hit: 0 });
+    for (let c = s.i0; c < s.i1; c++) spanOf[c] = spList.length - 1;
+  }
+  if (!spList.length) return null;
+  for (let k = 1; k < spList.length; k++) if (spList[k].t < spList[k - 1].t) spList[k].t = spList[k - 1].t;
+  return { idx, g, spans: spList, spanOf, cc, at, text, lineT: line.t, lineDur: dur };
+}
+
+function buildTargets(use) {
+  const g = use.g, pc = g.pc;
+  gN = Math.max(1800, Math.min(MAXN, Math.round(pc * 1.6)));
+  for (let i = 0; i < gN; i++) {
+    const pi = ((i * pc / gN) | 0) % pc;
+    const own = g.own[pi];
+    gtx[i] = blockGx + g.px[pi] + rnd(-1.1, 1.1);
+    gty[i] = blockGy + g.py[pi] + rnd(-1.1, 1.1);
+    gown[i] = own;
+    gat[i] = use.at[own] || use.lineT;
+    gdep[i] = 0; gact[i] = 0;
+    gvx[i] = 0; gvy[i] = 0;
+    /* 上一句的沙粒留在原地，从这里开始游向新字形；越界的拉回画面 */
+    if (!(gx[i] >= 0 && gx[i] <= W)) gx[i] = Math.random() * W;
+    if (!(gy[i] >= 0 && gy[i] <= H)) gy[i] = Math.random() * H;
+  }
+}
+
+function assignLine(idx) {
+  const use = (prep && prep.idx === idx) ? prep : prepLine(idx);
+  if (!use) { L = null; return; }
+  L = use.g; spans = use.spans; charChars = use.cc;
+  charGlow = new Float32Array(L.n);
+  blockGx = W / 2;
+  blockGy = H * 0.455;
+  lineT = use.lineT; lineDur = use.lineDur;
+  buildTargets(use);
+  /* 新的一句：沙床清空，沙粒从上一句的字形飞向新字形 */
+  if (bed) bed.clearRect(0, 0, bedCv.width, bedCv.height);
+  frontPrev = -1e9;
+}
+
+/* ============================ 8 · 相机 ============================ */
+function camUpdate(dt, T) {
+  const ke = 1 - Math.pow(0.0015, dt);
+  cam.tx = W / 2 + whip;
+  cam.ty = H * 0.48;
+  cam.x += (cam.tx - cam.x) * ke;
+  cam.y += (cam.ty - cam.y) * ke;
+  cam.vz += ((cam.tz - cam.z) * 190 - cam.vz * 22) * dt;
+  cam.z += cam.vz * dt;
+  cam.vrot += (-cam.rot * 260 - cam.vrot * 22) * dt;
+  cam.rot += cam.vrot * dt;
+  cam.sh *= Math.pow(0.00004, dt);
+  const wob = Math.sin(T * 61.7) * 0.62 + Math.sin(T * 41.3 + 1.2) * 0.38;
+  cam.shx = cam.dirx * cam.sh * wob;
+  cam.shy = cam.diry * cam.sh * wob;
+  whip *= Math.pow(0.0009, dt);
+}
+
+/* ============================ 9 · 画面 ============================ */
+let last = performance.now();
+let T0 = 0;
+let frontPrev = -1e9;
+let idleT = 0;
+
+function frame(nowMs) {
+  const dtReal = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; T0 += dtReal;
+  if (AE.freeze > 0) AE.freeze -= dtReal;
+  const dt = AE.freeze > 0 ? 0 : dtReal;
+  idleT += dt;
+
+  const T = now();
+  timing(T);
+
+  /* ---- 水线：整句一次退潮，从画面顶部走到画面底部 ---- */
+  let frontY;
+  if (L && curIdx >= 0) {
+    const lt = lines[curIdx].t, ld = Math.max(1.0, lines[curIdx].dur || 4);
+    const prog = clamp01((T - lt) / (ld * 0.88));
+    frontY = H * 0.13 + H * 1.0 * prog;
+  } else {
+    frontY = H * (0.25 + 0.5 * (0.5 + 0.5 * Math.sin(idleT * 0.25)));
+  }
+
+  /* ---- 逐字亮度（YRC） ---- */
+  if (L) {
+    if (charChars) for (let c = 0; c < L.n; c++) charGlow[c] = charChars[c] ? clamp01((T - charChars[c].t) / 0.22) : 0;
+    else for (let c = 0; c < L.n; c++) charGlow[c] = clamp01((T - lineT - lineDur * 0.85 * c / L.n) / 0.3);
+  }
+
+  /* ---- 词团命中：顿帧 + 白闪 + 竖直震动 + 甩镜 ---- */
+  if (L && curIdx >= 0 && spans.length) {
+    let fired = 0;
+    for (let k = 0; k < spans.length; k++) {
+      if (spans[k].t > T || spans[k].t < T - 0.5) continue;
+      if (spans[k].hit) continue;
+      spans[k].hit = 1; fired++;
+      const first = k === 0;
+      AE.freeze = Math.max(AE.freeze, first ? 0.055 : 0.026);
+      AE.flash = Math.max(AE.flash, first ? 0.4 : 0.18);
+      cam.tz = first ? 1.065 : 1.03;
+      camShake(0, 1, first ? 12 : 6);
+      cam.vrot += (first ? 0.5 : 0.25) * (k % 2 ? 1 : -1);
+      whip = (k % 2 ? 1 : -1) * (first ? 60 : 34);
+    }
+    cam.tz += (1.0 - cam.tz) * Math.min(1, dtReal * 2.4);
+    void fired;
+  }
+
+  camUpdate(dtReal, T0);
+  const z = cam.z;
+  const cosR = Math.cos(cam.rot), sinR = Math.sin(cam.rot);
+  const pjX = (x, y) => { const dx = (x - cam.x) * z, dy = (y - cam.y) * z; return W / 2 + cam.shx + dx * cosR - dy * sinR; };
+  const pjY = (x, y) => { const dx = (x - cam.x) * z, dy = (y - cam.y) * z; return H / 2 + cam.shy + dx * sinR + dy * cosR; };
+
+  /* ---- 沙粒物理：被沿岸流推着走，落到字位就停 ---- */
+  if (L && curIdx >= 0 && dt > 0) {
+    for (let i = 0; i < gN; i++) {
+      if (gdep[i]) continue;
+      const at = gat[i];
+      if (T < at - 0.4) continue;
+      gact[i] = 1;
+      const dx = gtx[i] - gx[i], dy = gty[i] - gy[i];
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const near = d < 90;
+      const kk = near ? 30 : 8.0;
+      gvx[i] += dx * kk * dt;
+      gvy[i] += dy * kk * dt;
+      /* 沿岸流：向下 + 横向涡，越靠近水线越强 */
+      const wl = Math.min(1, Math.abs(gy[i] - frontY) / 220);
+      const flow = (1 - wl) * 210;
+      gvy[i] += flow * dt;
+      const cx = Math.sin(gy[i] * 0.024 + T0 * 1.4) * 26 + Math.sin(gx[i] * 0.019 - T0 * 1.1) * 16;
+      gvx[i] += cx * dt * (0.4 + (1 - wl));
+      /* 靠近落点强阻尼 + 速度上限 —— 否则会冲过去来回振荡 */
+      const dampF = Math.exp(-(near ? 9.5 : 1.6) * dt);
+      gvx[i] *= dampF; gvy[i] *= dampF;
+      const sp = Math.sqrt(gvx[i] * gvx[i] + gvy[i] * gvy[i]);
+      if (sp > 860) { const s2 = 860 / sp; gvx[i] *= s2; gvy[i] *= s2; }
+      gx[i] += gvx[i] * dt; gy[i] += gvy[i] * dt;
+      if ((d < 2.8 && sp < 130) || T > at + 1.7) {
+        gdep[i] = 1;
+        gx[i] = gtx[i]; gy[i] = gty[i];
+        const wx = gx[i], wy = gy[i];
+        const tone = (i % 5 === 0) ? 2 : (i % 3 === 0 ? 1 : 0);
+        const w = gsz[i] * 1.6, h = gsz[i] * 1.7;
+        dab(wx, wy, w, h, tone);
+        /* 水痕：沿水流方向拉出短划 */
+        dab(wx + rnd(-1, 1), wy - 2.6, Math.max(1.0, w * 0.55), 3.0, tone);
+        dab(wx + rnd(-2, 2), wy - 5.0, Math.max(0.9, w * 0.42), 2.6, 2);
+        /* 湿沙的一层柔光（低 alpha 大块，堆出"润"的感觉） */
+        dab(wx - w * 0.7, wy - h * 0.7, w * 2.4, h * 2.4, 3);
+      }
+    }
+  }
+
+  /* ---- 画 ---- */
+  const [ar, ag, ab] = accent;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#07100f';
+  ctx.fillRect(0, 0, W, H);
+  if (bgCv) {
+    const ox = -(cam.x - W / 2) * 0.15, oy = -(cam.y - H / 2) * 0.15;
+    ctx.drawImage(bgCv, ox - 4, oy - 4, W + 8, H + 8);
+  }
+
+  /* 沙床：已沉积的沙粒（只画一次，之后每帧一次 blit） */
+  if (bedCv) {
+    ctx.save();
+    ctx.translate(W / 2 + cam.shx, H / 2 + cam.shy);
+    ctx.rotate(cam.rot);
+    ctx.scale(z, z);
+    ctx.translate(-cam.x, -cam.y);
+    ctx.drawImage(bedCv, BX, BY);
+    ctx.restore();
+  }
+
+  /* 水：水线以下压暗，水线附近一圈泡沫 */
+  if (frontY < H) {
+    if (watCv) {
+      ctx.drawImage(watCv, 0, frontY, W, H - frontY + 2);
+    } else {
+      ctx.fillStyle = 'rgba(6,17,21,0.62)';
+      ctx.fillRect(0, frontY, W, H - frontY + 2);
+    }
+    /* 水线正上方：刚退潮的湿亮带（镜子一样的一层水膜） */
+    ctx.fillStyle = 'rgba(120,160,152,0.10)';
+    ctx.fillRect(0, Math.max(0, frontY - 8), W, 9);
+    /* 水下焦散：一批短横线，随水面晃 */
+    ctx.fillStyle = `rgba(${Math.min(255, ar - 70)},${Math.min(255, ag - 50)},${Math.min(255, ab + 20)},0.075)`;
+    ctx.beginPath();
+    for (let k = 0; k < 130; k++) {
+      const yy = frontY + ((k * 97.13) % (H - frontY + 1));
+      const xx = ((k * 311.7 + T0 * (18 + (k % 7) * 6)) % (W + 160)) - 80;
+      const ww = 26 + (k % 5) * 22;
+      ctx.rect(xx + Math.sin(yy * 0.02 + T0 * 1.3) * 14, yy, ww, 1.4);
+    }
+    ctx.fill();
+    /* 泡沫线：两道错位的水线 */
+    ctx.fillStyle = `rgba(${Math.min(255, ar + 8)},${Math.min(255, ag + 16)},${Math.min(255, ab + 10)},0.6)`;
+    ctx.beginPath();
+    for (let x = -20; x < W + 20; x += 9) {
+      const y = frontY + Math.sin(x * 0.011 + T0 * 1.9) * 4.5 + Math.sin(x * 0.037 - T0 * 3.1) * 1.6;
+      ctx.rect(x, y - 1.2, 7.5, 2.4);
+    }
+    ctx.fill();
+    ctx.fillStyle = 'rgba(240,248,238,0.30)';
+    ctx.beginPath();
+    for (let x = -20; x < W + 20; x += 17) {
+      const y = frontY + 3 + Math.sin(x * 0.008 - T0 * 1.3) * 5;
+      ctx.rect(x, y, 4, 1.4);
+    }
+    ctx.fill();
+    /* 水线一路压过去，留下一条湿沙带 */
+    if (bed && frontY < H) {
+      const y0 = Math.max(frontPrev, frontY - 34);
+      if (frontY > y0) { bed.fillStyle = 'rgba(5,14,13,0.20)'; bed.fillRect(-BX, y0 - BY, W, frontY - y0); }
+    }
+  }
+  frontPrev = frontY;
+
+  /* 未沉积的沙粒：两档（水上亮 / 水下暗），一次 batch 一档 */
+  if (L) {
+    for (let pass = 0; pass < 2; pass++) {
+      const dry = pass === 1;
+      ctx.fillStyle = dry
+        ? `rgba(${Math.min(255, ar + 30)},${Math.min(255, ag + 24)},${Math.min(255, ab + 12)},0.85)`
+        : `rgba(${Math.min(255, ar - 40)},${Math.min(255, ag - 36)},${Math.min(255, ab - 20)},0.45)`;
+      ctx.beginPath();
+      for (let i = 0; i < gN; i++) {
+        if (gdep[i] || !gact[i]) continue;
+        if ((gy[i] < frontY) !== dry) continue;
+        const px = pjX(gx[i], gy[i]), py = pjY(gx[i], gy[i]);
+        if (px < -6 || px > W + 6 || py < -6 || py > H + 6) continue;
+        const s = gsz[i] * 1.15 * z;
+        ctx.rect(px - s * 0.5, py - s * 0.5, s, s);
+      }
+      ctx.fill();
+    }
+  }
+
+  /* 沉积队列 flush（一帧最多 4 次 fill：柔光 → 亮/中/暗） */
+  if (bed) {
+    for (let n = 0; n < 4; n++) {
+      const t = [3, 0, 1, 2][n];
+      const q = DQ[t];
+      if (!q.length) continue;
+      bed.fillStyle = t === 3
+        ? `rgba(${Math.min(255, ar + 10)},${Math.min(255, ag + 10)},${Math.min(255, ab + 4)},0.055)`
+        : t === 0
+          ? `rgba(${Math.min(255, ar + 62)},${Math.min(255, ag + 52)},${Math.min(255, ab + 26)},0.96)`
+          : t === 1
+            ? `rgba(${Math.min(255, ar + 6)},${Math.min(255, ag + 2)},${Math.min(255, ab - 12)},0.88)`
+            : `rgba(${Math.max(0, ar - 58)},${Math.max(0, ag - 54)},${Math.max(0, ab - 36)},0.62)`;
+      bed.beginPath();
+      for (let k = 0; k < q.length; k += 4) bed.rect(q[k], q[k + 1], q[k + 2], q[k + 3]);
+      bed.fill();
+      q.length = 0;
+    }
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  if (AE.flash > 0.012) {
+    ctx.fillStyle = `rgba(238,242,226,${(AE.flash * 0.055).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+    AE.flash *= Math.pow(0.000004, dtReal);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ============================ 10 · 节奏 ============================ */
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; L = null; prep = null; }
+  lastT = T;
+  let c = curIdx;
+  while (c + 1 < lines.length && T >= lines[c + 1].t) c++;
+  if (c !== curIdx) {
+    curIdx = c; brewIdx = -1; prep = null;
+    for (const s of spans) s.hit = 0;
+    if (curIdx >= 0) { assignLine(curIdx); hintShow('', 0); }
+    else hintShow(lines.length ? '等待第一句…' : '这首没有歌词', 0.5);
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    if (T >= lines[nx].t - Math.min(1.5, Math.max(0.55, gap * 0.5))) { brewIdx = nx; prep = prepLine(nx); }
+  }
+}
+
+/* ============================ 11 · 通信协议 ============================ */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent && p.accent.length >= 3) accent = p.accent;
+    curIdx = -1; brewIdx = -1; lastT = -1; L = null; prep = null; spans = [];
+    clockT = 0; clockAt = performance.now();
+    if (bed) bed.clearRect(0, 0, bedCv.width, bedCv.height);
+    frontPrev = -1e9;
+    hintShow(lines.length ? '等待第一句…' : '这首没有歌词', lines.length ? 1 : 0.5);
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    const lv = (d.payload && d.payload.level) || 0.6;
+    camShake(0, 1, 1.4 + lv * 2.4);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  curIdx, n: lines.length, pc: L ? L.pc : 0, grains: gN,
+  dep: (() => { let n = 0; for (let i = 0; i < gN; i++) if (gdep[i]) n++; return n; })(),
+  spans: spans.length, z: +cam.z.toFixed(3), t: +now().toFixed(2),
+});
+
+/* ============================ 12 · 启动 ============================ */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.max(2, Math.round(W * DPR));
+  cv.height = Math.max(2, Math.round(H * DPR));
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  BX = -Math.round(W * 0.12); BY = -Math.round(H * 0.12);
+  if (!bedCv) { bedCv = document.createElement('canvas'); bed = bedCv.getContext('2d'); }
+  bedCv.width = Math.max(2, Math.round(W * 1.24));
+  bedCv.height = Math.max(2, Math.round(H * 1.24));
+  bed.setTransform(1, 0, 0, 1, 0, 0);
+  bed.clearRect(0, 0, bedCv.width, bedCv.height);
+  buildBg();
+  initSand();
+  cam.x = W / 2; cam.y = H * 0.48; cam.tx = cam.x; cam.ty = cam.y;
+  if (L && curIdx >= 0) {
+    const p2 = prepLine(curIdx);
+    if (p2) { prep = p2; assignLine(curIdx); }
+  }
+}
+addEventListener('resize', resize);
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+
+
+

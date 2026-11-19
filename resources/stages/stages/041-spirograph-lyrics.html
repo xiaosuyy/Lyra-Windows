@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>万花尺</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  /* 一层静态暗角：纸面是"长曝光"的，边缘压暗一点才有景深（无混合模式，不增加每帧成本）*/
+  #vig{position:fixed;inset:0;pointer-events:none;
+       background:radial-gradient(118% 96% at 50% 50%,transparent 44%,rgba(3,4,8,.46) 78%,rgba(3,4,8,.86))}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(175,190,255,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="vig"></div>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   041 · 万花尺 —— 笔不离纸，一段一段把字「描」出来
+   ---------------------------------------------------------------------------
+   和已有 10 个的区别：这里没有粒子，也没有"目标点"。
+   只有**一支笔**，它永远在纸上滚，画的每一小段都是货真价实的内摆线。
+   字不是被"拼"出来的，是被这条线一段一段蹭出来的。
+
+   机制（参考页的 R / r / d 三个滑杆，到这里变成一次反解 + 一次打分搜索）：
+   · 反解：θ=0 时笔必须正好落在它现在的位置 P 上，于是孔位 d 与相位 ph
+     由 P 闭式解出（u = 1-r, q = (P-尺心)/RT）：
+        reach = 2u(1-qx)/(1-|q|²),  d = reach-u,
+        ph = atan2(-qy·reach, qx·reach-u),  k = ±u/r
+     所以笔是**连续的**：换齿轮不等于抬笔，它从当前这一点接着往下画。
+   · 搜索：每画完约 70px 就在
+       12 个齿比 × 2 个手性 × 6 个尺心方位 × 2 个转向 = 288 个候选
+     里挑一个。打分 = 这一段弧新画到多少格字（去重）+ 是否更靠近还没画到的
+     笔画（距离场，O(1) 查表）− 是否往外跑（往外跑会掉进"可达环带"的陷阱）。
+   · 尺心是自由的关键：万花尺的可达环带由"笔相对尺心的位置"唯一决定，
+     只放开齿比的话，笔一旦漂到外侧，环带内缘就跨过了字形，再也回不来。
+     让尺身能挪（参考页的机构示意里那条"尺心→滚动圆心→笔尖"），
+     环带就永远套着笔，哪个方向都去得了 —— 覆盖率从 20% 涨到 ~78%。
+   · 没歌词时它自己画一朵标准万花尺（参考页的"自动重绘"），
+     每 8 秒淡掉重来。
+
+   为什么快：轨迹全部累积在一张不透明的离屏画布上（长曝光），
+   每帧只往上面加一条折线（一次 beginPath + 一次 stroke）；
+   字形占据栅格与"到最近未画笔画"的距离场都是"一次建、之后 O(1) 查表"
+   （交接说明坑⑯：不要每帧 BFS）。
+
+   精修记录：① YRC 逐字描红 —— 每个字形格预存它所属字的成立时刻 cellT
+   （chars[k].t；无 chars / 长度不符时按 t+dur*k/n 均分，__stage 增 yrc 字段），
+   笔只把 cellT <= T+0.16 的格子当"纸上的字"（open[] 掩码），于是描红顺序
+   就是唱字顺序，第 k 字被笔描到的时刻正好压在 chars[k].t 上（提前 0.16s 预备，
+   给笔留出走到下一字的时间）；打分再按 (T-cellT) 给旧字加权，笔不会跳着乱描。
+   ② 长句改成自动折 2~3 行 + 字号自适应（41 字时 3 行 @80px，旧版压成一行
+   只剩 28px 且溢出）—— ③ 底稿：整句烘成半分辨率"铅笔底稿"层，每帧一次
+   drawImage，未唱到的字也完整可读（旧版 4s 时只画到第 19 字，后半句是黑的）；
+   ④ 镜头缓慢呼吸缩放 + 平移（整张纸连同笔迹一起漂），beat 保留相干整纸提亮。
+   分词：不使用。逐字时间已精确到字、底稿让整句始终可读，
+   按词团释放只会让"描"的节奏变粗。
+   ========================================================================== */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+const TAU = Math.PI * 2;
+const BG = '#05060a';
+const FONT = (fs) => '800 ' + fs + 'px "PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+
+let W = 0, H = 0, DPR = 1;
+
+/* ---- 长曝光轨迹层：万花尺的线是一层层加上去的，所以累积在一张不透明画布上 ---- */
+const trail = document.createElement('canvas');
+const tctx = trail.getContext('2d', { alpha: false });
+
+/* ---- 底稿（半分辨率，整句一直可读；每句烘一次，每帧一次 drawImage）---- */
+let guide = null;
+
+/* ---- 字形占据栅格（笔要"找"的就是它）---- */
+const CELL = 6;
+let gw = 0, gh = 0;
+let ink = null, cov = null, scratch = null, ctBuf = null;
+let cellT = null, open = null;            // 每格所属字的成立时刻 / 已开锁掩码
+let st1 = null, st2 = null, vid = 0;      // 打分去重：同一个格子一次候选里只算一次
+let du = null, duValid = false, duT = 0;  // "到最近的没画过的字形格"的距离场（每 0.25 秒重算一次）
+let histX = new Float32Array(12), histY = new Float32Array(12), histN = 0, histI = 0;
+let inkLeft = 0, inkTotalN = 0, hasField = false;
+let RT = 700;                             // 万花尺外接半径（像素）
+
+/* ---- 排版 / 逐字时间 ---- */
+let lay = null;                           // { glyphs, rowInfo, fs, LH, nr }
+let ctArr = null;                         // Float32Array：第 k 字的成立时刻
+let curLineRef = null, curYrc = false;
+let lit = 0;                              // 已经成立的字数（单调）
+let curT = 0;
+let openT = -1e9;
+
+/* ---- 笔 / 齿轮 ---- */
+const pen = { x: 0, y: 0 };
+let arc = null;                           // { g, thEnd, prog, dur }
+let huePhase = 0;
+let fadeT = 0, idleT = 0;
+let beatPulse = 0;
+
+let lines = [];
+let accent = [150, 160, 255];
+
+function clearTrail() {
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  tctx.globalCompositeOperation = 'source-over';
+  tctx.fillStyle = BG;
+  tctx.fillRect(0, 0, trail.width, trail.height);
+  tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  trail.width = cv.width; trail.height = cv.height;
+  tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  tctx.lineJoin = 'round'; tctx.lineCap = 'round';
+  clearTrail();
+  RT = Math.min(W * 0.47, H * 0.74);
+  arc = null;
+  if (curLineRef) relayout();
+  else { pen.x = W / 2; pen.y = H / 2; }
+}
+
+/* ---- 折行：1 行 ≤13 字，≤26 字两行，其余三行（41 字 → 14/14/13）---- */
+function splitRows(text) {
+  const n = text.length;
+  if (n <= 13) return [text];
+  const cut = (i) => {                       // 不要从代理对中间切开
+    if (i > 0 && i < n) {
+      const c = text.charCodeAt(i);
+      if (c >= 0xDC00 && c <= 0xDFFF) return i - 1;
+    }
+    return i;
+  };
+  if (n <= 26) { const c = cut(Math.round(n / 2)); return [text.slice(0, c), text.slice(c)]; }
+  const a = cut(Math.round(n / 3)), b = cut(Math.round(n * 2 / 3));
+  return [text.slice(0, a), text.slice(a, b), text.slice(b)];
+}
+
+/* ---- 排版：字号自适应 + 每个字的绝对画布坐标（YRC 需要逐字位置）---- */
+const off = document.createElement('canvas');
+const octx = off.getContext('2d', { willReadFrequently: true });
+
+function makeLayout(text) {
+  if (!text) return null;
+  const rows = splitRows(text);
+  const nr = rows.length;
+  const maxW = Math.min(W * 0.78, 1180);
+  const maxH = H * 0.58;
+  const LHK = 1.20;
+  octx.font = FONT(96);
+  let widest = 0;
+  for (const r of rows) widest = Math.max(widest, octx.measureText(r).width);
+  /* 行宽与总高两条约束一起夹；短句仍用 96px（和旧版一致），长句自动缩 */
+  let fs = 96 * Math.min(1, maxW / Math.max(1, widest), maxH / (nr * LHK * 96));
+  fs = Math.max(30, Math.floor(fs));
+  octx.font = FONT(fs);
+  /* 二次校正：把最宽的那行按真实宽度收到 maxW 以内 */
+  let wMax = 0;
+  for (const r of rows) wMax = Math.max(wMax, octx.measureText(r).width);
+  if (wMax > maxW) { fs = Math.max(30, Math.floor(fs * maxW / wMax)); octx.font = FONT(fs); }
+  const LH = fs * LHK;
+  const glyphs = [], rowInfo = [];
+  const y0 = H / 2 - (nr - 1) * LH / 2;
+  let gi = 0;
+  for (let r = 0; r < nr; r++) {
+    const row = rows[r];
+    let wsum = 0; const ws = [];
+    for (let j = 0; j < row.length; j++) {
+      const w = octx.measureText(row[j]).width;
+      ws.push(w); wsum += w;
+    }
+    let x = W / 2 - wsum / 2;
+    const y = y0 + r * LH;
+    for (let j = 0; j < row.length; j++) {
+      const w = ws[j];
+      glyphs.push({ ch: row[j], x: x + w / 2, y: y, w: w, i: gi++ });
+      x += w;
+    }
+    rowInfo.push({ text: row, x0: W / 2 - wsum / 2, w: wsum, y: y });
+  }
+  return { glyphs: glyphs, rowInfo: rowInfo, fs: fs, LH: LH, nr: nr, text: text };
+}
+
+/* ---- 逐字时间：chars 必须和 text 等长且每个 t 有限，否则均分回退 ---- */
+function charTimes(line) {
+  const n = line.text.length;
+  const ct = new Float32Array(n);
+  const chs = line.chars;
+  let ok = !!(chs && chs.length === n && n > 0);
+  if (ok) {
+    for (let k = 0; k < n; k++) {
+      const v = chs[k] ? +chs[k].t : NaN;
+      if (!isFinite(v)) { ok = false; break; }
+      ct[k] = v;
+    }
+  }
+  if (!ok) {
+    const dur = line.dur > 0 ? line.dur : 3;
+    const t0 = +line.t || 0;
+    for (let k = 0; k < n; k++) ct[k] = t0 + dur * k / Math.max(1, n);
+  }
+  for (let k = 1; k < n; k++) if (ct[k] < ct[k - 1]) ct[k] = ct[k - 1];
+  return { ct: ct, yrc: ok };
+}
+
+/* ---- 单字采样（返回相对字心的点；比整句一起画好逐字分配归属）---- */
+function sampleChar(ch, fs) {
+  octx.font = FONT(fs);
+  const w = Math.max(6, Math.ceil(octx.measureText(ch).width) + 8);
+  const h = Math.max(6, Math.ceil(fs * 1.35) + 8);
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, w, h);
+  octx.font = FONT(fs);
+  octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.fillStyle = '#fff';
+  octx.fillText(ch, w / 2, h / 2);
+  const d = octx.getImageData(0, 0, w, h).data;
+  const pts = [];
+  for (let y = 0; y < h; y += 2)
+    for (let x = 0; x < w; x += 2)
+      if (d[(y * w + x) * 4 + 3] > 128) pts.push(x - w / 2, y - h / 2);
+  return pts;
+}
+
+/* ---- 建场：一次建、之后每帧 O(1) 查表（不是每帧重算）---- */
+function buildField() {
+  gw = Math.ceil(W / CELL) + 1; gh = Math.ceil(H / CELL) + 1;
+  const n = gw * gh;
+  if (!ink || ink.length !== n) {
+    ink = new Uint8Array(n); cov = new Uint8Array(n); scratch = new Uint8Array(n);
+    cellT = new Float32Array(n); ctBuf = new Float32Array(n); open = new Uint8Array(n);
+    st1 = new Int32Array(n); st2 = new Int32Array(n); du = new Float32Array(n); vid = 0;
+  } else { ink.fill(0); cov.fill(0); }
+  cellT.fill(Infinity); open.fill(0); openT = -1e9;
+  const cx = W / 2, cy = H / 2;
+  let maxR2 = 0;
+  if (lay) {
+    for (let gi = 0; gi < lay.glyphs.length; gi++) {
+      const g = lay.glyphs[gi];
+      const t = ctArr ? ctArr[g.i] : 0;
+      const pts = sampleChar(g.ch, lay.fs);
+      for (let i = 0; i < pts.length; i += 2) {
+        const sx = g.x + pts[i], sy = g.y + pts[i + 1];
+        const gx = (sx / CELL) | 0, gy = (sy / CELL) | 0;
+        if (gx >= 0 && gx < gw && gy >= 0 && gy < gh) {
+          const ci = gy * gw + gx;
+          if (!ink[ci]) ink[ci] = 1;
+          if (t < cellT[ci]) cellT[ci] = t;
+        }
+        const dx = sx - cx, dy = sy - cy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > maxR2) maxR2 = d2;
+      }
+    }
+  }
+  /* 外接半径必须比字形大一圈：笔的解算在"离中心太远"时会退化成贴着外缘的细环，
+     留出余量，字才落在环带的中段，笔在里面才走得开（否则最左/最右一个字画不到）*/
+  if (maxR2 > 0) {
+    RT = Math.max(Math.min(W, H) * 0.50, Math.min(H * 0.92, Math.sqrt(maxR2) * 1.18));
+  } else RT = Math.min(W * 0.47, H * 0.74);
+  /* 膨胀一格：细笔画才连得起来，笔扫过时不会一格一格地漏。
+     邻居的成立时刻一起继承（取更早的那个），膨胀出来的格才跟着原字一起开锁 */
+  scratch.set(ink);
+  ctBuf.set(cellT);
+  for (let y = 1; y < gh - 1; y++) {
+    for (let x = 1; x < gw - 1; x++) {
+      const i = y * gw + x;
+      if (scratch[i]) continue;
+      let t = Infinity, any = 0;
+      if (scratch[i - 1]) { any = 1; if (ctBuf[i - 1] < t) t = ctBuf[i - 1]; }
+      if (scratch[i + 1]) { any = 1; if (ctBuf[i + 1] < t) t = ctBuf[i + 1]; }
+      if (scratch[i - gw]) { any = 1; if (ctBuf[i - gw] < t) t = ctBuf[i - gw]; }
+      if (scratch[i + gw]) { any = 1; if (ctBuf[i + gw] < t) t = ctBuf[i + gw]; }
+      if (any) { ink[i] = 1; cellT[i] = t; }
+    }
+  }
+  let c = 0;
+  for (let i = 0; i < n; i++) if (ink[i]) c++;
+  inkLeft = c; inkTotalN = c;
+  hasField = c > 0;
+  duT = 0; rebuildDU();
+}
+
+/* 逐字开锁：第 k 字的格子从 chars[k].t（提前 0.16s）起才算"纸上的字" */
+function syncOpen(T) {
+  openT = T;
+  const cut = T + 1e-4;
+  for (let i = 0; i < open.length; i++) open[i] = ink[i] && cellT[i] <= cut ? 1 : 0;
+  duValid = false;
+}
+
+/* "到最近的还没画到的字形格"的距离场：给搜索一个方向感。
+   没有它的话，附近的笔画画完之后笔就只会在空地上随机游走。
+   一次倒角变换，24 帧才重算一次（坑⑯：距离场一次建、之后 O(1) 查表）。*/
+function rebuildDU() {
+  const n = gw * gh;
+  const INF = 4000;
+  for (let i = 0; i < n; i++) du[i] = (open[i] && !cov[i]) ? 0 : INF;
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const i = y * gw + x; let v = du[i];
+    if (x > 0 && du[i - 1] + 1 < v) v = du[i - 1] + 1;
+    if (y > 0 && du[i - gw] + 1 < v) v = du[i - gw] + 1;
+    if (x > 0 && y > 0 && du[i - gw - 1] + 1.414 < v) v = du[i - gw - 1] + 1.414;
+    if (x < gw - 1 && y > 0 && du[i - gw + 1] + 1.414 < v) v = du[i - gw + 1] + 1.414;
+    du[i] = v;
+  }
+  for (let y = gh - 1; y >= 0; y--) for (let x = gw - 1; x >= 0; x--) {
+    const i = y * gw + x; let v = du[i];
+    if (x < gw - 1 && du[i + 1] + 1 < v) v = du[i + 1] + 1;
+    if (y < gh - 1 && du[i + gw] + 1 < v) v = du[i + gw] + 1;
+    if (x < gw - 1 && y < gh - 1 && du[i + gw + 1] + 1.414 < v) v = du[i + gw + 1] + 1.414;
+    if (x > 0 && y < gh - 1 && du[i + gw - 1] + 1.414 < v) v = du[i + gw - 1] + 1.414;
+    du[i] = v;
+  }
+  duValid = inkLeft > 0;
+}
+function dAt(x, y) {
+  const gx = (x / CELL) | 0, gy = (y / CELL) | 0;
+  if (gx < 0 || gx >= gw || gy < 0 || gy >= gh) return 200;
+  return du[gy * gw + gx];
+}
+
+/* ---- 齿轮：θ=0 时笔必须正好落在 P 上 ⇒ (d, ph, scl) 闭式解出。
+        齿比 r、手性、以及**定齿轮（外圈）摆在纸上哪里**都是自由的 ——
+        真实的万花尺本来就可以把尺身挪到别处，笔始终不提起来。
+        只放开齿比是不够的：可达环带由"笔相对尺心的位置"唯一决定，
+        笔一旦漂到外侧，环带内缘就跨过了字形，再也回不来。
+        让尺心可以跟着笔走，环带就永远套着笔，哪个方向都去得了。 ---- */
+function gearFrom(r, sgn, px, py, cx0, cy0) {
+  const u = 1 - r;
+  const qx = (px - cx0) / RT, qy = (py - cy0) / RT;
+  const q2 = qx * qx + qy * qy;
+  if (q2 > 0.985) return null;
+  const reach = 2 * u * (1 - qx) / (1 - q2);
+  if (!(reach > 0.20 && reach < 24)) return null;
+  const d = reach - u;
+  if (d < 0.02) return null;
+  const ph = Math.atan2(-qy * reach, qx * reach - u);
+  return { r: r, d: d, ph: ph, k: sgn * u / r, scl: RT / reach, cx: cx0, cy: cy0 };
+}
+const gxAt = (g, th) => g.cx + g.scl * ((1 - g.r) * Math.cos(th) + g.d * Math.cos(g.k * th + g.ph));
+const gyAt = (g, th) => g.cy + g.scl * ((1 - g.r) * Math.sin(th) - g.d * Math.sin(g.k * th + g.ph));
+/* 笔尖速率（解析解）：不同齿轮的速率能差两个数量级，
+   所以取样和分段都必须按"走 4px"来定步长，不能按固定的 Δθ */
+function speedAt(g, th) {
+  const c1 = Math.cos(th), s1 = Math.sin(th);
+  const a2 = g.k * th + g.ph, c2 = Math.cos(a2), s2 = Math.sin(a2);
+  const u = 1 - g.r;
+  const vx = g.scl * (-u * s1 - g.d * g.k * s2);
+  const vy = g.scl * (u * c1 - g.d * g.k * c2);
+  return Math.sqrt(vx * vx + vy * vy);
+}
+
+/* ---- 打分：沿弧走一遍（每步约 4px），落在"还没画到的字形格"上最值钱。
+        同一个格子一次候选里只算一次（去重）—— 否则慢齿轮反复蹭同一格会刷分。
+        只认 open 格（= 已经唱到的字），并按"这个字成立多久"给加成，
+        笔于是从左到右按唱字顺序描，不会跳着乱涂。 ---- */
+function evalGear(g, wantLen) {
+  let th = 0, len = 0, ng = 0, cg = 0, guard = 0;
+  const dir = g.dir || 1;
+  vid++;
+  const d0 = duValid ? dAt(pen.x, pen.y) : 0;
+  let dEnd = d0, xEnd = pen.x, yEnd = pen.y;
+  while (len < wantLen && th < 7 && guard++ < 400) {
+    const spd = speedAt(g, th);
+    let dth = 4 / Math.max(1, spd);
+    if (dth > 0.08) dth = 0.08;
+    th += dth;
+    len += spd * dth;
+    const tt = dir * th;
+    const x = gxAt(g, tt), y = gyAt(g, tt);
+    xEnd = x; yEnd = y;
+    if (hasField) {
+      const cxi = (x / CELL) | 0, cyi = (y / CELL) | 0;
+      if (cxi >= 0 && cxi < gw && cyi >= 0 && cyi < gh) {
+        const ci = cyi * gw + cxi;
+        if (open[ci] && st1[ci] !== vid) {
+          st1[ci] = vid;
+          if (cov[ci]) cg += 1;
+          else {
+            const age = curT - cellT[ci];
+            ng += 1 + (age > 0 ? Math.min(1.2, age * 0.55) : 0);
+          }
+        }
+      }
+      if (duValid) dEnd = dAt(x, y);
+    }
+  }
+  /* 目标 = 这一段弧**新画到多少格字**，再按弧长给一点点"起步费"，
+     再加"有没有更靠近还没画到的笔画"。
+     绝对不要给"跑到字外面"单独记罚分 —— 那样一旦附近的笔画都画完了，
+     "原地不动"（罚分 0）就会永远赢过"走出去找下一笔"，笔会当场卡死；
+     反过来，给长度一点点正分，不动的弧得 0，任何真的走起来的弧都赢它。 */
+  let s = ng + 0.02 * cg + 0.0008 * len;
+  if (duValid) {
+    let adv = (d0 - dEnd) * 0.7;   // du 的单位是格子（6px），所以系数要够大
+    if (adv > 12) adv = 12; else if (adv < -2.5) adv = -2.5;
+    s += adv;
+  }
+  /* 别往外跑：万花尺的"可达环带"由笔的位置唯一决定（内缘 = |qx-q²|/(1-qx)·RT），
+     越靠外环带越窄 —— 一旦漂到 ±x 轴远端，环带内缘就已经越过字形，
+     笔再也回不到字上了。所以向外只罚、向内小幅奖励，把笔锁在字附近。 */
+  const rS = Math.sqrt((pen.x - W / 2) * (pen.x - W / 2) + (pen.y - H / 2) * (pen.y - H / 2));
+  const rE = Math.sqrt((xEnd - W / 2) * (xEnd - W / 2) + (yEnd - H / 2) * (yEnd - H / 2));
+  const out = (rE - rS) * 0.08;
+  s -= out > 0 ? Math.min(out, 6) : Math.max(out, -2);
+  /* 反极限环：落点跟最近几个落点重合就扣分，防止笔在原地来回蹭 */
+  for (let k = 0; k < histN; k++) {
+    const hx = xEnd - histX[k], hy = yEnd - histY[k];
+    if (hx * hx + hy * hy < 900) { s -= 1.5; break; }
+  }
+  return { score: s, th: th, len: len, ng: ng, ex: xEnd, ey: yEnd };
+}
+
+function search(wantLen) {
+  let best = null, bestScore = -1e18, longest = null, longestLen = -1;
+  const N = 12;
+  const sOff = RT * 0.20;                        // 尺心离笔多远
+  for (let i = 0; i < N; i++) {
+    const r = 0.20 + 0.70 * (i / (N - 1));
+    for (let s = 0; s < 2; s++) {
+      const sg = s ? 1 : -1;
+      for (let w = 0; w < 6; w++) {
+        /* 尺心绕笔摆一圈：这一圈就是"笔能往哪个方向走"的自由度 */
+        const psi = w * (TAU / 6) + 0.31;
+        const g = gearFrom(r, sg, pen.x, pen.y,
+                           pen.x + Math.cos(psi) * sOff, pen.y + Math.sin(psi) * sOff);
+        if (!g) continue;
+        /* 齿轮正转 / 反转都要试：只让 θ 往前走的话，笔在每个决策点都只能
+           朝"大致向下"离场，向上的笔画永远描不到 */
+        for (let dI = 0; dI < 2; dI++) {
+          g.dir = dI ? -1 : 1;
+          const e = evalGear(g, wantLen);
+          if (e.len > longestLen) { longestLen = e.len; longest = { g: g, thEnd: e.th, len: e.len, ng: e.ng, dir: g.dir, ex: e.ex, ey: e.ey }; }
+          const sc = e.score + Math.random() * 0.30;   // 抖动：同一句两次也不会长得一样
+          if (sc > bestScore) {
+            bestScore = sc;
+            best = { g: g, thEnd: e.th, len: e.len, ng: e.ng, dir: g.dir, ex: e.ex, ey: e.ey };
+          }
+        }
+      }
+    }
+  }
+  /* 保险：万一分最高的那段几乎没动（笔会当场冻住），就换成动得最远的那段 */
+  if (best && best.len < 12 && longest) best = longest;
+  return best;
+}
+
+function pickGear() {
+  if (!hasField || inkLeft <= 0) {
+    /* 没歌词 / 这句已经描完：让它自己画一朵标准万花尺，参数缓慢漂移（参考页的"自动重绘"）*/
+    const r = 0.30 + 0.42 * (0.5 + 0.5 * Math.sin(huePhase * 0.11));
+    const g = gearFrom(r, (huePhase | 0) % 2 ? 1 : -1, pen.x, pen.y, W / 2, H / 2);
+    if (!g) return null;
+    g.dir = 1;
+    const e = evalGear(g, 420);
+    return { g: g, thEnd: e.th, len: e.len, ng: 0, dir: 1, ex: e.ex, ey: e.ey };
+  }
+  /* 两段搜索：
+     ① 短弧（70px）—— 弧一长，所有候选都跑出笔画，分数拉不开差距，笔就乱走；
+        短弧才"咬"得住笔画，这是一段一段蹭着字走的关键；
+     ② 附近的新笔画都画完了（ng≈0）就把弧拉到 700px 再搜一遍 ——
+        不然笔会永远绕着已经画过的那几笔转圈，覆盖率卡死。 */
+  let best = search(70);
+  if (!best || best.ng < 0.5) {
+    const far = search(420);
+    if (far && (!best || far.ng > best.ng)) best = far;
+  }
+  return best;
+}
+
+/* ================= 节奏：1-10 的教训固化在这里 =================
+   ① 显示与酝酿分离 —— curIdx 只在句首切换，brewIdx 提前 lead 秒准备
+   ② 索引单调不回退 —— 时钟在 tick 之间外推、tick 一来会往回缩一点，
+      不锁单调的话句边界来回跳、同一句被反复重建
+   ③ 提前量自适应 —— 快歌早开始，慢歌不提前太多
+   ④ 只有拖进度条（时间明显倒退）才允许重置
+   ================================================================ */
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+
+let pend = null, pendIdx = -1;
+
+/* 酝酿 = 排好版、算好逐字时间（建字形场是这里唯一的重活，放到换句那一刻做）*/
+function brewLine(i) {
+  const L = lines[i];
+  const tm = charTimes(L);
+  pend = { lay: makeLayout(L.text), ct: tm.ct, yrc: tm.yrc };
+  pendIdx = i;
+}
+
+/* 下一句的排版（换行 / 字号 / 每字坐标）与逐字时刻 */
+function relayout() {
+  const ct = charTimes(curLineRef);
+  ctArr = ct.ct; curYrc = ct.yrc;
+  lay = makeLayout(curLineRef.text);
+  buildGuide();
+  buildField();
+  lit = 0;
+  syncOpen(Math.max(curT + 0.16, ctArr.length ? ctArr[0] : 0));
+  placePen();
+}
+
+function placePen() {
+  arc = null;
+  if (hasField) {
+    /* 笔落在第一个开锁的字形格上 —— 也就是这句话的第一个字的第一个笔画 */
+    for (let i = 0; i < open.length; i++) {
+      if (open[i]) { pen.x = (i % gw + 0.5) * CELL; pen.y = ((i / gw) | 0) * CELL + CELL * 0.5; return; }
+    }
+  }
+  pen.x = W / 2; pen.y = H / 2;
+}
+
+function startLine(i) {
+  if (pendIdx !== i) brewLine(i);
+  const b = pend;
+  pend = null; pendIdx = -1;
+  curLineRef = lines[i];
+  if (!b || !b.lay) {
+    lay = null; ctArr = null; curYrc = false;
+    hasField = false; inkLeft = 0; if (open) open.fill(0);
+    RT = Math.min(W * 0.47, H * 0.74);
+    arc = null; fadeT = 0.5; idleT = 0;
+    pen.x = W / 2; pen.y = H / 2;
+    return;
+  }
+  lay = b.lay; ctArr = b.ct; curYrc = b.yrc;
+  lit = 0;
+  buildGuide();
+  buildField();
+  syncOpen(Math.max(curT + 0.16, ctArr.length ? ctArr[0] : 0));
+  placePen();
+  fadeT = 0.5;                                   // 旧的那朵花淡掉
+  idleT = 0;
+}
+
+/* 底稿：整句烘成半分辨率一层（每帧一次 drawImage，未唱到的字也完整可读）*/
+function buildGuide() {
+  const s = 0.6;
+  const w = Math.max(2, Math.round(W * s)), h = Math.max(2, Math.round(H * s));
+  if (!guide) guide = document.createElement('canvas');
+  guide.width = w; guide.height = h;
+  const g = guide.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, w, h);
+  if (!lay) return;
+  g.setTransform(s, 0, 0, s, 0, 0);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = FONT(lay.fs);
+  g.lineJoin = 'round';
+  const cr = Math.min(255, accent[0] + 30) | 0, cg = Math.min(255, accent[1] + 24) | 0,
+        cb = Math.min(255, accent[2] + 6) | 0;
+  g.fillStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',0.32)';
+  g.strokeStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',0.15)';
+  g.lineWidth = Math.max(1.4, lay.fs * 0.042);
+  for (let r = 0; r < lay.rowInfo.length; r++) {
+    const row = lay.rowInfo[r];
+    const x = row.x0 + row.w / 2;
+    g.fillText(row.text, x, row.y);
+    g.strokeText(row.text, x, row.y);
+  }
+}
+
+function timing(T) {
+  curT = T;
+  if (!lines.length) return;
+  if (T < lastT - 0.6) {
+    curIdx = -1; brewIdx = -1;
+    lay = null; ctArr = null; curLineRef = null; lit = 0;
+    pend = null; pendIdx = -1;
+    hasField = false; inkLeft = 0; arc = null; if (open) open.fill(0);
+    clearTrail(); pen.x = W / 2; pen.y = H / 2;
+  }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) startLine(ci);
+    hint.style.opacity = lines.length ? (ci >= 0 ? '0' : '1') : '0.5';
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) { brewIdx = nx; brewLine(nx); }
+  }
+  /* 逐字开锁：提前 0.16s 给笔留出走到下一字的时间（0.1~0.4s 的预备窗口内） */
+  if (ctArr && ctArr.length) {
+    let want = T + 0.16;
+    if (want < ctArr[0]) want = ctArr[0];
+    if (want > openT + 0.02) syncOpen(want);
+    while (lit < ctArr.length && T >= ctArr[lit]) lit++;
+  }
+}
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    lay = null; ctArr = null; curLineRef = null; lit = 0;
+    pend = null; pendIdx = -1;
+    hasField = false; inkLeft = 0; arc = null; huePhase = 0;
+    if (p.accent) accent = p.accent;
+    clearTrail();
+    pen.x = W / 2; pen.y = H / 2;
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 踩拍：必须相干。整朵花的外接半径一起涨一下、整张纸一起提亮一下，
+       不是逐颗乱踢 —— 万花尺只有一个自由度，乱踢会直接毁掉齿轮解 */
+    beatPulse = Math.min(1, beatPulse + 0.55 * (0.35 + (d.payload.level || 0)));
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+
+/* ---------------- 主循环 ---------------- */
+let last = performance.now();
+let t0 = 0;
+
+resize();
+requestAnimationFrame(frame);
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+
+  beatPulse *= Math.exp(-dt * 3.2);
+  huePhase += dt * 0.35;
+
+  /* 淡出：换句 / 空闲重绘时把旧线擦掉（这就是"释放"）*/
+  if (fadeT > 0) {
+    fadeT -= dt;
+    tctx.globalCompositeOperation = 'source-over';
+    tctx.fillStyle = 'rgba(5,6,10,0.15)';
+    tctx.fillRect(0, 0, W, H);
+  }
+  if (!hasField) {
+    idleT += dt;
+    if (idleT > 8) { idleT = 0; fadeT = 0.6; pen.x = W / 2; pen.y = H / 2; arc = null; }
+  } else {
+    duT += dt;
+    if (duT > 0.25) { duT = 0; rebuildDU(); }     // 方向场每 0.25 秒刷一次
+  }
+
+  /* ---- 选齿轮 ---- */
+  if (!arc) {
+    const p = pickGear();
+    /* 弧长决定这一小段画多久 —— 笔速保持大致恒定（约 2600 px/s），
+       而不是"长弧短弧都一个时长"，那样长弧会糊成一条直线 */
+    if (p) {
+      arc = { g: p.g, thEnd: Math.max(0.01, p.thEnd), dir: p.dir || 1, prog: 0,
+              dur: Math.max(0.03, Math.min(0.42, p.len / 3600)) };
+      histX[histI] = p.ex; histY[histI] = p.ey;
+      histI = (histI + 1) % 12;
+      if (histN < 12) histN++;
+    } else { pen.x = W / 2; pen.y = H / 2; }
+  }
+
+  /* ---- 滚一段：笔不离纸 ---- */
+  let segLen = 0;
+  if (arc) {
+    const prev = arc.prog;
+    arc.prog = Math.min(1, arc.prog + dt / arc.dur);
+    const d = arc.dir || 1;
+    const th0 = d * prev * arc.thEnd, th1 = d * arc.prog * arc.thEnd;
+    const spd = speedAt(arc.g, (th0 + th1) * 0.5);
+    const steps = Math.max(2, Math.min(120, Math.ceil(spd * Math.abs(th1 - th0) / 4)));
+    const hue = 195 + 150 * (0.5 + 0.5 * Math.sin(huePhase * 1.7 + beatPulse * 0.6));
+    tctx.globalCompositeOperation = 'lighter';
+    tctx.lineWidth = 1.9;
+    tctx.strokeStyle = 'hsla(' + hue.toFixed(1) + ',92%,68%,0.85)';
+    tctx.beginPath();
+    let px0 = gxAt(arc.g, th0), py0 = gyAt(arc.g, th0);
+    tctx.moveTo(px0, py0);
+    for (let i = 1; i <= steps; i++) {
+      const th = th0 + (th1 - th0) * (i / steps);
+      const x = gxAt(arc.g, th), y = gyAt(arc.g, th);
+      tctx.lineTo(x, y);
+      segLen += Math.sqrt((x - px0) * (x - px0) + (y - py0) * (y - py0));
+      px0 = x; py0 = y;
+      if (hasField) {
+        const cxi = (x / CELL) | 0, cyi = (y / CELL) | 0;
+        if (cxi >= 0 && cxi < gw && cyi >= 0 && cyi < gh) {
+          const ci = cyi * gw + cxi;
+          if (!cov[ci] && open[ci]) { cov[ci] = 1; inkLeft--; }
+        }
+      }
+    }
+    tctx.stroke();
+    huePhase += segLen * 0.0016;
+    pen.x = px0; pen.y = py0;
+    if (arc.prog >= 1) arc = null;
+  }
+
+  /* ---- 合成：镜头（缓慢呼吸缩放 + 漂移）→ 轨迹 → 底稿 → 机构示意 ---- */
+  /* 镜头只作用在"纸"这一层：轨迹、底稿、笔、机构示意用的是同一个变换，
+     所以笔尖永远压在它刚画出的那一笔上（漂移幅度 <8px，肉眼是"镜头在动"）。*/
+  const camS = 1 + 0.011 * Math.sin(t0 * 0.09) + 0.004 * Math.sin(t0 * 0.031);
+  const camX = Math.sin(t0 * 0.071) * 9, camY = Math.cos(t0 * 0.053) * 6;
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.save();
+  ctx.translate(W / 2 + camX, H / 2 + camY);
+  ctx.scale(camS, camS);
+  ctx.translate(-W / 2, -H / 2);
+
+  ctx.drawImage(trail, 0, 0, W, H);
+
+  /* 底稿：整句一直在，未唱到的字也完整可读；唱到的字上叠着刚描的笔迹 */
+  if (guide && lay) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(guide, 0, 0, W, H);
+  }
+
+  if (beatPulse > 0.01) {
+    /* 相干提亮：整张纸一起亮，不是逐颗粒子乱闪 */
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'rgba(' + Math.min(255, accent[0] + 60) + ',' + Math.min(255, accent[1] + 55) + ',' +
+                    Math.min(255, accent[2] + 40) + ',' + (0.035 * beatPulse).toFixed(3) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (arc) {
+    const g = arc.g, th = (arc.dir || 1) * arc.prog * arc.thEnd;
+    /* 机构示意：尺心 → 滚动圆心 → 笔尖。尺心会跳，所以能直接看出
+       "尺身挪到哪儿了" —— 这就是这个形态唯一的自由度 */
+    const ccx = g.cx + g.scl * (1 - g.r) * Math.cos(th);
+    const ccy = g.cy + g.scl * (1 - g.r) * Math.sin(th);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(140,150,255,0.26)';
+    ctx.beginPath();
+    ctx.moveTo(g.cx, g.cy);
+    ctx.lineTo(ccx, ccy);
+    ctx.lineTo(pen.x, pen.y);
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(140,150,255,0.12)';
+    ctx.beginPath();
+    ctx.arc(g.cx, g.cy, g.scl, 0, TAU);
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(140,150,255,0.16)';
+    ctx.beginPath();
+    ctx.arc(ccx, ccy, Math.abs(g.r) * g.scl, 0, TAU);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(224,228,255,0.95)';
+    ctx.beginPath();
+    ctx.arc(pen.x, pen.y, 2.6, 0, TAU);
+    ctx.fill();
+  } else if (lay) {
+    /* 笔在换齿轮的空档：只留一个笔尖光点，别让画面"没人" */
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'rgba(210,220,255,0.55)';
+    ctx.beginPath();
+    ctx.arc(pen.x, pen.y, 2.2, 0, TAU);
+    ctx.fill();
+  }
+
+  /* 当前字：笔已经开锁、但还没描完的那个字的字心 —— 一圈很淡的取景框，
+     说明"镜头正对着这一句正在写的这个字" */
+  if (lay && ctArr && ctArr.length) {
+    const k = Math.min(lay.glyphs.length - 1, Math.max(0, lit - 1));
+    const g0 = lay.glyphs[k];
+    if (g0) {
+      const rec = Math.max(0, 1 - (T - ctArr[k]) / 0.8);
+      const a = 0.20 + 0.16 * rec;
+      /* 当前这个字：底稿之上再亮一档 —— 镜头与笔都对着它，YRC 的进度看得见 */
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.font = FONT(lay.fs);
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = 'rgba(' + Math.min(255, accent[0] + 50) + ',' +
+                      Math.min(255, accent[1] + 46) + ',' + Math.min(255, accent[2] + 30) + ',' +
+                      (0.16 + 0.20 * rec).toFixed(3) + ')';
+      ctx.fillText(g0.ch, g0.x, g0.y);
+      ctx.strokeStyle = 'rgba(' + Math.min(255, accent[0] + 60) + ',' +
+                        Math.min(255, accent[1] + 56) + ',' + Math.min(255, accent[2] + 40) + ',' + a.toFixed(3) + ')';
+      ctx.lineWidth = 1;
+      const rr = Math.max(20, lay.fs * 0.46) * (1 + 0.05 * Math.sin(t0 * 3));
+      ctx.beginPath();
+      ctx.arc(g0.x, g0.y, rr, 0, TAU);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, brewIdx: brewIdx,
+  inkLeft: inkLeft, inkTotal: inkTotalN, hasField: hasField, yrc: !!curYrc,
+  rows: lay ? lay.rowInfo.length : 0, fs: lay ? lay.fs : 0, lit: lit,
+  chars: ctArr ? ctArr.length : 0,
+  pen: [Math.round(pen.x), Math.round(pen.y)], T: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

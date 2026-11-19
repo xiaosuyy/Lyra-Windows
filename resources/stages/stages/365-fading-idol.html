@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>失焦圣像</title>
+<style>
+  :root {
+    --accent: #7fd4ff;
+    --ink: #efebe2;
+    --dim: rgba(239, 235, 226, .30);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #05060a; }
+  body { color: var(--ink); font-family: "Songti SC", "STSong", "Noto Serif CJK SC", Georgia, serif; -webkit-font-smoothing: antialiased; }
+  #sky { position: fixed; inset: 0; width: 100%; height: 100%; display: block; background: #05060a; }
+  #scrim { position: fixed; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(120% 80% at 50% 18%, rgba(10, 14, 22, 0) 0%, rgba(4, 5, 9, .74) 68%, rgba(4, 5, 9, .96) 100%),
+      linear-gradient(180deg, rgba(4,5,9,0) 40%, rgba(4,5,9,.62) 74%, rgba(4,5,9,.92) 100%); }
+  #lyr { position: fixed; left: 7vw; right: 7vw; bottom: 9vh; pointer-events: none; }
+  #prev { font-size: clamp(11px, 1.05vw, 15px); letter-spacing: .07em; color: var(--dim); min-height: 1.4em; margin-bottom: .85em;
+    max-width: 62ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #cur {
+    font-size: calc(clamp(22px, min(3.6vw, 5.4vh), 50px) * var(--lyr-scale, 1));
+    line-height: 1.36; letter-spacing: .035em; max-width: 20ch; min-height: 1.4em;
+    text-shadow: 0 0 30px rgba(0,0,0,.92), 0 1px 2px rgba(0,0,0,.9);
+    word-break: break-word; overflow-wrap: anywhere;
+  }
+  #cur .g { opacity: .32; }
+  #cur .g.on { opacity: 1; }
+  #cur .g.hot {
+    text-shadow: 2px 0 0 var(--accent), -2px 0 0 rgba(255,72,120,.85), 0 0 24px rgba(0,0,0,.9);
+  }
+  #cur.broken { animation: shear .34s steps(3, end) 1; }
+  @keyframes shear {
+    0% { transform: translate3d(0,0,0); filter: none; }
+    40% { transform: translate3d(-3px,1px,0); }
+    70% { transform: translate3d(2px,-1px,0); }
+    100% { transform: translate3d(0,0,0); }
+  }
+  #next { font-size: clamp(11px, 1.05vw, 15px); letter-spacing: .07em; color: rgba(239,235,226,.22);
+    margin-top: .95em; max-width: 62ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #empty { display: none; font-size: clamp(15px, 1.5vw, 20px); color: rgba(239,235,226,.46); letter-spacing: .22em; margin-bottom: .5em; }
+  #empty small { display: block; margin-top: .9em; font-size: clamp(10px, .92vw, 12px); letter-spacing: .3em; color: rgba(239,235,226,.26); }
+  #empty.on { display: block; }
+  #next.gone { display: none; }
+  #cur.gone { display: none; }
+
+  /* scanline texture: cheap, static, keeps the "captured frame" feel */
+  #grain {
+    position: fixed; inset: 0; pointer-events: none; opacity: .5;
+    background: repeating-linear-gradient(180deg,
+      rgba(200, 226, 255, .035) 0px, rgba(200, 226, 255, .035) 1px,
+      rgba(0, 0, 0, 0) 1px, rgba(0, 0, 0, 0) 3px);
+    mix-blend-mode: screen;
+  }
+  #readout {
+    position: fixed; right: 6vw; top: 5.4vh; text-align: right;
+    font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+    font-size: 10px; letter-spacing: .26em; color: rgba(239,235,226,.30); text-transform: uppercase;
+  }
+  #readout b { font-weight: 400; color: var(--accent); opacity: .85; }
+  #rail { position: fixed; left: 7vw; right: 7vw; bottom: 5.2vh; height: 1px; background: rgba(239,235,226,.13); }
+  #railFill { height: 1px; width: 0; background: var(--accent); opacity: .75; }
+  #tag { position: fixed; left: 7vw; top: 5.4vh; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+    font-size: 10px; letter-spacing: .34em; color: rgba(239,235,226,.34); text-transform: uppercase; max-width: 60vw; }
+  @media (max-aspect-ratio: 3/4) {
+    #lyr { left: 8vw; right: 8vw; bottom: 7vh; }
+    #cur { max-width: 14ch; }
+    #tag { top: 4.2vh; }
+    #readout { display: none; }
+    #rail { left: 8vw; right: 8vw; bottom: 4vh; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #cur.broken { animation: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="sky" width="1440" height="900"></canvas>
+<div id="scrim"></div>
+<div id="grain"></div>
+<div id="tag">photogram / bust</div>
+<div id="readout">mesh <b id="roMesh">--</b> / gaps <b id="roGap">06</b></div>
+<div id="lyr">
+  <div id="empty">此曲无词<small>扫描到此为止 · 只剩空间</small></div>
+  <div id="prev"></div>
+  <div id="cur"></div>
+  <div id="next"></div>
+</div>
+<div id="rail"><div id="railFill"></div></div>
+<script>
+(function () {
+  "use strict";
+  var state = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, text: "", err: "", gl: false, rm: false, duration: 0 };
+  window.__stage = function () {
+    return {
+      lines: state.lines.length, idx: state.idx, t: state.t, playing: state.playing,
+      frames: state.frames, js: state.js, err: state.err, text: state.text, gl: state.gl, rm: state.rm
+    };
+  };
+
+  var elCur = document.getElementById("cur");
+  var elPrev = document.getElementById("prev");
+  var elNext = document.getElementById("next");
+  var elEmpty = document.getElementById("empty");
+  var elRail = document.getElementById("railFill");
+  var elTag = document.getElementById("tag");
+
+  try {
+    state.rm = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (e) { console.error("[stage] reduced-motion probe failed", e); }
+
+  function sendReady() {
+    try { parent.postMessage({ __c100: 1, type: "ready" }, "*"); }
+    catch (e) { console.error("[stage] ready post failed", e); }
+  }
+
+  function fmtTime(sec) {
+    if (!isFinite(sec) || sec < 0) { sec = 0; }
+    var m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+    return (m < 10 ? "0" + m : String(m)) + ":" + (s < 10 ? "0" + s : String(s));
+  }
+
+  var lyricState = { key: "", spans: [], times: [], lit: -1 };
+  var sawInit = false;
+
+  function lineKeyOf(line) {
+    if (!line) { return ""; }
+    return String(line.t) + "|" + String(line.text) + "|" + (line.chars ? line.chars.length : 0);
+  }
+
+  function buildSpans(line) {
+    elCur.textContent = "";
+    lyricState.spans = [];
+    lyricState.times = [];
+    lyricState.lit = -1;
+    if (!line || typeof line.text !== "string" || !line.text) { return; }
+    var text = line.text;
+    var chars = Array.isArray(line.chars) ? line.chars : null;
+    var base = isFinite(line.t) ? line.t : 0;
+    var dur = Number(line.dur);
+    if (!isFinite(dur) || dur <= 0) { dur = 3.4; }
+    var count = Math.min(text.length, 480);
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < count; i++) {
+      var span = document.createElement("span");
+      span.className = "g";
+      var glyph = text.charAt(i);
+      span.textContent = glyph === " " ? "\u00a0" : glyph;
+      var at;
+      if (chars && chars[i] && isFinite(Number(chars[i].t))) { at = Number(chars[i].t); }
+      else { at = base + (i / Math.max(1, count)) * dur * 0.96; }
+      lyricState.spans.push(span);
+      lyricState.times.push(at);
+      frag.appendChild(span);
+    }
+    elCur.appendChild(frag);
+    var scale = Math.min(1, Math.max(0.54, 13 / Math.max(6, count)));
+    elCur.style.setProperty("--lyr-scale", String(Math.round(scale * 100) / 100));
+  }
+
+  function paintLyrics(t) {
+    var spans = lyricState.spans;
+    var times = lyricState.times;
+    var n = spans.length;
+    if (!n) { return; }
+    var lit = 0;
+    for (var i = 0; i < n; i++) {
+      if (times[i] <= t && i + 1 > lit) { lit = i + 1; }
+    }
+    if (lit === lyricState.lit) { return; }
+    var previous = lyricState.lit < 0 ? 0 : lyricState.lit;
+    lyricState.lit = lit;
+    var from = Math.max(0, Math.min(previous, lit) - 1);
+    var to = Math.min(n - 1, Math.max(previous, lit));
+    for (var j = from; j <= to; j++) {
+      var on = j < lit;
+      spans[j].classList.toggle("on", on);
+      spans[j].classList.toggle("hot", on && j === lit - 1);
+    }
+  }
+
+  function renderLyrics() {
+    var line = state.lines[state.idx] || null;
+    var display = line || (state.lines.length ? state.lines[0] : null);
+    var key = lineKeyOf(display);
+    if (key !== lyricState.key) {
+      lyricState.key = key;
+      buildSpans(display);
+      if (display && !state.rm) {
+        elCur.classList.remove("broken");
+        void elCur.offsetWidth;
+        elCur.classList.add("broken");
+      }
+    }
+    paintLyrics(state.t);
+    state.text = line && typeof line.text === "string" ? line.text : "";
+    var hasLines = state.lines.length > 0;
+    elEmpty.classList.toggle("on", !hasLines && sawInit);
+    elCur.classList.toggle("gone", !hasLines);
+    elNext.classList.toggle("gone", !hasLines);
+    elPrev.textContent = state.idx > 0 && state.lines[state.idx - 1] ? state.lines[state.idx - 1].text : "";
+    var nextLine = state.lines[Math.max(0, state.idx) + 1] || null;
+    elNext.textContent = hasLines && nextLine ? nextLine.text : "";
+    elRail.style.width = (state.duration > 0 ? Math.min(100, Math.max(0, state.t / state.duration * 100)) : 0) + "%";
+  }
+
+  function indexAt(t) {
+    var lines = state.lines, lo = 0, hi = lines.length - 1, hit = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (lines[mid].t <= t) { hit = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return hit;
+  }
+
+  function onInit(payload) {
+    if (!payload) { return; }
+    var raw = Array.isArray(payload.lines) ? payload.lines : [];
+    var clean = [];
+    for (var i = 0; i < raw.length && i < 2000; i++) {
+      var item = raw[i];
+      if (!item) { continue; }
+      var t = Number(item.t);
+      if (!isFinite(t)) { continue; }
+      clean.push({ t: t, dur: isFinite(Number(item.dur)) ? Number(item.dur) : 0, text: item.text == null ? "" : String(item.text), chars: Array.isArray(item.chars) ? item.chars : null });
+    }
+    clean.sort(function (a, b) { return a.t - b.t; });
+    state.lines = clean;
+    state.duration = isFinite(Number(payload.duration)) ? Math.max(0, Number(payload.duration)) : 0;
+    setAccent(payload.accent);
+    var song = payload.song || {};
+    var artist = Array.isArray(song.artists) ? song.artists.join(" / ") : (song.artists ? String(song.artists) : "");
+    elTag.textContent = (song.name ? String(song.name) : "无题") + (artist ? " · " + artist : "") + " / " + fmtTime(state.duration);
+    lyricState.key = "__reset__";
+    sawInit = true;
+    state.idx = indexAt(state.t);
+    renderLyrics();
+  }
+
+  function onTick(payload) {
+    if (!payload) { return; }
+    var t = Number(payload.time);
+    if (isFinite(t)) { state.t = Math.max(0, t); }
+    if (typeof payload.playing === "boolean") { state.playing = payload.playing; }
+    var idx = indexAt(state.t);
+    if (idx !== state.idx) {
+      state.idx = idx;
+      renderLyrics();
+      return;
+    }
+    paintLyrics(state.t);
+    elRail.style.width = (state.duration > 0 ? Math.min(100, Math.max(0, state.t / state.duration * 100)) : 0) + "%";
+  }
+
+  function onBeat(payload) {
+    if (!payload) { return; }
+    var level = Number(payload.level);
+    if (!isFinite(level)) { level = 0.6; }
+    level = Math.min(1, Math.max(0, level));
+    if (level > pulse) { pulse = level; }
+  }
+
+  function onLive(payload) {
+    if (!payload) { return; }
+    var bass = Number(payload.bass);
+    if (isFinite(bass)) { liveBass = Math.min(1, Math.max(0, bass)); }
+    if (typeof payload.playing === "boolean") { state.playing = payload.playing; }
+  }
+
+  function onMessage(ev) {
+    var data = ev.data;
+    if (!data || data.__c100 !== 1) { return; }
+    try {
+      if (data.type === "init") { onInit(data.payload); }
+      else if (data.type === "tick") { onTick(data.payload); }
+      else if (data.type === "beat") { onBeat(data.payload); }
+      else if (data.type === "live") { onLive(data.payload); }
+    } catch (err) { console.error("[stage] message handling failed", data && data.type, err); }
+  }
+  window.addEventListener("message", onMessage);
+
+  // ---------------------------------------------------------------
+  // 3D scan of a ruined bust: point cloud + broken-rim wireframe.
+  // ---------------------------------------------------------------
+  var accent = [0.50, 0.83, 1.00];
+  var accentHot = [1.00, 0.36, 0.62];
+
+  function mat4Identity() {
+    var m = new Float32Array(16);
+    m[0] = m[5] = m[10] = m[15] = 1;
+    return m;
+  }
+
+  function mat4Perspective(fovy, aspect, near, far) {
+    var f = 1 / Math.tan(fovy * 0.5);
+    var nf = 1 / (near - far);
+    var m = new Float32Array(16);
+    m[0] = f / aspect; m[5] = f; m[10] = (far + near) * nf; m[11] = -1; m[14] = 2 * far * near * nf;
+    return m;
+  }
+
+  function mat4LookAt(eye, target, up) {
+    var zx = eye[0] - target[0], zy = eye[1] - target[1], zz = eye[2] - target[2];
+    var zl = Math.sqrt(zx * zx + zy * zy + zz * zz) || 1;
+    zx /= zl; zy /= zl; zz /= zl;
+    var xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+    var xl = Math.sqrt(xx * xx + xy * xy + xz * xz) || 1;
+    xx /= xl; xy /= xl; xz /= xl;
+    var yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+    var m = new Float32Array(16);
+    m[0] = xx; m[1] = yx; m[2] = zx;
+    m[4] = xy; m[5] = yy; m[6] = zy;
+    m[8] = xz; m[9] = yz; m[10] = zz;
+    m[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]);
+    m[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]);
+    m[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]);
+    m[15] = 1;
+    return m;
+  }
+
+  function mat4Orbit(posX, posY, posZ, yaw, pitch, scale) {
+    var cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    var m = new Float32Array(16);
+    m[0] = cy * scale; m[1] = 0; m[2] = -sy * scale;
+    m[4] = sy * sp * scale; m[5] = cp * scale; m[6] = cy * sp * scale;
+    m[8] = sy * cp * scale; m[9] = -sp * scale; m[10] = cy * cp * scale;
+    m[12] = posX; m[13] = posY; m[14] = posZ; m[15] = 1;
+    return m;
+  }
+
+  function makeRng(seed) {
+    var seedState = (seed >>> 0) || 1;
+    return function next() {
+      seedState ^= seedState << 13; seedState >>>= 0;
+      seedState ^= seedState >> 17;
+      seedState ^= seedState << 5; seedState >>>= 0;
+      return seedState / 4294967296;
+    };
+  }
+
+  // Holes are where the scanner simply lost the surface.
+  var scanHoles = [
+    { x: 0.33, y: 0.77, z: 0.19, r: 0.23 },
+    { x: -0.27, y: 0.40, z: 0.29, r: 0.17 },
+    { x: 0.44, y: -0.30, z: 0.26, r: 0.33 },
+    { x: -0.02, y: 0.24, z: 0.19, r: 0.13 },
+    { x: -0.13, y: 1.02, z: -0.06, r: 0.15 },
+    { x: -0.52, y: -0.52, z: 0.12, r: 0.26 }
+  ];
+
+  function holeField(x, y, z) {
+    var best = 0;
+    for (var i = 0; i < scanHoles.length; i++) {
+      var hole = scanHoles[i];
+      var dx = x - hole.x, dy = y - hole.y, dz = z - hole.z;
+      var d2 = dx * dx + dy * dy + dz * dz;
+      var g = Math.exp(-d2 / (hole.r * hole.r));
+      if (g > best) { best = g; }
+    }
+    return best;
+  }
+
+  // Photogrammetry colour: plaster base + wrongly-offset UV patches.
+  function shadeOf(x, y, z, uu, vv, rnd) {
+    var marble = 0.70 + rnd() * 0.16;
+    var band = (uu * 2.35 + vv * 0.85 + 0.31) % 1;
+    if (band < 0) { band += 1; }
+    var mix = 0, tint = 0;
+    if (band < 0.14) { mix = 0.85; }
+    else if (band < 0.24) { mix = 0.45; }
+    else if (band > 0.86) { mix = 0.18; tint = 1; }
+    var depth = 0.34 + 0.66 * Math.min(1, Math.max(0, (z + 0.85) / 1.7));
+    var sink = 1 - 0.42 * Math.min(1, Math.max(0, (-y - 0.05) / 0.75));
+    var shade = marble * depth * sink;
+    return [shade * 0.98, shade * 0.95, shade * 0.89, mix, tint];
+  }
+
+  function pushPoint(cloud, x, y, z, uu, vv, rnd) {
+    var color = shadeOf(x, y, z, uu, vv, rnd);
+    cloud.pos.push(x, y, z);
+    cloud.col.push(color[0], color[1], color[2]);
+    cloud.mix.push(color[3], color[4]);
+    cloud.seed.push(rnd());
+  }
+
+  function buildHead(cloud, edge, rnd) {
+    var U = 120, V = 62, rx = 0.40, ry = 0.50, rz = 0.44, cx = 0, cy = 0.62;
+    var grid = [];
+    for (var iv = 1; iv < V; iv++) {
+      var theta = iv / V * Math.PI;
+      var st = Math.sin(theta), ct = Math.cos(theta);
+      var row = [];
+      for (var iu = 0; iu < U; iu++) {
+        var phi = iu / U * Math.PI * 2;
+        var sx = Math.sin(phi), cz = Math.cos(phi);
+        var taper = 1 - 0.30 * Math.max(0, -ct) * Math.max(0, -ct);
+        var wobble = 1 + (rnd() - 0.5) * 0.05;
+        var px = cx + rx * st * sx * taper * wobble;
+        var py = cy + ry * ct * wobble;
+        var pz = rz * st * cz * taper * 0.94 * wobble;
+        grid.push([px, py, pz, iu / U, iv / V]);
+      }
+    }
+    emitPiece(cloud, edge, grid, U, rnd, true);
+  }
+
+  function buildNeck(cloud, edge, rnd) {
+    var U = 88, V = 13, grid = [];
+    for (var iv = 0; iv <= V; iv++) {
+      var v = iv / V;
+      var py = 0.36 - v * 0.42;
+      for (var iu = 0; iu < U; iu++) {
+        var phi = iu / U * Math.PI * 2;
+        var wobble = 1 + (rnd() - 0.5) * 0.04;
+        var rad = 0.175 * wobble;
+        grid.push([Math.sin(phi) * rad, py, Math.cos(phi) * rad * 0.92, iu / U, v]);
+      }
+    }
+    emitPiece(cloud, edge, grid, U, rnd, false);
+  }
+
+  function buildChest(cloud, edge, rnd) {
+    var U = 104, V = 34, grid = [];
+    for (var iv = 0; iv <= V; iv++) {
+      var v = iv / V;
+      var py = -0.04 - v * 0.60;
+      var rad = 0.30 + Math.pow(v, 0.78) * 0.40;
+      for (var iu = 0; iu < U; iu++) {
+        var phi = iu / U * Math.PI * 2;
+        var wobble = 1 + (rnd() - 0.5) * 0.05;
+        var sx = Math.sin(phi), cz = Math.cos(phi);
+        // shoulders: wider across x, flattened front-to-back
+        var px = sx * rad * 1.16 * wobble;
+        var pz = cz * rad * (0.62 + 0.10 * Math.abs(sx)) * wobble;
+        var py2 = py + Math.abs(sx) * 0.05 * v;
+        grid.push([px, py2, pz, iu / U, v]);
+      }
+    }
+    emitPiece(cloud, edge, grid, U, rnd, false);
+  }
+
+  function emitPiece(cloud, edge, grid, U, rnd, isHead) {
+    var rows = grid.length / U - 1;
+    var alive = new Uint8Array(grid.length);
+    var nearRim = new Float32Array(grid.length);
+    for (var i = 0; i < grid.length; i++) {
+      var p = grid[i];
+      var f = holeField(p[0], p[1], p[2]);
+      nearRim[i] = f;
+      var dropped = f > 0.60 || rnd() < (isHead ? 0.05 : 0.07) || (p[1] < -0.60 && rnd() < 0.5);
+      if (!dropped) {
+        alive[i] = 1;
+        pushPoint(cloud, p[0], p[1], p[2], p[3], p[4], rnd);
+      }
+    }
+    // Wireframe only where the surface broke: rims, dropped patches, cut edges.
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < U; c++) {
+        var a = r * U + c;
+        var b = r * U + ((c + 1) % U);
+        var d = (r + 1) * U + c;
+        var rim = Math.max(nearRim[a], nearRim[b], nearRim[d]);
+        var broken = (1 - alive[a]) + (1 - alive[b]) + (1 - alive[d]);
+        var cut = !isHead && (r === 0 || r === rows - 1);
+        if (!cut && rim <= 0.16 && !(broken > 0 && rnd() < 0.26)) { continue; }
+        var keep = cut ? 0.88 : 0.34 + 0.66 * Math.min(1, rim);
+        if (rnd() >= keep) { continue; }
+        var ga = grid[a], gb = grid[b], gd = grid[d];
+        edge.pos.push(ga[0], ga[1], ga[2], gb[0], gb[1], gb[2]);
+        edge.pos.push(ga[0], ga[1], ga[2], gd[0], gd[1], gd[2]);
+        var alpha = 0.14 + 0.60 * Math.min(1, Math.max(rim, cut ? 0.7 : 0));
+        edge.alpha.push(alpha, alpha, alpha, alpha);
+      }
+    }
+  }
+
+  function buildShatter(seed, radius) {
+    var rnd = makeRng(seed);
+    var cloud = { pos: [], col: [], mix: [], seed: [] };
+    var edge = { pos: [], alpha: [] };
+    var count = 46;
+    for (var i = 0; i < count; i++) {
+      var u = rnd() * Math.PI * 2, v = Math.acos(2 * rnd() - 1);
+      var solid = radius * (0.42 + 0.58 * Math.pow(rnd(), 0.4));
+      var px = solid * Math.sin(v) * Math.cos(u);
+      var py = solid * Math.cos(v) * 0.7;
+      var pz = solid * Math.sin(v) * Math.sin(u);
+      var color = shadeOf(px, py, pz, rnd(), rnd(), rnd);
+      cloud.pos.push(px, py, pz);
+      cloud.col.push(color[0], color[1], color[2]);
+      cloud.mix.push(color[3], color[4]);
+      cloud.seed.push(rnd());
+      if (i > 0 && i % 3 === 0) {
+        edge.pos.push(px, py, pz, 0, 0, 0);
+        edge.alpha.push(0.5, 0.5);
+      }
+    }
+    return { cloud: cloud, edge: edge };
+  }
+
+  var canvas = document.getElementById("sky");
+  var gl = null, canvas2d = null;
+  var glReady = false;
+  var viewW = 1440, viewH = 900, dpr = 1;
+  var buffers = { cloud: null, edge: null, shards: [] };
+  var counts = { points: 0, edges: 0 };
+  var progs = { points: null, lines: null };
+  var base = { proj: mat4Identity(), view: mat4Identity() };
+  var clock = 0, pulse = 0, liveBass = 0, levelSmooth = 0;
+
+  var pointVS = [
+    "attribute vec3 aPos; attribute vec3 aCol; attribute vec2 aMix; attribute float aSeed;",
+    "uniform mat4 uProj; uniform mat4 uView; uniform mat4 uModel;",
+    "uniform float uTime; uniform float uScale; uniform float uDrift;",
+    "varying vec3 vCol; varying vec2 vMix; varying float vFade; varying float vSeed; varying float vBand;",
+    "void main() {",
+    "  vec3 p = aPos;",
+    "  float w1 = uTime * 0.55 + aSeed * 9.13;",
+    "  float w2 = uTime * 0.41 + aSeed * 7.71;",
+    "  p += vec3(sin(w1), cos(w2), sin(w2 * 0.8)) * (0.004 + uDrift * 0.03) * (0.3 + aSeed);",
+    "  vec4 mv = uView * uModel * vec4(p, 1.0);",
+    "  gl_Position = uProj * mv;",
+    "  float w = max(0.4, -mv.z);",
+    "  gl_PointSize = clamp(uScale * (0.7 + aSeed * 0.8) / w, 1.0, 9.0);",
+    "  float fog = 1.0 - smoothstep(2.2, 7.4, w);",
+    "  float sweepY = -0.95 + fract(uTime * 0.055) * 2.45;",
+    "  float bandDy = (aPos.y - sweepY) * 6.5;",
+    "  vBand = exp(-bandDy * bandDy);",
+    "  vCol = aCol * (0.30 + 0.70 * fog);",
+    "  vMix = aMix; vFade = 0.28 + 0.72 * fog; vSeed = aSeed;",
+    "}"
+  ].join("\n");
+
+  var pointFS = [
+    "precision mediump float;",
+    "uniform vec3 uAccent; uniform vec3 uAccentHot; uniform float uPulse;",
+    "varying vec3 vCol; varying vec2 vMix; varying float vFade; varying float vSeed; varying float vBand;",
+    "void main() {",
+    "  vec2 d = gl_PointCoord - 0.5;",
+    "  float r = length(d) * 2.0;",
+    "  float mask = 1.0 - smoothstep(0.18, 1.0, r);",
+    "  if (mask < 0.02) { discard; }",
+    "  vec3 col = mix(vCol, uAccent, vMix.x * 0.9);",
+    "  col = mix(col, uAccentHot, vMix.y * 0.7);",
+    "  col += uAccent * vBand * 0.75;",
+    "  col *= 1.0 + uPulse * (0.35 + 0.55 * vSeed);",
+    "  gl_FragColor = vec4(col * 1.25, mask * (0.42 + 0.58 * vFade));",
+    "}"
+  ].join("\n");
+
+  var lineVS = [
+    "attribute vec3 aPos; attribute float aAlpha;",
+    "uniform mat4 uProj; uniform mat4 uView; uniform mat4 uModel; uniform float uFlicker;",
+    "varying float vA;",
+    "void main() {",
+    "  gl_Position = uProj * uView * uModel * vec4(aPos, 1.0);",
+    "  vA = aAlpha * uFlicker;",
+    "}"
+  ].join("\n");
+
+  var lineFS = [
+    "precision mediump float;",
+    "uniform vec3 uAccent; uniform vec3 uAccentHot; uniform float uPulse;",
+    "varying float vA;",
+    "void main() {",
+    "  vec3 col = mix(uAccent, uAccentHot, 0.22) * (0.8 + uPulse * 0.7);",
+    "  gl_FragColor = vec4(col, vA * 0.72);",
+    "}"
+  ].join("\n");
+
+  function compileShader(programTarget, type, source) {
+    var shader = programTarget.createShader(type);
+    programTarget.shaderSource(shader, source);
+    programTarget.compileShader(shader);
+    if (!programTarget.getShaderParameter(shader, programTarget.COMPILE_STATUS)) {
+      console.error("[stage] shader compile failed", programTarget.getShaderInfoLog(shader));
+      return null;
+    }
+    return shader;
+  }
+
+  function buildProgram(programTarget, vsSource, fsSource, uniforms, attribs) {
+    var vs = compileShader(programTarget, programTarget.VERTEX_SHADER, vsSource);
+    var fs = compileShader(programTarget, programTarget.FRAGMENT_SHADER, fsSource);
+    if (!vs || !fs) { return null; }
+    var prog = programTarget.createProgram();
+    programTarget.attachShader(prog, vs);
+    programTarget.attachShader(prog, fs);
+    programTarget.linkProgram(prog);
+    if (!programTarget.getProgramParameter(prog, programTarget.LINK_STATUS)) {
+      console.error("[stage] program link failed", programTarget.getProgramInfoLog(prog));
+      return null;
+    }
+    var wrapped = { prog: prog, u: {}, a: {} };
+    var i;
+    for (i = 0; i < uniforms.length; i++) { wrapped.u[uniforms[i]] = programTarget.getUniformLocation(prog, uniforms[i]); }
+    for (i = 0; i < attribs.length; i++) { wrapped.a[attribs[i]] = programTarget.getAttribLocation(prog, attribs[i]); }
+    return wrapped;
+  }
+
+  function uploadPoints(cloud) {
+    var n = cloud.pos.length / 3;
+    var posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cloud.pos), gl.STATIC_DRAW);
+    var colBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cloud.col), gl.STATIC_DRAW);
+    var mixBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, mixBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cloud.mix), gl.STATIC_DRAW);
+    var seedBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, seedBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cloud.seed), gl.STATIC_DRAW);
+    return { pos: posBuf, col: colBuf, mix: mixBuf, seed: seedBuf, count: n };
+  }
+
+  function uploadLines(edge) {
+    var n = edge.pos.length / 3;
+    var posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(edge.pos), gl.STATIC_DRAW);
+    var alphaBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, alphaBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(edge.alpha), gl.STATIC_DRAW);
+    return { pos: posBuf, alpha: alphaBuf, count: n };
+  }
+
+  var scene = null;
+
+  function buildScene() {
+    var rnd = makeRng(20261102);
+    var cloud = { pos: [], col: [], mix: [], seed: [] };
+    var edge = { pos: [], alpha: [] };
+    buildHead(cloud, edge, rnd);
+    buildNeck(cloud, edge, rnd);
+    buildChest(cloud, edge, rnd);
+    var shards = [];
+    for (var i = 0; i < 8; i++) {
+      var shard = buildShatter(7717 + i * 131, 0.16 + rnd() * 0.10);
+      shard.phase = rnd() * Math.PI * 2;
+      shard.radius = 0.95 + rnd() * 0.85;
+      shard.height = -0.55 + rnd() * 1.45;
+      shard.speed = 0.06 + rnd() * 0.12;
+      shard.spin = (rnd() - 0.5) * 0.9;
+      shards.push(shard);
+    }
+    // Pre-bucketed copy for the 2d fallback (no GL at all).
+    var flat = [];
+    var n = cloud.pos.length / 3;
+    for (var j = 0; j < n; j++) {
+      var mix = cloud.mix[j * 2], tint = cloud.mix[j * 2 + 1];
+      var bucket = tint > 0.4 ? 2 : (mix > 0.6 ? 1 : 0);
+      flat.push(cloud.pos[j * 3], cloud.pos[j * 3 + 1], cloud.pos[j * 3 + 2], bucket);
+    }
+    return { cloud: cloud, edge: edge, shards: shards, flat: new Float32Array(flat) };
+  }
+
+  function initGL() {
+    var attrs = { antialias: true, alpha: false, depth: true, powerPreference: "default" };
+    try {
+      gl = canvas.getContext("webgl", attrs) || canvas.getContext("experimental-webgl", attrs);
+    } catch (err) {
+      console.error("[stage] webgl context failed", err);
+      gl = null;
+    }
+    if (!gl) {
+      state.gl = false;
+      console.error("[stage] no webgl context, keeping 2d fallback");
+      return false;
+    }
+    progs.points = buildProgram(gl, pointVS, pointFS,
+      ["uProj", "uView", "uModel", "uTime", "uScale", "uDrift", "uAccent", "uAccentHot", "uPulse"],
+      ["aPos", "aCol", "aMix", "aSeed"]);
+    progs.lines = buildProgram(gl, lineVS, lineFS,
+      ["uProj", "uView", "uModel", "uFlicker", "uAccent", "uAccentHot", "uPulse"],
+      ["aPos", "aAlpha"]);
+    if (!progs.points || !progs.lines) {
+      state.gl = false;
+      console.error("[stage] shader program missing, keeping 2d fallback");
+      return false;
+    }
+    buffers.cloud = uploadPoints(scene.cloud);
+    buffers.edge = uploadLines(scene.edge);
+    counts.points = buffers.cloud.count;
+    counts.edges = buffers.edge.count;
+    for (var i = 0; i < scene.shards.length; i++) {
+      var shard = scene.shards[i];
+      buffers.shards.push({
+        cloud: uploadPoints(shard.cloud),
+        edge: uploadLines(shard.edge),
+        phase: shard.phase, radius: shard.radius, height: shard.height,
+        speed: shard.speed, spin: shard.spin
+      });
+    }
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clearColor(0.016, 0.021, 0.033, 1);
+    glReady = true;
+    state.gl = true;
+    return true;
+  }
+
+  function resizeCanvas() {
+    var rect = canvas.getBoundingClientRect();
+    var w = Math.round(rect.width || window.innerWidth || 0);
+    var h = Math.round(rect.height || window.innerHeight || 0);
+    if (!isFinite(w) || !isFinite(h) || w < 2 || h < 2) { w = 1440; h = 900; }
+    dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+    viewW = w; viewH = h;
+    var pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+    if (isNaN(pw) || isNaN(ph) || pw < 2 || ph < 2) { pw = 1440; ph = 900; }
+    if (canvas.width !== pw || canvas.height !== ph) {
+      canvas.width = pw;
+      canvas.height = ph;
+    }
+    if (glReady) { gl.viewport(0, 0, canvas.width, canvas.height); }
+    base.proj = mat4Perspective(0.78, Math.max(0.35, pw / Math.max(1, ph)), 0.1, 24);
+  }
+
+  function setAccent(rgb) {
+    if (!rgb || rgb.length < 3) { return; }
+    var r = Math.min(255, Math.max(0, Math.round(Number(rgb[0]) || 0)));
+    var g = Math.min(255, Math.max(0, Math.round(Number(rgb[1]) || 0)));
+    var b = Math.min(255, Math.max(0, Math.round(Number(rgb[2]) || 0)));
+    accent = [r / 255, g / 255, b / 255];
+    accentHot = [
+      Math.min(1, accent[0] * 0.9 + 0.42),
+      Math.min(1, accent[1] * 0.45 + 0.10),
+      Math.min(1, accent[2] * 0.7 + 0.30)
+    ];
+    try {
+      document.documentElement.style.setProperty("--accent", "rgb(" + r + "," + g + "," + b + ")");
+    } catch (err) { console.error("[stage] accent css failed", err); }
+  }
+
+  function bindCloud(target, mesh) {
+    var a = target.a;
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.pos);
+    gl.enableVertexAttribArray(a.aPos);
+    gl.vertexAttribPointer(a.aPos, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.col);
+    gl.enableVertexAttribArray(a.aCol);
+    gl.vertexAttribPointer(a.aCol, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.mix);
+    gl.enableVertexAttribArray(a.aMix);
+    gl.vertexAttribPointer(a.aMix, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.seed);
+    gl.enableVertexAttribArray(a.aSeed);
+    gl.vertexAttribPointer(a.aSeed, 1, gl.FLOAT, false, 0, 0);
+  }
+
+  function bindLines(target, mesh) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.pos);
+    gl.enableVertexAttribArray(target.a.aPos);
+    gl.vertexAttribPointer(target.a.aPos, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.alpha);
+    gl.enableVertexAttribArray(target.a.aAlpha);
+    gl.vertexAttribPointer(target.a.aAlpha, 1, gl.FLOAT, false, 0, 0);
+  }
+
+  function renderScene(dt) {
+    clock += dt;
+    pulse *= Math.exp(-dt * 5.2);
+    if (liveBass > 0.01) { levelSmooth += (liveBass - levelSmooth) * Math.min(1, dt * 6); }
+    var beat = Math.max(pulse, levelSmooth * 0.55);
+
+    var aspect = canvas.width / Math.max(1, canvas.height);
+    var portrait = aspect < 0.95;
+    var ang = 0.55 + (state.rm ? 0 : clock * 0.135);
+    var bob = state.rm ? 0 : Math.sin(clock * 0.37) * 0.07;
+    var radius = (portrait ? 3.85 : 3.18) - beat * 0.12;
+    var targetY = portrait ? -0.45 : 0.34;
+    var eye = [Math.sin(ang) * radius, targetY + 0.10 + bob, Math.cos(ang) * radius];
+    base.view = mat4LookAt(eye, [0, targetY, 0], [0, 1, 0]);
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+
+    var pointProg = progs.points;
+    gl.useProgram(pointProg.prog);
+    gl.uniformMatrix4fv(pointProg.u.uProj, false, base.proj);
+    gl.uniformMatrix4fv(pointProg.u.uView, false, base.view);
+    gl.uniformMatrix4fv(pointProg.u.uModel, false, mat4Identity());
+    gl.uniform1f(pointProg.u.uTime, clock);
+    gl.uniform1f(pointProg.u.uScale, dpr * (8.2 + Math.min(3.2, viewH * 0.0022)));
+    gl.uniform1f(pointProg.u.uDrift, state.rm ? 0.15 : 1.0);
+    gl.uniform1f(pointProg.u.uPulse, beat);
+    gl.uniform3f(pointProg.u.uAccent, accent[0], accent[1], accent[2]);
+    gl.uniform3f(pointProg.u.uAccentHot, accentHot[0], accentHot[1], accentHot[2]);
+    bindCloud(pointProg, buffers.cloud);
+    gl.drawArrays(gl.POINTS, 0, buffers.cloud.count);
+
+    var lineProg = progs.lines;
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.uProj, false, base.proj);
+    gl.uniformMatrix4fv(lineProg.u.uView, false, base.view);
+    gl.uniform1f(lineProg.u.uPulse, beat);
+    gl.uniform1f(lineProg.u.uFlicker, (state.rm ? 0.8 : 0.62 + 0.3 * Math.abs(Math.sin(clock * 0.9))) + beat * 0.5);
+    gl.uniform3f(lineProg.u.uAccent, accent[0], accent[1], accent[2]);
+    gl.uniform3f(lineProg.u.uAccentHot, accentHot[0], accentHot[1], accentHot[2]);
+    gl.depthMask(false);
+    gl.enable(gl.BLEND);
+
+    for (var i = 0; i < buffers.shards.length; i++) {
+      var shard = buffers.shards[i];
+      var phase = shard.phase + clock * shard.speed;
+      var model = mat4Orbit(
+        Math.sin(phase) * shard.radius,
+        shard.height + (state.rm ? 0 : Math.sin(clock * 0.5 + shard.phase) * 0.10),
+        Math.cos(phase * 0.82) * shard.radius,
+        phase * 1.7, clock * shard.spin * 0.35, 1
+      );
+      gl.useProgram(pointProg.prog);
+      gl.uniformMatrix4fv(pointProg.u.uModel, false, model);
+      bindCloud(pointProg, shard.cloud);
+      gl.drawArrays(gl.POINTS, 0, shard.cloud.count);
+      gl.useProgram(lineProg.prog);
+      gl.uniformMatrix4fv(lineProg.u.uModel, false, model);
+      bindLines(lineProg, shard.edge);
+      gl.drawArrays(gl.LINES, 0, shard.edge.count);
+    }
+
+    gl.useProgram(lineProg.prog);
+    gl.uniformMatrix4fv(lineProg.u.uModel, false, mat4Identity());
+    gl.uniform1f(lineProg.u.uFlicker, (state.rm ? 0.7 : 0.5 + 0.25 * Math.abs(Math.sin(clock * 1.7))) + beat * 0.6);
+    bindLines(lineProg, buffers.edge);
+    gl.drawArrays(gl.LINES, 0, buffers.edge.count);
+    gl.depthMask(true);
+  }
+
+  function renderFallback(dt) {
+    clock += dt;
+    pulse *= Math.exp(-dt * 5.2);
+    if (!canvas2d) { canvas2d = canvas.getContext("2d"); }
+    if (!canvas2d) { return; }
+    var ctx = canvas2d;
+    var cw = canvas.width, ch = canvas.height;
+    var focal = ch * 1.05;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    try {
+      var bg = ctx.createRadialGradient(cw * 0.5, ch * 0.42, 1, cw * 0.5, ch * 0.5, Math.max(cw, ch) * 0.7);
+      bg.addColorStop(0, "rgba(26,32,44,1)");
+      bg.addColorStop(1, "rgba(4,5,9,1)");
+      ctx.fillStyle = bg;
+    } catch (err) {
+      console.error("[stage] fallback gradient failed", err);
+      ctx.fillStyle = "#05060a";
+    }
+    ctx.fillRect(0, 0, cw, ch);
+    var ang = 0.55 + (state.rm ? 0 : clock * 0.135);
+    var ca = Math.cos(ang), sa = Math.sin(ang);
+    var flat = scene.flat;
+    var palette = [
+      "rgba(176,170,158,0.55)",
+      "rgba(" + Math.round(accent[0] * 255) + "," + Math.round(accent[1] * 255) + "," + Math.round(accent[2] * 255) + ",0.62)",
+      "rgba(" + Math.round(accentHot[0] * 255) + "," + Math.round(accentHot[1] * 255) + "," + Math.round(accentHot[2] * 255) + ",0.5)"
+    ];
+    ctx.fillStyle = palette[0];
+    var half = 1.6 * dpr;
+    for (var i = 0; i < flat.length; i += 4) {
+      var px = flat[i], py = flat[i + 1], pz = flat[i + 2];
+      var bucket = flat[i + 3];
+      var xr = px * ca - pz * sa;
+      var zr = px * sa + pz * ca + 3.2;
+      if (zr < 0.6) { continue; }
+      var sx = cw * 0.5 + (xr / zr) * focal;
+      var sy = ch * 0.5 - ((py - 0.34) / zr) * focal;
+      if (sx < -8 || sy < -8 || sx > cw + 8 || sy > ch + 8) { continue; }
+      if (bucket !== 0) { ctx.fillStyle = palette[bucket]; }
+      ctx.fillRect(sx, sy, half, half);
+      if (bucket !== 0) { ctx.fillStyle = palette[0]; }
+    }
+  }
+
+  var lastStamp = 0;
+  var started = false;
+  var booted = false;
+
+  function boot() {
+    try {
+      resizeCanvas();
+      scene = buildScene();
+      resizeCanvas();
+      initGL();
+      var points = counts.points || Math.round(scene.flat.length / 4);
+      var meshEl = document.getElementById("roMesh");
+      var gapEl = document.getElementById("roGap");
+      if (meshEl) { meshEl.textContent = (Math.round(points / 100) / 10).toFixed(1) + "k"; }
+      if (gapEl) { gapEl.textContent = (scanHoles.length < 10 ? "0" : "") + scanHoles.length; }
+    } catch (err) {
+      console.error("[stage] boot failed", err);
+      glReady = false;
+    }
+    booted = true;
+  }
+
+  function frame(now) {
+    state.frames++;
+    if (!started) { started = true; sendReady(); }
+    if (!booted) { boot(); }
+    var stamp = (typeof now === "number" && isFinite(now)) ? now : performance.now();
+    if (!lastStamp) { lastStamp = stamp; }
+    var dt = (stamp - lastStamp) / 1000;
+    lastStamp = stamp;
+    if (!isFinite(dt) || dt < 0) { dt = 0; }
+    if (dt > 0.06) { dt = 0.06; }
+    var jsStart = performance.now();
+    try {
+      if (glReady) { renderScene(dt); }
+      else if (scene) { renderFallback(dt); }
+    } catch (err) {
+      console.error("[stage] render failed", err);
+      if (glReady) { glReady = false; }
+    }
+    state.js = Math.round((performance.now() - jsStart) * 100) / 100;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  window.addEventListener("resize", function () { resizeCanvas(); });
+  setTimeout(function () { if (!started) { started = true; sendReady(); } }, 900);
+})();
+</script>
+</body>
+</html>

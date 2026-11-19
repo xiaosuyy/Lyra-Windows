@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>矢量招贴</title>
+<!--
+  292 · 矢量招贴 —— Frutiger Metro（Vector Flourish）+ 千禧年数码乐观主义
+  一张会唱的 2006 年电台海报：白底、钴蓝、耳机线盘成卷曲藤蔓、左侧三格 iPod 剪影、
+  半调网点、喷溅、五角星、声波条、纵向的 MP3 字样。
+  歌词不是贴上去的：它由**半调网点的疏密**构成 —— 十万个点，半径由字形覆盖率与逐字进度决定，
+  所以「字」就是这张海报本身的网点，唱到哪个字，那片网点才变密。
+  技术：WebGL2 实例化 10 万点（drawArraysInstanced）；海报本体（剪影/耳机线/卷草/星/MP3）
+  用 Canvas2D 烘成一张纹理上传；声波条在片元着色器里程序化生成，跟 bass/treble 动。
+  无 getImageData、无外部资源、暂停冻结、reduced-motion 跟随。
+-->
+<style>
+  html,body{margin:0;height:100%;background:#f4f6fb;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);pointer-events:none;z-index:3;
+        font:500 11px/1.6 ui-monospace,Consolas,monospace;letter-spacing:.18em;
+        color:rgba(30,60,140,.30);transition:opacity .8s;white-space:nowrap}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ── 协议层 ────────────────────────────────────────────────────────────── */
+const cv = document.getElementById('c');
+const hint = document.getElementById('hint');
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let W = 1, H = 1, PR = 1;
+let lines = [], idx = -1;
+let clockT = 0, clockAt = 0, playing = false, vT = 0;
+let beatPulse = 0, bass = 0, treb = 0, frames = 0, jsMs = 0, errMsg = '';
+let readySent = false, dirty = true, raf = 0;
+let RM = false, mq = null;
+try {
+  mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  if (mq) {
+    RM = !!mq.matches;
+    const on = (e) => { RM = !!e.matches; };
+    if (mq.addEventListener) mq.addEventListener('change', on); else if (mq.addListener) mq.addListener(on);
+  }
+} catch (_) {}
+
+/* ── 海报：Canvas2D 烘一张纹理（只在 resize / 换尺寸时重画） ───────────── */
+const pc = document.createElement('canvas');
+const px = pc.getContext('2d');
+const dc = document.createElement('canvas');
+const dxx = dc.getContext('2d');
+const COB = '#1f4fd8', SKY = '#4d8bf0', LIL = '#8f9df0', INK = '#0b1b3a';
+
+function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+
+/* 卷草纹：一条控制点随机的双贝塞尔藤蔓 */
+function flourish(g, x0, y0, s, seed) {
+  let sd = seed;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  g.beginPath(); g.moveTo(x0, y0);
+  let x = x0, y = y0;
+  for (let i = 0; i < 7; i++) {
+    const dx = (rnd() - 0.35) * 90 * s, dy = (rnd() - 0.5) * 70 * s;
+    const c1x = x + dx * 0.7 + (rnd() - 0.5) * 40 * s, c1y = y + dy * 0.7 - 50 * s;
+    const c2x = x + dx + (rnd() - 0.5) * 60 * s, c2y = y + dy + 30 * s;
+    g.bezierCurveTo(c1x, c1y, c2x, c2y, x + dx, y + dy);
+    x += dx; y += dy;
+  }
+  g.lineWidth = 3.6 * s; g.strokeStyle = 'rgba(40,95,215,.75)'; g.stroke();
+  g.lineWidth = 1.8 * s; g.strokeStyle = 'rgba(22,58,175,.9)'; g.stroke();
+}
+
+function star(g, x, y, r, col) {
+  g.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5, rad = i % 2 ? r * 0.42 : r;
+    g[i ? 'lineTo' : 'moveTo'](x + Math.cos(a) * rad, y + Math.sin(a) * rad);
+  }
+  g.closePath(); g.fillStyle = col; g.fill();
+}
+
+/* 剪影：头 + 肩 + 一条抬起的手臂（iPod 广告那种姿态） */
+function silhouette(g, cx, cy, s, arm) {
+  g.fillStyle = COB;
+  g.beginPath(); g.arc(cx, cy - 26 * s, 15 * s, 0, 6.2832); g.fill();
+  g.beginPath();
+  g.moveTo(cx - 26 * s, cy + 58 * s);
+  g.quadraticCurveTo(cx - 24 * s, cy - 6 * s, cx - 9 * s, cy - 8 * s);
+  g.lineTo(cx + 9 * s, cy - 8 * s);
+  g.quadraticCurveTo(cx + 24 * s, cy - 6 * s, cx + 26 * s, cy + 58 * s);
+  g.closePath(); g.fill();
+  /* 手臂 */
+  g.strokeStyle = COB; g.lineWidth = 11 * s; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(cx + 18 * s, cy + 6 * s);
+  g.quadraticCurveTo(cx + 40 * s, cy - 18 * s * arm, cx + 26 * s, cy - 34 * s * arm);
+  g.stroke();
+  /* 耳机线（白色） */
+  g.strokeStyle = '#fff'; g.lineWidth = 2.4 * s; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(cx - 15 * s, cy - 27 * s);
+  g.quadraticCurveTo(cx - 2 * s, cy - 40 * s, cx + 12 * s, cy - 28 * s);
+  g.stroke();
+  g.beginPath(); g.moveTo(cx + 12 * s, cy - 28 * s);
+  g.quadraticCurveTo(cx + 34 * s, cy + 10 * s, cx + 20 * s, cy + 44 * s);
+  g.stroke();
+}
+
+/* ── 动态层：每帧重画（线条飘、星星闪、剪影挥手） ─────────────────── */
+function drawDyn(T) {
+  const w = dc.width = 1024, h = dc.height = 640;
+  const S = Math.min(w / 1440, h / 900);
+  dxx.setTransform(1, 0, 0, 1, 0, 0);
+  dxx.clearRect(0, 0, w, h);
+  /* 卷草：整体缓慢漂移 + 轻微呼吸缩放 */
+  for (let i = 0; i < 9; i++) {
+    const ph = i * 1.37;
+    const dx = Math.sin(T * 0.28 + ph) * 22 * S, dy = Math.cos(T * 0.21 + ph * 1.3) * 16 * S;
+    const sc = 1 + 0.06 * Math.sin(T * 0.33 + ph);
+    dxx.save();
+    dxx.translate((i / 8) * w * 1.1 - w * 0.05 + dx, h * (0.12 + 0.09 * i) + dy);
+    dxx.rotate(0.03 * Math.sin(T * 0.24 + ph));
+    dxx.scale(sc, sc);
+    flourish(dxx, 0, 0, S * (0.9 + 0.25 * (i % 3)), 1234 + i * 77);
+    dxx.restore();
+  }
+  for (let i = 0; i < 7; i++) {
+    const ph = i * 2.11 + 3.0;
+    const dx = Math.cos(T * 0.19 + ph) * 26 * S, dy = Math.sin(T * 0.26 + ph) * 18 * S;
+    dxx.save();
+    dxx.translate(w * (0.15 + 0.12 * i) + dx, h * 0.86 + dy);
+    dxx.scale(1 + 0.05 * Math.sin(T * 0.31 + ph), 1 + 0.05 * Math.sin(T * 0.27 + ph));
+    flourish(dxx, 0, 0, S * 0.8, 771 + i * 31);
+    dxx.restore();
+  }
+  /* 星星：各自不同的频率闪 */
+  let sd = 99;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  for (let i = 0; i < 16; i++) {
+    const x = rnd() * w, y = rnd() * h, r = (7 + rnd() * 15) * S;
+    const sp = 0.6 + rnd() * 2.2, ph = rnd() * 6.2832;
+    const a = 0.12 + 0.88 * Math.pow(Math.abs(Math.sin(T * sp + ph)), 1.6);
+    dxx.globalAlpha = a;
+    star(dxx, x, y, r, i % 3 ? '#4d8bf0' : '#1f4fd8');
+  }
+  dxx.globalAlpha = 1;
+  /* 左侧三格：剪影挥手 */
+  const pw = w * 0.115, ph2 = h * 0.205, gx = w * 0.035, gy = h * 0.10, gap = h * 0.045;
+  for (let i = 0; i < 3; i++) {
+    const y = gy + i * (ph2 + gap);
+    const wave = 0.88 + 0.30 * Math.sin(T * (1.5 + i * 0.22) + i * 1.9);
+    dxx.save(); rr(dxx, gx, y, pw, ph2, 3 * S); dxx.clip();
+    silhouette(dxx, gx + pw * 0.5, y + ph2 * 0.62, ph2 / 150, wave);
+    dxx.restore();
+  }
+}
+function buildPoster() {
+  const w = pc.width = Math.max(320, Math.round(W * PR));
+  const h = pc.height = Math.max(240, Math.round(H * PR));
+  const S = Math.min(w / 1440, h / 900);              /* 统一缩放 */
+  px.setTransform(1, 0, 0, 1, 0, 0);
+  /* 底色：高明度白，右上一点点暖白 */
+  const bgGrad = px.createLinearGradient(0, 0, w, h);
+  bgGrad.addColorStop(0, '#ffffff'); bgGrad.addColorStop(0.55, '#f6f8ff'); bgGrad.addColorStop(1, '#eef3ff');
+  px.fillStyle = bgGrad; px.fillRect(0, 0, w, h);
+
+  /* 背景卷草 + 尖角流线 */
+  if (0) for (let i = 0; i < 9; i++) flourish(px, (i / 8) * w * 1.1 - w * 0.05, h * (0.12 + 0.09 * i), S * (0.9 + 0.25 * (i % 3)), 1234 + i * 77);
+  for (let i = 0; i < 7; i++) flourish(px, w * (0.15 + 0.12 * i), h * 0.86, S * 0.8, 771 + i * 31);
+
+  /* 半调网点带（左下、右上各一片），从疏到密 */
+  for (let band = 0; band < 2; band++) {
+    const bx = band ? w * 0.62 : w * 0.02, by = band ? h * 0.04 : h * 0.60;
+    const bw = w * 0.34, bh = h * 0.30;
+    for (let y = 0; y < bh; y += 11 * S) {
+      for (let x = 0; x < bw; x += 11 * S) {
+        const t = 1 - Math.hypot(x / bw, y / bh) * 1.15;
+        if (t <= 0) continue;
+        px.beginPath(); px.arc(bx + x, by + y, Math.max(0.4, 4.1 * S * t), 0, 6.2832);
+        px.fillStyle = 'rgba(31,79,216,' + (0.10 + 0.34 * t).toFixed(3) + ')'; px.fill();
+      }
+    }
+  }
+
+  /* 五角星 + 喷溅 */
+  let sd = 99;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  if (0) for (let i = 0; i < 14; i++) star(px, rnd() * w, rnd() * h, (7 + rnd() * 15) * S, i % 3 ? 'rgba(77,139,240,.55)' : 'rgba(31,79,216,.40)');
+  for (let c = 0; c < 5; c++) {
+    const cx0 = rnd() * w, cy0 = rnd() * h;
+    for (let i = 0; i < 90; i++) {
+      const a = rnd() * 6.2832, r = Math.pow(rnd(), 0.55) * 60 * S;
+      px.beginPath(); px.arc(cx0 + Math.cos(a) * r, cy0 + Math.sin(a) * r * 0.8, (0.6 + rnd() * 2.4) * S, 0, 6.2832);
+      px.fillStyle = 'rgba(31,79,216,' + (0.10 + rnd() * 0.30).toFixed(3) + ')'; px.fill();
+    }
+  }
+
+  /* 左侧三格分镜（iPod 剪影广告） */
+  const pw = w * 0.115, ph = h * 0.205, gx = w * 0.035, gy = h * 0.10, gap = h * 0.045;
+  for (let i = 0; i < 3; i++) {
+    const y = gy + i * (ph + gap);
+    px.fillStyle = 'rgba(255,255,255,.86)'; rr(px, gx, y, pw, ph, 3 * S); px.fill();
+    px.strokeStyle = 'rgba(31,79,216,.55)'; px.lineWidth = 1.4 * S; rr(px, gx, y, pw, ph, 3 * S); px.stroke();
+    px.save(); rr(px, gx, y, pw, ph, 3 * S); px.clip();
+    if (0) silhouette(px, gx + pw * 0.5, y + ph * 0.62, ph / 150, 0.9 + i * 0.12);
+    px.restore();
+    /* 分镜编号条 */
+    px.fillStyle = 'rgba(31,79,216,.75)';
+    px.fillRect(gx, y + ph - 9 * S, pw * (0.35 + i * 0.2), 3 * S);
+  }
+
+  /* 中央：白色耳机 + 盘成漩涡的耳机线 */
+  const ecx = w * 0.50, ecy = h * 0.46, es = S * 1.0;
+  /* 线：从耳机往下，盘成一大团漩涡，再到右侧 MP3 */
+  px.strokeStyle = 'rgba(31,79,216,.42)'; px.lineWidth = 9.5 * es; px.lineCap = 'round';
+  px.beginPath();
+  px.moveTo(ecx - 40 * es, ecy + 30 * es);
+  px.bezierCurveTo(ecx - 180 * es, ecy + 190 * es, ecx - 60 * es, ecy + 330 * es, ecx + 120 * es, ecy + 250 * es);
+  px.bezierCurveTo(ecx + 320 * es, ecy + 160 * es, ecx + 150 * es, ecy + 40 * es, ecx + 20 * es, ecy + 120 * es);
+  px.bezierCurveTo(ecx - 110 * es, ecy + 200 * es, ecx + 60 * es, ecy + 330 * es, ecx + 300 * es, ecy + 300 * es);
+  px.stroke();
+  px.strokeStyle = '#ffffff'; px.lineWidth = 5.4 * es; px.stroke();
+
+  /* 耳机头（两个圆角形 + 短柄） */
+  function bud(x, y, rot) {
+    px.save(); px.translate(x, y); px.rotate(rot);
+    px.fillStyle = '#ffffff'; px.strokeStyle = 'rgba(31,79,216,.55)'; px.lineWidth = 2.4 * es;
+    px.beginPath(); px.ellipse(0, 0, 34 * es, 30 * es, 0, 0, 6.2832); px.fill(); px.stroke();
+    px.beginPath(); px.ellipse(-6 * es, 4 * es, 15 * es, 12 * es, 0, 0, 6.2832);
+    px.fillStyle = 'rgba(143,157,240,.55)'; px.fill();
+    px.strokeStyle = 'rgba(31,79,216,.55)'; px.lineWidth = 6 * es; px.lineCap = 'round';
+    px.beginPath(); px.moveTo(20 * es, -18 * es); px.lineTo(46 * es, -52 * es); px.stroke();
+    px.restore();
+  }
+  bud(ecx - 62 * es, ecy - 10 * es, -0.38);
+  bud(ecx + 54 * es, ecy - 32 * es, 0.52);
+
+  /* 右侧：纵向拉伸、细黑描边的白色 MP3 */
+  px.save();
+  px.translate(w * 0.885, h * 0.50); px.scale(1, 2.35);
+  px.font = '900 ' + (86 * S) + 'px "Helvetica Neue", Arial, sans-serif';
+  px.textAlign = 'center'; px.textBaseline = 'middle';
+  px.lineWidth = 2.2 * S; px.strokeStyle = 'rgba(11,27,58,.85)';
+  px.fillStyle = 'rgba(255,255,255,.92)';
+  px.strokeText('MP3', 0, 0); px.fillText('MP3', 0, 0);
+  px.restore();
+
+  /* 中央下方给歌词留的空白区（不画任何东西，让网点去长） */
+  px.fillStyle = 'rgba(255,255,255,.55)';
+  px.beginPath(); px.ellipse(w * 0.50, h * 0.50, w * 0.36, h * 0.13, 0, 0, 6.2832); px.fill();
+}
+
+/* ── 字形纹理：当前那句 ─────────────────────────────────────────────── */
+const gc = document.createElement('canvas');
+const gx2 = gc.getContext('2d');
+const GT = { w: 0, h: 0, box: [0.06, 0.36, 0.88, 0.16], chars: [] };
+function bakeText(text) {
+  const t = (text || '').trim();
+  if (!t) { GT.w = 0; return; }
+  const fsPx = 150;
+  gx2.font = '900 ' + fsPx + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+  const mt = gx2.measureText(t);
+  const pad = 26, w = Math.ceil(mt.width + pad * 2), h = Math.ceil(fsPx * 1.5);
+  gc.width = w; gc.height = h;
+  gx2.font = '900 ' + fsPx + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+  gx2.textBaseline = 'middle'; gx2.textAlign = 'left';
+  gx2.fillStyle = '#000'; gx2.fillRect(0, 0, w, h);
+  gx2.fillStyle = '#fff'; gx2.fillText(t, pad, h * 0.52);
+  GT.w = w; GT.h = h;
+  const arr = Array.from(t), chars = [];
+  let acc = 0;
+  for (const ch of arr) { const cw = gx2.measureText(ch).width; chars.push({ t: ch, x0: (pad + acc) / w, x1: (pad + acc + cw) / w }); acc += cw; }
+  GT.chars = chars;
+  /* 字块放在画面中央偏下（海报的中景留白处） */
+  GT.box = [0.13, 0.38, 0.72, 0.72 * (h / w) * (W / H)];
+  if (glOk) uploadGlyph();
+}
+
+/* ── WebGL2 ─────────────────────────────────────────────────────────── */
+const GL = { alpha: false, antialias: false, depth: false, premultipliedAlpha: false, powerPreference: 'high-performance' };
+let gl = cv.getContext('webgl2', GL);
+let glOk = !!gl, P = null, U = {}, bgP = null, bgU = {}, pVao = null, bgVao = null;
+let posterTex = null, glyphTex = null, dynTex = null;let flashAmt = 0;
+const N = 100000;
+
+const BG_VS = `#version 300 es
+in vec2 aQ; out vec2 vUV;
+void main(){ vUV = aQ; gl_Position = vec4(aQ * 2.0 - 1.0, 0.0, 1.0); }`;
+
+/* 海报 + 声波条（声波在片元里程序化画，跟 bass/treble 动） */
+const BG_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform sampler2D uPoster;
+uniform sampler2D uDyn;
+uniform float uFlash;
+uniform float uT, uBass, uTre, uBeat, uAsp;
+void main(){
+  vec2 uv = vUV + vec2(sin(uT * 0.23), cos(uT * 0.19)) * 0.0035;
+  vec3 c = texture(uPoster, uv).rgb;
+  vec4 dy = texture(uDyn, uv);
+  c = mix(c, dy.rgb, dy.a);
+  /* 声波条：横贯中景的一排竖条 */
+  float band = smoothstep(0.028, 0.0, abs(uv.y - 0.315));
+  if (band > 0.001) {
+    float n = fract(uv.x * 46.0);
+    float w = 0.34;
+    float on = step(n, w);
+    float hh = 0.10 + 0.16 * (0.5 + 0.5 * sin(uv.x * 38.0 + uT * 1.4)) * (0.4 + 0.9 * uBass)
+             + 0.10 * uTre * (0.5 + 0.5 * sin(uv.x * 71.0 - uT * 2.2));
+    float bar = step(abs(uv.y - 0.315), hh) * on;
+    c = mix(c, vec3(0.44, 0.55, 0.72), bar * band * 0.55);
+  }
+  /* 一点点纸的噪点，避免大面积纯白死板 */
+  float g = fract(sin(dot(uv * vec2(1024.0, 768.0), vec2(12.9898, 78.233))) * 43758.5453);
+  c += (g - 0.5) * 0.012;
+  c = mix(c, vec3(1.0), clamp(uFlash, 0.0, 0.55));
+  o = vec4(c, 1.0);
+}`;
+
+/* 十万个半调网点：半径 = 字形覆盖率 × 该字进度 */
+const P_VS = `#version 300 es
+precision highp float;
+in vec2 aQ; in vec4 aSeed;
+uniform vec2 uRes;
+uniform float uAsp, uT, uBeat, uBass;
+uniform vec4 uBox;
+uniform sampler2D uGlyph, uRamp;
+out vec2 vQ; out vec3 vCol; out float vA;
+
+float rampAt(float u){ return texture(uRamp, vec2(clamp(u, 0.002, 0.998), 0.5)).r; }
+
+void main(){
+  /* 屏幕空间的网点栅格（斜 15° 的经典半调角度） */
+  vec2 g = vec2((aSeed.x * 2.0 - 1.0) * uAsp, (aSeed.y * 2.0 - 1.0));
+  float a = 0.2618;
+  vec2 r = vec2(g.x * cos(a) - g.y * sin(a), g.x * sin(a) + g.y * cos(a));
+  vec2 rc = floor(r * 172.0) + 0.5;
+  r = rc / 172.0;
+  vec2 sp = vec2(r.x * cos(-a) - r.y * sin(-a), r.x * sin(-a) + r.y * cos(-a));
+  vec2 uv = sp * vec2(1.0 / uAsp, 1.0) * 0.5 + 0.5;
+
+  /* 画到字形框里取覆盖率 */
+  vec2 guv = (uv - uBox.xy) / uBox.zw;
+  float cov = 0.0;
+  if (guv.x > -0.01 && guv.x < 1.01 && guv.y > -0.01 && guv.y < 1.01) cov = texture(uGlyph, guv).r;
+  float pr = rampAt(guv.x);
+  float lit = smoothstep(0.05, 0.55, pr);          /* 唱到的字才变密 */
+
+  /* 海报本身也有网点：远处用稀网点当纸纹 */
+  float paper = 0.10 + 0.06 * sin(uv.x * 220.0) * sin(uv.y * 190.0);
+  float dens = max(cov * lit, paper * 0.18);
+  float rad = dens * 0.0052 + 0.0006;
+
+  vec2 pos = uv * 2.0 - 1.0;
+  pos.x *= uAsp;
+  pos += (aQ - 0.5) * 2.0 * rad;
+  pos.x /= uAsp;
+  gl_Position = vec4(pos, 0.0, 1.0);
+  vQ = aQ;
+  /* 字：钴蓝；纸纹：极浅的蓝灰 */
+  float isInk = step(0.01, cov * lit);
+  vCol = mix(vec3(0.74, 0.80, 0.92), vec3(0.055, 0.145, 0.60), isInk);
+  vA = mix(0.40, 1.0, isInk) * (0.86 + 0.14 * uBeat) * (0.86 + 0.14 * sin(uT * 1.7 + aSeed.x * 40.0));
+}`;
+
+const P_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec3 vCol; in float vA; out vec4 o;
+void main(){
+  vec2 d = vQ - 0.5;
+  float f = 1.0 - smoothstep(0.40, 0.50, length(d));
+  o = vec4(vCol, vA * f);
+}`;
+
+function compile(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; }
+function program(v, f) { const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, v)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, f)); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
+function locs(p, n) { const o = {}; for (const k of n) o[k] = gl.getUniformLocation(p, k); return o; }
+
+function uploadGlyph() {
+  gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gc);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+function uploadPoster() {
+  gl.bindTexture(gl.TEXTURE_2D, posterTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, pc);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+let rampTex = null, ramp = new Uint8Array(64 * 4), charProg = [];
+function buildRamp() {
+  for (let i = 0; i < 64; i++) {
+    const u = (i + 0.5) / 64;
+    let v = 0;
+    for (let k = 0; k < GT.chars.length; k++) {
+      const c = GT.chars[k];
+      if (u >= c.x0 - 0.004 && u <= c.x1 + 0.004) { v = charProg[k] || 0; break; }
+      if (u < c.x0) { v = charProg[k] || 0; break; }
+    }
+    const b = Math.round(Math.max(0, Math.min(1, v)) * 255);
+    ramp[i*4] = b; ramp[i*4+1] = b; ramp[i*4+2] = b; ramp[i*4+3] = 255;
+  }
+  if (!glOk) return;
+  gl.bindTexture(gl.TEXTURE_2D, rampTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, ramp);
+}
+
+function initGL() {
+  if (!gl) return false;
+  P = program(P_VS, P_FS);
+  U = locs(P, ['uRes','uAsp','uT','uBeat','uBass','uBox','uGlyph','uRamp']);
+  bgP = program(BG_VS, BG_FS);
+  bgU = locs(bgP, ['uPoster','uDyn','uFlash','uT','uBass','uTre','uBeat','uAsp']);
+
+  const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  const hal = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+  let sd = 2026292;
+  const rnd = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  const seeds = new Float32Array(N * 4);
+  const GW = 420, GH = 238; for (let i = 0; i < N; i++) { const gx = i % GW, gy = Math.floor(i / GW) % GH; seeds[i*4] = (gx + 0.5) / GW; seeds[i*4+1] = (gy + 0.5) / GH + ((gx % 2) ? 0.5 / GH : 0); seeds[i*4+2] = rnd(); seeds[i*4+3] = rnd(); }
+  const sb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, seeds, gl.STATIC_DRAW);
+
+  pVao = gl.createVertexArray(); gl.bindVertexArray(pVao);
+  const aQ = gl.getAttribLocation(P, 'aQ'), aS = gl.getAttribLocation(P, 'aSeed');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(aQ); gl.vertexAttribPointer(aQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(aS, 1);
+
+  bgVao = gl.createVertexArray(); gl.bindVertexArray(bgVao);
+  const bQ = gl.getAttribLocation(bgP, 'aQ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.enableVertexAttribArray(bQ); gl.vertexAttribPointer(bQ, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  posterTex = gl.createTexture(); glyphTex = gl.createTexture(); dynTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, dynTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); rampTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, rampTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  buildRamp();
+  gl.clearColor(0.96, 0.97, 1.0, 1);
+  glOk = true;
+  uploadPoster();
+  if (GT.w) uploadGlyph();
+  return true;
+}
+
+let curText = '';
+function showLine(ci) {
+  const L = lines[ci]; if (!L) return;
+  if (L.text !== curText) { curText = L.text; bakeText(L.text); }
+  hint.style.opacity = '0'; dirty = true;
+}
+function hideAll() {
+  curText = ''; GT.w = 0; GT.chars = [];
+  hint.style.opacity = '0.9';
+  hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+  dirty = true;
+}
+
+function updChars(T) {
+  if (idx < 0 || !lines[idx] || !GT.chars.length) return;
+  const L = lines[idx], chs = L.chars, n = GT.chars.length;
+  charProg.length = n;
+  if (chs && chs.length === n) {
+    for (let i = 0; i < n; i++) { const d = (chs[i].d && chs[i].d > 0.05) ? chs[i].d : 0.42; charProg[i] = Math.max(0, Math.min(1, (T - chs[i].t) / Math.min(0.6, Math.max(0.16, d)))); }
+  } else {
+    const d = Math.max(0.5, L.dur || 4);
+    for (let i = 0; i < n; i++) charProg[i] = Math.max(0, Math.min(1, (T - L.t - d * 0.86 * i / n) / 0.45));
+  }
+  buildRamp();
+}
+
+function draw() {
+  if (!glOk) return;
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  const asp = W / H;
+
+  gl.disable(gl.BLEND);
+  gl.useProgram(bgP); gl.bindVertexArray(bgVao);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, posterTex);
+  gl.uniform1i(bgU.uPoster, 0);
+  gl.uniform1f(bgU.uT, vT); gl.uniform1f(bgU.uBass, bass); gl.uniform1f(bgU.uTre, treb);
+  gl.uniform1f(bgU.uBeat, beatPulse); gl.uniform1f(bgU.uAsp, asp); gl.uniform1f(bgU.uFlash, flashAmt);
+  drawDyn(vT);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, dynTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, dc);
+  gl.uniform1i(bgU.uDyn, 3);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.useProgram(P); gl.bindVertexArray(pVao);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.uniform2f(U.uRes, W, H); gl.uniform1f(U.uAsp, asp);
+  gl.uniform1f(U.uT, vT); gl.uniform1f(U.uBeat, beatPulse); gl.uniform1f(U.uBass, bass);
+  gl.uniform4f(U.uBox, GT.box[0], GT.box[1], GT.box[2], GT.box[3]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  gl.uniform1i(U.uGlyph, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, rampTex);
+  gl.uniform1i(U.uRamp, 2);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+  gl.bindVertexArray(null);
+}
+
+function resize() {
+  W = Math.max(2, window.innerWidth); H = Math.max(2, window.innerHeight);
+  PR = Math.min(1.5, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * PR); cv.height = Math.round(H * PR);
+  buildPoster();
+  if (glOk) { gl.viewport(0, 0, cv.width, cv.height); uploadPoster(); if (GT.w) { bakeText(curText); uploadGlyph(); } }
+  dirty = true;
+}
+let rzT = 0;
+addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 140); });
+
+let last = performance.now();
+function frame(ms) {
+  const js0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0, (ms - last) / 1000));
+  last = ms; frames++;
+  const T = now();
+  vT = RM ? T * 0.24 : T;
+  if (playing) { beatPulse *= Math.exp(-dt * 3.6); bass *= Math.exp(-dt * 0.08); treb *= Math.exp(-dt * 0.10); }
+  flashAmt = RM ? 0 : Math.max(0, Math.min(0.20, (beatPulse - 0.34) * 0.55));
+  if (!RM) { const sh = beatPulse * beatPulse * 3.0; cv.style.transform = 'translate3d(' + (Math.sin(vT * 7.3) * sh).toFixed(2) + 'px,' + (Math.cos(vT * 5.1) * sh * 0.7).toFixed(2) + 'px,0) scale(1.012)'; } else cv.style.transform = '';
+  let ci = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (T >= lines[i].t) { ci = i; break; } }
+  if (ci !== idx) { idx = ci; if (ci < 0) hideAll(); else showLine(ci); dirty = true; }
+  try { updChars(T); } catch (e) { errMsg = 'ch: ' + (e && e.message ? e.message : e); }
+  try { if (playing || dirty) { draw(); dirty = false; } } catch (e) { errMsg = 'draw: ' + (e && e.message ? e.message : e); }
+  if (!readySent) { readySent = true; try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {} }
+  jsMs = performance.now() - js0;
+  raf = requestAnimationFrame(frame);
+}
+
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', (e) => {
+  ping();
+  if (e.code === 'Space' || e.key === ' ') { e.preventDefault(); try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {} }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    idx = -1; curText = ''; vT = 0; beatPulse = 0; bass = 0; treb = 0;
+    clockT = 0; clockAt = performance.now(); playing = true;
+    hint.style.opacity = lines.length ? '0.9' : '0.4';
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    dirty = true;
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing; dirty = true;
+  } else if (d.type === 'beat') {
+    beatPulse = Math.min(1, beatPulse + 0.32 + (d.payload.level || 0) * 0.5); dirty = true;
+  } else if (d.type === 'live') {
+    const l = d.payload || {};
+    if (typeof l.bass === 'number') bass = Math.max(bass, Math.min(1, l.bass));
+    if (typeof l.treble === 'number') treb = Math.max(treb, Math.min(1, l.treble));
+    if (typeof l.level === 'number') beatPulse = Math.max(beatPulse, Math.min(0.9, l.level * 0.8));
+  }
+});
+addEventListener('pagehide', () => cancelAnimationFrame(raf));
+
+window.__stage = () => ({
+  lines: lines.length, idx: idx, t: +now().toFixed(2), playing: playing, frames: frames,
+  js: +jsMs.toFixed(2), err: errMsg, text: (idx >= 0 && lines[idx]) ? lines[idx].text : '',
+  gl: glOk, rm: RM, vT: +vT.toFixed(2), chars: GT.chars.length
+});
+
+resize();
+try { initGL(); } catch (e) { errMsg = 'gl: ' + (e && e.message ? e.message : e); glOk = false; }
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>

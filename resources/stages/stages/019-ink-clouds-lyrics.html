@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>墨云</title>
+<style>
+  html,body{margin:0;height:100%;background:#06080c;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(190,205,225,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ============================================================================
+   019 · 墨云  (v2 重做 / 2026-10-28)
+
+   **字是墨的沉积区 —— 不是把字画出来，是让墨愿意待在那些笔画上。**
+
+   三层：
+   ① 墨层（半分辨率画布 CW=W/2）：9 团**横向拉长的墨雾**（带颗粒的预烘软贴图，
+      缓慢变形/旋转/漂移，两团暖色）+ 3 根极淡墨丝。
+      再把一张**每句烘一次**的"湿晕"贴图（只描字形轮廓 → 模糊）叠上去 ——
+      墨就贴着笔画停住，笔画内部留暗。整层放大 2× 铺满主画布，放大本身即柔化。
+   ② 字层（全分辨率）：逐字 4 档竖向渐变（纸白→冷蓝）+ 一圈亮边 + 一线暗影（厚度）。
+      未唱到的字也亮（α≥0.74），整句一眼读完。入场由**时间**驱动（浮沉/微转/缩放），
+      起始就 42% 不透明 —— 任何一帧截下来都能读；不绑逐字点亮。
+   ③ 收尾：预烘的暗角 + 四边硬压暗（保证字形永不贴边）。
+
+   镜头：墨与字 1.0 / 浮尘 1.35 视差 + 呼吸变焦 + 换句推镜。
+   换句：湿晕重烘 + settle 从 0 爬升，墨雾亮一档（像有人在水里落了一笔）。
+
+   走过三条弯路（都别回头）：
+   · 粒子撒点 + 模糊 → 粒子一聚堆就是一堆亮球（散景），不是墨。
+   · 值噪声 fBm → 格点露出方块 + 滚动接缝，像马赛克。
+   · 贝塞尔细描 / 笔刷盖章 → 要么像光轨，要么像珠链，而且慢。
+
+   坑（真踩过）：
+   · Canvas 渐变坐标在**创建时**按当时 CTM 烘死。逐字 translate 之后，
+     建在字局部坐标里的渐变会让整行字拿到末端暗色 → 渐变必须建在屏幕空间。
+   · 湿晕的描边宽度别超过 0.1em：CJK 字形密集，粗描边一模糊就糊成一整条亮板。
+   · 字号量化到 8 的倍数：每句换亚像素字号会让 Chrome 每句重建字形图集，换句那帧会抖。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+const FONT = '"PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif';
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const mix3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+
+let W = 0, H = 0, DPR = 1;
+let CW = 1, CH = 1;                   // 墨层画布尺寸（半分辨率）
+
+/* ---------------- 状态 ---------------- */
+let lines = [];
+let accent = [118, 158, 214];
+let curIdx = -1;
+let clockT = 0, clockAt = 0, playing = false;
+let pulse = 0, lum = 0, kick = 0;
+let t0 = 0, last = performance.now();
+let lineT = 0, lineDur = 2.4, lineText = '';
+let chars = [];
+let fs = 72, baseY = 0;
+
+/* ---------------- 字色 4 档 ---------------- */
+let T_TOP = [246, 251, 255], T_MID = [210, 230, 255], T_LOW = [140, 182, 238], T_BOT = [78, 120, 184];
+let T_RIM = 'rgba(196,226,255,0.45)';
+let INK_DEEP = '120,160,215';         // 墨的暗部
+let INK_HOT = '180,215,255';          // 墨的亮部
+
+function recolor() {
+  const A = accent;
+  T_TOP = mix3([244, 249, 255], A, 0.05).map(Math.round);
+  T_MID = mix3([206, 228, 255], A, 0.16).map(Math.round);
+  T_LOW = mix3([146, 188, 242], A, 0.20).map(Math.round);
+  T_BOT = mix3([84, 126, 190], A, 0.16).map(Math.round);
+  T_RIM = 'rgba(' + Math.round(Math.min(255, A[0] * .5 + 150)) + ',' +
+    Math.round(Math.min(255, A[1] * .5 + 158)) + ',' +
+    Math.round(Math.min(255, A[2] * .45 + 172)) + ',0.45)';
+  INK_DEEP = Math.round(A[0] * 0.55 + 40) + ',' + Math.round(A[1] * 0.60 + 50) + ',' + Math.round(A[2] * 0.72 + 60);
+  INK_HOT = Math.round(A[0] * 0.62 + 92) + ',' + Math.round(A[1] * 0.62 + 100) + ',' + Math.round(A[2] * 0.58 + 112);
+}
+recolor();
+
+/* ---------------- 墨层画布 ---------------- */
+const inkCv = document.createElement('canvas');
+const ink = inkCv.getContext('2d');
+const bgCv = document.createElement('canvas');
+const bgc = bgCv.getContext('2d');
+
+/* 软墨块贴图（预烘一次，之后只做 drawImage） */
+function makeBlob(rgb) {
+  const S = 128;
+  const c = document.createElement('canvas');
+  c.width = S; c.height = S;
+  const b = c.getContext('2d');
+  const img = b.createImageData(S, S);
+  const d = img.data;
+  const R = Math.round(rgb[0]), G = Math.round(rgb[1]), B = Math.round(rgb[2]);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const dx = (x + 0.5) / S * 2 - 1, dy = (y + 0.5) / S * 2 - 1;
+      const rr = Math.sqrt(dx * dx + dy * dy);
+      if (rr >= 1) continue;
+      const q = 1 - rr;
+      const fall = q * q * (3 - 2 * q);
+      /* 高频细砂：低频颗粒放大后会变成大块"污渍" */
+      const g1 = Math.sin(x * 1.31 + y * 0.97) * Math.cos(y * 0.83 - x * 0.61);
+      const g2 = Math.sin(x * 2.53 - y * 2.11) * 0.5;
+      const grain = 0.93 + 0.05 * g1 + 0.03 * g2;
+      const a = Math.max(0, Math.min(1, fall * grain));
+      const i = (y * S + x) * 4;
+      d[i] = R; d[i + 1] = G; d[i + 2] = B;
+      d[i + 3] = (a * 255) | 0;
+    }
+  }
+  b.putImageData(img, 0, 0);
+  return c;
+}
+let BLOB_COOL = null, BLOB_WARM = null;
+function bakeBlobs() {
+  BLOB_COOL = makeBlob([accent[0] * 0.92 + 26, accent[1] * 0.92 + 34, accent[2] * 0.98 + 46]);
+  BLOB_WARM = makeBlob([246, 152, 96]);
+}
+bakeBlobs();
+
+function bakeBg() {
+  bgCv.width = CW; bgCv.height = CH;
+  bgc.globalCompositeOperation = 'source-over';
+  bgc.fillStyle = '#070910';
+  bgc.fillRect(0, 0, CW, CH);
+  bgc.globalCompositeOperation = 'lighter';
+  const A = accent;
+  const blobs = [
+    [0.32, 0.42, 0.55, 0.030],
+    [0.68, 0.62, 0.62, 0.026],
+    [0.50, 0.20, 0.45, 0.018],
+    [0.18, 0.78, 0.40, 0.015]
+  ];
+  for (let i = 0; i < blobs.length; i++) {
+    const b = blobs[i];
+    bgc.globalAlpha = b[3];
+    bgc.fillStyle = 'rgb(' + A[0] + ',' + A[1] + ',' + A[2] + ')';
+    const r = b[2] * Math.max(CW, CH);
+    bgc.drawImage(BLOB_COOL, b[0] * CW - r, b[1] * CH - r, r * 2, r * 2);
+  }
+  bgc.globalAlpha = 1;
+}
+
+/* ---------------- 淡墨雾 ---------------- */
+const NB = 9;
+const bxp = new Float32Array(NB), byp = new Float32Array(NB), bsc = new Float32Array(NB),
+  bph = new Float32Array(NB), bal = new Float32Array(NB);
+function seedBlob(i) {
+  /* 墨雾集中在歌词那条带上：远处接近全黑，字才有对比，墨才看得见 */
+  bxp[i] = Math.random();
+  byp[i] = 0.33 + Math.random() * 0.40;
+  bsc[i] = 0.24 + Math.random() * 0.30;
+  bph[i] = Math.random() * TAU;
+  bal[i] = 0.055 + Math.random() * 0.075;
+}
+for (let i = 0; i < NB; i++) seedBlob(i);
+
+/* ---------------- 字体排版 ---------------- */
+function measureFont(size) { return '800 ' + size + 'px ' + FONT; }
+
+function buildText(L) {
+  lineText = (L && L.text) ? String(L.text) : '';
+  chars = [];
+  if (!lineText) return;
+  const maxW = W * 0.76;
+  let size = Math.min(H * 0.17, 124);
+  ctx.font = measureFont(size);
+  const wsum = ctx.measureText(lineText).width;
+  if (wsum > maxW) size *= maxW / wsum;
+  const arr = Array.from(lineText);
+  const spK = 0.035;
+  const layout = (sz) => {
+    ctx.font = measureFont(sz);
+    const ws = new Array(arr.length);
+    let tot = 0;
+    for (let i = 0; i < arr.length; i++) {
+      ws[i] = ctx.measureText(arr[i]).width;
+      tot += ws[i] + (i ? sz * spK : 0);
+    }
+    return { ws: ws, tot: tot };
+  };
+  /* 字号量化到 8 的倍数：每句都换一个亚像素字号会让 Chrome 每句重建字形图集，
+     换句那一帧会抖一下。量化之后常用的几个字号都会被复用。 */
+  fs = Math.max(24, Math.round(size / 8) * 8);
+  let lay = layout(fs);
+  if (lay.tot > maxW) {
+    fs = Math.max(16, Math.round(fs * (maxW / lay.tot) / 8) * 8);
+    lay = layout(fs);
+  }
+  const sp = fs * spK;
+  baseY = H * 0.525;
+  let x = W / 2 - lay.tot / 2;
+  const ych = L.chars || null;
+  for (let i = 0; i < arr.length; i++) {
+    chars.push({
+      c: arr[i], x: x + lay.ws[i] / 2, y: baseY, w: lay.ws[i],
+      t: (ych && ych[i] && ych[i].t != null) ? ych[i].t : (L.t + i * 0.2),
+      g: 0
+    });
+    x += lay.ws[i] + sp;
+  }
+}
+
+/* ---------------- 湿晕：每句烘一次 ---------------- */
+const glowCv = document.createElement('canvas');
+const glowS = document.createElement('canvas');
+let glowReady = false;
+
+function bakeGlow() {
+  glowReady = false;
+  glowCv.width = CW; glowCv.height = CH;
+  const gw = Math.max(2, CW >> 1), gh = Math.max(2, CH >> 1);
+  glowS.width = gw; glowS.height = gh;
+  const gs = glowS.getContext('2d');
+  gs.clearRect(0, 0, gw, gh);
+  if (!chars.length) return;
+  const s = gw / W;
+  gs.font = measureFont(fs * s);
+  gs.textAlign = 'center';
+  gs.textBaseline = 'middle';
+  /* 只描边不填：晕要贴着笔画的边，笔画内部留暗 —— 这才是"墨润边"，
+     填实再模糊会变成字背后的一坨灰雾。 */
+  gs.strokeStyle = 'rgb(' + INK_HOT + ')';
+  gs.lineJoin = 'round';
+  gs.lineWidth = Math.max(0.8, fs * s * 0.09);
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i];
+    if (!c.c || c.c === ' ') continue;
+    gs.strokeText(c.c, c.x * s, c.y * s);
+  }
+  gs.lineWidth = Math.max(0.6, fs * s * 0.16);
+  gs.strokeStyle = 'rgba(' + INK_DEEP + ',0.34)';
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i];
+    if (!c.c || c.c === ' ') continue;
+    gs.strokeText(c.c, c.x * s, c.y * s);
+  }
+  const g = glowCv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, CW, CH);
+  g.globalCompositeOperation = 'source-over';
+  g.filter = 'blur(' + Math.max(1.6, fs * s * 0.26).toFixed(1) + 'px)';
+  g.drawImage(glowS, 0, 0, CW, CH);
+  g.filter = 'none';
+  glowReady = true;
+}
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(1, window.innerWidth);
+  H = Math.max(1, window.innerHeight);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CW = Math.max(2, Math.round(W * 0.5));
+  CH = Math.max(2, Math.round(H * 0.5));
+  inkCv.width = CW; inkCv.height = CH;
+  bakeBg();
+  bakeMask();
+  if (curIdx >= 0 && lines[curIdx]) { buildText(lines[curIdx]); bakeGlow(); }
+}
+
+/* ---------------- 暗角 + 硬边框（预烘，每帧一次 blit） ---------------- */
+const maskCv = document.createElement('canvas');
+const mctx = maskCv.getContext('2d');
+function bakeMask() {
+  maskCv.width = Math.max(2, Math.round(W));
+  maskCv.height = Math.max(2, Math.round(H));
+  mctx.clearRect(0, 0, W, H);
+  const vg = mctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.24, W / 2, H / 2, Math.max(W, H) * 0.76);
+  vg.addColorStop(0, 'rgba(4,5,8,0)');
+  vg.addColorStop(0.60, 'rgba(4,5,8,0.30)');
+  vg.addColorStop(1, 'rgba(4,5,8,0.74)');
+  mctx.fillStyle = vg;
+  mctx.fillRect(0, 0, W, H);
+  const EM = Math.max(30, Math.min(70, Math.min(W, H) * 0.062));
+  const edges = [
+    [0, 0, W, EM, 0, 0, 0, EM],
+    [0, H - EM, W, EM, 0, H, 0, H - EM],
+    [0, 0, EM, H, 0, 0, EM, 0],
+    [W - EM, 0, EM, H, W, 0, W - EM, 0]
+  ];
+  for (let i = 0; i < 4; i++) {
+    const e = edges[i];
+    const g = mctx.createLinearGradient(e[4], e[5], e[6], e[7]);
+    g.addColorStop(0, 'rgba(5,6,10,1)');
+    g.addColorStop(0.66, 'rgba(5,6,10,0.55)');
+    g.addColorStop(1, 'rgba(5,6,10,0)');
+    mctx.fillStyle = g;
+    mctx.fillRect(e[0], e[1], e[2], e[3]);
+  }
+}
+
+/* ---------------- 时间 ---------------- */
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+function idxAt(T) {
+  let lo = -1, hi = lines.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (lines[mid].t <= T) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+function enterLine(ci) {
+  const L = lines[ci];
+  if (!L) return;
+  lineT = L.t;
+  lineDur = (L.dur && L.dur > 0.25) ? L.dur : 2.4;
+  kick = 1;
+  gradMain = null;
+  buildText(L);
+  bakeGlow();
+  hint.style.opacity = '0';
+  /* 换句：墨雾整体被推一下，像有人在水里落了一笔 */
+  for (let i = 0; i < NB; i++) bal[i] = Math.min(0.24, bal[i] * 1.5);
+}
+function timing(T) {
+  if (!lines.length) return;
+  const ci = idxAt(T);
+  if (ci !== curIdx) {
+    curIdx = ci;
+    if (ci >= 0) enterLine(ci);
+    else { lineT = 1e9; chars = []; }
+  }
+}
+
+/* ---------------- 镜头 ---------------- */
+let camDX = 0, camDY = 0, camROT = 0, camZ = 1;
+const OVER = 28;
+function applyCam(k) {
+  const z = 1 + (camZ - 1) * k;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.translate(W / 2 + camDX * k, H / 2 + camDY * k);
+  ctx.rotate(camROT * k);
+  ctx.scale(z, z);
+  ctx.translate(-W / 2, -H / 2);
+}
+
+/* ---------------- 浮尘 ---------------- */
+const DUST = 72;
+const dux = new Float32Array(DUST), duy = new Float32Array(DUST),
+  duv = new Float32Array(DUST), dur = new Float32Array(DUST),
+  dua = new Float32Array(DUST), dph = new Float32Array(DUST);
+for (let i = 0; i < DUST; i++) {
+  dux[i] = Math.random(); duy[i] = Math.random();
+  duv[i] = 0.004 + Math.random() * 0.013;
+  dur[i] = Math.random() < 0.25 ? 2 : 1;
+  dua[i] = 0.10 + Math.random() * 0.34;
+  dph[i] = Math.random() * TAU;
+}
+
+/* ---------------- 墨层绘制（全部在半分辨率画布上） ---------------- */
+function drawInk(dt, settle, surge) {
+  ink.setTransform(1, 0, 0, 1, 0, 0);
+  ink.globalCompositeOperation = 'source-over';
+  ink.globalAlpha = 1;
+  ink.drawImage(bgCv, 0, 0);
+  ink.globalCompositeOperation = 'lighter';
+  ink.imageSmoothingEnabled = true;
+
+  /* 墨雾：大块缓慢变形 + 旋一点角度 —— 看上去像水里的墨在扩散，
+     不是光带、不是贴图、不是亮球。整层只有十几次 drawImage。 */
+  const M = Math.max(CW, CH);
+  for (let i = 0; i < NB; i++) {
+    const ph = t0 * (0.095 + i * 0.016) + bph[i];
+    const x = (bxp[i] + Math.sin(ph) * 0.13) * CW;
+    const y = (byp[i] + Math.cos(ph * 0.77) * 0.07) * CH;
+    const base = bsc[i] * M;
+    /* 横向拉长：墨在水里是被拉成带的，不是圆球 */
+    const rx = base * (1.75 + 0.45 * Math.sin(ph * 1.27 + i));
+    const ry = base * (0.20 + 0.10 * Math.cos(ph * 1.09 + i * 1.7));
+    const rot = Math.sin(ph * 0.55 + i) * 0.22;
+    const spr = (i === 2 || i === 7) ? BLOB_WARM : BLOB_COOL;
+    ink.globalAlpha = Math.min(0.26, bal[i] * (0.85 + 0.40 * surge) * (spr === BLOB_WARM ? 0.55 : 1));
+    ink.save();
+    ink.translate(x, y);
+    ink.rotate(rot);
+    ink.drawImage(spr, -rx, -ry, rx * 2, ry * 2);
+    ink.restore();
+  }
+
+  /* 湿晕：预烘的"墨在笔画上停住"的柔光（每句烘一次，每帧一次 drawImage） */
+  if (settle > 0.002 && glowReady) {
+    ink.globalAlpha = 0.55 * settle;
+    ink.drawImage(glowCv, 0, 0, CW, CH);
+  }
+  ink.globalAlpha = 1;
+}
+
+/* ---------------- 主循环 ---------------- */
+let gradMain = null;
+
+function frame(ms) {
+  const dt = Math.min(0.05, (ms - last) / 1000);
+  last = ms; t0 += dt;
+  const T = now();
+  timing(T);
+
+  pulse *= Math.exp(-dt * 2.6);
+  kick *= Math.exp(-dt * 2.2);
+  lum += ((playing ? 1 : 0.6) - lum) * Math.min(1, dt * 1.6);
+
+  camDX = Math.sin(t0 * 0.11) * 13 + Math.sin(t0 * 0.041 + 1.3) * 7;
+  camDY = Math.cos(t0 * 0.145) * 8 + Math.cos(t0 * 0.053) * 4;
+  camROT = Math.sin(t0 * 0.083) * 0.0055 + Math.sin(t0 * 0.191) * 0.0016;
+  camZ = 1 + Math.sin(t0 * 0.207) * 0.017 + kick * 0.05 + pulse * 0.012;
+
+  const live = curIdx >= 0 && chars.length > 0 && W > 0;
+  const lineAge = live ? T - lineT : -1;
+  let settle = 0;
+  if (live) {
+    const ramp = clamp(lineAge / 1.0, 0, 1);
+    const hold = clamp(1 - (lineAge - lineDur - 0.12) / 0.55, 0, 1);
+    settle = (ramp * ramp * (3 - 2 * ramp)) * (hold * hold * (3 - 2 * hold));
+  }
+  const surge = 1 + 0.9 * Math.exp(-Math.max(0, lineAge) * 2.6) + pulse * 0.25 + (lum - 0.6) * 0.5;
+
+  /* ---- 墨层 ---- */
+  drawInk(dt, settle, surge);
+
+  /* ---- 铺到主画布 ---- */
+  applyCam(1);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(inkCv, -OVER, -OVER, W + OVER * 2, H + OVER * 2);
+
+  /* ---- 浮尘（视差更快） ---- */
+  ctx.globalCompositeOperation = 'lighter';
+  applyCam(1.35);
+  const az = accent;
+  ctx.fillStyle = 'rgb(' + az[0] + ',' + az[1] + ',' + az[2] + ')';
+  for (let i = 0; i < DUST; i++) {
+    const x = ((dux[i] + Math.sin(t0 * 0.05 + dph[i]) * 0.012) % 1 + 1) % 1;
+    let y = duy[i] + ((t0 * duv[i]) % 1);
+    if (y > 1) y -= 1;
+    const a = dua[i] * (0.5 + 0.5 * Math.sin(t0 * 1.3 + dph[i]));
+    if (a <= 0.02) continue;
+    ctx.globalAlpha = a;
+    /* 收在画面内侧 4%：边上不留亮点，避免"贴边"误判 */
+    ctx.fillRect((0.04 + x * 0.92) * W, (0.05 + y * 0.90) * H, dur[i], dur[i]);
+  }
+  ctx.globalAlpha = 1;
+
+  /* ---- 字 ---- */
+  applyCam(1);
+  ctx.globalCompositeOperation = 'source-over';
+  if (live && chars.length) {
+    ctx.font = measureFont(fs);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    if (!gradMain) {
+      /* 渐变坐标在创建时按 CTM 烘死 → 必须用屏幕坐标建 */
+      gradMain = ctx.createLinearGradient(0, baseY - fs * 0.58, 0, baseY + fs * 0.58);
+      gradMain.addColorStop(0, 'rgb(' + T_TOP[0] + ',' + T_TOP[1] + ',' + T_TOP[2] + ')');
+      gradMain.addColorStop(0.34, 'rgb(' + T_MID[0] + ',' + T_MID[1] + ',' + T_MID[2] + ')');
+      gradMain.addColorStop(0.72, 'rgb(' + T_LOW[0] + ',' + T_LOW[1] + ',' + T_LOW[2] + ')');
+      gradMain.addColorStop(1, 'rgb(' + T_BOT[0] + ',' + T_BOT[1] + ',' + T_BOT[2] + ')');
+    }
+    for (let i = 0; i < chars.length; i++) {
+      const c = chars[i];
+      if (!c.c || c.c === ' ') continue;
+      c.g += ((T >= c.t ? 1 : 0) - c.g) * Math.min(1, dt * 6.5);
+      const e = clamp((lineAge - i * 0.026) / 0.40, 0, 1);
+      const ease = 1 - (1 - e) * (1 - e) * (1 - e);
+      const yoff = -(1 - ease) * fs * 0.26;
+      const rot = (1 - ease) * 0.16 * ((i % 2) ? 1 : -1) + Math.sin(t0 * 0.9 + i * 1.7) * 0.013;
+      const scl = (0.92 + 0.08 * ease) * (1 + 0.028 * c.g);
+      const fy2 = Math.sin(t0 * 1.05 + i * 0.85) * fs * 0.017;
+      const alpha = (0.42 + 0.58 * ease) * (0.74 + 0.26 * c.g);
+
+      ctx.save();
+      ctx.translate(c.x, c.y + yoff + fy2);
+      ctx.rotate(rot);
+      ctx.scale(scl, scl);
+      /* 暗影：压出一线厚度，字才有重量 */
+      ctx.globalAlpha = alpha * 0.38;
+      ctx.fillStyle = 'rgba(3,5,9,1)';
+      ctx.fillText(c.c, fs * 0.022, fs * 0.040);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = gradMain;
+      ctx.fillText(c.c, 0, 0);
+      ctx.globalAlpha = alpha * (0.5 + 0.5 * c.g);
+      ctx.lineWidth = Math.max(0.7, fs * 0.011);
+      ctx.strokeStyle = T_RIM;
+      ctx.strokeText(c.c, 0, 0);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---- 落墨冲击环 ---- */
+  if (live && lineAge >= 0 && lineAge < 1.05) {
+    const u = lineAge / 1.05;
+    const ea = (1 - u) * (1 - u);
+    const rad = fs * (0.5 + 2.6 * u);
+    ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(W / 2, baseY, rad * 0.7, W / 2, baseY, rad);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(0.76, 'rgba(' + accent[0] + ',' + accent[1] + ',' + accent[2] + ',' + (0.22 * ea).toFixed(3) + ')');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(W / 2, baseY, rad, 0, TAU);
+    ctx.fill();
+  }
+
+  /* ---- 暗角 + 硬边框 ---- */
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.drawImage(maskCv, 0, 0, W, H);
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 装配 ---------------- */
+addEventListener('resize', () => { gradMain = null; resize(); });
+resize();
+requestAnimationFrame(frame);
+
+/* ---- 与播放器通信 ---- */
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    curIdx = -1; chars = [];
+    gradMain = null;
+    if (p.accent && p.accent.length === 3) {
+      accent = [
+        Math.round(92 * 0.55 + p.accent[0] * 0.45),
+        Math.round(126 * 0.55 + p.accent[1] * 0.45),
+        Math.round(176 * 0.55 + p.accent[2] * 0.45)
+      ];
+      recolor();
+      bakeBlobs();
+      bakeBg();
+    }
+    clockT = 0; clockAt = performance.now();
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    pulse = Math.min(1.5, pulse + 0.38 + (d.payload.level || 0) * 0.45);
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+window.__stage = () => ({
+  lines: lines.length, curIdx: curIdx, chars: chars.length,
+  text: lineText, fs: fs, age: curIdx >= 0 ? +(now() - lineT).toFixed(2) : -1,
+  ink: CW + 'x' + CH, t: +now().toFixed(2)
+});
+</script>
+</body>
+</html>

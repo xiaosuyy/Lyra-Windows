@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>超公式</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060b;overflow:hidden}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+        font:500 11px/1.5 ui-monospace,Consolas,monospace;
+        color:rgba(170,190,230,.30);letter-spacing:.08em;pointer-events:none;transition:opacity .6s}
+</style>
+</head>
+<body data-chrome="off">
+<canvas id="c"></canvas>
+<div id="hint">等待第一句…</div>
+<script>
+"use strict";
+/* ===========================================================================
+   050 · 超公式 —— 一句话换一个"物种"的轮廓
+   ---------------------------------------------------------------------------
+   核心机制：**Gielis 超公式的参数空间连续变形**。
+        r(θ) = ( |cos(mθ/4)/a|^n2 + |sin(mθ/4)/b|^n3 )^(−1/n1)
+   这一条式子能画出圆、花、齿轮、星形、圆角方、海星……换的不是形状，
+   是四个参数 (m, n1, n2, n3)。所以这里演的不是"图"，是**参数空间的旅行**：
+     · 每句词在参数空间里对应一个目标点（由这句的文字哈希决定，同一句永远同一形状）；
+     · 换句时四个参数**平滑插值**过去（约 1.1 秒），轮廓在中间态会经过
+       一些谁也没见过的形状 —— 那才是超公式最好看的地方，不是端点；
+     · 三层同形：外层、中层、内层各有一套自己的参数与相位，互相错开，
+       于是变形时会"套娃式"地一层层错位，像细胞分裂；
+     · 踩拍时 m 临时跳 1.2 档（脉冲衰减回去）：瓣数瞬间多出来又收回去，
+       这是超公式里最像"呼吸"的一个动作。
+
+   歌词怎么演：当前这句的每个字**沿最外层的轮廓等弧长排布**（字是正的，不旋转，
+   保证读得出来）；正在唱的那个字放大、提亮，唱过的留在中亮，没唱的很暗。
+   轮廓一变，字环跟着重排 —— 句子于是成了这个"物种"的装饰纹。
+
+   和已有形态的区别：041 万花尺 / 043 利萨如 都是**参数曲线**，但参数是时间；
+   这里是**参数空间本身在移动**（句与句之间是一段插值路径），
+   而且 045 泰森多边形、042 叶序都不涉及"一条公式长出一个物种"这件事。
+
+   性能：每帧 3 条轮廓 × 420 采样点，各自一条 Path2D 一次 fill+stroke；
+   字形环只在换句/尺寸变化时重排，每帧只量一次位置。
+
+   精修记录：① 逐字时刻集中在 charTimes()——chars 只在长度与正文相等且时间可解析时
+      采信，并做单调钳位；否则 line.t + dur*k/n 均分回退。② 长句（>26 字）不再绕环，
+      改成 1~3 行居中（41 字约 40px、3 行；环在 41 字时会绕成一圈、读不成句），
+      短句仍沿最外层轮廓等弧长成环。③ "轮廓随字变形"：瓣数 m 除了踩拍跳，
+      还按"已唱比例"慢慢长出来；进场 0.35s 缩放淡入，未唱到的字保持可读的灰。
+      ④ 长句的阅读台放宽到 2R 内、垫底的聚焦暗场改成"按句子块大小拉伸"（原来是
+      固定 2.34R 的软光斑，41 字时边缘只剩三成暗度，亮轮廓会从字缝里穿过去）。
+      分词：不接 —— 长句是折行、短句是沿轮廓等弧长成环，两条路都吃"逐字"这条时间轴；
+      词边界比字更粗，塞进环上只会把等弧长的节奏打断，所以不读 segdict。
+   ========================================================================== */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const hint = document.getElementById('hint');
+
+let W = 0, H = 0, DPR = 1, CX = 0, CY = 0, R = 280;
+let accent = [150, 190, 255];
+const PI = Math.PI, TAU = PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rgba = (r, g, b, a) => 'rgba(' + (clamp(r, 0, 255) | 0) + ',' + (clamp(g, 0, 255) | 0) + ',' + (clamp(b, 0, 255) | 0) + ',' + a + ')';
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (t) => t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
+
+/* ---------------- 超公式本体 ---------------- */
+const SEG = 420;
+const sx = new Float32Array(SEG + 1), sy = new Float32Array(SEG + 1);
+const sLen = new Float32Array(SEG + 1);
+
+function superR(th, m, n1, n2, n3) {
+  const c = Math.abs(Math.cos(m * th / 4));
+  const s = Math.abs(Math.sin(m * th / 4));
+  const t = Math.pow(c, n2) + Math.pow(s, n3);
+  if (!(t > 1e-9)) return 0;
+  const r = Math.pow(t, -1 / n1);
+  return isFinite(r) ? Math.min(r, 4) : 4;
+}
+
+/* 一套参数 → 归一化到半径 R 的闭合折线 */
+function buildShape(m, n1, n2, n3, rot, outX, outY, outLen) {
+  let mx = 1e-6;
+  for (let i = 0; i < SEG; i++) {
+    const th = i / SEG * TAU;
+    const r = superR(th, m, n1, n2, n3);
+    if (r > mx) mx = r;
+  }
+  const sc = R / mx;
+  const cr = Math.cos(rot), sr = Math.sin(rot);
+  for (let i = 0; i <= SEG; i++) {
+    const th = (i % SEG) / SEG * TAU;
+    const r = superR(th, m, n1, n2, n3) * sc;
+    const x = Math.cos(th) * r, y = Math.sin(th) * r;
+    outX[i] = CX + (x * cr - y * sr);
+    outY[i] = CY + (x * sr + y * cr);
+  }
+  if (outLen) {
+    let acc = 0;
+    outLen[0] = 0;
+    for (let i = 1; i <= SEG; i++) {
+      acc += Math.hypot(outX[i] - outX[i - 1], outY[i] - outY[i - 1]);
+      outLen[i] = acc;
+    }
+  }
+  return mx;
+}
+
+/* ---------------- 参数：当前 / 目标 ---------------- */
+const P = [
+  { m: 6, n1: 1.0, n2: 1.0, n3: 1.0, rot: 0.0, spin: 0.05, tx: { m: 6, n1: 1, n2: 1, n3: 1 } },
+  { m: 5, n1: 0.9, n2: 2.2, n3: 1.4, rot: 0.4, spin: -0.07, tx: { m: 5, n1: 0.9, n2: 2.2, n3: 1.4 } },
+  { m: 8, n1: 1.4, n2: 0.8, n3: 3.0, rot: 1.1, spin: 0.11, tx: { m: 8, n1: 1.4, n2: 0.8, n3: 3.0 } },
+];
+let morphT = 1;                     // 0..1，插值进度
+const MORPH_DUR = 1.15;
+
+/* 由文字决定目标参数：同一句永远长成同一个形状 */
+function hashOf(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function pickTargets(text, seedIdx) {
+  const h = hashOf(text || '') ^ (seedIdx * 2654435761 >>> 0);
+  const rnd = (k) => ((h >>> (k * 5)) & 1023) / 1023;
+  for (let i = 0; i < P.length; i++) {
+    const rr = (k) => ((hashOf(text + '#' + k + '_' + i) % 1000) / 1000);
+    const m = 3 + Math.floor(rr(0) * 10);                       // 3..12 瓣
+    const n1 = 0.55 + rr(1) * 2.6;                              // 形状刚性
+    const n2 = 0.5 + rr(2) * 6.0;
+    const n3 = 0.5 + rr(3) * 6.0;
+    /* 参数之间隔一层，叠起来才不会同形 */
+    P[i].tx = { m: m + i * 1, n1: n1 * (1 + i * 0.18), n2: n2 * (1 - i * 0.20), n3: n3 * (1 + i * 0.14) };
+  }
+  void rnd;
+  morphT = 0;
+}
+
+/* ---------------- 字形：短句沿轮廓成环，长句折行（否则 41 字没法读） ---------------- */
+const om = document.createElement('canvas').getContext('2d');
+const FONT = (fs) => '900 ' + fs.toFixed(1) + 'px ui-sans-serif,system-ui,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
+const RING_MAX = 26;         // 超过这么多字就不再绕环，改成 1~3 行居中（读得出来优先）
+let ring = [];              // 每个字的位置与切向
+let ringFs = 30;
+let curLine = null;
+let rowsMode = null;        // { rows, fs, lh, n } —— 长句的分行排版
+let curCt = null, curYrc = false, curN = 0;
+
+/* 逐字时刻：chars 与正文逐字对齐（长度相等 + 时间可解析）才采信，并单调钳位；
+   否则 line.t + dur*k/n 均分回退 —— 缺 chars 绝不能报错。 */
+function charTimes(line, n) {
+  const out = new Float32Array(n);
+  const txt = line ? (line.text || '') : '';
+  const chs = line ? line.chars : null;
+  const base = line ? line.t : 0;
+  const dur = line ? (line.dur || 4) : 4;
+  let ok = !!(chs && chs.length === txt.length && txt.length === n && n > 0);
+  if (ok) {
+    let prev = -1e9;
+    for (let k = 0; k < n; k++) {
+      const c = chs[k];
+      if (!c || !isFinite(c.t)) { ok = false; break; }
+      if (c.t > prev) prev = c.t;
+      out[k] = prev;
+    }
+  }
+  if (!ok) for (let k = 0; k < n; k++) out[k] = base + dur * k / Math.max(1, n);
+  return { t: out, yrc: ok };
+}
+
+function wrapAt(s, fs, availW) {
+  om.font = FONT(fs);
+  const out = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (cur && om.measureText(cur + ch).width > availW) {
+      const sp = cur.lastIndexOf(' ');
+      if (sp > cur.length * 0.45) { out.push(cur.slice(0, sp)); cur = cur.slice(sp + 1) + ch; }
+      else { out.push(cur); cur = ch; }
+    } else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/* 长句：1~3 行，取放得下的最大字号（41 字约 40px、3 行） */
+function buildRows(text) {
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s) { rowsMode = null; return; }
+  /* 阅读台要用满轮廓的内接框（2R），否则 41 字只能排到 35px —— 播放器里偏小 */
+  const availW = Math.min(R * 2.00, W * 0.74);
+  const availH = Math.min(R * 1.22, H * 0.54);
+  om.font = FONT(100);
+  const w100 = Math.max(1, om.measureText(s).width);
+  let best = 0;
+  for (let nl = 1; nl <= 3; nl++) {
+    const f = Math.min(availW * nl / (w100 / 100), availH / (nl * 1.26), 120);
+    if (f > best) best = f;
+  }
+  let fs = Math.max(13, best);
+  let rows = wrapAt(s, fs, availW);
+  let guard = 0;
+  while (rows.length > 3 && fs > 12 && guard++ < 40) { fs *= 0.92; rows = wrapAt(s, fs, availW); }
+  const lh = fs * 1.26;
+  om.font = FONT(fs);
+  const out = [];
+  for (const r of rows) {
+    const chars = [];
+    let x = 0;
+    for (const ch of r) {
+      const w = om.measureText(ch).width;
+      chars.push({ ch, x, w });
+      x += w;
+    }
+    out.push({ chars, w: x });
+  }
+  rowsMode = { rows: out, fs, lh, n: s.length };
+}
+
+function buildRing(text) {
+  ring = [];
+  const s = (text || '').replace(/\s+/g, ' ').trim();
+  if (!s || !sLen[SEG]) { return; }
+  const n = s.length;
+  const total = sLen[SEG];
+  /* 字体大小：环长 / 字数，再按屏幕收一下 */
+  ringFs = clamp(total / n * 0.60, 12, 62);
+  /* 从**最高点**开始沿顺时针排（12 点方向起读，和钟面一致，才不别扭） */
+  let topI = 0, topY = 1e9;
+  for (let i = 0; i <= SEG; i++) if (sy[i] < topY) { topY = sy[i]; topI = i; }
+  const start = sLen[topI];
+  for (let i = 0; i < n; i++) {
+    let target = start + (i + 0.5) / n * total;
+    while (target >= total) target -= total;
+    /* 二分找弧长位置 */
+    let lo = 0, hi = SEG;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (sLen[mid] < target) lo = mid + 1; else hi = mid; }
+    const idx = clamp(lo, 1, SEG);
+    const segLen = sLen[idx] - sLen[idx - 1] || 1;
+    const f = clamp((target - sLen[idx - 1]) / segLen, 0, 1);
+    ring.push({
+      ch: s[i],
+      x: lerp(sx[idx - 1], sx[idx], f),
+      y: lerp(sy[idx - 1], sy[idx], f)
+    });
+  }
+}
+
+/* ---------------- 节奏 ---------------- */
+let lines = [];
+let clockT = 0, clockAt = 0, playing = false;
+const now = () => clockT + (playing ? (performance.now() - clockAt) / 1000 : 0);
+let curIdx = -1, brewIdx = -1, lastT = -1;
+const LEAD = 1.3;
+let brewLine = null, pulse = 0, t0 = 0;
+
+function timing(T) {
+  if (!lines.length) return;
+  if (T < lastT - 0.6) { curIdx = -1; brewIdx = -1; curLine = null; ring = []; rowsMode = null; curCt = null; }
+  lastT = T;
+  let ci = curIdx;
+  while (ci + 1 < lines.length && T >= lines[ci + 1].t) ci++;
+  if (ci !== curIdx) {
+    curIdx = ci;
+    brewIdx = -1;
+    if (ci >= 0) {
+      curLine = lines[ci];
+      pickTargets(curLine.text || '', ci);
+      const txt = (curLine.text || '').replace(/\s+/g, ' ').trim();
+      const ct = charTimes(curLine, txt.length);
+      curCt = ct.t; curYrc = ct.yrc; curN = txt.length;
+      /* 长句分行、短句成环：两条路都逐字接 YRC */
+      if (txt.length > RING_MAX) { buildRows(txt); ring = []; }
+      else { rowsMode = null; }
+      ringDirty = true;
+      hint.style.opacity = '0';
+    } else { curLine = null; ring = []; rowsMode = null; curCt = null; }
+  }
+  const nx = curIdx + 1;
+  if (nx < lines.length && brewIdx !== nx) {
+    const gap = lines[nx].t - (curIdx >= 0 ? lines[curIdx].t : lines[nx].t - 4);
+    const lead = Math.min(LEAD, Math.max(0.45, gap * 0.55));
+    if (T >= lines[nx].t - lead) brewIdx = nx;
+  }
+}
+
+/* ---------------- 渲染 ---------------- */
+let bgGrd = null, vigGrd = null, txtSpr = null;
+
+function buildStatic() {
+  bgGrd = ctx.createRadialGradient(CX, CY, 0, CX, CY, Math.max(W, H) * 0.75);
+  bgGrd.addColorStop(0, '#0a1020');
+  bgGrd.addColorStop(0.5, '#05080f');
+  bgGrd.addColorStop(1, '#02040a');
+  /* 暗角压在外圈之外（原来从 R*0.7 就开始压，把字环整圈压灰了） */
+  vigGrd = ctx.createRadialGradient(CX, CY, R * 1.18, CX, CY, Math.max(W, H) * 0.80);
+  vigGrd.addColorStop(0, rgba(accent[0], accent[1], accent[2], 0));
+  vigGrd.addColorStop(1, 'rgba(1,3,8,0.78)');
+  /* 字的"聚焦暗场"：轮廓是亮的，不垫一层暗底长句就糊在图形里。
+     烘成小位图（256²）后按文字块大小拉伸 —— 比每帧全屏铺一层径向渐变省一半像素。
+     中间留一段"平台"（到 0.70 半径都还有 0.52），否则长句两头的字正好落在
+     光斑的衰减段上，亮轮廓又会从字缝里穿过去。 */
+  const tc = document.createElement('canvas');
+  tc.width = tc.height = 256;
+  const tg = tc.getContext('2d');
+  const tr = tg.createRadialGradient(128, 128, 0, 128, 128, 128);
+  tr.addColorStop(0, 'rgba(3,5,11,0.62)');
+  tr.addColorStop(0.70, 'rgba(3,5,11,0.52)');
+  tr.addColorStop(0.90, 'rgba(3,5,11,0.28)');
+  tr.addColorStop(1, 'rgba(3,5,11,0)');
+  tg.fillStyle = tr;
+  tg.fillRect(0, 0, 256, 256);
+  txtSpr = tc;
+}
+
+const outerX = new Float32Array(SEG + 1), outerY = new Float32Array(SEG + 1), outerLen = new Float32Array(SEG + 1);
+const shapeX = new Float32Array(SEG + 1), shapeY = new Float32Array(SEG + 1);
+let ringDirty = true;
+
+function frame(nowMs) {
+  const dt = Math.min(0.05, (nowMs - last) / 1000);
+  last = nowMs; t0 += dt;
+  const T = now();
+  timing(T);
+  if (pulse > 0) { pulse *= Math.exp(-dt * 3.8); if (pulse < 0.004) pulse = 0; }
+  if (morphT < 1) morphT = Math.min(1, morphT + dt / MORPH_DUR);
+  const e = smooth(morphT);
+
+  /* 参数插值（每个形态各自朝自己的目标走） */
+  for (let i = 0; i < P.length; i++) {
+    const p = P[i];
+    p.m = lerp(p.m, p.tx.m, 0.12 + e * 0.5);
+    p.n1 = lerp(p.n1, p.tx.n1, 0.10 + e * 0.45);
+    p.n2 = lerp(p.n2, p.tx.n2, 0.10 + e * 0.45);
+    p.n3 = lerp(p.n3, p.tx.n3, 0.10 + e * 0.45);
+    p.rot += p.spin * dt;
+  }
+
+  /* 唱到几成：轮廓的瓣数随它慢慢长出来 —— "轮廓随字变形" */
+  let litFrac = 0;
+  if (curCt && curCt.length) {
+    let c = 0;
+    for (let i = 0; i < curCt.length; i++) if (T >= curCt[i]) c++;
+    litFrac = c / curCt.length;
+  }
+
+  /* 背景 */
+  ctx.fillStyle = '#04060b';
+  ctx.fillRect(0, 0, W, H);
+  if (bgGrd) { ctx.fillStyle = bgGrd; ctx.fillRect(0, 0, W, H); }
+
+  /* 三层轮廓：从里到外画，外层最后画（压在最上面） */
+  for (let i = P.length - 1; i >= 0; i--) {
+    const p = P[i];
+    /* 踩拍 m 临时多一两瓣（呼吸），另外每唱过一部分就再长出一点 */
+    const mEff = p.m + pulse * (1.2 + i * 0.3) + litFrac * (0.9 + i * 0.5);
+    const scale = 1 - i * 0.20;
+    const RR = R * scale;
+    const ox = shapeX, oy = shapeY;
+    /* 采样（内层按 scale 缩小：直接复用归一化后的半径） */
+    let mxr = 1e-6;
+    for (let k = 0; k < SEG; k++) {
+      const r = superR(k / SEG * TAU, mEff, p.n1, p.n2, p.n3);
+      if (r > mxr) mxr = r;
+    }
+    const sc = RR / mxr;
+    const cr = Math.cos(p.rot), sr = Math.sin(p.rot);
+    const path = new Path2D();
+    for (let k = 0; k <= SEG; k++) {
+      const th = (k % SEG) / SEG * TAU;
+      const r = superR(th, mEff, p.n1, p.n2, p.n3) * sc;
+      const x = Math.cos(th) * r, y = Math.sin(th) * r;
+      const px = CX + (x * cr - y * sr);
+      const py = CY + (x * sr + y * cr);
+      ox[k] = px; oy[k] = py;
+      if (k === 0) path.moveTo(px, py); else path.lineTo(px, py);
+    }
+    path.closePath();
+
+    /* 三层用 lighter 叠加：交点会自己变亮，于是"套娃"的层次不用画就出来了 */
+    const aFill = 0.20 - i * 0.040;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = rgba(accent[0] * 0.55 + i * 12, accent[1] * 0.60 + i * 8, accent[2] * 0.80, Math.max(0.04, aFill));
+    ctx.fill(path);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = rgba(accent[0] + 90 - i * 15, accent[1] + 80 - i * 10, 255, 0.88 - i * 0.20 + pulse * 0.14);
+    ctx.lineWidth = i === 0 ? 1.8 : 1.1;
+    ctx.stroke(path);
+  }
+
+  /* 最外层：把它的采样点留出来给字环用，并重建字环 */
+  const p0 = P[0];
+  buildShape(p0.m + pulse * 1.2 + litFrac * 0.9, p0.n1, p0.n2, p0.n3, p0.rot, sx, sy, sLen);
+  if (curLine && ringDirty) {
+    if (!rowsMode) buildRing(curLine.text);
+    ringDirty = false;
+  }
+
+  /* 字的暗场（先垫底，字才压得住发亮的轮廓）：跟着句子块的实际大小走 */
+  if (txtSpr && curLine && curCt && curCt.length) {
+    let tw = Math.min(W * 0.90, R * 2.34), th = Math.min(H * 0.78, R * 1.74);
+    if (rowsMode) {
+      let bw = 0;
+      for (const ln of rowsMode.rows) if (ln.w > bw) bw = ln.w;
+      tw = Math.min(W * 0.96, bw * 1.26 + 64);
+      th = Math.min(H * 0.90, rowsMode.rows.length * rowsMode.lh * 2.1 + 40);
+    }
+    ctx.drawImage(txtSpr, CX - tw / 2, CY - th / 2, tw, th);
+  }
+
+  /* 字：短句沿轮廓成环、长句折行居中；两条路都按 YRC 逐字点亮 */
+  if (curLine && curCt && curCt.length && (ring.length || rowsMode)) {
+    const n = curCt.length;
+    let curCh = -1;
+    for (let i = 0; i < n; i++) if (T >= curCt[i]) curCh = i;
+    /* 进场：开唱那一刻 0.35s 内从 1.04 缩到 1 并淡入 */
+    const app = clamp((T - curLine.t) / 0.35, 0, 1);
+    const ease = app * app * (3 - 2 * app);
+    const pop = 1 + 0.04 * (1 - ease);
+    ctx.save();
+    ctx.translate(CX, CY); ctx.scale(pop, pop); ctx.translate(-CX, -CY);
+    ctx.globalAlpha = ease;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    let lastFs = -1;
+    if (ring.length) {
+      for (let i = 0; i < ring.length; i++) {
+        const r = ring[i];
+        const isCur = i === curCh;
+        const fsz = ringFs * (isCur ? 1.26 : 1);
+        if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+        const sung = T >= curCt[i];
+        ctx.fillStyle = isCur ? 'rgba(250,253,255,0.97)'
+          : sung ? rgba(accent[0] + 70, accent[1] + 60, 255, 0.84)
+            : rgba(158, 172, 214, 0.44);
+        ctx.fillText(r.ch, r.x, r.y);
+      }
+    } else {
+      const RM = rowsMode;
+      const blockH = RM.rows.length * RM.lh;
+      let y = CY - blockH / 2 + RM.lh / 2;
+      let k = 0;
+      for (const ln of RM.rows) {
+        let x = CX - ln.w / 2;
+        for (const ch of ln.chars) {
+          const isCur = k === curCh;
+          const fsz = RM.fs * (isCur ? 1.08 : 1);
+          if (fsz !== lastFs) { ctx.font = FONT(fsz); lastFs = fsz; }
+          const cw = ch.w;
+          const sung = T >= curCt[k];
+          ctx.fillStyle = isCur ? 'rgba(250,253,255,0.98)'
+            : sung ? rgba(accent[0] + 70, accent[1] + 60, 255, 0.86)
+              : rgba(158, 172, 214, 0.46);
+          ctx.fillText(ch.ch, x + cw / 2, y);
+          x += cw;
+          k++;
+        }
+        y += RM.lh;
+      }
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  if (vigGrd) { ctx.fillStyle = vigGrd; ctx.fillRect(0, 0, W, H); }
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- 尺寸 / 通信 ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CX = W / 2; CY = H / 2;
+  R = Math.min(W, H) * 0.395;
+  buildStatic();
+  ringDirty = true;
+  if (curLine) {
+    const txt = (curLine.text || '').replace(/\s+/g, ' ').trim();
+    if (txt.length > RING_MAX) buildRows(txt);
+  }
+}
+addEventListener('resize', resize);
+
+const ping = () => { try { parent.postMessage({ __c100: 1, type: 'activity' }, '*'); } catch (_) {} };
+addEventListener('pointermove', ping, { passive: true });
+addEventListener('pointerdown', ping, { passive: true });
+addEventListener('wheel', ping, { passive: true });
+addEventListener('keydown', ping);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    try { parent.postMessage({ __c100: 1, type: 'key', payload: { key: 'Space' } }, '*'); } catch (_) {}
+  }
+}, true);
+
+addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.__c100 !== 1) return;
+  if (d.type === 'init') {
+    const p = d.payload || {};
+    lines = (p.lines || []).slice().sort((a, b) => a.t - b.t);
+    if (p.accent) { accent = p.accent; buildStatic(); }
+    curIdx = -1; brewIdx = -1; lastT = -1;
+    curLine = null; brewLine = null; ring = []; rowsMode = null; curCt = null;
+    pulse = 0; morphT = 1;
+    clockT = 0; clockAt = performance.now(); playing = false;
+    hint.textContent = lines.length ? '等待第一句…' : '这首没有歌词';
+    hint.style.opacity = lines.length ? '1' : '0.5';
+  } else if (d.type === 'tick') {
+    clockT = d.payload.time; clockAt = performance.now(); playing = !!d.payload.playing;
+  } else if (d.type === 'beat') {
+    /* 相干：整层一起多长出一瓣，再收回去（轮廓呼吸） */
+    const lv = d.payload && d.payload.level ? d.payload.level : 0.5;
+    pulse = 0.35 + lv * 0.65;
+  }
+});
+try { parent.postMessage({ __c100: 1, type: 'ready' }, '*'); } catch (_) {}
+
+let last = performance.now();
+resize();
+requestAnimationFrame(frame);
+
+window.__stage = () => ({
+  lines: lines.length, curIdx, brewIdx, T: +now().toFixed(2),
+  ring: ring.length, rows: rowsMode ? rowsMode.rows.length : 0,
+  yrc: curYrc, yrcLen: curLine && curLine.chars ? curLine.chars.length : 0,
+  fs: rowsMode ? +rowsMode.fs.toFixed(1) : +ringFs.toFixed(1),
+  morph: +morphT.toFixed(2), m: P.map((p) => +p.m.toFixed(2))
+});
+</script>
+</body>
+</html>

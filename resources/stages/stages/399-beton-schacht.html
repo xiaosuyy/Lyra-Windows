@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>振捣</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#111214;overflow:hidden}
+  canvas#cv{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+/* ===================================================================
+   1. 自检口：脚本最外层、无条件赋值（第一段）
+   =================================================================== */
+var STAGE = {
+  lines: [], idx: -1, t: 0, playing: true,
+  frames: 0, js: 0, err: '', text: '',
+  gl: false, rm: false,
+  duration: 0, accent: [176, 88, 54], bootOk: false,
+  beatCount: 0, beatSeen: false, lastBeatT: -99, level: 0,
+  bpm: 0, bass: 0, mid: 0, treble: 0,
+  songName: '', songArtist: ''
+};
+window.__stage = function () {
+  return {
+    lines: STAGE.lines.length,
+    idx: STAGE.idx,
+    t: STAGE.t,
+    playing: STAGE.playing,
+    frames: STAGE.frames,
+    js: STAGE.js,
+    err: STAGE.err,
+    text: STAGE.text,
+    gl: false,
+    rm: STAGE.rm
+  };
+};
+
+/* ===================================================================
+   2. ready：第一个 rAF 里无条件发一次 + 定时兜底；排在所有 boot 之前
+   =================================================================== */
+var READY_SENT = false;
+function fireReady() {
+  if (READY_SENT) return;
+  READY_SENT = true;
+  try {
+    parent.postMessage({ __c100: 1, type: 'ready' }, '*');
+  } catch (err) {
+    STAGE.err = 'ready:' + (err && err.message ? err.message : err);
+    console.error('[399] ready postMessage failed', err);
+  }
+}
+requestAnimationFrame(function () {
+  fireReady();
+  bootStage();
+});
+/* 定时兜底：除了补发 ready，也保证 boot 一定跑起来（标签页被隐藏时 rAF 不触发） */
+setTimeout(function () {
+  fireReady();
+  bootStage();
+}, 700);
+
+/* ===================================================================
+   3. 工具
+   =================================================================== */
+function clampNum(v, lo, hi) {
+  if (!isFinite(v)) return lo;
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+function safeSize(v, fallback) {
+  var n = +v;
+  return (isFinite(n) && n > 0) ? n : fallback;
+}
+function reportError(where, err) {
+  var now = Date.now();
+  if (now - LAST_ERR_AT < 1000) return;
+  LAST_ERR_AT = now;
+  STAGE.err = where + ':' + (err && err.message ? err.message : err);
+  console.error('[399] ' + where, err);
+}
+var LAST_ERR_AT = 0;
+
+/* ===================================================================
+   4. 画布 / 尺寸
+   =================================================================== */
+var canvasEl = null, ctx2d = null;
+var VW = 1440, VH = 900, DPR = 1;
+
+var RESIZE_BAKE_TIMER = 0;
+
+function resizeStage() {
+  if (!ctx2d || !canvasEl) return;
+  var cssW = safeSize(window.innerWidth, 1440);
+  var cssH = safeSize(window.innerHeight, 900);
+  DPR = clampNum(window.devicePixelRatio || 1, 1, 2);
+  canvasEl.width = Math.max(1, Math.round(cssW * DPR));
+  canvasEl.height = Math.max(1, Math.round(cssH * DPR));
+  canvasEl.style.width = cssW + 'px';
+  canvasEl.style.height = cssH + 'px';
+  VW = cssW;
+  VH = cssH;
+  ctx2d.setTransform(DPR, 0, 0, DPR, 0, 0);
+  LYR.key = '';
+  if (STAGE.bootOk) {
+    if (RESIZE_BAKE_TIMER) clearTimeout(RESIZE_BAKE_TIMER);
+    RESIZE_BAKE_TIMER = setTimeout(function () {
+      RESIZE_BAKE_TIMER = 0;
+      try { shadeCanvas = bakeShade(); } catch (err) { reportError('bakeShade', err); }
+    }, 140);
+  }
+}
+
+/* ===================================================================
+   5. 相机与投影（手写透视：世界坐标 → 屏幕）
+   =================================================================== */
+var CAM = { yaw: -0.17, pitch: 0.19, focalScale: 0.92 };
+var SCENE = { cosYaw: 1, sinYaw: 0, cosPitch: 1, sinPitch: 0, focal: 828, cx: 720, cyc: 450, near: 1.2, jolt: 0 };
+
+function makeProj() { return { x: 0, y: 0, z: 0, k: 0 }; }
+var PROJ_Q = [makeProj(), makeProj(), makeProj(), makeProj(), makeProj(), makeProj(), makeProj(), makeProj()];
+
+function updateCamera(nowSec) {
+  var calm = STAGE.rm ? 0.18 : 1;
+  var yaw = CAM.yaw + Math.sin(nowSec * 0.11) * 0.030 * calm;
+  var pitch = CAM.pitch + Math.sin(nowSec * 0.07 + 1.3) * 0.010 * calm;
+  SCENE.cosYaw = Math.cos(yaw);
+  SCENE.sinYaw = Math.sin(yaw);
+  SCENE.cosPitch = Math.cos(pitch);
+  SCENE.sinPitch = Math.sin(pitch);
+  SCENE.focal = Math.max(160, VH * CAM.focalScale);
+  SCENE.cx = VW * 0.5;
+  SCENE.cyc = VH * 0.52;
+}
+
+function projectPt(wx, wy, wz, out) {
+  var x1 = wx * SCENE.cosYaw + wz * SCENE.sinYaw;
+  var z1 = -wx * SCENE.sinYaw + wz * SCENE.cosYaw;
+  var y1 = wy * SCENE.cosPitch - z1 * SCENE.sinPitch;
+  var z2 = wy * SCENE.sinPitch + z1 * SCENE.cosPitch;
+  if (!(z2 > SCENE.near) || !isFinite(z2)) return false;
+  var k = SCENE.focal / z2;
+  if (!isFinite(k)) return false;
+  out.x = SCENE.cx + x1 * k;
+  out.y = SCENE.cyc - y1 * k + SCENE.jolt;
+  out.z = z2;
+  out.k = k;
+  return true;
+}
+
+function fillPoly(pts, count, style) {
+  if (count < 3) return;
+  ctx2d.beginPath();
+  ctx2d.moveTo(pts[0].x, pts[0].y);
+  for (var q = 1; q < count; q++) ctx2d.lineTo(pts[q].x, pts[q].y);
+  ctx2d.closePath();
+  ctx2d.fillStyle = style;
+  ctx2d.fill();
+}
+
+/* 颜色工具：取 accent 前判空、进 canvas 前 Math.round + 夹取 */
+function safeAccent() {
+  var src = STAGE.accent;
+  if (!src || src.length < 3) return [176, 88, 54];
+  var r = clampNum(+src[0], 0, 255), g = clampNum(+src[1], 0, 255), b = clampNum(+src[2], 0, 255);
+  if (!isFinite(r) || !isFinite(g) || !isFinite(b)) return [176, 88, 54];
+  return [r, g, b];
+}
+function mixRgb(base, tint, amount) {
+  var m = clampNum(amount, 0, 1);
+  return [
+    Math.round(clampNum(base[0] + (tint[0] - base[0]) * m, 0, 255)),
+    Math.round(clampNum(base[1] + (tint[1] - base[1]) * m, 0, 255)),
+    Math.round(clampNum(base[2] + (tint[2] - base[2]) * m, 0, 255))
+  ];
+}
+function rgbaOf(rgb, alpha) {
+  var a = clampNum(alpha, 0, 1);
+  return 'rgba(' + Math.round(clampNum(rgb[0], 0, 255)) + ',' +
+    Math.round(clampNum(rgb[1], 0, 255)) + ',' +
+    Math.round(clampNum(rgb[2], 0, 255)) + ',' + a.toFixed(3) + ')';
+}
+function makeGradient(x0, y0, x1, y1, stops) {
+  var grd = null;
+  try {
+    grd = ctx2d.createLinearGradient(x0, y0, x1, y1);
+    for (var s = 0; s < stops.length; s++) {
+      var stop = stops[s];
+      if (!stop) continue;
+      try { grd.addColorStop(clampNum(stop[0], 0, 1), stop[1]); }
+      catch (err) { console.error('[399] addColorStop 失败', stop, err); }
+    }
+  } catch (err) {
+    console.error('[399] createGradient 失败', err);
+    return '#7c786f';
+  }
+  return grd;
+}
+
+/* ===================================================================
+   6. 立面几何（柏林粗野主义混凝土：模板拼缝 + 圆锚孔 + 深窗洞 + 铁锈流痕）
+   =================================================================== */
+var FACE = {
+  z: 42, halfW: 56, topY: 34, botY: -30,
+  cols: 24, rows: 8, colW: 4.7, rowH: 4.2,
+  winBase: 0.4, winW: 1.75, winH: 2.5, winSill: 1.0
+};
+var CELL_RAND = [];
+
+function hashCell(ci, ri) {
+  var v = Math.sin(ci * 127.1 + ri * 311.7) * 43758.5453;
+  return v - Math.floor(v);
+}
+
+function buildCellRand() {
+  CELL_RAND.length = 0;
+  var total = Math.min(FACE.cols * FACE.rows, 400);
+  for (var n = 0; n < total; n++) {
+    CELL_RAND.push(hashCell(n % FACE.cols, Math.floor(n / FACE.cols)));
+  }
+}
+
+function drawFacade(nowSec) {
+  var tl = PROJ_Q[0], tr = PROJ_Q[1], br = PROJ_Q[2], bl = PROJ_Q[3];
+  var okFace = projectPt(-FACE.halfW, FACE.topY, FACE.z, tl) &&
+    projectPt(FACE.halfW, FACE.topY, FACE.z, tr) &&
+    projectPt(FACE.halfW, FACE.botY, FACE.z, br) &&
+    projectPt(-FACE.halfW, FACE.botY, FACE.z, bl);
+  if (!okFace) return;
+
+  var faceGrad = makeGradient(tl.x, tl.y, br.x, br.y, [
+    [0, '#a7aaa9'], [0.42, '#8a8d8c'], [0.78, '#5d6162'], [1, '#3a3e3f']
+  ]);
+  fillPoly(PROJ_Q, 4, faceGrad);
+
+  /* 模板横缝 */
+  ctx2d.lineWidth = 1;
+  var stepY = 1.55;
+  var yLimit = Math.min(FACE.topY, FACE.botY + 90);
+  for (var gy = FACE.botY; gy < yLimit; gy += stepY) {
+    var la = PROJ_Q[4], lb = PROJ_Q[5];
+    if (!projectPt(-FACE.halfW, gy, FACE.z, la)) continue;
+    if (!projectPt(FACE.halfW, gy, FACE.z, lb)) continue;
+    ctx2d.beginPath();
+    ctx2d.moveTo(la.x, la.y);
+    ctx2d.lineTo(lb.x, lb.y);
+    ctx2d.strokeStyle = 'rgba(22,25,25,0.13)';
+    ctx2d.stroke();
+  }
+  /* 模板竖缝（大板拼缝，粗） */
+  var panelW = FACE.colW * 2;
+  for (var gx = -FACE.halfW; gx <= FACE.halfW; gx += panelW) {
+    var va = PROJ_Q[4], vb = PROJ_Q[5];
+    if (!projectPt(gx, FACE.topY, FACE.z, va)) continue;
+    if (!projectPt(gx, FACE.botY, FACE.z, vb)) continue;
+    ctx2d.beginPath();
+    ctx2d.moveTo(va.x, va.y);
+    ctx2d.lineTo(vb.x, vb.y);
+    ctx2d.strokeStyle = 'rgba(20,23,23,0.22)';
+    ctx2d.lineWidth = 2;
+    ctx2d.stroke();
+  }
+  ctx2d.lineWidth = 1;
+
+  var piston = pistonRow();
+  var level = clampNum(STAGE.level || 0, 0, 1);
+  var tint = mixRgb([176, 88, 54], safeAccent(), 0.35);
+
+  for (var ri = 0; ri < FACE.rows; ri++) {
+    for (var ci = 0; ci < FACE.cols; ci++) {
+      drawCell(ci, ri, piston, level, tint);
+    }
+  }
+  drawScanSeam(piston);
+  drawWeathering();
+  drawTieHoles();
+}
+
+/* 大面积雨水锈痕：从檐口一路挂到底，把整面墙"脏"成真的 */
+var WEATHER_BANDS = [
+  { fx: -0.46, w: 3.4, a: 0.30 },
+  { fx: -0.12, w: 1.8, a: 0.18 },
+  { fx: 0.18, w: 4.2, a: 0.26 },
+  { fx: 0.44, w: 1.6, a: 0.14 }
+];
+
+function drawWeathering() {
+  for (var b = 0; b < WEATHER_BANDS.length; b++) {
+    var band = WEATHER_BANDS[b];
+    var bx = band.fx * FACE.halfW;
+    var q0 = PROJ_Q[4], q1 = PROJ_Q[5], q2 = PROJ_Q[6], q3 = PROJ_Q[7];
+    if (!projectPt(bx - band.w * 0.5, FACE.topY, FACE.z, q0)) continue;
+    if (!projectPt(bx + band.w * 0.5, FACE.topY, FACE.z, q1)) continue;
+    if (!projectPt(bx + band.w * 0.9, FACE.botY, FACE.z, q2)) continue;
+    if (!projectPt(bx - band.w * 0.9, FACE.botY, FACE.z, q3)) continue;
+    var stainGrad = makeGradient(q0.x, q0.y, q3.x, q3.y, [
+      [0, 'rgba(104,52,26,' + band.a.toFixed(3) + ')'],
+      [0.38, 'rgba(96,56,34,' + (band.a * 0.55).toFixed(3) + ')'],
+      [1, 'rgba(70,48,34,0.02)']
+    ]);
+    fillPoly([q0, q1, q2, q3], 4, stainGrad);
+  }
+}
+
+/* 活塞扫描缝：每一拍沿立面下一格的发热接缝 */
+function drawScanSeam(row) {
+  var rows = Math.max(1, FACE.rows);
+  var ySeam = FACE.winBase + (clampNum(row, 0, rows - 1) + 0.52) * FACE.rowH;
+  var pa = PROJ_Q[4], pb = PROJ_Q[5];
+  if (!projectPt(-FACE.halfW, ySeam, FACE.z, pa)) return;
+  if (!projectPt(FACE.halfW, ySeam, FACE.z, pb)) return;
+  var seamGrad = makeGradient(pa.x, pa.y, pb.x, pb.y, [
+    [0, 'rgba(126,56,26,0.06)'],
+    [0.22, 'rgba(206,118,66,0.50)'],
+    [0.72, 'rgba(238,170,112,0.62)'],
+    [1, 'rgba(126,56,26,0.06)']
+  ]);
+  ctx2d.save();
+  ctx2d.globalCompositeOperation = 'lighter';
+  ctx2d.lineWidth = Math.max(2, VH * 0.0042);
+  ctx2d.strokeStyle = seamGrad;
+  ctx2d.beginPath();
+  ctx2d.moveTo(pa.x, pa.y);
+  ctx2d.lineTo(pb.x, pb.y);
+  ctx2d.stroke();
+  ctx2d.restore();
+}
+
+function cellBounds(ci, ri) {
+  var x0 = -FACE.halfW + ci * FACE.colW + (FACE.colW - FACE.winW) * 0.5;
+  var y0 = FACE.winBase + ri * FACE.rowH + FACE.winSill;
+  return { x0: x0, x1: x0 + FACE.winW, y0: y0, y1: y0 + FACE.winH };
+}
+
+function drawCell(ci, ri, piston, level, tint) {
+  var b = cellBounds(ci, ri);
+  var o0 = PROJ_Q[0], o1 = PROJ_Q[1], o2 = PROJ_Q[2], o3 = PROJ_Q[3];
+  if (!projectPt(b.x0, b.y1, FACE.z, o0)) return;
+  if (!projectPt(b.x1, b.y1, FACE.z, o1)) return;
+  if (!projectPt(b.x1, b.y0, FACE.z, o2)) return;
+  if (!projectPt(b.x0, b.y0, FACE.z, o3)) return;
+  var minY = Math.min(o0.y, o1.y, o2.y, o3.y);
+  var maxY = Math.max(o0.y, o1.y, o2.y, o3.y);
+  if (maxY < -40 || minY > VH * 0.72) return;
+  var minX = Math.min(o0.x, o1.x, o2.x, o3.x);
+  var maxX = Math.max(o0.x, o1.x, o2.x, o3.x);
+  if (maxX < -30 || minX > VW + 30) return;
+
+  var dist = Math.abs(ri - piston);
+  var pulse = dist < 2.4 ? (1 - dist / 2.4) : 0;
+  if (STAGE.rm) pulse *= 0.40;
+  var lit = pulse * (0.28 + 0.72 * level);
+  var cellIdx = ri * FACE.cols + ci;
+  var variation = CELL_RAND[cellIdx % Math.max(1, CELL_RAND.length)];
+  if (typeof variation !== 'number' || !isFinite(variation)) variation = 0.5;
+
+  /* 洞：外框全黑，内壁更深的洞底 = 深窗洞的体积感 */
+  fillPoly([o0, o1, o2, o3], 4, '#0a0b0c');
+
+  var i0 = PROJ_Q[4], i1 = PROJ_Q[5], i2 = PROJ_Q[6], i3 = PROJ_Q[7];
+  var cxm = (o0.x + o1.x + o2.x + o3.x) * 0.25;
+  var cym = (o0.y + o1.y + o2.y + o3.y) * 0.25;
+  var shrink = 0.80;
+  i0.x = cxm + (o0.x - cxm) * shrink; i0.y = cym + (o0.y - cym) * shrink;
+  i1.x = cxm + (o1.x - cxm) * shrink; i1.y = cym + (o1.y - cym) * shrink;
+  i2.x = cxm + (o2.x - cxm) * shrink; i2.y = cym + (o2.y - cym) * shrink;
+  i3.x = cxm + (o3.x - cxm) * shrink; i3.y = cym + (o3.y - cym) * shrink;
+  i0.z = o0.z; i1.z = o1.z; i2.z = o2.z; i3.z = o3.z;
+
+  var backBase = mixRgb([15, 15, 17], [44, 42, 39], variation * 0.5);
+  if (lit > 0.03) {
+    var glowCol = mixRgb(backBase, tint, 0.55 + 0.45 * lit);
+    fillPoly([i0, i1, i2, i3], 4, rgbaOf(glowCol, 1));
+    ctx2d.save();
+    ctx2d.globalCompositeOperation = 'lighter';
+    ctx2d.globalAlpha = clampNum(lit * 0.16, 0, 0.16);
+    fillPoly([o0, o1, o2, o3], 4, rgbaOf(tint, 1));
+    ctx2d.restore();
+  } else {
+    fillPoly([i0, i1, i2, i3], 4, rgbaOf(backBase, 1));
+  }
+
+  /* 铁锈流痕（从窗台往下挂） */
+  if (variation > 0.845) {
+    var r0 = PROJ_Q[4], r1 = PROJ_Q[5], r2 = PROJ_Q[6], r3 = PROJ_Q[7];
+    var streakLen = 3.5 + variation * 11;
+    if (projectPt(b.x0 + 0.18, b.y0 - 0.15, FACE.z, r0) &&
+      projectPt(b.x1 - 0.18, b.y0 - 0.15, FACE.z, r1) &&
+      projectPt(b.x1 - 0.62, b.y0 - 0.15 - streakLen, FACE.z, r2) &&
+      projectPt(b.x0 + 0.62, b.y0 - 0.15 - streakLen, FACE.z, r3)) {
+      var rustGrad = makeGradient(r0.x, r0.y, r3.x, r3.y, [
+        [0, 'rgba(122,58,30,0.62)'],
+        [0.45, 'rgba(140,72,38,0.26)'],
+        [1, 'rgba(118,64,36,0.00)']
+      ]);
+      fillPoly([r0, r1, r2, r3], 4, rustGrad);
+    }
+  }
+}
+
+function drawTieHoles() {
+  var holeR = 0.34;
+  for (var ri = 0; ri <= FACE.rows; ri += 3) {
+    for (var ci = 0; ci <= FACE.cols; ci += 3) {
+      var hx = -FACE.halfW + ci * FACE.colW;
+      var hy = FACE.winBase + ri * FACE.rowH + FACE.winSill * 0.4;
+      var p = PROJ_Q[0];
+      if (!projectPt(hx, hy, FACE.z, p)) continue;
+      if (p.x < -60 || p.x > VW + 60 || p.y < -60 || p.y > VH + 60) continue;
+      var rad = Math.max(0.8, holeR * p.k);
+      ctx2d.beginPath();
+      ctx2d.arc(p.x, p.y, rad, 0, Math.PI * 2);
+      ctx2d.fillStyle = 'rgba(26,29,29,0.55)';
+      ctx2d.fill();
+      ctx2d.beginPath();
+      ctx2d.arc(p.x, p.y - rad * 0.35, rad * 0.72, 0, Math.PI * 2);
+      ctx2d.fillStyle = 'rgba(150,155,152,0.15)';
+      ctx2d.fill();
+    }
+  }
+}
+
+function pistonRow() {
+  var rows = Math.max(1, FACE.rows);
+  var beats = 0;
+  var recentBeat = STAGE.beatSeen && Math.abs((STAGE.t || 0) - STAGE.lastBeatT) < 4;
+  if (recentBeat && isFinite(STAGE.beatCount)) beats = STAGE.beatCount;
+  else if (STAGE.bpm > 0) beats = Math.floor((STAGE.t || 0) * STAGE.bpm / 60);
+  else beats = Math.floor((STAGE.t || 0) * 2);
+  if (!isFinite(beats)) beats = 0;
+  return ((Math.round(beats) % rows) + rows) % rows;
+}
+
+/* ===================================================================
+   7. 前景：巨大混凝土墩子（真实 3D 盒子）
+   位置随画幅宽度换算，横竖屏都留在画面里
+   =================================================================== */
+var PIER_BOX = { x0: -21, x1: -12.2, z0: 21.5, z1: 30, y0: -40, y1: 44 };
+
+function updatePierBox() {
+  var x1 = -0.0096 * VW + 1.7;
+  var width = Math.max(3.0, 0.0062 * VW);
+  PIER_BOX.x1 = x1;
+  PIER_BOX.x0 = x1 - width;
+  PIER_BOX.z0 = 21.5;
+  PIER_BOX.z1 = 30;
+  PIER_BOX.y0 = -40;
+  PIER_BOX.y1 = 44;
+}
+
+function drawPier() {
+  updatePierBox();
+  var corners = [PROJ_Q[0], PROJ_Q[1], PROJ_Q[2], PROJ_Q[3], PROJ_Q[4], PROJ_Q[5], PROJ_Q[6], PROJ_Q[7]];
+  /* 右侧面 x = x1（朝相机），正面 z = z0 */
+  var okA = projectPt(PIER_BOX.x1, PIER_BOX.y1, PIER_BOX.z0, corners[0]) &&
+    projectPt(PIER_BOX.x1, PIER_BOX.y0, PIER_BOX.z0, corners[1]) &&
+    projectPt(PIER_BOX.x1, PIER_BOX.y0, PIER_BOX.z1, corners[2]) &&
+    projectPt(PIER_BOX.x1, PIER_BOX.y1, PIER_BOX.z1, corners[3]);
+  if (okA) {
+    fillPoly(corners, 4, makeGradient(corners[0].x, corners[0].y, corners[1].x, corners[1].y, [
+      [0, '#595d5d'], [0.5, '#444849'], [1, '#232727']
+    ]));
+    /* 墩子竖向模板缝 */
+    ctx2d.lineWidth = 2;
+    for (var k = 1; k < 3; k++) {
+      ctx2d.beginPath();
+      ctx2d.moveTo(corners[0].x + (corners[3].x - corners[0].x) * (k / 3), corners[0].y + (corners[3].y - corners[0].y) * (k / 3));
+      ctx2d.lineTo(corners[1].x + (corners[2].x - corners[1].x) * (k / 3), corners[1].y + (corners[2].y - corners[1].y) * (k / 3));
+      ctx2d.strokeStyle = 'rgba(14,14,14,0.45)';
+      ctx2d.stroke();
+    }
+  }
+  var okB = projectPt(PIER_BOX.x1, PIER_BOX.y1, PIER_BOX.z0, corners[0]) &&
+    projectPt(PIER_BOX.x0, PIER_BOX.y1, PIER_BOX.z0, corners[1]) &&
+    projectPt(PIER_BOX.x0, PIER_BOX.y0, PIER_BOX.z0, corners[2]) &&
+    projectPt(PIER_BOX.x1, PIER_BOX.y0, PIER_BOX.z0, corners[3]);
+  if (okB) {
+    fillPoly(corners, 4, makeGradient(corners[1].x, corners[1].y, corners[2].x, corners[2].y, [
+      [0, '#686c6b'], [0.45, '#484c4c'], [1, '#212525']
+    ]));
+  }
+  ctx2d.lineWidth = 1;
+}
+
+/* ===================================================================
+   8. 烘焙：明暗整型 + 颗粒（拆到 ready 之后，分帧做）
+   =================================================================== */
+var shadeCanvas = null, grainCanvas = null;
+
+function bakeShade() {
+  var w = Math.max(2, Math.round(VW)), h = Math.max(2, Math.round(VH));
+  var off = document.createElement('canvas');
+  off.width = w;
+  off.height = h;
+  var c2 = off.getContext('2d');
+  if (!c2) return null;
+  try {
+    c2.fillStyle = '#ffffff';
+    c2.fillRect(0, 0, w, h);
+    var rad = c2.createRadialGradient(w * 0.32, h * 0.12, Math.min(w, h) * 0.06, w * 0.52, h * 0.58, Math.max(w, h) * 0.82);
+    rad.addColorStop(0, 'rgba(255,255,255,0)');
+    rad.addColorStop(0.55, 'rgba(122,116,108,0.30)');
+    rad.addColorStop(1, 'rgba(36,34,32,0.92)');
+    c2.fillStyle = rad;
+    c2.fillRect(0, 0, w, h);
+  } catch (err) {
+    console.error('[399] bakeShade 失败', err);
+  }
+  return off;
+}
+
+function bakeGrain() {
+  var size = 160;
+  var off = document.createElement('canvas');
+  off.width = size;
+  off.height = size;
+  var c2 = off.getContext('2d');
+  if (!c2) return null;
+  try {
+    var img = c2.createImageData(size, size);
+    var data = img.data;
+    var seed = 1337;
+    for (var p = 0; p < data.length; p += 4) {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      var v = (seed % 256) | 0;
+      data[p] = v;
+      data[p + 1] = v;
+      data[p + 2] = v;
+      data[p + 3] = 42;
+    }
+    c2.putImageData(img, 0, 0);
+  } catch (err) {
+    console.error('[399] bakeGrain 失败', err);
+  }
+  return off;
+}
+
+var grainPattern = null;
+
+function drawGrainOverlay() {
+  if (!grainCanvas || !ctx2d) return;
+  if (!(grainCanvas.width > 0 && grainCanvas.height > 0)) return;
+  if (!grainPattern) {
+    try { grainPattern = ctx2d.createPattern(grainCanvas, 'repeat'); }
+    catch (err) { console.error('[399] grain pattern 失败', err); grainPattern = null; }
+  }
+  if (!grainPattern) return;
+  ctx2d.save();
+  ctx2d.globalAlpha = 0.5;
+  ctx2d.globalCompositeOperation = 'overlay';
+  ctx2d.fillStyle = grainPattern;
+  ctx2d.fillRect(0, 0, VW, Math.round(VH * 0.70));
+  ctx2d.restore();
+}
+
+/* ===================================================================
+   9. 歌词版块（工程铭牌式：石板 + 逐字点亮 + 上一句/下一句幽灵）
+   =================================================================== */
+var LYRIC_FAMILY = "'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif";
+var MONO_FAMILY = "ui-monospace, Consolas, 'SF Mono', monospace";
+var LYR = { key: '', rows: [], size: 0, empty: false, useText: '' };
+
+function plateMetrics() {
+  var padX = clampNum(VW * 0.055, 16, 132);
+  var top = VH * 0.655;
+  var h = VH - top;
+  if (h < 110) { top = Math.max(0, VH - 130); h = VH - top; }
+  return { top: top, h: h, padX: padX, maxW: Math.max(80, VW - padX * 2) };
+}
+
+function composeLyric(cfg) {
+  var text = cfg.text;
+  var n = Math.min(text.length, 400);
+  var font = '600 ' + Math.round(cfg.size) + 'px ' + LYRIC_FAMILY;
+  ctx2d.font = font;
+  var widths = new Array(n);
+  var totalWidth = 0;
+  for (var m = 0; m < n; m++) {
+    var w = ctx2d.measureText(text.charAt(m)).width;
+    widths[m] = isFinite(w) ? w : cfg.size * 0.6;
+    totalWidth += widths[m];
+  }
+  var rowsIdx = [];
+  var curRow = [];
+  var curWidth = 0;
+  for (var k = 0; k < n; k++) {
+    if (curRow.length > 0 && curWidth + widths[k] > cfg.maxW) {
+      if (rowsIdx.length + 1 >= cfg.maxLines) return null;
+      rowsIdx.push(curRow);
+      curRow = [];
+      curWidth = 0;
+    }
+    curRow.push(k);
+    curWidth += widths[k];
+  }
+  if (curRow.length > 0) rowsIdx.push(curRow);
+  if (!rowsIdx.length) return null;
+
+  var per = cfg.chars;
+  var usePer = !!(per && per.length === n);
+  var rows = [];
+  for (var r = 0; r < rowsIdx.length; r++) {
+    var items = [];
+    var pen = 0;
+    var list = rowsIdx[r];
+    for (var q = 0; q < list.length; q++) {
+      var gi = list[q];
+      var ct = NaN;
+      if (usePer) {
+        var src = per[gi];
+        if (src && isFinite(+src.t)) ct = +src.t;
+      }
+      if (!isFinite(ct)) ct = cfg.lineT + cfg.dur * ((gi + 0.5) / Math.max(1, n));
+      items.push({ c: text.charAt(gi), x: pen, w: widths[gi], t: ct, gi: gi });
+      pen += widths[gi];
+    }
+    rows.push({ chars: items, width: pen });
+  }
+  return { rows: rows, size: cfg.size, font: font, total: totalWidth };
+}
+
+function ensureLyricLayout() {
+  var useText = STAGE.text;
+  var useIdx = STAGE.idx;
+  var source = null;
+  if (useIdx >= 0 && STAGE.lines[useIdx]) source = STAGE.lines[useIdx];
+  else if (STAGE.lines.length) source = STAGE.lines[0];
+  if (!useText && source) useText = source.text;
+  useText = useText || '';
+
+  var key = Math.round(VW) + ':' + Math.round(VH) + ':' + useIdx + ':' + useText.length +
+    ':' + (STAGE.lines.length ? 1 : 0);
+  if (LYR.key === key) return;
+
+  LYR.key = key;
+  LYR.useText = useText;
+  LYR.rows = [];
+  LYR.empty = (useText.length === 0);
+
+  if (LYR.empty) {
+    LYR.size = 0;
+    return;
+  }
+  var met = plateMetrics();
+  var baseSize = clampNum(met.h * 0.42, 24, 76);
+  var ratio = [1, 0.9, 0.8, 0.7, 0.61, 0.53, 0.46, 0.40];
+  var built = null;
+  for (var s = 0; s < ratio.length; s++) {
+    var trySize = Math.max(16, baseSize * ratio[s]);
+    built = composeLyric({
+      text: useText,
+      size: trySize,
+      maxW: met.maxW,
+      maxLines: 2,
+      chars: source ? source.chars : null,
+      lineT: source ? source.t : 0,
+      dur: source ? (source.dur > 0 ? source.dur : 4) : 4
+    });
+    if (built) break;
+  }
+  if (!built) {
+    /* 极端超长句：截断 + 省略号，绝不留白也不溢出 */
+    var minSize = 16;
+    var perLine = Math.max(4, Math.floor(met.maxW / (minSize * 0.62)));
+    var cap = Math.max(4, perLine * 3 - 1);
+    var cut = useText.length > cap ? useText.slice(0, cap) + '…' : useText;
+    built = composeLyric({
+      text: cut,
+      size: minSize,
+      maxW: met.maxW,
+      maxLines: 3,
+      chars: null,
+      lineT: 0,
+      dur: 4
+    });
+  }
+  if (!built) {
+    LYR.rows = [{ chars: [{ c: '—', x: 0, w: 0, t: 0 }], width: 0 }];
+    LYR.size = 20;
+    return;
+  }
+  LYR.rows = built.rows;
+  LYR.size = built.size;
+}
+
+function charIsLit(charT, renderTime) {
+  return renderTime >= charT - 0.02;
+}
+
+function drawLyricPlate(nowMs) {
+  var met = plateMetrics();
+  var padX = met.padX;
+
+  var plateGrad = makeGradient(0, met.top, 0, VH, [
+    [0, '#222524'], [0.16, '#181b1a'], [0.62, '#121514'], [1, '#0a0d0c']
+  ]);
+  ctx2d.fillStyle = plateGrad;
+  ctx2d.fillRect(0, met.top, VW, met.h);
+
+  /* 上沿：锈色压顶 + 一道阴影缝 */
+  ctx2d.fillStyle = 'rgba(150,74,40,0.90)';
+  ctx2d.fillRect(0, met.top, VW, Math.max(2, VH * 0.0034));
+  ctx2d.fillStyle = 'rgba(0,0,0,0.62)';
+  ctx2d.fillRect(0, met.top + Math.max(2, VH * 0.0034), VW, 2);
+
+  /* 板面竖向分格（浇筑分仓） */
+  var seamStep = Math.max(90, VW / 7);
+  for (var sx = seamStep; sx < VW - 4; sx += seamStep) {
+    ctx2d.fillStyle = 'rgba(255,255,255,0.030)';
+    ctx2d.fillRect(Math.round(sx), met.top + 6, 1, met.h - 10);
+    ctx2d.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx2d.fillRect(Math.round(sx) + 1, met.top + 6, 1, met.h - 10);
+  }
+
+  ensureLyricLayout();
+
+  var labelY = met.top + Math.max(14, met.h * 0.115);
+  drawTrackLabel(padX, labelY, met);
+
+  if (LYR.empty) {
+    drawEmptyState(padX, met);
+  } else {
+    drawLyricRows(padX, met, nowMs);
+  }
+  drawPlateFooter(padX, met);
+}
+
+function drawTrackLabel(x, y, met) {
+  var size = clampNum(VH * 0.0165, 9, 15);
+  ctx2d.textAlign = 'left';
+  ctx2d.textBaseline = 'middle';
+  ctx2d.font = '500 ' + Math.round(size) + 'px ' + MONO_FAMILY;
+  try { ctx2d.letterSpacing = (size * 0.16).toFixed(1) + 'px'; } catch (err) { /* 老浏览器无 letterSpacing */ }
+  var total = STAGE.lines.length;
+  var pos = STAGE.idx + 1;
+  var left = 'SCHALUNG 399 · 4/4 · BETON';
+  ctx2d.fillStyle = 'rgba(198,128,84,0.85)';
+  ctx2d.fillText(left, x, y);
+  var right = total > 0 ? ('SEG ' + pad3(pos) + ' / ' + pad3(total)) : 'SEG --- / ---';
+  ctx2d.textAlign = 'right';
+  ctx2d.fillStyle = 'rgba(226,220,206,0.42)';
+  ctx2d.fillText(right, VW - x, y);
+  ctx2d.textAlign = 'left';
+  try { ctx2d.letterSpacing = '0px'; } catch (err2) { /* noop */ }
+
+  /* 4/4 拍位指示：四个小方块，像机器的计数器 */
+  var sq = clampNum(VH * 0.0115, 4, 9);
+  var sqGap = sq * 2.0;
+  var sqY = y + sq * 2.6;
+  var activeBeat = STAGE.beatSeen ? (((STAGE.beatCount % 4) + 4) % 4) : -1;
+  var sqX0 = VW - x - (sq * 4 + sqGap * 3);
+  for (var bt = 0; bt < 4; bt++) {
+    var isOn = (bt === activeBeat);
+    ctx2d.fillStyle = isOn ? 'rgba(216,134,80,0.95)' : 'rgba(226,220,206,0.15)';
+    ctx2d.fillRect(Math.round(sqX0 + bt * sqGap), Math.round(sqY), sq, sq);
+  }
+}
+
+function pad3(v) {
+  var n = Math.round(clampNum(v, 0, 9999));
+  if (n < 10) return '00' + n;
+  if (n < 100) return '0' + n;
+  return '' + n;
+}
+
+function drawLyricRows(padX, met, nowMs) {
+  var renderTime = STAGE.t;
+  if (STAGE.playing && isFinite(STAGE.tickWall)) {
+    var extra = (nowMs - STAGE.tickWall) / 1000;
+    if (isFinite(extra) && extra > 0 && extra < 0.10) renderTime += extra;
+  }
+
+  var rows = LYR.rows;
+  var size = LYR.size;
+  var rowH = size * 1.26;
+  var blockH = rowH * rows.length;
+  var baseY = met.top + met.h * 0.52;
+  var firstBaseline = baseY - blockH * 0.5 + rowH * 0.76;
+
+  ctx2d.font = '600 ' + Math.round(size) + 'px ' + LYRIC_FAMILY;
+  ctx2d.textAlign = 'left';
+  ctx2d.textBaseline = 'alphabetic';
+
+  var freshWindow = 0.30;
+
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r];
+    var y = firstBaseline + r * rowH;
+    /* 行首锈色刻线 */
+    if (r === 0) {
+      var tickH = Math.max(6, size * 0.55);
+      ctx2d.fillStyle = 'rgba(178,104,62,0.85)';
+      ctx2d.fillRect(Math.max(3, padX - Math.max(10, size * 0.30)), y - tickH, Math.max(2, size * 0.075), tickH);
+    }
+    for (var q = 0; q < row.chars.length; q++) {
+      var ch = row.chars[q];
+      var cx = padX + ch.x;
+      var lit = charIsLit(ch.t, renderTime);
+      if (lit) {
+        var age = renderTime - ch.t;
+        ctx2d.fillStyle = (age >= 0 && age < freshWindow) ? '#d98a4e' : '#eff1ec';
+      } else {
+        ctx2d.fillStyle = 'rgba(146,150,147,0.45)';
+      }
+      ctx2d.fillText(ch.c, cx, y);
+    }
+  }
+
+  /* 下一句：板底幽灵 */
+  var nextIdx = STAGE.idx + 1;
+  if (nextIdx >= 0 && nextIdx < STAGE.lines.length) {
+    var nextText = STAGE.lines[nextIdx].text;
+    var ns = clampNum(size * 0.30, 10, 20);
+    ctx2d.font = '400 ' + Math.round(ns) + 'px ' + LYRIC_FAMILY;
+    ctx2d.fillStyle = 'rgba(226,220,206,0.34)';
+    var clip = nextText.length > 60 ? nextText.slice(0, 60) : nextText;
+    ctx2d.fillText(clip, padX, met.top + met.h - Math.max(14, met.h * 0.115));
+  }
+}
+
+function drawEmptyState(padX, met) {
+  var big = clampNum(met.h * 0.22, 20, 40);
+  ctx2d.textAlign = 'left';
+  ctx2d.textBaseline = 'alphabetic';
+  ctx2d.font = '600 ' + Math.round(big) + 'px ' + LYRIC_FAMILY;
+  ctx2d.fillStyle = 'rgba(226,220,206,0.52)';
+  ctx2d.fillText('无歌词', padX, met.top + met.h * 0.60);
+  var sub = clampNum(big * 0.42, 9, 15);
+  ctx2d.font = '400 ' + Math.round(sub) + 'px ' + MONO_FAMILY;
+  ctx2d.fillStyle = 'rgba(170,104,66,0.72)';
+  try { ctx2d.letterSpacing = (sub * 0.18).toFixed(1) + 'px'; } catch (err) { /* noop */ }
+  ctx2d.fillText('INSTRUMENTAL · 本曲无字可浇', padX, met.top + met.h * 0.60 + big * 0.86);
+  try { ctx2d.letterSpacing = '0px'; } catch (err) { /* noop */ }
+}
+
+function drawPlateFooter(padX, met) {
+  var barY = VH - Math.max(5, VH * 0.008);
+  var barH = Math.max(2, VH * 0.0055);
+  ctx2d.fillStyle = 'rgba(255,255,255,0.07)';
+  ctx2d.fillRect(0, barY, VW, barH);
+  var dur = STAGE.duration;
+  var pct = (dur > 0) ? clampNum(STAGE.t / dur, 0, 1) : 0;
+  if (pct > 0) {
+    var tint = mixRgb([150, 74, 40], safeAccent(), 0.30);
+    ctx2d.fillStyle = rgbaOf(tint, 0.92);
+    ctx2d.fillRect(0, barY, VW * pct, barH);
+  }
+  var size = clampNum(VH * 0.0145, 8, 13);
+  ctx2d.font = '500 ' + Math.round(size) + 'px ' + MONO_FAMILY;
+  ctx2d.textAlign = 'left';
+  ctx2d.textBaseline = 'bottom';
+  ctx2d.fillStyle = 'rgba(226,220,206,0.30)';
+  var bpmTxt = (STAGE.bpm > 0 ? Math.round(STAGE.bpm) : '--') + ' BPM';
+  ctx2d.fillText(bpmTxt + '  ·  ' + fmtClock(STAGE.t) + ' / ' + fmtClock(dur), padX, barY - 6);
+  ctx2d.textAlign = 'right';
+  ctx2d.fillText('ORDNUNG 46 / CONCRETE', VW - padX, barY - 6);
+  ctx2d.textAlign = 'left';
+}
+
+function fmtClock(sec) {
+  var s = clampNum(Math.floor(isFinite(sec) ? sec : 0), 0, 359999);
+  var m = Math.floor(s / 60);
+  var r = s % 60;
+  return (m < 10 ? '0' + m : '' + m) + ':' + (r < 10 ? '0' + r : '' + r);
+}
+
+/* ===================================================================
+   10. 左上角工程铭牌 + 右侧标尺
+   =================================================================== */
+function drawNameplate() {
+  var padX = clampNum(VW * 0.045, 14, 96);
+  var size = clampNum(VW * 0.0092, 9, 15);
+  var x = padX;
+  var y = VH * 0.075;
+
+  ctx2d.textAlign = 'left';
+  ctx2d.textBaseline = 'alphabetic';
+  ctx2d.font = '600 ' + Math.round(size * 1.15) + 'px ' + MONO_FAMILY;
+  try { ctx2d.letterSpacing = (size * 0.22).toFixed(1) + 'px'; } catch (err) { /* noop */ }
+  ctx2d.fillStyle = 'rgba(240,234,221,0.86)';
+  ctx2d.fillText('KRAFTWERK · BLOCK 07', x, y);
+  ctx2d.fillStyle = 'rgba(226,216,198,0.52)';
+  ctx2d.font = '500 ' + Math.round(size * 0.86) + 'px ' + MONO_FAMILY;
+  ctx2d.fillText('BETON 1968 · SCHALUNG 2.4M · 4/4', x, y + size * 1.9);
+  try { ctx2d.letterSpacing = '0px'; } catch (err2) { /* noop */ }
+
+  ctx2d.fillStyle = 'rgba(240,234,221,0.22)';
+  ctx2d.fillRect(x, y + size * 2.9, Math.min(VW * 0.20, 260), 1);
+
+  /* 曲名 */
+  var title = STAGE.songName || 'UNTITLED';
+  var artist = STAGE.songArtist || '';
+  ctx2d.font = '600 ' + Math.round(size * 1.02) + 'px ' + LYRIC_FAMILY;
+  ctx2d.fillStyle = 'rgba(242,236,224,0.90)';
+  var titleClip = title.length > 28 ? title.slice(0, 28) : title;
+  ctx2d.fillText(titleClip, x, y + size * 4.6);
+  if (artist) {
+    ctx2d.font = '400 ' + Math.round(size * 0.86) + 'px ' + LYRIC_FAMILY;
+    ctx2d.fillStyle = 'rgba(232,224,208,0.58)';
+    var aClip = artist.length > 40 ? artist.slice(0, 40) : artist;
+    ctx2d.fillText(aClip, x, y + size * 6.2);
+  }
+}
+
+function drawScaleRuler() {
+  var x = VW - Math.max(10, VW * 0.018);
+  var top = VH * 0.245;
+  var bottom = VH * 0.615;
+  var span = bottom - top;
+  if (span < 40) return;
+  ctx2d.strokeStyle = 'rgba(242,236,224,0.20)';
+  ctx2d.lineWidth = 1;
+  ctx2d.beginPath();
+  ctx2d.moveTo(x, top);
+  ctx2d.lineTo(x, bottom);
+  ctx2d.stroke();
+  var steps = 10;
+  for (var s = 0; s <= steps; s++) {
+    var ty = top + span * (s / steps);
+    var len = (s % 5 === 0) ? 9 : 5;
+    ctx2d.beginPath();
+    ctx2d.moveTo(x, ty);
+    ctx2d.lineTo(x - len, ty);
+    ctx2d.stroke();
+  }
+}
+/* 头顶压下来的结构：画面上沿的深阴影，仰视感 */
+function drawOverhangShadow() {
+  var bottom = VH * 0.20;
+  var grd = makeGradient(0, 0, 0, bottom, [
+    [0, 'rgba(8,8,7,0.90)'],
+    [0.55, 'rgba(10,10,9,0.45)'],
+    [1, 'rgba(10,10,9,0.0)']
+  ]);
+  ctx2d.fillStyle = grd;
+  ctx2d.fillRect(0, 0, VW, bottom);
+}
+
+/* ===================================================================
+   11. 主循环
+   =================================================================== */
+var LAST_FRAME_AT = 0;
+
+function frameLoop(nowMs) {
+  var frameStart = (window.performance && performance.now) ? performance.now() : Date.now();
+  STAGE.frames++;
+  try {
+    drawStage(nowMs || 0);
+  } catch (err) {
+    reportError('draw', err);
+  }
+  var frameEnd = (window.performance && performance.now) ? performance.now() : Date.now();
+  STAGE.js = frameEnd - frameStart;
+  LAST_FRAME_AT = frameEnd;
+  requestAnimationFrame(frameLoop);
+}
+
+function drawStage(nowMs) {
+  var nowSec = (nowMs || 0) / 1000;
+  /* 隐藏的 iframe 里拿不到尺寸，露出来时没有 resize 事件，这里自查一次 */
+  if (safeSize(window.innerWidth, 1440) !== VW || safeSize(window.innerHeight, 900) !== VH) {
+    try { resizeStage(); } catch (errR) { reportError('resize', errR); }
+  }
+  ctx2d.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx2d.globalCompositeOperation = 'source-over';
+  ctx2d.globalAlpha = 1;
+  ctx2d.lineWidth = 1;
+
+  var beatAge = -1;
+  if (isFinite(STAGE.beatWall)) beatAge = ((nowMs || 0) - STAGE.beatWall) / 1000;
+  SCENE.jolt = 0;
+  if (!STAGE.rm && beatAge >= 0) {
+    if (beatAge < 0.045) SCENE.jolt = 2;
+    else if (beatAge < 0.095) SCENE.jolt = 1;
+  }
+
+  updateCamera(nowSec);
+
+  ctx2d.fillStyle = '#212324';
+  ctx2d.fillRect(0, 0, VW, VH);
+
+  /* 每一层各自兜底：某一层画挂了，歌词层也必须照常出来 */
+  try { drawFacade(nowSec); } catch (errA) { reportError('facade', errA); }
+  try { drawPier(); } catch (errB) { reportError('pier', errB); }
+  try { drawOverhangShadow(); } catch (errC) { reportError('overhang', errC); }
+
+  if (shadeCanvas && shadeCanvas.width > 0 && shadeCanvas.height > 0) {
+    try {
+      ctx2d.save();
+      ctx2d.globalCompositeOperation = 'multiply';
+      ctx2d.drawImage(shadeCanvas, 0, 0, VW, VH);
+      ctx2d.restore();
+    } catch (errD) { reportError('shade', errD); }
+  }
+  try { drawGrainOverlay(); } catch (errE) { reportError('grain', errE); }
+
+  ctx2d.globalCompositeOperation = 'source-over';
+  ctx2d.globalAlpha = 1;
+  try { drawLyricPlate(nowMs || 0); } catch (errF) { reportError('lyrics', errF); }
+  try { drawNameplate(); } catch (errG) { reportError('nameplate', errG); }
+  try { drawScaleRuler(); } catch (errH) { reportError('ruler', errH); }
+}
+
+/* ===================================================================
+   6. 消息
+   =================================================================== */
+function parseLyrics(rawLines) {
+  var out = [];
+  if (!rawLines || !rawLines.length) return out;
+  var limit = Math.min(rawLines.length, 800);
+  for (var n = 0; n < limit; n++) {
+    var src = rawLines[n];
+    if (!src) continue;
+    var body = (src.text === null || src.text === undefined) ? '' : String(src.text);
+    if (!body.length) continue;
+    out.push({ t: clampNum(+src.t, 0, 1e6), dur: clampNum(+src.dur, 0, 600), text: body, chars: src.chars || null });
+  }
+  out.sort(function (a, b) { return a.t - b.t; });
+  return out;
+}
+
+function handleInit(payload) {
+  var p = payload || {};
+  STAGE.lines = parseLyrics(p.lines);
+  STAGE.idx = -1;
+  STAGE.text = '';
+  STAGE.duration = safeSize(p.duration, 0);
+  STAGE.accent = (p.accent && p.accent.length >= 3 && isFinite(+p.accent[0]))
+    ? [clampNum(+p.accent[0], 0, 255), clampNum(+p.accent[1], 0, 255), clampNum(+p.accent[2], 0, 255)]
+    : [176, 88, 54];
+  STAGE.playing = (p.playing === undefined) ? true : !!p.playing;
+
+  var song = p.song || {};
+  STAGE.songName = (song.name === null || song.name === undefined) ? '' : String(song.name);
+  var artists = song.artists;
+  if (Object.prototype.toString.call(artists) === '[object Array]') {
+    var names = [];
+    for (var a = 0; a < artists.length && a < 8; a++) {
+      if (artists[a]) names.push(String(artists[a]));
+    }
+    STAGE.songArtist = names.join(' / ');
+  } else if (artists === null || artists === undefined) {
+    STAGE.songArtist = '';
+  } else {
+    STAGE.songArtist = String(artists);
+  }
+
+  LYR.key = '';
+  LYR.rows = [];
+  resolveLine(STAGE.t);
+}
+
+function resolveLine(seconds) {
+  var arr = STAGE.lines;
+  var found = -1;
+  var probe = isFinite(seconds) ? seconds : 0;
+  for (var k = 0; k < arr.length; k++) {
+    if (arr[k].t <= probe + 0.02) found = k; else break;
+  }
+  STAGE.idx = found;
+  STAGE.text = found >= 0 ? arr[found].text : '';
+}
+
+function handleTick(payload) {
+  var p = payload || {};
+  var tv = +p.time;
+  if (!isFinite(tv)) return;
+  STAGE.t = tv;                       /* 无条件采纳，大跨度跳变照收 */
+  STAGE.tickWall = (window.performance && performance.now) ? performance.now() : Date.now();
+  if (p.playing !== undefined) STAGE.playing = !!p.playing;
+  resolveLine(STAGE.t);
+}
+
+function handleMessage(evt) {
+  var data = evt && evt.data;
+  if (!data || data.__c100 !== 1) return;
+  try {
+    if (data.type === 'init') handleInit(data.payload);
+    else if (data.type === 'tick') handleTick(data.payload);
+    else if (data.type === 'beat') handleBeat(data.payload);
+    else if (data.type === 'live') handleLive(data.payload);
+  } catch (err) {
+    reportError('message:' + data.type, err);
+  }
+}
+
+function handleBeat(payload) {
+  var p = payload || {};
+  var idx = +p.index;
+  if (isFinite(idx)) STAGE.beatCount = Math.abs(Math.round(idx));
+  else STAGE.beatCount = (isFinite(STAGE.beatCount) ? STAGE.beatCount : 0) + 1;
+  STAGE.level = clampNum(+p.level, 0, 1);
+  if (!isFinite(STAGE.level)) STAGE.level = 0.6;
+  STAGE.beatSeen = true;
+  STAGE.lastBeatT = STAGE.t;
+  STAGE.beatWall = (window.performance && performance.now) ? performance.now() : Date.now();
+}
+
+function handleLive(payload) {
+  var p = payload || {};
+  STAGE.bpm = clampNum(+p.bpm, 0, 300);
+  STAGE.level = clampNum(+p.level, 0, 1);
+  STAGE.bass = clampNum(+p.bass, 0, 1);
+  STAGE.mid = clampNum(+p.mid, 0, 1);
+  STAGE.treble = clampNum(+p.treble, 0, 1);
+}
+
+/* ===================================================================
+   7. 启动（在 ready 之后）
+   =================================================================== */
+function bootStage() {
+  if (STAGE.bootOk) return;
+  try {
+    canvasEl = document.getElementById('cv');
+    if (!canvasEl) throw new Error('canvas 缺失');
+    ctx2d = canvasEl.getContext('2d', { alpha: false });
+    if (!ctx2d) throw new Error('无 2d context');
+    var mq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+    STAGE.rm = !!(mq && mq.matches);
+    buildCellRand();
+    resizeStage();
+    window.addEventListener('resize', resizeStage);
+    window.addEventListener('message', handleMessage);
+    STAGE.bootOk = true;
+    requestAnimationFrame(frameLoop);
+    /* 重活拆帧：先出画面，再烘焙 */
+    setTimeout(function () {
+      try { shadeCanvas = bakeShade(); } catch (err) { reportError('bakeShade', err); }
+    }, 80);
+    setTimeout(function () {
+      try { grainCanvas = bakeGrain(); } catch (err) { reportError('bakeGrain', err); }
+    }, 260);
+  } catch (err) {
+    reportError('boot', err);
+  }
+}
+
+window.addEventListener('error', function (evt) {
+  reportError('window', evt && evt.message ? evt.message : evt);
+});
+</script>
+</body>
+</html>
